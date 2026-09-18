@@ -21,3 +21,20 @@ dependency injection and domain modeling. Keep effects composable and typed
 with their required services and errors; provide platform layers at runtime
 boundaries. Use direct platform APIs only for existing non-Effect
 integrations or runtime entrypoint adapters.
+
+## Agent skills
+
+### Issue tracker
+
+Issues live in Linear for team `tiara-stack`; use the Linear MCP and canonical
+Linear issue URLs. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Use the default labels: `needs-triage`, `needs-info`, `ready-for-agent`,
+`ready-for-human`, and `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+This is a single-context repo; read `CONTEXT.md` when present and relevant
+ADRs under `docs/adr/`. See `docs/agents/domain.md`.
