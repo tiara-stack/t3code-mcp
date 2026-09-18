@@ -1,4 +1,4 @@
-# Effect MCP Server
+# t3code-mcp
 
 This context defines the vocabulary for the standalone server that exposes
 Effect-backed capabilities through the Model Context Protocol.

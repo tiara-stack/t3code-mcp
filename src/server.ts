@@ -4,7 +4,7 @@ import { McpProtocol, McpServer } from "effect/unstable/ai";
 import { ServerToolkit, serverToolkitLayer } from "./tools";
 
 export const serverLayer = McpServer.layerStdio({
-  name: "effect-mcp-server",
+  name: "t3code-mcp",
   version: "0.1.0",
   description: "An Effect-based MCP server starter.",
   protocols: [

@@ -1,4 +1,4 @@
-# Effect MCP Server
+# t3code-mcp
 
 A standalone TypeScript starter for building an [MCP](https://modelcontextprotocol.io/)
 server with Effect 4.
@@ -26,7 +26,7 @@ After building, run the packaged server with `pnpm start` or the local binary:
 
 ```bash
 pnpm start
-pnpm exec effect-mcp-server
+pnpm exec t3code-mcp
 ```
 
 An MCP client can launch the development server with a configuration like:
@@ -34,9 +34,9 @@ An MCP client can launch the development server with a configuration like:
 ```json
 {
   "mcpServers": {
-    "effect-mcp-server": {
+    "t3code-mcp": {
       "command": "pnpm",
-      "args": ["--dir", "/path/to/effect-mcp-server", "dev"]
+      "args": ["--dir", "/path/to/t3code-mcp", "dev"]
     }
   }
 }

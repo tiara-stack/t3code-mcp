@@ -1,10 +1,10 @@
 {
-  "name": "effect-mcp-server",
+  "name": "t3code-mcp",
   "version": "0.1.0",
   "private": true,
   "description": "A standalone MCP server starter built with Effect.",
   "bin": {
-    "effect-mcp-server": "./dist/main.mjs"
+    "t3code-mcp": "./dist/main.mjs"
   },
   "type": "module",
   "scripts": {

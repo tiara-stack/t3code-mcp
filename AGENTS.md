@@ -1,4 +1,4 @@
-# Effect MCP Server
+# t3code-mcp
 
 This is a standalone pnpm TypeScript repository for an MCP server built with
 Effect.
