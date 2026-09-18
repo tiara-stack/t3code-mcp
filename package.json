@@ -1,0 +1,40 @@
+{
+  "name": "effect-mcp-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A standalone MCP server starter built with Effect.",
+  "bin": {
+    "effect-mcp-server": "./dist/main.mjs"
+  },
+  "type": "module",
+  "scripts": {
+    "dev": "tsx src/main.ts",
+    "start": "node dist/main.mjs",
+    "format": "vp fmt --check",
+    "format:apply": "vp fmt",
+    "lint": "vp lint src",
+    "test": "vp test run",
+    "test:watch": "vp test",
+    "typecheck": "tsc --noEmit",
+    "build": "vp pack",
+    "check": "vp check",
+    "fallow": "fallow audit --base main",
+    "checks": "pnpm check && pnpm test && pnpm build && pnpm fallow"
+  },
+  "dependencies": {
+    "@effect/platform-node": "4.0.0-rc.115",
+    "effect": "4.0.0-rc.115"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.1",
+    "fallow": "3.27.0",
+    "tsx": "4.23.13",
+    "typescript": "7.0.2",
+    "vite-plus": "0.3.3",
+    "vitest": "4.1.11"
+  },
+  "engines": {
+    "node": ">=24.11.0"
+  },
+  "packageManager": "pnpm@11.9.0"
+}

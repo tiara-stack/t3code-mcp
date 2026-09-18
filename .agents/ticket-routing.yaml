@@ -1,0 +1,26 @@
+# Recommendations for the developer choosing a coding agent for a Linear issue.
+# These are defaults, not enforcement. The developer can override every choice.
+# Model-selection basis: https://deepswe.datacurve.ai/
+# DeepSWE reports about $0.60 per trial for gpt-5.6-luna[max], $4.38 for
+# gpt-6-astra[medium], and about $6.50 for gpt-5.6-sol[max] or
+# gpt-6-astra[xhigh]. Use Astra medium for complex work because it scores
+# nearly as well as the expensive configurations, and reserve Astra xhigh
+# for architectural work where a missed design choice is costly.
+version: 1
+
+levels:
+  quick:
+    model: "gpt-5.6-luna"
+    reasoning_effort: "medium"
+  focused:
+    model: "gpt-5.6-luna"
+    reasoning_effort: "high"
+  standard:
+    model: "gpt-5.6-luna"
+    reasoning_effort: "max"
+  complex:
+    model: "gpt-6-astra"
+    reasoning_effort: "medium"
+  architectural:
+    model: "gpt-6-astra"
+    reasoning_effort: "xhigh"

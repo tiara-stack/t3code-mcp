@@ -1,0 +1,7 @@
+interface:
+  display_name: "Autonomous Development"
+  short_description: "Autonomous feature and PR gate workflow"
+  default_prompt: "Use $autonomous-development to implement a feature or run a selected PR gate."
+
+policy:
+  allow_implicit_invocation: false

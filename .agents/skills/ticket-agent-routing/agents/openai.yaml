@@ -1,0 +1,7 @@
+interface:
+  display_name: "Ticket Agent Routing"
+  short_description: "Recommend coding agents for Linear tickets"
+  default_prompt: "Use $ticket-agent-routing with $to-tickets to add model recommendations to the approved Linear issues."
+
+policy:
+  allow_implicit_invocation: false

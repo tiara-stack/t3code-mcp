@@ -1,0 +1,10 @@
+{
+  "$schema": "./node_modules/fallow/schema.json",
+  "entry": ["src/main.ts"],
+  "ignorePatterns": ["dist/**", "node_modules/**"],
+  "rules": {
+    "unused-files": "error",
+    "unused-exports": "warn",
+    "unused-types": "off"
+  }
+}
