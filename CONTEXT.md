@@ -83,11 +83,13 @@ execution interruption and does not shut down the T3Code instance.
 _Avoid_: instance shutdown, task completion
 
 **Guarded cleanup**:
-Removal of a thread or worktree subject to checks that protect active work
-and changes that have not been preserved.
+Removal of explicitly named resources subject to checks for active work
+and other threads sharing a worktree. Thread removal retains its worktree
+unless the controlling agent separately requests explicit discard.
 _Avoid_: unconditional deletion, automatic cleanup
 
 **Explicit discard**:
-A separate request by the controlling agent to remove specified resources
-despite a cleanup guard identifying work or changes that would be lost.
+A separate request by the controlling agent to remove a specified worktree
+and its contents without requiring their preservation. Active-work and
+shared-reference guards still apply, and the branch is retained.
 _Avoid_: ordinary cleanup, implicit force
