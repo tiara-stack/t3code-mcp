@@ -6,7 +6,7 @@ export default defineConfig({
     include: ["src/**/*.test.ts"],
   },
   lint: {
-    ignorePatterns: [".agents/**", "dist/**", ".fallow/**", "node_modules/**"],
+    ignorePatterns: ["dist/**", ".fallow/**", "node_modules/**"],
     options: {
       typeAware: true,
       typeCheck: true,

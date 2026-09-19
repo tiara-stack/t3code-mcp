@@ -1,6 +1,6 @@
 ---
 name: autonomous-development
-description: Runs configurable autonomous feature implementation, CodeRabbit CLI repair loops, incremental Graphite commits, PR CI babysitting, undrafting, and merge-readiness labeling. Use when explicitly invoking this workflow for an implementation or PR; supports review-only, pre-undraft, pre-merge, and read-only delegation routes.
+description: Runs configurable autonomous feature implementation, CodeRabbit CLI repair loops, incremental Graphite commits, silent Effect CLI polling for review gates, undrafting, and merge-readiness labeling. Use when explicitly invoking this workflow for an implementation or PR; supports review-only, pre-undraft, pre-merge, and read-only delegation routes.
 ---
 
 # Autonomous Development
@@ -44,18 +44,16 @@ Complete this gate before editing files, committing, submitting, undrafting,
 or applying a label.
 
 1. Parse the route, feature, Linear issue, and PR number or URL. Resolve a
-   supplied Linear issue before collecting branch-only inputs.
+   supplied Linear issue before collecting branch-only inputs. A supplied issue
+   is the work item this run owns.
 2. If Linear provides the branch name, use it verbatim; that name supplies
    the identity needed for branch setup, so do not ask for a username. Ask for
    a username only when no Linear branch name is available and `implement`
    must derive `<username>/<feature-slug>`. Ask all genuinely missing
    questions in one message.
 3. Read `.agents/autonomous-development.yaml`. Require a non-empty string
-   `merge_label` for any route that can apply a label. Before any required
-   explorer handoff, validate that `subagent.model` and
-   `subagent.reasoning_effort` are non-empty strings. Missing or invalid
-   `merge_label` or subagent configuration is a blocker; do not use a guessed
-   label or fallback subagent configuration.
+   `merge_label` for any route that can apply a label. Missing or invalid
+   `merge_label` is a blocker; do not use a guessed label.
 4. If a Linear ticket was supplied but its branch name could not be obtained,
    stop and ask the user to enable or provide access; do not substitute a
    guessed GitHub branch name.
@@ -72,34 +70,78 @@ or applying a label.
    untouched and unstaged. Never deliberately untrack an existing file. Ask
    before proceeding when a path mixes scopes or existing commits make intent
    unclear.
-8. Set the branch name before implementation edits. Define an empty branch as
-   a clean branch with no commits ahead of the trunk. Rename an empty branch
-   and track the trunk:
-
-   ```bash
-   TRUNK=master # resolved from the repository's Graphite trunk
-   git branch -m <target-branch>
-   gt track --parent "$TRUNK"
-   ```
-
-   Keep `TRUNK` set while choosing the existing-work path below.
-
-   If the branch already has work, create the target branch from the trunk.
-   When clearly in-scope changes are uncommitted, preserve them while changing
-   bases with a reversible stash, then inspect for conflicts:
-
-   ```bash
-   git stash push --include-untracked -m "autonomous-development intake" -- <related-pathspec>...
-   gt create <target-branch> --onto "$TRUNK"
-   git stash pop
-   ```
-
-   Never discard commits or working-tree changes. If moving the work would omit
-   a meaningful commit or the stash cannot be restored safely, report that at
-   intake and stop.
-9. For routes that apply the configured merge label, verify that the exact
+8. For routes that apply the configured merge label, verify that the exact
    repository label already exists. If it does not, stop and report the
    missing-label blocker; do not create the label.
+9. Claim a supplied Linear issue immediately before the first repository
+   mutation. If it is unassigned, assign it to yourself (`me`) and move it to
+   `In Progress`. If it is already assigned to you, move it to `In Progress`
+   when needed. If another developer owns it, stop with an ownership conflict;
+   do not silently take it over. Record the initial assignee and status in the
+   intake state. If a later blocker stops the run, restore that recorded
+   assignee and status before reporting the blocker.
+10. Set the branch name before implementation edits. Define an empty branch as
+    a clean non-trunk branch with no commits ahead of the trunk. Resolve the
+    Graphite trunk and keep it in `TRUNK`:
+
+    ```bash
+    TRUNK=$(gt trunk) || exit 1
+    test -n "$TRUNK" || {
+      printf '%s\n' 'Could not resolve the Graphite trunk' >&2
+      exit 1
+    }
+    ```
+
+    If the current branch is the trunk, create the target branch without
+    renaming the trunk:
+
+    ```bash
+    gt create <target-branch> --onto "$TRUNK"
+    ```
+
+    If the current branch is non-trunk and empty, with no commits ahead of
+    `TRUNK`, rename it and track the trunk:
+
+    ```bash
+    git branch -m <target-branch>
+    gt track --parent "$TRUNK"
+    ```
+
+    Keep `TRUNK` set while choosing the existing-work path below.
+
+    If the current branch is non-trunk with existing commits or work, keep its
+    name unchanged and create the target branch from `TRUNK`. Before creating
+    it, inspect each existing commit and record every clearly in-scope commit.
+    Transfer those commits to the target with the established Graphite restack
+    or an explicit cherry-pick, then inspect the target log and diff. If a
+    meaningful commit cannot be transferred safely, report the blocker and stop
+    before changing bases. Preserve clearly in-scope uncommitted changes with a
+    reversible stash, then inspect for conflicts:
+
+    ```bash
+    set -euo pipefail
+    STASH_BEFORE=$(git rev-parse --verify refs/stash 2>/dev/null || true)
+    STASH_AFTER=$STASH_BEFORE
+    git stash push --include-untracked -m "autonomous-development intake" -- <related-pathspec>...
+    STASH_AFTER=$(git rev-parse --verify refs/stash 2>/dev/null || true)
+    restore_stash() {
+      if [[ -n "$STASH_AFTER" && "$STASH_AFTER" != "$STASH_BEFORE" ]]; then
+        STASH_AFTER=
+        if ! git stash pop; then
+          printf '%s\n' 'Could not restore the autonomous-development stash' >&2
+          exit 1
+        fi
+      fi
+    }
+    trap restore_stash EXIT
+    gt create <target-branch> --onto "$TRUNK"
+    restore_stash
+    trap - EXIT
+    ```
+
+    Never discard commits or working-tree changes. If moving the work would omit
+    a meaningful commit or the stash cannot be restored safely, report that at
+    intake and stop.
 
 The gate is complete only when the route, identity, branch, worktree scope,
 PR target, configuration, and final-label availability (when applicable) are
@@ -110,8 +152,8 @@ all resolved.
 Delegation is declared by the active phase reference. Follow its named
 explorer handoff and attach the reference file it specifies; the main agent
 then receives only the worker's report while retaining all mutation and repair
-decisions. The handoff keeps long command chains and polling output out of the
-main context.
+decisions. The local CI gate uses a dedicated read-only polling worker; the
+CodeRabbit review gate uses the [Effect poller](references/polling-scripts.md).
 
 When a phase reference requires an explorer, pass `subagent.model` and
 `subagent.reasoning_effort` from `.agents/autonomous-development.yaml`. If
@@ -150,11 +192,10 @@ submitted.
 
 Use [CI gates](references/ci-gates.md) for failure repair and conflict
 handling. The full gate repairs code or repository state, so keep it in the
-main agent. A separate read-only diagnosis task may attach that file to an
-explorer; otherwise read it locally. Follow its polling handoff, spawn the
-named polling explorer, and wait for its terminal report. For a
-repository-owned failure, repair it, run the local CodeRabbit loop, commit and
-submit the new head, then spawn a new polling explorer for the new head.
+main agent. Follow its polling handoff, spawn the named read-only CI polling
+worker, and wait for its terminal report. For a repository-owned failure,
+repair it, run the local CodeRabbit loop, commit and submit the new head, then
+spawn a new CI polling worker for the new head.
 
 `pre-undraft` completes only when the repository's `checks` gate and every
 additional required check pass for the current head. The CI polling reference
@@ -176,8 +217,10 @@ the undraft operation is already satisfied.
 reviews, issue comments, and inline review comments. The full phase can fix
 code, reply, submit, and label, so keep it in the main agent.
 
-Follow the polling handoff in the review reference, spawn the named polling
-explorer, and wait for its terminal report. For every current
+Run the [CodeRabbit poller](references/polling-scripts.md) for the current head.
+It captures the platform CLI and GitHub status output and emits one terminal
+report; it may run for the full timeout, and the main agent gives no progress
+updates while it runs. For every current
 or unresolved CodeRabbit finding:
 
 1. Fix a valid finding, including a worthwhile in-scope preference, with the
@@ -186,9 +229,8 @@ or unresolved CodeRabbit finding:
    and the reason it does not apply. Reply in the existing thread when GitHub
    supports it; otherwise post a PR comment that identifies the finding.
 3. After any finding is handled, run the complete local CodeRabbit loop and
-   submit the resulting head. Repeat the review reference's polling handoff
-   for the new head and wait for its new GitHub review before deciding that the
-   PR is green.
+   submit the resulting head. Run a new CodeRabbit poller for the new head
+   before deciding that the PR is green.
 
 The GitHub review gate completes only when CI is green for the current head,
 CodeRabbit has completed its review of that head, no actionable valid finding
@@ -221,3 +263,9 @@ ask the user to enable or provide it. For any other missing credentials or
 permissions, a failed external service, or an unresolvable valid finding, stop
 and report instead of asking for a routine override. Report the exact state,
 head SHA, command, and next action when stopping.
+
+Move a supplied Linear issue to `Done` only after the full GitHub CodeRabbit
+review and repair gate completes. The full-work routes are `implement`,
+`babysit`, `merge`, and their full composed variants. `coderabbit-loop`,
+`pre-undraft`, `undraft`, `pre-merge`, and other partial routes leave the owned
+issue `In Progress`, even when their own terminal criterion is satisfied.
