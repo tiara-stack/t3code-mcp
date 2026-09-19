@@ -59,6 +59,29 @@ task. A thread ending its current response does not by itself establish work
 completion.
 _Avoid_: settled, stopped, response finished
 
+**Execution interruption**:
+A request to stop the current execution in a thread. Depending on the
+provider, interruption may also close the provider session; it does not
+establish work completion.
+_Avoid_: task completion, thread settlement
+
+**Thread settlement**:
+T3Code's attention state for parking a thread as done, whether explicitly
+requested or applied by its own settlement policy. It is distinct from a
+turn ending and does not establish the controlling agent's work completion.
+_Avoid_: turn completion, execution idle
+
+**Turn reference**:
+The instance registration, thread, and native orchestration turn identity
+that identify a particular observed execution. A submitted prompt does not
+necessarily create a new turn or identify one in its acknowledgement.
+_Avoid_: submission receipt, provider turn ID
+
+**Provider session shutdown**:
+A request to close a thread's provider session. It is distinct from
+execution interruption and does not shut down the T3Code instance.
+_Avoid_: instance shutdown, task completion
+
 **Guarded cleanup**:
 Removal of a thread or worktree subject to checks that protect active work
 and changes that have not been preserved.
