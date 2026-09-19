@@ -36,6 +36,18 @@ A running T3Code server that holds the threads and worktrees available to the
 controlling agent. One MCP server can connect to multiple T3Code instances.
 _Avoid_: worker, MCP server
 
+**Instance registration**:
+A persistent connection record through which the MCP server identifies and
+accesses one T3Code instance. Removing a registration does not remove the
+instance or its work.
+_Avoid_: instance, environment
+
+**Resource reference**:
+An instance-qualified designation of a project, thread, turn, or worktree
+held by T3Code. A reference does not require a separate resource record in
+the MCP server.
+_Avoid_: managed resource, registration
+
 **Controlling agent**:
 The agent that directs work in T3Code, decides whether that work is complete,
 and requests cleanup when its resources are no longer needed.
