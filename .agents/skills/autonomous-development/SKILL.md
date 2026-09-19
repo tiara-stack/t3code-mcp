@@ -19,7 +19,7 @@ Treat `implement <feature>` as the default route when no mode is named.
 | --- | --- | --- |
 | `implement <feature>` | Implement, commit coherent slices as they are validated, run the local CodeRabbit loop, submit, babysit CI, undraft, babysit GitHub CodeRabbit review, apply the configured label | Current PR is green and has the configured merge label |
 | `coderabbit-loop` | Run only the local CodeRabbit loop on the current branch diff | A successful review run has no new valid findings |
-| `pre-undraft <PR>` | Babysit CI and repair the PR | Named CI checks are green; leave the PR draft state unchanged |
+| `pre-undraft <PR>` | Babysit CI and repair the PR | The repository's `checks` gate and every additional required check pass; leave the PR draft state unchanged |
 | `undraft <PR>` | Run `pre-undraft`, then undraft | The PR is ready and the agent stops |
 | `pre-merge <PR>` | Run the full PR babysit flow without labeling | CI and GitHub CodeRabbit review are green; do not apply the configured merge label |
 | `babysit <PR>` | Run the full PR babysit flow and label | CI and GitHub CodeRabbit review are green; the configured merge label is present |
@@ -156,8 +156,9 @@ named polling explorer, and wait for its terminal report. For a
 repository-owned failure, repair it, run the local CodeRabbit loop, commit and
 submit the new head, then spawn a new polling explorer for the new head.
 
-`pre-undraft` completes only when the named checks and every required check are
-green for the current head. It stops before changing draft state. `undraft`
+`pre-undraft` completes only when the repository's `checks` gate and every
+additional required check pass for the current head. The CI polling reference
+defines the gate validation. It stops before changing draft state. `undraft`
 continues from that gate with:
 
 ```bash

@@ -19,11 +19,12 @@ command_error=$(<"$command_error_file")
 
 Keep the temporary file outside the repository and remove it after polling.
 
-Monitor every required check, including `workspace_ci`, `fallow`, and
-`fallow_baseline`. These are the expected required contexts. Poll at the
-documented cadence. If the command reports that no checks are registered,
-retry the transient condition up to three times, waiting 10 seconds between
-attempts. Keep the submitted PR identity and head SHA for every attempt. After
+Monitor the repository's required `checks` job and every additional required
+check. The `checks` job runs the validation steps in `.github/workflows/ci.yml`,
+including Fallow. Poll at the documented cadence. If the command reports that
+no checks are registered, retry the transient condition up to three times,
+waiting 10 seconds between attempts. Keep the submitted PR identity and head SHA
+for every attempt. After
 those retries, report a no-checks blocker.
 
 Check `command_status` for the timeout value before classifying any generic
@@ -37,11 +38,56 @@ state or bucket. If no recognized check state is present, report a
 polling-command blocker with the captured error, including unrecognized API or
 service errors. Preserve `--fail-fast` for confirmed failed required checks.
 
-After polling, query the required checks as JSON and validate that every
-expected context is present exactly as a required check and has `bucket: pass`
-or an equivalent successful state. Treat missing contexts, `fail`, and
-`cancel` buckets as blockers. A successful terminal report is valid only when
-all three expected contexts pass.
+After polling, query the required checks as JSON and validate them with
+[the gate script](../scripts/required-checks-pass.sh). Run from the repository
+root. Resolve `REPO` to the PR's base repository in `owner/name` form and `BASE`
+to its current `baseRefName`. A failed metadata lookup blocks the gate. Preserve
+command failures separately from check results:
+
+```bash
+set +e
+required_checks=$(timeout --foreground 30s gh pr checks "$PR" --required --json name,bucket 2>"$command_error_file")
+required_checks_status=$?
+required_checks_command_error=$(<"$command_error_file")
+checks_gate_status=1
+checks_gate_command_error=
+if [ "$required_checks_status" -eq 0 ]; then
+  bash .agents/skills/autonomous-development/scripts/required-checks-pass.sh "$REPO" "$BASE" <<<"$required_checks" 2>"$command_error_file"
+  checks_gate_status=$?
+  checks_gate_command_error=$(<"$command_error_file")
+fi
+set -e
+
+if [ "$required_checks_status" -eq 0 ] && [ "$checks_gate_status" -eq 0 ]; then
+  checks_gate=pass
+else
+  checks_gate=blocked
+fi
+```
+
+The script obtains the required names from [branch protection](https://docs.github.com/en/rest/branches/branch-protection#get-status-checks-protection)
+and [active branch rules](https://docs.github.com/en/rest/repos/rules#get-rules-for-a-branch).
+It requires `checks` to be configured and every configured name to appear in
+the reported results. Every returned result must have `bucket: pass`, including
+duplicate runs of the same job. A required job that has not reported blocks the
+gate even if the other jobs passed. Empty or malformed data, failed, cancelled,
+skipped, and pending checks also block it.
+Active `workflows` rules block this gate explicitly: they require workflow
+identity and state that the check-name results cannot establish. This script
+validates CI status checks; other branch policies remain GitHub's responsibility.
+
+The repository uses classic branch protection; reading that configuration and
+all active rule pages must succeed. An unavailable configuration, including an
+HTTP 404, blocks the gate rather than implying an empty required set. Report
+configuration failures from `checks_gate_command_error`, query failures from
+`required_checks_command_error`, and earlier polling failures from
+`command_error` separately. Head validation below is required before reporting
+any result.
+
+When changing the validator, run
+`bash .agents/skills/autonomous-development/scripts/test-required-checks.sh`.
+It uses a stub GitHub CLI to cover missing configured jobs and API failures
+without changing GitHub state.
 
 Before every terminal report, including command errors, success, failure,
 missing-context, no-checks exhaustion, cancelled-check, and timeout outcomes,

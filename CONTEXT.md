@@ -1,7 +1,7 @@
 # t3code-mcp
 
-This context defines the vocabulary for the standalone server that exposes
-Effect-backed capabilities through the Model Context Protocol.
+This context defines the vocabulary for an MCP server through which a
+controlling agent manages work across T3Code instances.
 
 ## Language
 
@@ -30,3 +30,29 @@ _Avoid_: protocol, channel
 **Protocol version**:
 The MCP message and capability contract negotiated between a client and server.
 _Avoid_: API version, transport version
+
+**T3Code instance**:
+A running T3Code server that holds the threads and worktrees available to the
+controlling agent. One MCP server can connect to multiple T3Code instances.
+_Avoid_: worker, MCP server
+
+**Controlling agent**:
+The agent that directs work in T3Code, decides whether that work is complete,
+and requests cleanup when its resources are no longer needed.
+_Avoid_: MCP server, worker
+
+**Work completion**:
+The controlling agent's decision that no further work is required for the
+task. A thread ending its current response does not by itself establish work
+completion.
+_Avoid_: settled, stopped, response finished
+
+**Guarded cleanup**:
+Removal of a thread or worktree subject to checks that protect active work
+and changes that have not been preserved.
+_Avoid_: unconditional deletion, automatic cleanup
+
+**Explicit discard**:
+A separate request by the controlling agent to remove specified resources
+despite a cleanup guard identifying work or changes that would be lost.
+_Avoid_: ordinary cleanup, implicit force

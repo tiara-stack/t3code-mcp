@@ -1,8 +1,11 @@
 # CI gates
 
 Use this reference to keep a pull request in draft while checking CI before
-removing its draft state. The `pre-undraft` phase ends with all required checks
-green and leaves the PR draft unchanged.
+removing its draft state. The `pre-undraft` phase requires this repository's
+`checks` job and every additional required check to pass for the submitted
+head, and leaves the PR draft unchanged. The `checks` job in
+`.github/workflows/ci.yml` runs the repository's validation commands, including
+Fallow.
 When the file is attached to a read-only explorer, inspect and report the
 failure only. The main agent performs repairs, commits, submissions, and
 conflict resolution.
@@ -20,13 +23,12 @@ repair.
 1. Rerun a clearly transient or infrastructure-only failure once. Repair a
    reproducible repository failure in the code, configuration, generated
    output, or test that caused it.
-2. Run `pnpm dlx fallow@2.88.2 audit` for ordinary Fallow findings. For
-   `fallow_baseline`, use the exact baseline command from
-   `.github/workflows/ci.yml`.
-3. Fix a baseline finding before changing the baseline. Update a baseline only
-   when the code change intentionally and legitimately changes the accepted
-   result, after local verification, and commit the update as an understandable
-   change. Never regenerate a baseline solely to suppress a failure.
+2. Reproduce the failed step using the command and dependency versions in
+   `.github/workflows/ci.yml`. Before rerunning Fallow, fetch the Git base
+   reference used by that workflow step so it is available for comparison.
+3. Fix the finding before changing an audit baseline or configuration. Change
+   an accepted result only when the code intentionally changes it, after local
+   verification, and commit that change with its reason.
 4. If Git reports merge conflicts, fetch the target and resolve each conflict
    while preserving both sides when their intent is clear. Validate the result.
    Report a precise blocker when the intended resolution is ambiguous.
@@ -35,7 +37,9 @@ repair.
    handoff for that new head:
 
    ```bash
-   coderabbit review --agent --base master --include-untracked
+   TRUNK=$(gt trunk) || exit 1
+   test -n "$TRUNK" || exit 1
+   coderabbit review --agent --base "$TRUNK" --include-untracked
    gt submit --no-interactive
    ```
 
