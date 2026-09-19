@@ -517,7 +517,7 @@ type ToolFailure = {
 
 Freshness describes the evidence available at the recorded upstream observation, not a promise that no UI client has changed state since. Across-instance discovery returns healthy data alongside typed per-instance failures. A targeted operation never fails over to another registration.
 
-Failure codes include `invalid_argument`, `registration_not_found`, `pairing_required`, `pairing_failed`, `identity_mismatch`, `identity_conflict`, `incompatible_instance`, `unsupported_capability`, `configuration_required`, `read_denied`, `operate_denied`, `unavailable`, `resource_not_found`, `request_id_conflict`, `request_record_unavailable`, `cursor_expired`, `cursor_mismatch`, `stale_state`, `uncheckable_target`, `uncheckable_references`, `active_execution`, `pending_request`, `shared_worktree`, `interruption_pending`, `pending_request_not_current`, `resume_unavailable`, `result_too_large`, and `upstream_failure`.
+Failure codes include `invalid_argument`, `registration_not_found`, `pairing_required`, `pairing_failed`, `identity_mismatch`, `identity_conflict`, `incompatible_instance`, `unsupported_capability`, `configuration_required`, `read_denied`, `operate_denied`, `unavailable`, `resource_not_found`, `request_id_conflict`, `request_record_unavailable`, `cursor_expired`, `cursor_mismatch`, `stale_state`, `uncheckable_target`, `uncheckable_references`, `active_execution`, `pending_request`, `shared_worktree`, `pending_request_not_current`, `resume_unavailable`, `result_too_large`, and `upstream_failure`.
 
 An error must not erase completed steps or uncertainty about effects. A timeout waiting for observation is a normal wait result. An unsupported requested operation is an error, not a successful no-op. Partial discovery and partial cleanup are explicit result cases. MCP `isError` is true for the outer error case and for a mutator reporting failed or partial execution. Reading an operation whose state is failed, partial, or unknown is a successful status read with `isError: false`. Mutations with an unknown outcome use their explicit operation state rather than implying a no-effect failure. Invalid protocol arguments remain MCP `InvalidParams`; semantic validation uses the typed envelope. The adapter must map these cases deliberately; the pinned Effect `failureMode: "return"` path does not do so automatically.
 
@@ -597,7 +597,7 @@ Pending requests include their native request identity when available, kind, off
 
 The pinned native approval decisions are `accept`, `acceptForSession`, `acceptAlways`, `decline`, and `cancel`. Expose only choices supported for the observed request and provider. `acceptAlways` and `acceptForSession` retain their broader scope; never relabel them as a one-time approval. Input responses validate against the observed form before dispatch. Stale or resolved request IDs fail explicitly. Response commands have no upstream atomic turn guard, so the contract cannot promise one.
 
-Cancelling a wait cancels observation only. A later wait may target the same turn. Thread interruption and provider-session shutdown use their separate mutation tools. While interruption is pending, the MCP server rejects its own new submissions to that thread, without promising to fence UI activity.
+Cancelling a wait cancels observation only. A later wait may target the same turn. Thread interruption and provider-session shutdown use their separate mutation tools. Pending interruption does not block new submissions, within one MCP process or across processes. Distinct requests follow upstream ordering and may race. Operation records preserve evidence and uncertainty without locking the thread.
 
 ## Output and cursors
 
@@ -780,7 +780,7 @@ The next ticket must choose mechanisms that satisfy this contract and validate t
 - Durable admission and recovery records, request-ID lifetime and reuse protection, private credential storage, and enrollment recovery without storing pairing codes.
 - Record lookup and safe behavior across restart, retention expiry, interrupted admission, and loss of upstream acknowledgement. Unknown history cannot become authority for blind resubmission.
 - Observation freshness, per-instance isolation, stream recovery, retention of exact-turn evidence, RPC snapshot size limits, bounded output captures, and cursor expiry.
-- Local interruption-gate lifecycle and observation of shutdown before deletion, including stale or missing provider evidence.
+- Concurrent interruption/submission behavior without local gates, and observation of shutdown before deletion, including stale or missing provider evidence.
 - Correct MCP output schema, structured/text result parity, typed error projection, request cancellation, and detached admitted operations using the pinned Effect version.
 - Contract and live tests for UI-created resources, colliding IDs across instances, missing model defaults, lost mutation replies, unsupported steering or resume guarantees, pending requests without IDs/turn correlation, partial inventories, shared-worktree refusal, partial cleanup, and reused worktree paths.
 
