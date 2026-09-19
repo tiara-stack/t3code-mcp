@@ -77,6 +77,18 @@ that identify a particular observed execution. A submitted prompt does not
 necessarily create a new turn or identify one in its acknowledgement.
 _Avoid_: submission receipt, provider turn ID
 
+**Mutation admission**:
+The MCP server's acceptance of responsibility for a requested change,
+independent of the originating MCP call. Admission does not establish that
+T3Code accepted or completed the change.
+_Avoid_: command acceptance, execution start, completion
+
+**Mutation receipt**:
+The MCP server's record of a requested change and its known outcome. It can
+identify accepted intent while the resulting execution remains uncorrelated
+or unresolved.
+_Avoid_: turn reference, execution receipt, work completion
+
 **Provider session shutdown**:
 A request to close a thread's provider session. It is distinct from
 execution interruption and does not shut down the T3Code instance.
