@@ -1,4 +1,5 @@
 node_modules/
+/.t3code/
 dist/
 .fallow/
 *.tsbuildinfo

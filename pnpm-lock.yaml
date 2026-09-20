@@ -15,6 +15,9 @@ importers:
       '@effect/platform-node':
         specifier: 4.0.0-rc.115
         version: 4.0.0-rc.115(effect@4.0.0-rc.115)(redis@6.2.1)
+      '@effect/sql-sqlite-node':
+        specifier: 4.0.0-rc.115
+        version: 4.0.0-rc.115(effect@4.0.0-rc.115)
       effect:
         specifier: 4.0.0-rc.115
         version: 4.0.0-rc.115
@@ -67,6 +70,11 @@ packages:
     peerDependencies:
       effect: ^4.0.0-rc.115
       redis: '>=5.0.0 <7.0.0'
+
+  '@effect/sql-sqlite-node@4.0.0-rc.115':
+    resolution: {integrity: sha512-53n3Kbwush7K/8/G1CDz638ClEoMvnUOT5BltCxMZ8TqcxeNoMv+nty08ZdrJ7P6m1q1RIeWlqdy5J9ZDICpbw==}
+    peerDependencies:
+      effect: ^4.0.0-rc.115
 
   '@esbuild/aix-ppc64@0.28.2':
     resolution: {integrity: sha512-XExcO+dvLKvVtNTibSTBej1NCAbaGhWn9Ww1ZPx80qsahhPFe/8jgWP0IchNe0F3HwkU7n8ejhH8bjonqht8mQ==}
@@ -1576,6 +1584,10 @@ snapshots:
     transitivePeerDependencies:
       - bufferutil
       - utf-8-validate
+
+  '@effect/sql-sqlite-node@4.0.0-rc.115(effect@4.0.0-rc.115)':
+    dependencies:
+      effect: 4.0.0-rc.115
 
   '@esbuild/aix-ppc64@0.28.2':
     optional: true

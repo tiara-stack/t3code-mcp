@@ -1,6 +1,7 @@
 import { NodeStdio } from "@effect/platform-node";
 import * as Layer from "effect/Layer";
 import { McpProtocol, McpServer } from "effect/unstable/ai";
+import { LocalStore } from "./local-store";
 import { ServerToolkit, serverToolkitLayer } from "./tools";
 
 export const serverLayer = McpServer.layerStdio({
@@ -16,5 +17,6 @@ export const serverLayer = McpServer.layerStdio({
 }).pipe(
   Layer.provide(McpServer.toolkit(ServerToolkit)),
   Layer.provide(serverToolkitLayer),
+  Layer.provide(LocalStore.layerFromEnvironment),
   Layer.provide(NodeStdio.layer),
 );
