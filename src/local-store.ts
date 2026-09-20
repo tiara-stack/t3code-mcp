@@ -38,6 +38,7 @@ import {
   MIGRATION_TABLE,
   CAPTURE_MIGRATION_NAME,
   LATEST_MIGRATION_NAME,
+  PAIRING_MIGRATION_NAME,
   migrations,
   SUPPORTED_SCHEMA_VERSION,
 } from "./migrations";
@@ -52,6 +53,7 @@ type RegistrationRow = {
   readonly environment_id: unknown;
   readonly connection: unknown;
   readonly last_observed_at: unknown;
+  readonly revision: unknown;
 };
 
 type CaptureRow = {
@@ -171,7 +173,9 @@ export type LocalStoreErrorKind =
   | "request_id_conflict"
   | "request_record_unavailable"
   | "registration_removed"
-  | "registration_not_found";
+  | "registration_not_found"
+  | "identity_conflict"
+  | "identity_mismatch";
 
 export class LocalStoreError extends Data.TaggedError("LocalStoreError")<{
   readonly kind: LocalStoreErrorKind;
@@ -201,19 +205,44 @@ export interface PutRegistrationInput extends InstanceSummary {
   readonly credential?: string;
 }
 
+export interface StagePairingInput {
+  readonly instanceId: string;
+  readonly alias: string;
+  readonly endpoint: string;
+  readonly credential: string;
+  readonly expiresAt: number;
+}
+
+export interface PublishPairingInput extends InstanceSummary {
+  readonly credential: string;
+}
+
+export interface StoredRegistration {
+  readonly registration: InstanceSummary;
+  readonly revision: number;
+  readonly credential: string | null;
+}
+
+export type OperationIntent = {
+  readonly instanceId: string;
+  readonly [key: string]: unknown;
+};
+
 export interface OperationAdmissionInput {
   readonly requestId: string;
   readonly tool: string;
   readonly fingerprint: string;
   readonly processNonce: string;
   readonly admittedAt: string;
-  readonly intent: { readonly instanceId: string };
+  readonly intent: OperationIntent;
   readonly completionMeans: OperationRecord["completionMeans"];
+  readonly steps?: ReadonlyArray<string>;
+  readonly created?: OperationRecord["created"];
 }
 
 export type StoredOperation = {
   readonly record: OperationRecord;
-  readonly intent: { readonly instanceId: string };
+  readonly intent: OperationIntent;
   readonly ownerProcessNonce: string;
 };
 
@@ -223,12 +252,17 @@ export interface OperationUpdate {
   readonly dispatch?: OperationRecord["dispatch"];
   readonly target?: OperationRecord["target"];
   readonly stepState?: OperationStepState;
+  readonly stepPosition?: number;
   readonly stepError?: OperationRecord["error"];
   readonly evidence?: ReadonlyArray<Evidence>;
   readonly evidenceStepPosition?: number | null;
   readonly error?: OperationRecord["error"];
   readonly recovery?: OperationRecord["recovery"];
   readonly recoverableUntil?: string | null;
+  readonly commandId?: string | null;
+  readonly messageId?: string | null;
+  readonly correlation?: OperationRecord["correlation"];
+  readonly created?: OperationRecord["created"];
 }
 
 export type RegistrationInspection =
@@ -249,6 +283,14 @@ export interface LocalStoreService {
   readonly putRegistration: (
     registration: PutRegistrationInput,
   ) => Effect.Effect<void, LocalStoreError>;
+  readonly stagePairing: (input: StagePairingInput) => Effect.Effect<void, LocalStoreError>;
+  readonly publishPairing: (
+    input: PublishPairingInput,
+  ) => Effect.Effect<InstanceSummary, LocalStoreError>;
+  readonly discardPairing: (instanceId: string) => Effect.Effect<void, LocalStoreError>;
+  readonly getRegistration: (
+    instanceId: string,
+  ) => Effect.Effect<StoredRegistration | null, LocalStoreError>;
   readonly fingerprintRequest: (
     tool: string,
     input: unknown,
@@ -355,12 +397,28 @@ export class LocalStore extends Context.Service<LocalStore, LocalStoreService>()
               }),
           ),
         );
+        const now = yield* Clock.currentTimeMillis;
+        yield* Effect.retry(
+          Effect.gen(function* () {
+            yield* sql`DELETE FROM staged_pairings WHERE expires_at <= ${now}`;
+            // request_keys are permanent request-ID tombstones. Expired operation
+            // details may be removed, but the ID remains reserved for its lifetime.
+            yield* sql`
+              DELETE FROM operations
+              WHERE recoverable_until IS NOT NULL
+                AND recoverable_until <= ${new Date(now).toISOString()}
+            `;
+          }).pipe(Effect.mapError(toStartupError)),
+          {
+            schedule: startupRetrySchedule,
+            while: (error) => error.kind === "contention",
+          },
+        );
         yield* protectDatabaseFiles(fileSystem, config.databasePath);
 
         const listRegistrations = (options: ListRegistrationsOptions) =>
           listRegistrationsFromDatabase(
             sql,
-            fileSystem,
             crypto,
             config,
             databaseId,
@@ -376,6 +434,30 @@ export class LocalStore extends Context.Service<LocalStore, LocalStoreService>()
             registration,
             verifySchemaForOperation,
           );
+
+        const stagePairing = (input: StagePairingInput) =>
+          stagePairingInDatabase(
+            sql,
+            fileSystem,
+            config.databasePath,
+            input,
+            verifySchemaForOperation,
+          );
+
+        const publishPairing = (input: PublishPairingInput) =>
+          publishPairingInDatabase(
+            sql,
+            fileSystem,
+            config.databasePath,
+            input,
+            verifySchemaForOperation,
+          );
+
+        const discardPairing = (instanceId: string) =>
+          discardPairingInDatabase(sql, instanceId, verifySchemaForOperation);
+
+        const getRegistration = (instanceId: string) =>
+          getRegistrationInDatabase(sql, instanceId, verifySchemaForOperation);
 
         const fingerprintRequest = (tool: string, input: unknown) =>
           fingerprintRequestInDatabase(crypto, fingerprintKey, tool, input);
@@ -401,6 +483,10 @@ export class LocalStore extends Context.Service<LocalStore, LocalStoreService>()
         return LocalStore.of({
           listRegistrations,
           putRegistration,
+          stagePairing,
+          publishPairing,
+          discardPairing,
+          getRegistration,
           fingerprintRequest,
           findRequest,
           admitOperation,
@@ -528,7 +614,7 @@ const verifySchema = (
       "SELECT value FROM local_store_meta WHERE key = 'schema_version'",
     );
     const tables = yield* sql.unsafe<{ name: string }>(
-      "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('local_store_meta', 'registrations', 'captures', 'capture_items', 'registration_credentials', 'registration_tombstones', 'request_keys', 'operations', 'operation_steps', 'operation_evidence') ORDER BY name",
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('local_store_meta', 'registrations', 'captures', 'capture_items', 'registration_credentials', 'registration_tombstones', 'request_keys', 'operations', 'operation_steps', 'operation_evidence', 'staged_pairings') ORDER BY name",
     );
     const metaColumns = yield* sql.unsafe<{ name: string }>("PRAGMA table_info(local_store_meta)");
     const registrationColumns = yield* sql.unsafe<{ name: string }>(
@@ -554,6 +640,9 @@ const verifySchema = (
     const operationEvidenceColumns = yield* sql.unsafe<{ name: string }>(
       "PRAGMA table_info(operation_evidence)",
     );
+    const stagedPairingColumns = yield* sql.unsafe<{ name: string }>(
+      "PRAGMA table_info(staged_pairings)",
+    );
     const foreignKeys = [
       ...(yield* sql.unsafe<{ table: string; on_delete: string }>(
         "PRAGMA foreign_key_list(capture_items)",
@@ -572,7 +661,7 @@ const verifySchema = (
       )),
     ];
     const definitions = yield* sql.unsafe<{ name: string; sql: string | null }>(
-      "SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name IN ('registrations', 'captures', 'capture_items', 'operations', 'operation_steps')",
+      "SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name IN ('registrations', 'captures', 'capture_items', 'operations', 'operation_steps', 'staged_pairings')",
     );
 
     const hasColumns = (actual: ReadonlyArray<{ name: string }>, expected: ReadonlyArray<string>) =>
@@ -594,8 +683,10 @@ const verifySchema = (
       journal[0]?.name !== MIGRATION_NAME ||
       journal[1]?.migration_id !== 2 ||
       journal[1]?.name !== CAPTURE_MIGRATION_NAME ||
-      journal[2]?.migration_id !== SUPPORTED_SCHEMA_VERSION ||
-      journal[2]?.name !== LATEST_MIGRATION_NAME
+      journal[2]?.migration_id !== 3 ||
+      journal[2]?.name !== LATEST_MIGRATION_NAME ||
+      journal[3]?.migration_id !== SUPPORTED_SCHEMA_VERSION ||
+      journal[3]?.name !== PAIRING_MIGRATION_NAME
     ) {
       return yield* Effect.fail(
         new LocalStoreStartupError({
@@ -611,7 +702,7 @@ const verifySchema = (
     if (
       userVersion[0]?.user_version !== SUPPORTED_SCHEMA_VERSION ||
       schemaMetadata[0]?.value !== String(SUPPORTED_SCHEMA_VERSION) ||
-      tables.length !== 10 ||
+      tables.length !== 11 ||
       !hasColumns(metaColumns, ["key", "value"]) ||
       !hasColumns(registrationColumns, [
         "instance_id",
@@ -621,6 +712,7 @@ const verifySchema = (
         "connection",
         "last_observed_at",
         "updated_at",
+        "revision",
       ]) ||
       !hasColumns(captureColumns, [
         "capture_id",
@@ -682,6 +774,14 @@ const verifySchema = (
         "native_event_id",
         "detail",
       ]) ||
+      !hasColumns(stagedPairingColumns, [
+        "instance_id",
+        "alias",
+        "endpoint",
+        "credential",
+        "expires_at",
+        "created_at",
+      ]) ||
       !hasForeignKey(foreignKeys, "captures", "CASCADE") ||
       !hasForeignKey(foreignKeys, "registrations", "CASCADE") ||
       !hasForeignKey(foreignKeys, "request_keys", "NO ACTION") ||
@@ -689,7 +789,7 @@ const verifySchema = (
     ) {
       return yield* Effect.fail(
         new LocalStoreStartupError({
-          kind: tables.length === 10 ? "incompatible_schema" : "migration_not_ready",
+          kind: tables.length === 11 ? "incompatible_schema" : "migration_not_ready",
           message: "The local store schema is not ready or is unsupported.",
         }),
       );
@@ -842,7 +942,6 @@ const retryStorage = <A>(
 
 const listRegistrationsFromDatabase = (
   sql: SqlClient.SqlClient,
-  fileSystem: FileSystem.FileSystem,
   crypto: Crypto.Crypto,
   config: Required<LocalStoreConfigValue>,
   databaseId: string,
@@ -859,14 +958,7 @@ const listRegistrationsFromDatabase = (
       : readContinuationPage(sql, databaseId, options.cursor, limit, maxBytes);
   });
 
-  return retryStorage(
-    effect.pipe(
-      Effect.mapError(toStoreError),
-      Effect.tap(() =>
-        protectDatabaseFiles(fileSystem, config.databasePath).pipe(Effect.mapError(toStoreError)),
-      ),
-    ),
-  );
+  return retryStorage(effect.pipe(Effect.mapError(toStoreError)));
 };
 
 const publishAndReadFirstPage = (
@@ -880,7 +972,7 @@ const publishAndReadFirstPage = (
   sql.withTransaction(
     Effect.gen(function* () {
       const rows = yield* sql<RegistrationRow>`
-        SELECT instance_id, alias, endpoint, environment_id, connection, last_observed_at
+        SELECT instance_id, alias, endpoint, environment_id, connection, last_observed_at, revision
         FROM registrations
         ORDER BY instance_id ASC
       `;
@@ -1256,10 +1348,10 @@ const putRegistrationInDatabase = (
           }
           yield* sql`
             INSERT INTO registrations (
-              instance_id, alias, endpoint, environment_id, connection, last_observed_at, updated_at
+              instance_id, alias, endpoint, environment_id, connection, last_observed_at, updated_at, revision
             ) VALUES (
               ${value.instanceId}, ${value.alias}, ${value.endpoint}, ${value.environmentId},
-              ${value.connection}, ${value.lastObservedAt}, ${now}
+              ${value.connection}, ${value.lastObservedAt}, ${now}, 0
             )
             ON CONFLICT(instance_id) DO UPDATE SET
               alias = excluded.alias,
@@ -1267,7 +1359,8 @@ const putRegistrationInDatabase = (
               environment_id = excluded.environment_id,
               connection = excluded.connection,
               last_observed_at = excluded.last_observed_at,
-              updated_at = excluded.updated_at
+              updated_at = excluded.updated_at,
+              revision = registrations.revision + 1
           `;
           if (credential !== undefined) {
             yield* sql`
@@ -1284,6 +1377,222 @@ const putRegistrationInDatabase = (
     }).pipe(Effect.mapError(toStoreError)),
   );
 };
+
+const stagePairingInDatabase = (
+  sql: SqlClient.SqlClient,
+  fileSystem: FileSystem.FileSystem,
+  databasePath: string,
+  input: StagePairingInput,
+  verify: SchemaVerifier,
+): Effect.Effect<void, LocalStoreError> =>
+  retryStorage(
+    Effect.gen(function* () {
+      const now = yield* Clock.currentTimeMillis;
+      if (input.credential.length === 0 || input.expiresAt <= now) {
+        return yield* Effect.fail(
+          new LocalStoreError({
+            kind: "malformed_row",
+            message: "The staged pairing credential is malformed.",
+          }),
+        );
+      }
+      yield* verify();
+      yield* sql.withTransaction(
+        Effect.gen(function* () {
+          yield* sql`DELETE FROM staged_pairings WHERE expires_at <= ${now}`;
+          const existing = yield* sql<{ instance_id: string }>`
+            SELECT instance_id FROM staged_pairings WHERE instance_id = ${input.instanceId}
+          `;
+          if (existing.length > 0) {
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: "identity_conflict",
+                message: "A staged pairing already exists for this local identity.",
+              }),
+            );
+          }
+          yield* sql`
+            INSERT INTO staged_pairings (
+              instance_id, alias, endpoint, credential, expires_at, created_at
+            ) VALUES (
+              ${input.instanceId}, ${input.alias}, ${input.endpoint}, ${input.credential},
+              ${input.expiresAt}, ${now}
+            )
+          `;
+        }),
+      );
+      yield* protectDatabaseFiles(fileSystem, databasePath);
+    }).pipe(Effect.mapError(toStoreError)),
+  );
+
+const publishPairingInDatabase = (
+  sql: SqlClient.SqlClient,
+  fileSystem: FileSystem.FileSystem,
+  databasePath: string,
+  input: PublishPairingInput,
+  verify: SchemaVerifier,
+): Effect.Effect<InstanceSummary, LocalStoreError> =>
+  retryStorage(
+    Effect.gen(function* () {
+      const value = yield* Schema.decodeUnknownEffect(InstanceSummarySchema)(input).pipe(
+        Effect.mapError(
+          () =>
+            new LocalStoreError({
+              kind: "malformed_row",
+              message: "The paired registration is malformed.",
+            }),
+        ),
+      );
+      if (input.credential.length === 0) {
+        return yield* Effect.fail(
+          new LocalStoreError({
+            kind: "malformed_row",
+            message: "The paired registration credential is malformed.",
+          }),
+        );
+      }
+      yield* verify();
+      const now = yield* Clock.currentTimeMillis;
+      yield* sql.withTransaction(
+        Effect.gen(function* () {
+          yield* sql`DELETE FROM staged_pairings WHERE expires_at <= ${now}`;
+          const staged = yield* sql<{
+            readonly credential: string;
+            readonly expires_at: number;
+          }>`
+            SELECT credential, expires_at
+            FROM staged_pairings
+            WHERE instance_id = ${value.instanceId}
+          `;
+          if (staged[0] === undefined || staged[0].expires_at <= now) {
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: "identity_mismatch",
+                message: "The staged pairing credential is unavailable.",
+              }),
+            );
+          }
+          if (staged[0].credential !== input.credential) {
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: "identity_mismatch",
+                message: "The staged pairing credential does not match.",
+              }),
+            );
+          }
+          const tombstones = yield* sql<{ instance_id: string }>`
+            SELECT instance_id FROM registration_tombstones WHERE instance_id = ${value.instanceId}
+          `;
+          if (tombstones.length > 0) {
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: "registration_removed",
+                message: "The removed registration ID cannot be rebound.",
+              }),
+            );
+          }
+          const duplicateIdentity = yield* sql<{ instance_id: string }>`
+            SELECT instance_id
+            FROM registrations
+            WHERE environment_id = ${value.environmentId}
+              AND instance_id <> ${value.instanceId}
+          `;
+          if (duplicateIdentity.length > 0) {
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: "identity_conflict",
+                message: "This T3Code environment is already registered.",
+              }),
+            );
+          }
+          const existing = yield* sql<{ instance_id: string }>`
+            SELECT instance_id FROM registrations WHERE instance_id = ${value.instanceId}
+          `;
+          if (existing.length > 0) {
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: "identity_conflict",
+                message: "The local registration identity is already in use.",
+              }),
+            );
+          }
+          yield* sql`
+            INSERT INTO registrations (
+              instance_id, alias, endpoint, environment_id, connection,
+              last_observed_at, updated_at, revision
+            ) VALUES (
+              ${value.instanceId}, ${value.alias}, ${value.endpoint}, ${value.environmentId},
+              ${value.connection}, ${value.lastObservedAt}, ${now}, 0
+            )
+          `;
+          yield* sql`
+            INSERT INTO registration_credentials (instance_id, credential, updated_at)
+            VALUES (${value.instanceId}, ${input.credential}, ${now})
+          `;
+          yield* sql`DELETE FROM staged_pairings WHERE instance_id = ${value.instanceId}`;
+        }),
+      );
+      yield* protectDatabaseFiles(fileSystem, databasePath);
+      return value;
+    }).pipe(Effect.mapError(toStoreError)),
+  );
+
+const getRegistrationInDatabase = (
+  sql: SqlClient.SqlClient,
+  instanceId: string,
+  verify: SchemaVerifier,
+): Effect.Effect<StoredRegistration | null, LocalStoreError> =>
+  retryStorage(
+    Effect.gen(function* () {
+      yield* verify();
+      const rows = yield* sql<RegistrationRow>`
+        SELECT instance_id, alias, endpoint, environment_id, connection, last_observed_at, revision
+        FROM registrations WHERE instance_id = ${instanceId}
+      `;
+      const row = rows[0];
+      if (row === undefined) return null;
+      const decoded = yield* decodeRegistrationRow(row);
+      if (decoded.item === null || !Number.isSafeInteger(Number(row.revision))) {
+        return yield* Effect.fail(
+          new LocalStoreError({
+            kind: "malformed_row",
+            message: "The saved registration row is malformed.",
+          }),
+        );
+      }
+      const credentials = yield* sql<{ credential: unknown }>`
+        SELECT credential FROM registration_credentials WHERE instance_id = ${instanceId}
+      `;
+      const credential = credentials[0]?.credential;
+      if (credential !== undefined && typeof credential !== "string") {
+        return yield* Effect.fail(
+          new LocalStoreError({
+            kind: "malformed_row",
+            message: "The saved registration credential is malformed.",
+          }),
+        );
+      }
+      return {
+        registration: decoded.item,
+        revision: Number(row.revision),
+        credential: credential ?? null,
+      } satisfies StoredRegistration;
+    }).pipe(Effect.mapError(toStoreError)),
+  );
+
+const discardPairingInDatabase = (
+  sql: SqlClient.SqlClient,
+  instanceId: string,
+  verify: SchemaVerifier,
+): Effect.Effect<void, LocalStoreError> =>
+  retryStorage(
+    Effect.gen(function* () {
+      yield* verify();
+      yield* sql.withTransaction(
+        sql`DELETE FROM staged_pairings WHERE instance_id = ${instanceId}`,
+      );
+    }).pipe(Effect.mapError(toStoreError)),
+  );
 
 const findRequestInDatabase = (
   sql: SqlClient.SqlClient,
@@ -1364,15 +1673,13 @@ const admitOperationInDatabase = (
             commandId: null,
             messageId: null,
             correlation: null,
-            created: {},
-            steps: [
-              {
-                name: "remove_registration",
-                state: "not_started",
-                evidence: [],
-                error: null,
-              },
-            ],
+            created: input.created ?? {},
+            steps: (input.steps ?? ["remove_registration"]).map((name) => ({
+              name,
+              state: "not_started" as const,
+              evidence: [],
+              error: null,
+            })),
             evidence: [],
             error: null,
             recovery: "observe_operation",
@@ -1394,14 +1701,19 @@ const admitOperationInDatabase = (
             ) VALUES (
               ${input.requestId}, ${input.tool}, 0, 'admitted', ${input.admittedAt},
               ${input.admittedAt}, NULL, ${JSON.stringify(input.intent)}, NULL,
-              ${input.completionMeans}, 'not_dispatched', NULL, NULL, NULL, '{}', NULL,
+              ${input.completionMeans}, 'not_dispatched', NULL, NULL, NULL,
+              ${JSON.stringify(input.created ?? {})}, NULL,
               'observe_operation', ${input.processNonce}
             )
           `;
-          yield* sql`
-            INSERT INTO operation_steps (request_id, position, name, state, error_json)
-            VALUES (${input.requestId}, 0, 'remove_registration', 'not_started', NULL)
-          `;
+          yield* Effect.forEach(
+            input.steps ?? ["remove_registration"],
+            (name, position) =>
+              sql`
+              INSERT INTO operation_steps (request_id, position, name, state, error_json)
+              VALUES (${input.requestId}, ${position}, ${name}, 'not_started', NULL)
+            `,
+          );
           return {
             kind: "inserted" as const,
             operation: {
@@ -1458,6 +1770,14 @@ const updateOperationInDatabase = (
 
           const targetJson =
             update.target === undefined ? row.target_json : JSON.stringify(update.target);
+          const correlationJson =
+            update.correlation === undefined
+              ? row.correlation_json
+              : update.correlation === null
+                ? null
+                : JSON.stringify(update.correlation);
+          const createdJson =
+            update.created === undefined ? row.created_json : JSON.stringify(update.created);
           const errorJson =
             update.error === undefined || update.error === null
               ? update.error === undefined
@@ -1474,12 +1794,17 @@ const updateOperationInDatabase = (
               recoverable_until = ${recoverableUntil},
               target_json = ${targetJson},
               dispatch = ${update.dispatch ?? row.dispatch},
+              command_id = ${update.commandId === undefined ? row.command_id : update.commandId},
+              message_id = ${update.messageId === undefined ? row.message_id : update.messageId},
+              correlation_json = ${correlationJson},
+              created_json = ${createdJson},
               error_json = ${errorJson},
               recovery = ${update.recovery ?? row.recovery}
             WHERE request_id = ${requestId}
           `;
 
           if (update.stepState !== undefined || update.stepError !== undefined) {
+            const stepPosition = update.stepPosition ?? 0;
             const stepError =
               update.stepError === undefined
                 ? undefined
@@ -1490,13 +1815,13 @@ const updateOperationInDatabase = (
               yield* sql`
                 UPDATE operation_steps
                 SET state = ${update.stepState}, error_json = error_json
-                WHERE request_id = ${requestId} AND position = 0
+                WHERE request_id = ${requestId} AND position = ${stepPosition}
               `;
             } else {
               yield* sql`
                 UPDATE operation_steps
                 SET state = COALESCE(${update.stepState ?? null}, state), error_json = ${stepError}
-                WHERE request_id = ${requestId} AND position = 0
+                WHERE request_id = ${requestId} AND position = ${stepPosition}
               `;
             }
           }
@@ -1534,7 +1859,7 @@ const inspectRegistrationInDatabase = (
     Effect.gen(function* () {
       yield* verify();
       const rows = yield* sql<RegistrationRow>`
-        SELECT instance_id, alias, endpoint, environment_id, connection, last_observed_at
+        SELECT instance_id, alias, endpoint, environment_id, connection, last_observed_at, revision
         FROM registrations WHERE instance_id = ${instanceId}
       `;
       const row = rows[0];
@@ -1584,7 +1909,7 @@ const removeRegistrationInDatabase = (
         // fallow-ignore-next-line complexity
         Effect.gen(function* () {
           const rows = yield* sql<RegistrationRow>`
-            SELECT instance_id, alias, endpoint, environment_id, connection, last_observed_at
+            SELECT instance_id, alias, endpoint, environment_id, connection, last_observed_at, revision
             FROM registrations WHERE instance_id = ${instanceId}
           `;
           const row = rows[0];
@@ -1657,6 +1982,7 @@ const getStoredOperationInTransaction = (
   sql: SqlClient.SqlClient,
   requestId: string,
 ): Effect.Effect<StoredOperation | null, LocalStoreError | SqlError.SqlError> =>
+  // fallow-ignore-next-line complexity
   Effect.gen(function* () {
     const rows = yield* sql<OperationRow>`
       SELECT request_id, tool, revision, state, admitted_at, updated_at,
@@ -1706,7 +2032,10 @@ const getStoredOperationInTransaction = (
     const decodedIntent = Schema.decodeUnknownResult(
       Schema.Struct({ instanceId: Schema.NonEmptyString }),
     )(intent);
-    if (decodedIntent._tag === "Failure") {
+    const decodedIntentRecord = Schema.decodeUnknownResult(
+      Schema.Record(Schema.String, Schema.Unknown),
+    )(intent);
+    if (decodedIntent._tag === "Failure" || decodedIntentRecord._tag === "Failure") {
       return yield* Effect.fail(
         new LocalStoreError({
           kind: "malformed_row",
@@ -1826,7 +2155,10 @@ const getStoredOperationInTransaction = (
     }
     return {
       record: decoded.success,
-      intent: decodedIntent.success,
+      intent: {
+        ...decodedIntentRecord.success,
+        instanceId: decodedIntent.success.instanceId,
+      },
       ownerProcessNonce: row.owner_process_nonce,
     };
   });

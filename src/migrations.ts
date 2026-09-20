@@ -3,10 +3,11 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { cachedConnectionLimitation } from "./domain";
 
 export const MIGRATION_TABLE = "effect_sql_migrations";
-export const SUPPORTED_SCHEMA_VERSION = 3;
+export const SUPPORTED_SCHEMA_VERSION = 4;
 export const MIGRATION_NAME = "create_local_registration_store";
 export const CAPTURE_MIGRATION_NAME = "add_capture_metadata";
 export const LATEST_MIGRATION_NAME = "add_mutation_receipts";
+export const PAIRING_MIGRATION_NAME = "add_pairing_recovery";
 
 export const migrations = {
   [`0001_${MIGRATION_NAME}`]: Effect.gen(function* () {
@@ -90,7 +91,7 @@ export const migrations = {
         + length(CAST(limitations_json AS BLOB))
     `;
     yield* sql`UPDATE local_store_meta SET value = '2' WHERE key = 'schema_version'`;
-    yield* sql`PRAGMA user_version = 2`;
+    yield* sql.unsafe("PRAGMA user_version = 2");
   }),
   [`0003_${LATEST_MIGRATION_NAME}`]: Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
@@ -182,6 +183,43 @@ export const migrations = {
       VALUES ('fingerprint_key', lower(hex(randomblob(32))))
     `;
     yield* sql`UPDATE local_store_meta SET value = '3' WHERE key = 'schema_version'`;
-    yield* sql`PRAGMA user_version = 3`;
+    yield* sql.unsafe("PRAGMA user_version = 3");
+  }),
+  [`0004_${PAIRING_MIGRATION_NAME}`]: Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+
+    yield* sql`
+      ALTER TABLE registrations ADD COLUMN revision INTEGER NOT NULL DEFAULT 0
+    `;
+    yield* sql`
+      UPDATE registrations
+      SET environment_id = NULL
+      WHERE environment_id IS NOT NULL
+        AND instance_id NOT IN (
+          SELECT MIN(instance_id)
+          FROM registrations
+          WHERE environment_id IS NOT NULL
+          GROUP BY environment_id
+        )
+    `;
+    yield* sql`
+      CREATE UNIQUE INDEX registrations_environment_idx
+      ON registrations (environment_id)
+      WHERE environment_id IS NOT NULL
+    `;
+    yield* sql`
+      CREATE TABLE staged_pairings (
+        instance_id TEXT PRIMARY KEY NOT NULL,
+        alias TEXT NOT NULL,
+        endpoint TEXT NOT NULL,
+        credential TEXT NOT NULL,
+        expires_at INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        CHECK (expires_at >= created_at)
+      )
+    `;
+    yield* sql`CREATE INDEX staged_pairings_expiry_idx ON staged_pairings (expires_at, created_at)`;
+    yield* sql`UPDATE local_store_meta SET value = '4' WHERE key = 'schema_version'`;
+    yield* sql.unsafe("PRAGMA user_version = 4");
   }),
 } as const;

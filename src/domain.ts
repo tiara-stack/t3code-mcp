@@ -8,16 +8,26 @@ export const MAX_SERIALIZED_RESULT_BYTES = 128 * 1024;
 const MAX_REQUEST_ID_LENGTH = 128;
 export const MAX_OPERATION_WAIT_MILLIS = 30_000;
 export const MAX_OPERATION_CAPACITY = 128;
+export const MAX_INSTANCE_RPC_CAPACITY = 8;
+export const MAX_TOTAL_RPC_CAPACITY = 32;
+export const MUTATION_RPC_DEADLINE_MILLIS = 30_000;
+export const LIVE_EFFECT_OBSERVATION_MILLIS = 60_000;
+export const STAGED_PAIRING_RETENTION_MILLIS = 24 * 60 * 60 * 1000;
 export const OPERATION_DETAIL_RETENTION_MILLIS = 30 * 24 * 60 * 60 * 1000;
 
+// fallow-ignore-next-line complexity
 const endpoint = Schema.String.check(
   Schema.makeFilter(
+    // fallow-ignore-next-line complexity
     (value) => {
       try {
         const url = new URL(value);
+        const hostname = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+        const loopback = hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
         return (
           (url.protocol === "http:" || url.protocol === "https:") &&
           url.hostname.length > 0 &&
+          (url.protocol === "https:" || loopback) &&
           url.username.length === 0 &&
           url.password.length === 0
         );
@@ -128,6 +138,53 @@ export const InstanceRemoveInputSchema = Schema.declare<{
 );
 
 export type InstanceRemoveInput = typeof InstanceRemoveInputSchema.Type;
+
+const instancePairFields = Schema.Struct({
+  requestId,
+  alias: nonEmptyString,
+  endpoint,
+  pairingCode: nonEmptyString,
+});
+
+const unknownInstancePairField = Schema.String.check(
+  Schema.makeFilter(
+    (key) => key !== "requestId" && key !== "alias" && key !== "endpoint" && key !== "pairingCode",
+    { message: "unknown instance_pair argument" },
+  ),
+);
+
+const instancePairRuntimeShape = Schema.StructWithRest(instancePairFields, [
+  Schema.Record(unknownInstancePairField, Schema.Never),
+]);
+
+const instancePairJsonShape = Schema.StructWithRest(instancePairFields, [
+  Schema.Record(Schema.String, Schema.Never),
+]);
+
+export const InstancePairInputSchema = Schema.declare<{
+  readonly requestId: string;
+  readonly alias: string;
+  readonly endpoint: string;
+  readonly pairingCode: string;
+}>(
+  (
+    input,
+  ): input is {
+    readonly requestId: string;
+    readonly alias: string;
+    readonly endpoint: string;
+    readonly pairingCode: string;
+  } => Schema.is(instancePairRuntimeShape)(input),
+  {
+    toCodecJson: () =>
+      Schema.link()(instancePairJsonShape, {
+        decode: SchemaGetter.passthrough({ strict: false }),
+        encode: SchemaGetter.passthrough({ strict: false }),
+      } as never),
+  },
+);
+
+export type InstancePairInput = typeof InstancePairInputSchema.Type;
 
 const operationGetFields = Schema.Struct({
   requestId,

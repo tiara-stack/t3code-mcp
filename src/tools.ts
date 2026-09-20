@@ -15,6 +15,7 @@ import { Tool, Toolkit } from "effect/unstable/ai";
 import {
   InstanceRemoveInputSchema,
   InstanceListInputSchema,
+  InstancePairInputSchema,
   MAX_OPERATION_CAPACITY,
   makeToolSuccess,
   MAX_SERIALIZED_RESULT_BYTES,
@@ -53,6 +54,19 @@ export const InstanceRemoveTool = Tool.make("instance_remove", {
   .annotate(Tool.OpenWorld, false);
 
 // fallow-ignore-next-line unused-export
+export const InstancePairTool = Tool.make("instance_pair", {
+  description: "Pair an existing T3Code instance with a one-use bearer code.",
+  parameters: InstancePairInputSchema,
+  success: OperationToolResultSchema,
+})
+  .addDependency(LocalStore)
+  .addDependency(Operations)
+  .annotate(Tool.Readonly, false)
+  .annotate(Tool.Destructive, false)
+  .annotate(Tool.Idempotent, true)
+  .annotate(Tool.OpenWorld, true);
+
+// fallow-ignore-next-line unused-export
 export const OperationGetTool = Tool.make("operation_get", {
   description: "Recover an admitted mutation receipt by request ID.",
   parameters: OperationGetInputSchema,
@@ -60,12 +74,17 @@ export const OperationGetTool = Tool.make("operation_get", {
 })
   .addDependency(LocalStore)
   .addDependency(Operations)
-  .annotate(Tool.Readonly, true)
+  .annotate(Tool.Readonly, false)
   .annotate(Tool.Destructive, false)
   .annotate(Tool.Idempotent, true)
   .annotate(Tool.OpenWorld, false);
 
-export const ServerToolkit = Toolkit.make(InstanceListTool, InstanceRemoveTool, OperationGetTool);
+export const ServerToolkit = Toolkit.make(
+  InstanceListTool,
+  InstancePairTool,
+  InstanceRemoveTool,
+  OperationGetTool,
+);
 
 // fallow-ignore-next-line complexity
 const toToolFailure = (error: LocalStoreError | OperationServiceError) => {
@@ -114,6 +133,10 @@ const toToolFailure = (error: LocalStoreError | OperationServiceError) => {
       return failure("stale_state", "reconcile_first");
     case "registration_not_found":
       return failure("registration_not_found", "none");
+    case "identity_conflict":
+      return failure("identity_conflict", "change_request");
+    case "identity_mismatch":
+      return failure("identity_mismatch", "reconcile_first");
     default:
       return failure("unavailable", "safe_read");
   }
@@ -142,6 +165,37 @@ const serverToolHandlers = ServerToolkit.of({
     Effect.gen(function* () {
       const operations = yield* Operations;
       const operation = yield* operations.removeRegistration(input);
+      const observedAt = new Date(yield* Clock.currentTimeMillis).toISOString();
+      return {
+        result: { kind: "ok" as const, value: operation },
+        observations:
+          operation.target === null
+            ? []
+            : [
+                {
+                  instanceId: operation.target.instanceId,
+                  observedAt,
+                  freshness: "fresh" as const,
+                  sourceSequence: null,
+                  coverage: "complete_for_query" as const,
+                  limitations: [],
+                },
+              ],
+        warnings: [],
+      };
+    }).pipe(
+      Effect.catch((error: LocalStoreError | OperationServiceError) =>
+        Effect.succeed({
+          result: { kind: "error" as const, error: toToolFailure(error) },
+          observations: [],
+          warnings: [],
+        }),
+      ),
+    ),
+  instance_pair: (input) =>
+    Effect.gen(function* () {
+      const operations = yield* Operations;
+      const operation = yield* operations.pairInstance(input);
       const observedAt = new Date(yield* Clock.currentTimeMillis).toISOString();
       return {
         result: { kind: "ok" as const, value: operation },
@@ -213,10 +267,11 @@ const toStructuredContent = (value: unknown): Schema.JsonObject | undefined =>
 
 // fallow-ignore-next-line complexity
 const mutatorResultIsError = (toolName: string, value: unknown): boolean => {
-  if (toolName !== "instance_remove" || typeof value !== "object" || value === null) return false;
+  if (typeof value !== "object" || value === null) return false;
   const result = (value as { result?: unknown }).result;
   if (typeof result !== "object" || result === null) return false;
   if ((result as { kind?: unknown }).kind === "error") return true;
+  if (toolName !== "instance_remove" && toolName !== "instance_pair") return false;
   const operation = (result as { value?: { state?: unknown } }).value;
   return (
     (result as { kind?: unknown }).kind === "ok" &&
@@ -237,10 +292,10 @@ export const mcpServerToolkitLayer: Layer.Layer<never, never, ServerToolkitRequi
   Layer.effectDiscard(
     Effect.gen(function* () {
       const registry = yield* McpServer.McpServer;
-      const built = yield* ServerToolkit as any as Effect.Effect<any, never, any>;
-      const services = yield* Effect.context<never>();
+      const built = yield* ServerToolkit;
+      const services = yield* Effect.context<Tool.HandlerServices<ServerToolDefinition>>();
 
-      for (const tool of Object.values(built.tools) as ReadonlyArray<any>) {
+      for (const tool of Object.values(built.tools)) {
         const outputJsonSchema = Tool.getJsonSchemaFromSchema(tool.successSchema);
         const outputSchema =
           outputJsonSchema.type === "object"
@@ -251,7 +306,7 @@ export const mcpServerToolkitLayer: Layer.Layer<never, never, ServerToolkitRequi
         const inputSchema = yield* Schema.decodeUnknownEffect(McpSchema.ToolJsonSchema)(
           Tool.getJsonSchema(tool),
         ).pipe(Effect.orDie);
-        const annotations = Context.get(tool.annotations, Tool.Readonly);
+        const readOnlyHint = Context.get(tool.annotations, Tool.Readonly);
 
         yield* registry.addTool({
           tool: new McpSchema.Tool({
@@ -260,7 +315,7 @@ export const mcpServerToolkitLayer: Layer.Layer<never, never, ServerToolkitRequi
             inputSchema,
             ...(outputSchema === undefined ? {} : { outputSchema }),
             annotations: {
-              readOnlyHint: annotations,
+              readOnlyHint,
               destructiveHint: Context.get(tool.annotations, Tool.Destructive),
               idempotentHint: Context.get(tool.annotations, Tool.Idempotent),
               openWorldHint: Context.get(tool.annotations, Tool.OpenWorld),
@@ -271,9 +326,16 @@ export const mcpServerToolkitLayer: Layer.Layer<never, never, ServerToolkitRequi
             return built.handle(tool.name, payload ?? {}).pipe(
               Stream.unwrap,
               Stream.run(Sink.last()),
-              Effect.flatMap((option: Option.Option<unknown>) => Effect.fromOption(option)),
+              Effect.flatMap((option: Option.Option<Tool.HandlerResult<ServerToolDefinition>>) =>
+                Effect.fromOption(option),
+              ),
               Effect.map(
-                (result: any) =>
+                (
+                  result: Pick<
+                    Tool.HandlerResult<ServerToolDefinition>,
+                    "encodedResult" | "isFailure"
+                  >,
+                ) =>
                   new McpSchema.CallToolResult({
                     isError:
                       result.isFailure || mutatorResultIsError(tool.name, result.encodedResult),
@@ -284,7 +346,7 @@ export const mcpServerToolkitLayer: Layer.Layer<never, never, ServerToolkitRequi
                         : [{ type: "text", text: JSON.stringify(result.encodedResult) }],
                   }),
               ),
-              Effect.provideContext(services as Context.Context<any>),
+              Effect.provideContext(services),
               Effect.catch((error: unknown) => {
                 if (AiError.isAiError(error)) {
                   const reason = error.reason;
@@ -294,7 +356,11 @@ export const mcpServerToolkitLayer: Layer.Layer<never, never, ServerToolkitRequi
                 }
                 return Effect.fail(error);
               }),
-            ) as any;
+            ) as unknown as Effect.Effect<
+              McpSchema.CallToolResult,
+              McpSchema.InternalError | McpSchema.InvalidParams,
+              McpSchema.McpServerClient
+            >;
           },
         });
       }

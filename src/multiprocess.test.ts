@@ -82,34 +82,41 @@ const startServer = async (databasePath: string): Promise<Server> => {
     stdio: ["pipe", "pipe", "inherit"],
   });
   const next = waitForMessage(child);
-  child.stdin?.write(
-    `${JSON.stringify({
-      jsonrpc: "2.0",
-      id: 1,
-      method: "initialize",
-      params: {
-        protocolVersion: "2025-06-18",
-        capabilities: {},
-        clientInfo: { name: "multiprocess-test", version: "1.0.0" },
-      },
-    })}\n`,
-  );
-  let initialized = await next();
-  while (initialized.id !== 1) initialized = await next();
-  child.stdin?.write(
-    `${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} })}\n`,
-  );
-  child.stdin?.write(
-    `${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} })}\n`,
-  );
-  let listed = await next();
-  while (listed.id !== 2) listed = await next();
-  expect(listed.result?.tools?.map((tool) => tool.name)).toEqual([
-    "instance_list",
-    "instance_remove",
-    "operation_get",
-  ]);
-  return { child, next };
+  const server = { child, next };
+  try {
+    child.stdin?.write(
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-06-18",
+          capabilities: {},
+          clientInfo: { name: "multiprocess-test", version: "1.0.0" },
+        },
+      })}\n`,
+    );
+    let initialized = await next();
+    while (initialized.id !== 1) initialized = await next();
+    child.stdin?.write(
+      `${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} })}\n`,
+    );
+    child.stdin?.write(
+      `${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} })}\n`,
+    );
+    let listed = await next();
+    while (listed.id !== 2) listed = await next();
+    expect(listed.result?.tools?.map((tool) => tool.name)).toEqual([
+      "instance_list",
+      "instance_pair",
+      "instance_remove",
+      "operation_get",
+    ]);
+    return server;
+  } catch (error) {
+    await stopServer(server);
+    throw error;
+  }
 };
 
 const stopServer = async (server: Server) => {
@@ -132,7 +139,7 @@ const seed = async (
           yield* store.putRegistration({
             instanceId: registration.instanceId,
             alias: registration.instanceId,
-            endpoint: `http://${registration.instanceId}.test`,
+            endpoint: `https://${registration.instanceId}.test`,
             environmentId: `env-${registration.instanceId}`,
             connection: "connected",
             lastObservedAt: null,

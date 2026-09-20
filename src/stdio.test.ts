@@ -95,6 +95,7 @@ describe("stdio transport", () => {
       while (toolsMessage.id !== 2) toolsMessage = await nextMessage();
       expect(toolsMessage.result?.tools?.map((tool) => tool.name)).toEqual([
         "instance_list",
+        "instance_pair",
         "instance_remove",
         "operation_get",
       ]);

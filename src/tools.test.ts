@@ -6,6 +6,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LocalStore } from "./local-store";
+import { InstanceConnections } from "./instance-connections";
+import { T3CodeAdapterError } from "./t3code-adapter";
 import { ServerToolkit, serverToolkitLayer } from "./tools";
 
 const makeDatabasePath = () => {
@@ -13,8 +15,74 @@ const makeDatabasePath = () => {
   return { directory, databasePath: join(directory, "state.sqlite") };
 };
 
-const appLayer = (databasePath: string) =>
-  serverToolkitLayer.pipe(Layer.provideMerge(LocalStore.layer({ databasePath })));
+const appLayer = (
+  databasePath: string,
+  connections: Layer.Layer<InstanceConnections, never, LocalStore> = InstanceConnections.layer,
+) =>
+  serverToolkitLayer.pipe(
+    Layer.provideMerge(connections),
+    Layer.provideMerge(LocalStore.layer({ databasePath })),
+  );
+
+const fakeConnections = (options?: {
+  readonly environmentId?: string;
+  readonly rejectPairing?: boolean;
+  readonly rejectVerification?: boolean;
+}) => {
+  const environmentId = options?.environmentId ?? "environment-paired";
+  const exchangePairingCode = (_input: {
+    readonly endpoint: string;
+    readonly pairingCode: string;
+  }) =>
+    options?.rejectPairing
+      ? Effect.fail(
+          new T3CodeAdapterError({
+            kind: "invalid_pairing_code",
+            message: "The pairing code was rejected by the test instance.",
+            uncertain: false,
+            status: 400,
+          }),
+        )
+      : Effect.succeed({ credential: "secret-token", expiresAtMillis: null });
+  const verifyCredential = (_input: { readonly endpoint: string; readonly credential: string }) =>
+    options?.rejectVerification
+      ? Effect.fail(
+          new T3CodeAdapterError({
+            kind: "wire_incompatible",
+            message: "The test instance rejected the pinned wire contract.",
+            uncertain: false,
+            status: null,
+          }),
+        )
+      : Effect.succeed({
+          environmentId,
+          serverVersion: "0.0.38",
+          scopes: ["orchestration:read", "orchestration:operate"],
+          capabilities: {},
+        });
+  return InstanceConnections.layerTest({
+    exchangePairingCode,
+    verifyCredential,
+    pair: (input) =>
+      Effect.gen(function* () {
+        const staged = yield* exchangePairingCode(input);
+        return {
+          ...staged,
+          ...(yield* verifyCredential({ endpoint: input.endpoint, credential: staged.credential })),
+        };
+      }),
+    acquire: () =>
+      Effect.fail(
+        new T3CodeAdapterError({
+          kind: "capacity",
+          message: "The test connection does not support acquisition.",
+          uncertain: false,
+          status: null,
+        }),
+      ),
+    invalidate: () => Effect.void,
+  });
+};
 
 const callList = (input: unknown = {}) =>
   Effect.gen(function* () {
@@ -87,7 +155,7 @@ describe("instance_list", () => {
             yield* store.putRegistration({
               instanceId: "instance-a",
               alias: "A",
-              endpoint: "http://a.test",
+              endpoint: "https://a.test",
               environmentId: "env-a",
               connection: "connected",
               lastObservedAt: "2026-09-19T00:00:00.000Z",
@@ -95,7 +163,7 @@ describe("instance_list", () => {
             yield* store.putRegistration({
               instanceId: "instance-b",
               alias: "B",
-              endpoint: "http://b.test",
+              endpoint: "https://b.test",
               environmentId: null,
               connection: "pairing_required",
               lastObservedAt: null,
@@ -130,6 +198,181 @@ describe("instance_list", () => {
   });
 });
 
+describe("instance_pair", () => {
+  it("persists a verified registration without exposing pairing credentials", async () => {
+    const { directory, databasePath } = makeDatabasePath();
+    try {
+      const result = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const pairing = yield* callTool("instance_pair", {
+              requestId: "pair-1",
+              alias: "Disposable instance",
+              endpoint: "https://pair.test",
+              pairingCode: "one-use-code",
+            });
+            const list = yield* callList();
+            const lookup = yield* callTool("operation_get", { requestId: "pair-1" });
+            return { pairing, list, lookup };
+          }).pipe(Effect.provide(appLayer(databasePath, fakeConnections()))),
+        ),
+      );
+
+      expect(result.pairing[0]?.result).toMatchObject({
+        result: {
+          kind: "ok",
+          value: {
+            requestId: "pair-1",
+            tool: "instance_pair",
+            state: "completed",
+            completionMeans: "registration_saved",
+            dispatch: "accepted",
+            target: {
+              alias: "Disposable instance",
+              environmentId: "environment-paired",
+              connection: "connected",
+            },
+            created: { instanceId: expect.any(String) },
+          },
+        },
+      });
+      expect(result.list[0]?.result).toMatchObject({
+        result: {
+          kind: "ok",
+          value: {
+            items: [
+              {
+                alias: "Disposable instance",
+                environmentId: "environment-paired",
+              },
+            ],
+          },
+        },
+      });
+      expect(JSON.stringify(result.lookup)).not.toContain("secret-token");
+      expect(JSON.stringify(result.lookup)).not.toContain("one-use-code");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("returns a recoverable failure for an invalid one-use code", async () => {
+    const { directory, databasePath } = makeDatabasePath();
+    try {
+      const result = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const pairing = yield* callTool("instance_pair", {
+              requestId: "pair-invalid",
+              alias: "Invalid instance",
+              endpoint: "https://pair.test",
+              pairingCode: "expired-code",
+            });
+            const lookup = yield* callTool("operation_get", { requestId: "pair-invalid" });
+            return { pairing, lookup };
+          }).pipe(Effect.provide(appLayer(databasePath, fakeConnections({ rejectPairing: true })))),
+        ),
+      );
+
+      expect(result.pairing[0]?.result).toMatchObject({
+        result: {
+          kind: "ok",
+          value: {
+            state: "failed",
+            dispatch: "rejected",
+            error: { code: "pairing_failed" },
+          },
+        },
+      });
+      expect(result.lookup[0]?.result).toMatchObject({
+        result: { kind: "ok", value: { operation: { state: "failed" } } },
+      });
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("does not publish a staged credential when verification fails", async () => {
+    const { directory, databasePath } = makeDatabasePath();
+    try {
+      const result = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const pairing = yield* callTool("instance_pair", {
+              requestId: "pair-unverified",
+              alias: "Unverified instance",
+              endpoint: "https://pair.test",
+              pairingCode: "verified-later-code",
+            });
+            const list = yield* callList();
+            return { pairing, list };
+          }).pipe(
+            Effect.provide(appLayer(databasePath, fakeConnections({ rejectVerification: true }))),
+          ),
+        ),
+      );
+
+      expect(result.pairing[0]?.result).toMatchObject({
+        result: {
+          kind: "ok",
+          value: {
+            state: "failed",
+            dispatch: "accepted",
+            error: { code: "incompatible_instance" },
+          },
+        },
+      });
+      expect(result.list[0]?.result).toMatchObject({
+        result: { kind: "ok", value: { items: [] } },
+      });
+      expect(JSON.stringify(result.pairing)).not.toContain("secret-token");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects duplicate environment identities without replacing the first registration", async () => {
+    const { directory, databasePath } = makeDatabasePath();
+    try {
+      const result = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const first = yield* callTool("instance_pair", {
+              requestId: "pair-first",
+              alias: "First",
+              endpoint: "https://first.test",
+              pairingCode: "first-code",
+            });
+            const second = yield* callTool("instance_pair", {
+              requestId: "pair-second",
+              alias: "Second",
+              endpoint: "https://second.test",
+              pairingCode: "second-code",
+            });
+            const list = yield* callList();
+            return { first, second, list };
+          }).pipe(Effect.provide(appLayer(databasePath, fakeConnections()))),
+        ),
+      );
+
+      expect(result.first[0]?.result).toMatchObject({
+        result: { kind: "ok", value: { state: "completed" } },
+      });
+      expect(result.second[0]?.result).toMatchObject({
+        result: {
+          kind: "ok",
+          value: { state: "failed", error: { code: "identity_conflict" } },
+        },
+      });
+      expect(result.list[0]?.result).toMatchObject({
+        result: { kind: "ok", value: { items: [{ alias: "First" }] } },
+      });
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("instance_remove and operation_get", () => {
   it("removes a saved registration and returns a recoverable receipt", async () => {
     const { directory, databasePath } = makeDatabasePath();
@@ -141,7 +384,7 @@ describe("instance_remove and operation_get", () => {
             yield* store.putRegistration({
               instanceId: "instance-remove",
               alias: "Remove me",
-              endpoint: "http://remove.test",
+              endpoint: "https://remove.test",
               environmentId: "env-remove",
               connection: "connected",
               lastObservedAt: null,
@@ -202,7 +445,7 @@ describe("instance_remove and operation_get", () => {
             yield* store.putRegistration({
               instanceId: "instance-dedup",
               alias: "Dedup",
-              endpoint: "http://dedup.test",
+              endpoint: "https://dedup.test",
               environmentId: "env-dedup",
               connection: "connected",
               lastObservedAt: null,
@@ -228,7 +471,7 @@ describe("instance_remove and operation_get", () => {
               store.putRegistration({
                 instanceId: "instance-dedup",
                 alias: "Rebound",
-                endpoint: "http://rebound.test",
+                endpoint: "https://rebound.test",
                 environmentId: "env-rebound",
                 connection: "connected",
                 lastObservedAt: null,
