@@ -20,7 +20,7 @@ import {
   type OperationRecord,
   type ToolFailure,
 } from "./domain";
-import { LocalStore, LocalStoreError } from "./local-store";
+import { LocalStore, LocalStoreError, REQUEST_RECORD_UNAVAILABLE_MESSAGE } from "./local-store";
 import type { OperationIntent, StoredOperation } from "./local-store";
 import { InstanceConnections } from "./instance-connections";
 import { T3CodeAdapterError } from "./t3code-adapter";
@@ -234,6 +234,8 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           const observed = yield* evidence(detail, "adapter_inference");
           yield* store.updateOperation(stored.record.requestId, {
             now: observed.observedAt,
+            // Retain only the recovery identity after a prior dispatch attempt.
+            intent: { instanceId: stored.intent.instanceId },
             state: "outcome_unknown",
             dispatch: "unknown",
             stepPosition: 0,
@@ -362,14 +364,27 @@ export class Operations extends Context.Service<Operations, OperationsService>()
       ): Effect.Effect<OperationGetValue, LocalStoreError> =>
         // fallow-ignore-next-line complexity
         Effect.gen(function* () {
-          const stored = yield* store.getOperation(input.requestId);
+          let stored = yield* store.getOperation(input.requestId);
           if (stored === null) {
-            return yield* Effect.fail(
-              new LocalStoreError({
-                kind: "request_record_unavailable",
-                message: "No mutation receipt exists for that request ID.",
-              }),
-            );
+            const requestKey = yield* store.findRequest(input.requestId);
+            if (requestKey === null) {
+              return yield* Effect.fail(
+                new LocalStoreError({
+                  kind: "request_record_unavailable",
+                  message: "No mutation receipt exists for that request ID.",
+                }),
+              );
+            }
+            const refreshed = yield* store.getOperation(input.requestId);
+            if (refreshed === null) {
+              return yield* Effect.fail(
+                new LocalStoreError({
+                  kind: "request_record_unavailable",
+                  message: REQUEST_RECORD_UNAVAILABLE_MESSAGE,
+                }),
+              );
+            }
+            stored = refreshed;
           }
           let record = yield* reconcile(stored);
           const baselineRevision = record.revision;
@@ -427,6 +442,8 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           );
           yield* store.updateOperation(input.requestId, {
             now: started.observedAt,
+            // Pairing endpoints and transient prompt payload are no longer needed.
+            intent: { instanceId },
             state: "pending",
             dispatch: "unknown",
             stepPosition,
@@ -591,6 +608,8 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           );
           yield* store.updateOperation(input.requestId, {
             now: started.observedAt,
+            // Removal has no recovery need for the original transient payload.
+            intent: { instanceId: input.instanceId },
             state: "pending",
             dispatch: "unknown",
             stepState: "pending",
@@ -663,9 +682,12 @@ export class Operations extends Context.Service<Operations, OperationsService>()
                       error.kind === "registration_not_found"
                         ? "inspect_target"
                         : "observe_operation",
-                    recoverableUntil: new Date(
-                      Date.parse(now) + OPERATION_DETAIL_RETENTION_MILLIS,
-                    ).toISOString(),
+                    recoverableUntil:
+                      error.kind === "registration_not_found"
+                        ? new Date(
+                            Date.parse(now) + OPERATION_DETAIL_RETENTION_MILLIS,
+                          ).toISOString()
+                        : null,
                   });
                   yield* signalCompletion(input.requestId);
                 }),
@@ -784,7 +806,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
               return yield* Effect.fail(
                 new LocalStoreError({
                   kind: "request_record_unavailable",
-                  message: "The request key exists but its operation record is unavailable.",
+                  message: REQUEST_RECORD_UNAVAILABLE_MESSAGE,
                 }),
               );
             }
@@ -804,7 +826,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
             requestId: input.requestId,
             fingerprint,
             tool: "instance_pair",
-            intent: { instanceId, alias: input.alias, endpoint: input.endpoint },
+            intent: { instanceId },
             completionMeans: "registration_saved",
             steps: [
               "exchange_pairing_code",
@@ -837,7 +859,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
               return yield* Effect.fail(
                 new LocalStoreError({
                   kind: "request_record_unavailable",
-                  message: "The request key exists but its operation record is unavailable.",
+                  message: REQUEST_RECORD_UNAVAILABLE_MESSAGE,
                 }),
               );
             }

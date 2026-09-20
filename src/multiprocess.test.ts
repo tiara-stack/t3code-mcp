@@ -3,6 +3,7 @@ import { createRequire } from "node:module";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import * as Effect from "effect/Effect";
 import { describe, expect, it } from "vitest";
 import { LocalStore } from "./local-store";
@@ -149,7 +150,79 @@ const seed = async (
     ),
   );
 
+const expireResolvedOperation = (databasePath: string, requestId: string) => {
+  const database = new DatabaseSync(databasePath);
+  try {
+    const timestamp = new Date(Date.now() - 1).toISOString();
+    database.exec("PRAGMA busy_timeout = 5000");
+    const result = database
+      .prepare("UPDATE operations SET recoverable_until = ?, updated_at = ? WHERE request_id = ?")
+      .run(timestamp, timestamp, requestId);
+    if (Number(result.changes) !== 1) {
+      throw new Error(`Could not age operation ${requestId}`);
+    }
+  } finally {
+    database.close();
+  }
+};
+
 describe("shared SQLite mutation admission", () => {
+  it("does not reuse an expired request ID while lookup and admission race across processes", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "t3code-mcp-expiry-race-"));
+    const databasePath = join(directory, "state.sqlite");
+    let left: Server | undefined;
+    let right: Server | undefined;
+    try {
+      await seed(databasePath, [
+        { instanceId: "expired-process" },
+        { instanceId: "fresh-process" },
+      ]);
+      left = await startServer(databasePath);
+      const initialRemoval = await call(left, 3, "instance_remove", {
+        requestId: "expired-process-request",
+        instanceId: "expired-process",
+      });
+      expect(initialRemoval.result?.structuredContent).toMatchObject({
+        result: { kind: "ok", value: { state: "completed" } },
+      });
+      right = await startServer(databasePath);
+      expireResolvedOperation(databasePath, "expired-process-request");
+
+      const raced = await Promise.all([
+        call(left, 4, "operation_get", { requestId: "expired-process-request" }),
+        call(right, 4, "instance_remove", {
+          requestId: "expired-process-request",
+          instanceId: "expired-process",
+        }),
+      ]);
+      for (const response of raced) {
+        expect(response.result?.structuredContent).toMatchObject({
+          result: { kind: "error", error: { code: "request_record_unavailable" } },
+        });
+      }
+
+      const conflict = await call(left, 5, "instance_remove", {
+        requestId: "expired-process-request",
+        instanceId: "fresh-process",
+      });
+      expect(conflict.result?.structuredContent).toMatchObject({
+        result: { kind: "error", error: { code: "request_id_conflict" } },
+      });
+
+      const fresh = await call(right, 6, "instance_remove", {
+        requestId: "fresh-process-request",
+        instanceId: "fresh-process",
+      });
+      expect(fresh.result?.structuredContent).toMatchObject({
+        result: { kind: "ok", value: { requestId: "fresh-process-request", state: "completed" } },
+      });
+    } finally {
+      if (left !== undefined) await stopServer(left);
+      if (right !== undefined) await stopServer(right);
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }, 60000);
+
   it("admits the same request ID once across OS processes", async () => {
     const directory = mkdtempSync(join(tmpdir(), "t3code-mcp-multiprocess-"));
     const databasePath = join(directory, "state.sqlite");

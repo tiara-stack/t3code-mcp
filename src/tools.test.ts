@@ -1,14 +1,19 @@
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
+import * as Duration from "effect/Duration";
 import { describe, expect, it } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { LocalStore } from "./local-store";
 import { InstanceConnections } from "./instance-connections";
 import { T3CodeAdapterError } from "./t3code-adapter";
 import { ServerToolkit, serverToolkitLayer } from "./tools";
+
+const THIRTY_DAYS_MILLIS = 30 * 24 * 60 * 60 * 1000;
 
 const makeDatabasePath = () => {
   const directory = mkdtempSync(join(tmpdir(), "t3code-mcp-tools-"));
@@ -374,6 +379,231 @@ describe("instance_pair", () => {
 });
 
 describe("instance_remove and operation_get", () => {
+  it("expires resolved details at thirty days while retaining the request tombstone", async () => {
+    const { directory, databasePath } = makeDatabasePath();
+    try {
+      const result = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            yield* TestClock.setTime(1_000_000);
+            const store = yield* LocalStore;
+            yield* store.putRegistration({
+              instanceId: "instance-expiring",
+              alias: "Expiring",
+              endpoint: "https://expiring.test",
+              environmentId: "env-expiring",
+              connection: "connected",
+              lastObservedAt: null,
+            });
+            yield* store.putRegistration({
+              instanceId: "instance-new-request",
+              alias: "New request",
+              endpoint: "https://new-request.test",
+              environmentId: "env-new-request",
+              connection: "connected",
+              lastObservedAt: null,
+            });
+
+            const removal = yield* callTool("instance_remove", {
+              requestId: "expired-request",
+              instanceId: "instance-expiring",
+            });
+            const retained = yield* callTool("operation_get", {
+              requestId: "expired-request",
+            });
+            yield* TestClock.adjust(Duration.millis(THIRTY_DAYS_MILLIS - 1));
+            const lastMoment = yield* callTool("operation_get", {
+              requestId: "expired-request",
+            });
+            yield* TestClock.adjust(Duration.millis(1));
+            const expired = yield* callTool("operation_get", {
+              requestId: "expired-request",
+            });
+            const sameRequest = yield* callTool("instance_remove", {
+              instanceId: "instance-expiring",
+              requestId: "expired-request",
+            });
+            const conflictingRequest = yield* callTool("instance_remove", {
+              requestId: "expired-request",
+              instanceId: "instance-new-request",
+            });
+            const newRequest = yield* callTool("instance_remove", {
+              requestId: "new-request-after-expiry",
+              instanceId: "instance-new-request",
+            });
+            return {
+              removal,
+              retained,
+              lastMoment,
+              expired,
+              sameRequest,
+              conflictingRequest,
+              newRequest,
+            };
+          }).pipe(Effect.provide(appLayer(databasePath)), Effect.provide(TestClock.layer())),
+        ),
+      );
+
+      expect(result.removal[0]?.result).toMatchObject({
+        result: { kind: "ok", value: { state: "completed" } },
+      });
+      expect(result.retained[0]?.result).toMatchObject({
+        result: { kind: "ok", value: { operation: { requestId: "expired-request" } } },
+      });
+      expect(result.lastMoment[0]?.result).toMatchObject({
+        result: { kind: "ok", value: { operation: { requestId: "expired-request" } } },
+      });
+      expect(result.expired[0]?.result).toMatchObject({
+        result: {
+          kind: "error",
+          error: {
+            code: "request_record_unavailable",
+            message:
+              "The mutation receipt details are unavailable; the request ID remains permanently reserved.",
+          },
+        },
+      });
+      expect(result.sameRequest[0]?.result).toMatchObject({
+        result: { kind: "error", error: { code: "request_record_unavailable" } },
+      });
+      expect(result.conflictingRequest[0]?.result).toMatchObject({
+        result: { kind: "error", error: { code: "request_id_conflict" } },
+      });
+      expect(JSON.stringify(result.conflictingRequest)).not.toContain("expired-request");
+      expect(result.newRequest[0]?.result).toMatchObject({
+        result: { kind: "ok", value: { requestId: "new-request-after-expiry" } },
+      });
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("retains unresolved evidence across restart beyond the resolved-detail window", async () => {
+    const { directory, databasePath } = makeDatabasePath();
+    const startedAt = 2_000_000;
+    try {
+      const result = await Effect.runPromise(
+        Effect.gen(function* () {
+          yield* TestClock.setTime(startedAt);
+          yield* Effect.scoped(
+            Effect.gen(function* () {
+              const store = yield* LocalStore;
+              yield* store.admitOperation({
+                requestId: "unknown-request",
+                tool: "instance_remove",
+                fingerprint: "fingerprint",
+                processNonce: "process",
+                admittedAt: new Date(startedAt).toISOString(),
+                intent: { instanceId: "unknown-instance" },
+                completionMeans: "registration_removed",
+              });
+              yield* store.updateOperation("unknown-request", {
+                now: new Date(startedAt).toISOString(),
+                state: "outcome_unknown",
+                dispatch: "unknown",
+                stepState: "outcome_unknown",
+                stepError: {
+                  code: "unavailable",
+                  message: "The test operation has an unresolved outcome.",
+                  retry: "reconcile_first",
+                  details: {},
+                },
+                error: {
+                  code: "unavailable",
+                  message: "The test operation has an unresolved outcome.",
+                  retry: "reconcile_first",
+                  details: {},
+                },
+                recovery: "observe_operation",
+              });
+            }).pipe(Effect.provide(LocalStore.layer({ databasePath }))),
+          );
+          yield* TestClock.adjust(Duration.millis(THIRTY_DAYS_MILLIS));
+          return yield* Effect.scoped(
+            callTool("operation_get", { requestId: "unknown-request" }).pipe(
+              Effect.provide(appLayer(databasePath)),
+            ),
+          );
+        }).pipe(Effect.provide(TestClock.layer())),
+      );
+
+      expect(result[0]?.result).toMatchObject({
+        result: {
+          kind: "ok",
+          value: { operation: { requestId: "unknown-request", state: "outcome_unknown" } },
+        },
+      });
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("drains more than one expired-operation cleanup batch at startup", async () => {
+    const { directory, databasePath } = makeDatabasePath();
+    const startedAt = 3_000_000;
+    try {
+      const counts = await Effect.runPromise(
+        Effect.gen(function* () {
+          yield* TestClock.setTime(startedAt);
+          yield* Effect.scoped(
+            Effect.gen(function* () {
+              const store = yield* LocalStore;
+              for (let index = 0; index < 65; index += 1) {
+                const requestId = `expired-batch-${index}`;
+                yield* store.admitOperation({
+                  requestId,
+                  tool: "instance_remove",
+                  fingerprint: `fingerprint-${index}`,
+                  processNonce: "process",
+                  admittedAt: new Date(startedAt).toISOString(),
+                  intent: { instanceId: `expired-instance-${index}` },
+                  completionMeans: "registration_removed",
+                });
+                yield* store.updateOperation(requestId, {
+                  now: new Date(startedAt).toISOString(),
+                  state: "completed",
+                  dispatch: "accepted",
+                  stepState: "succeeded",
+                  recovery: "none",
+                });
+              }
+            }).pipe(Effect.provide(LocalStore.layer({ databasePath }))),
+          );
+          yield* TestClock.adjust(Duration.millis(THIRTY_DAYS_MILLIS));
+          yield* Effect.scoped(
+            Effect.gen(function* () {
+              yield* LocalStore;
+            }).pipe(Effect.provide(LocalStore.layer({ databasePath }))),
+          );
+          const database = new DatabaseSync(databasePath);
+          try {
+            return database
+              .prepare(
+                "SELECT (SELECT COUNT(*) FROM operations) AS operation_count, (SELECT COUNT(*) FROM operation_steps) AS operation_step_count, (SELECT COUNT(*) FROM operation_evidence) AS operation_evidence_count, (SELECT COUNT(*) FROM request_keys) AS request_key_count",
+              )
+              .get() as {
+              operation_count: number;
+              operation_step_count: number;
+              operation_evidence_count: number;
+              request_key_count: number;
+            };
+          } finally {
+            database.close();
+          }
+        }).pipe(Effect.provide(TestClock.layer())),
+      );
+
+      expect(counts).toEqual({
+        operation_count: 0,
+        operation_step_count: 0,
+        operation_evidence_count: 0,
+        request_key_count: 65,
+      });
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it("removes a saved registration and returns a recoverable receipt", async () => {
     const { directory, databasePath } = makeDatabasePath();
     try {

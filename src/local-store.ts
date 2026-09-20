@@ -20,6 +20,7 @@ import {
   InstanceSummarySchema,
   MAX_PAGE_LIMIT,
   MAX_SERIALIZED_RESULT_BYTES,
+  OPERATION_DETAIL_RETENTION_MILLIS,
   EvidenceSchema,
   OperationRecordSchema,
   type Evidence,
@@ -45,6 +46,10 @@ import {
 
 const CAPTURE_SCOPE = "instance_list";
 const CAPTURE_ORDER = "instance_id_asc";
+const OPERATION_DETAIL_CLEANUP_BATCH_SIZE = 64;
+
+export const REQUEST_RECORD_UNAVAILABLE_MESSAGE =
+  "The mutation receipt details are unavailable; the request ID remains permanently reserved.";
 
 type RegistrationRow = {
   readonly instance_id: unknown;
@@ -184,6 +189,7 @@ export class LocalStoreError extends Data.TaggedError("LocalStoreError")<{
 
 export type LocalStoreStartupErrorKind =
   | "contention"
+  | "disk"
   | "migration_not_ready"
   | "unsupported_sqlite"
   | "incompatible_schema"
@@ -248,6 +254,8 @@ export type StoredOperation = {
 
 export interface OperationUpdate {
   readonly now: string;
+  /** The minimal nonsecret intent retained after transient dispatch data is dropped. */
+  readonly intent?: OperationIntent;
   readonly state?: OperationState;
   readonly dispatch?: OperationRecord["dispatch"];
   readonly target?: OperationRecord["target"];
@@ -397,17 +405,14 @@ export class LocalStore extends Context.Service<LocalStore, LocalStoreService>()
               }),
           ),
         );
-        const now = yield* Clock.currentTimeMillis;
         yield* Effect.retry(
           Effect.gen(function* () {
-            yield* sql`DELETE FROM staged_pairings WHERE expires_at <= ${now}`;
-            // request_keys are permanent request-ID tombstones. Expired operation
-            // details may be removed, but the ID remains reserved for its lifetime.
-            yield* sql`
-              DELETE FROM operations
-              WHERE recoverable_until IS NOT NULL
-                AND recoverable_until <= ${new Date(now).toISOString()}
-            `;
+            const now = yield* Clock.currentTimeMillis;
+            yield* sql.withTransaction(sql`DELETE FROM staged_pairings WHERE expires_at <= ${now}`);
+            yield* expireAllResolvedOperationDetails(sql, now);
+            if (!isMemoryDatabase) {
+              yield* sql.unsafe("PRAGMA wal_checkpoint(PASSIVE)");
+            }
           }).pipe(Effect.mapError(toStartupError)),
           {
             schedule: startupRetrySchedule,
@@ -866,6 +871,100 @@ const fingerprintRequestInDatabase = (
     return bytesToHex(digest);
   });
 
+const expireResolvedOperationDetails = (
+  sql: SqlClient.SqlClient,
+  now: number,
+  requestId: string,
+): Effect.Effect<number, SqlError.SqlError> =>
+  Effect.gen(function* () {
+    const deletedRows = yield* sql<{ readonly request_id: string }>`
+      DELETE FROM operations
+      WHERE request_id = ${requestId}
+        AND recoverable_until IS NOT NULL
+        AND recoverable_until <= ${new Date(now).toISOString()}
+        AND state IN ('completed', 'failed', 'partial')
+      RETURNING request_id
+    `;
+    return deletedRows.length;
+  });
+
+const expireResolvedOperationDetailsBatch = (
+  sql: SqlClient.SqlClient,
+  now: number,
+): Effect.Effect<number, SqlError.SqlError> =>
+  Effect.gen(function* () {
+    const deletedRows = yield* sql<{ readonly request_id: string }>`
+      DELETE FROM operations
+      WHERE request_id IN (
+        SELECT request_id
+        FROM operations
+        WHERE recoverable_until IS NOT NULL
+          AND recoverable_until <= ${new Date(now).toISOString()}
+          AND state IN ('completed', 'failed', 'partial')
+        ORDER BY recoverable_until ASC, request_id ASC
+        LIMIT ${OPERATION_DETAIL_CLEANUP_BATCH_SIZE}
+      )
+      RETURNING request_id
+    `;
+    return deletedRows.length;
+  });
+
+const hasExpiredResolvedOperation = (
+  sql: SqlClient.SqlClient,
+  now: number,
+  requestId: string,
+): Effect.Effect<boolean, SqlError.SqlError> =>
+  sql<{ readonly request_id: string }>`
+    SELECT request_id
+    FROM operations
+    WHERE request_id = ${requestId}
+      AND recoverable_until IS NOT NULL
+      AND recoverable_until <= ${new Date(now).toISOString()}
+      AND state IN ('completed', 'failed', 'partial')
+  `.pipe(Effect.map((rows) => rows.length > 0));
+
+const expireAllResolvedOperationDetails = (
+  sql: SqlClient.SqlClient,
+  now: number,
+): Effect.Effect<number, SqlError.SqlError> =>
+  Effect.gen(function* () {
+    let deleted = 0;
+    while (true) {
+      const batch = yield* sql.withTransaction(expireResolvedOperationDetailsBatch(sql, now));
+      deleted += batch;
+      if (batch < OPERATION_DETAIL_CLEANUP_BATCH_SIZE) return deleted;
+    }
+  });
+
+const operationRetentionPolicy: Record<OperationState, "unresolved" | "resolved"> = {
+  admitted: "unresolved",
+  pending: "unresolved",
+  outcome_unknown: "unresolved",
+  completed: "resolved",
+  failed: "resolved",
+  partial: "resolved",
+};
+
+const operationRetentionDeadline = (now: string): string | null => {
+  const resolvedAt = Date.parse(now);
+  return Number.isFinite(resolvedAt)
+    ? new Date(resolvedAt + OPERATION_DETAIL_RETENTION_MILLIS).toISOString()
+    : null;
+};
+
+const operationRecoverableUntil = (
+  state: unknown,
+  current: unknown,
+  now: string,
+): string | null => {
+  const policy =
+    typeof state === "string" ? operationRetentionPolicy[state as OperationState] : undefined;
+  if (policy === "unresolved") return null;
+  const currentDeadline = typeof current === "string" ? current : null;
+  if (policy !== "resolved") return currentDeadline;
+  return currentDeadline ?? operationRetentionDeadline(now);
+};
+
 type SchemaVerifier = () => Effect.Effect<void, LocalStoreError>;
 
 const toOperationalSchemaError = (error: unknown): LocalStoreError =>
@@ -899,6 +998,12 @@ const isSupportedSqliteVersion = (version: string): boolean => {
 const toStartupError = (error: unknown): LocalStoreStartupError => {
   if (error instanceof LocalStoreStartupError) return error;
   if (SqlError.isSqlError(error)) {
+    if (isDiskFullSqlError(error)) {
+      return new LocalStoreStartupError({
+        kind: "disk",
+        message: "The local store is out of disk space.",
+      });
+    }
     return error.reason._tag === "LockTimeoutError"
       ? new LocalStoreStartupError({ kind: "contention", message: "The local store is busy." })
       : new LocalStoreStartupError({
@@ -918,9 +1023,30 @@ const toStartupError = (error: unknown): LocalStoreStartupError => {
   });
 };
 
+const sqliteCauseProperty = (cause: unknown, property: "code" | "message"): unknown =>
+  typeof cause === "object" && cause !== null && property in cause
+    ? (cause as Record<string, unknown>)[property]
+    : undefined;
+
+const isDiskFullSqlError = (error: SqlError.SqlError): boolean => {
+  const cause = error.reason.cause;
+  const code = sqliteCauseProperty(cause, "code");
+  const message = sqliteCauseProperty(cause, "message");
+  const fullCode = code === "SQLITE_FULL" || code === 13;
+  const fullMessage =
+    typeof message === "string" && /database or disk is full|SQLITE_FULL/i.test(message);
+  return fullCode || fullMessage;
+};
+
 const toStoreError = (error: unknown): LocalStoreError => {
   if (error instanceof LocalStoreError) return error;
   if (SqlError.isSqlError(error)) {
+    if (isDiskFullSqlError(error)) {
+      return new LocalStoreError({
+        kind: "disk",
+        message: "The local store is out of disk space.",
+      });
+    }
     if (error.reason._tag === "LockTimeoutError") {
       return new LocalStoreError({ kind: "contention", message: "The local store is busy." });
     }
@@ -1602,21 +1728,35 @@ const findRequestInDatabase = (
   retryStorage(
     Effect.gen(function* () {
       yield* verify();
-      const rows = yield* sql<RequestKeyRow>`
-        SELECT request_id, tool, fingerprint, process_nonce, admitted_at
-        FROM request_keys WHERE request_id = ${requestId}
-      `;
-      const row = rows[0];
-      if (row === undefined) return null;
-      if (typeof row.fingerprint !== "string" || row.fingerprint.length === 0) {
-        return yield* Effect.fail(
-          new LocalStoreError({
-            kind: "malformed_row",
-            message: "The mutation request key is malformed.",
-          }),
-        );
-      }
-      return { fingerprint: row.fingerprint };
+      const now = yield* Clock.currentTimeMillis;
+      const readRequestKey = () =>
+        Effect.gen(function* () {
+          const rows = yield* sql<RequestKeyRow>`
+            SELECT request_id, tool, fingerprint, process_nonce, admitted_at
+            FROM request_keys WHERE request_id = ${requestId}
+          `;
+          const row = rows[0];
+          if (row === undefined) return null;
+          if (typeof row.fingerprint !== "string" || row.fingerprint.length === 0) {
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: "malformed_row",
+                message: "The mutation request key is malformed.",
+              }),
+            );
+          }
+          return { fingerprint: row.fingerprint };
+        });
+      const expired = yield* hasExpiredResolvedOperation(sql, now, requestId);
+      return !expired
+        ? yield* readRequestKey()
+        : yield* sql.withTransaction(
+            Effect.gen(function* () {
+              const transactionNow = yield* Clock.currentTimeMillis;
+              yield* expireResolvedOperationDetails(sql, transactionNow, requestId);
+              return yield* readRequestKey();
+            }),
+          );
     }).pipe(Effect.mapError(toStoreError)),
   );
 
@@ -1633,6 +1773,8 @@ const admitOperationInDatabase = (
       yield* verify();
       return yield* sql.withTransaction(
         Effect.gen(function* () {
+          const transactionNow = yield* Clock.currentTimeMillis;
+          yield* expireResolvedOperationDetails(sql, transactionNow, input.requestId);
           const existingKeys = yield* sql<RequestKeyRow>`
             SELECT request_id, tool, fingerprint, process_nonce, admitted_at
             FROM request_keys WHERE request_id = ${input.requestId}
@@ -1652,7 +1794,7 @@ const admitOperationInDatabase = (
               return yield* Effect.fail(
                 new LocalStoreError({
                   kind: "request_record_unavailable",
-                  message: "The request key exists but its operation record is unavailable.",
+                  message: REQUEST_RECORD_UNAVAILABLE_MESSAGE,
                 }),
               );
             }
@@ -1735,7 +1877,13 @@ const getOperationFromDatabase = (
   retryStorage(
     Effect.gen(function* () {
       yield* verify();
-      return yield* sql.withTransaction(getStoredOperationInTransaction(sql, requestId));
+      return yield* sql.withTransaction(
+        Effect.gen(function* () {
+          const transactionNow = yield* Clock.currentTimeMillis;
+          yield* expireResolvedOperationDetails(sql, transactionNow, requestId);
+          return yield* getStoredOperationInTransaction(sql, requestId);
+        }),
+      );
     }).pipe(Effect.mapError(toStoreError)),
   );
 
@@ -1751,6 +1899,8 @@ const updateOperationInDatabase = (
       yield* sql.withTransaction(
         // fallow-ignore-next-line complexity
         Effect.gen(function* () {
+          const transactionNow = yield* Clock.currentTimeMillis;
+          yield* expireResolvedOperationDetails(sql, transactionNow, requestId);
           const current = yield* sql<OperationRow>`
             SELECT request_id, tool, revision, state, admitted_at, updated_at,
               recoverable_until, intent_json, target_json, completion_means, dispatch,
@@ -1770,6 +1920,8 @@ const updateOperationInDatabase = (
 
           const targetJson =
             update.target === undefined ? row.target_json : JSON.stringify(update.target);
+          const intentJson =
+            update.intent === undefined ? row.intent_json : JSON.stringify(update.intent);
           const correlationJson =
             update.correlation === undefined
               ? row.correlation_json
@@ -1784,14 +1936,19 @@ const updateOperationInDatabase = (
                 ? row.error_json
                 : null
               : JSON.stringify(update.error);
-          const recoverableUntil =
-            update.recoverableUntil === undefined ? row.recoverable_until : update.recoverableUntil;
+          const nextState = update.state ?? row.state;
+          const recoverableUntil = operationRecoverableUntil(
+            nextState,
+            update.recoverableUntil === undefined ? row.recoverable_until : update.recoverableUntil,
+            update.now,
+          );
           yield* sql`
             UPDATE operations SET
               revision = revision + 1,
-              state = ${update.state ?? row.state},
+              state = ${nextState},
               updated_at = ${update.now},
               recoverable_until = ${recoverableUntil},
+              intent_json = ${intentJson},
               target_json = ${targetJson},
               dispatch = ${update.dispatch ?? row.dispatch},
               command_id = ${update.commandId === undefined ? row.command_id : update.commandId},
