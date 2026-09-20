@@ -2,9 +2,9 @@ import { NodeStdio } from "@effect/platform-node";
 import * as Layer from "effect/Layer";
 import { McpProtocol, McpServer } from "effect/unstable/ai";
 import { LocalStore } from "./local-store";
-import { ServerToolkit, serverToolkitLayer } from "./tools";
+import { mcpServerToolkitLayer, serverToolkitLayer } from "./tools";
 
-export const serverLayer = McpServer.layerStdio({
+const mcpLayer = McpServer.layerStdio({
   name: "t3code-mcp",
   version: "0.1.0",
   description: "An Effect-based MCP server starter.",
@@ -14,8 +14,10 @@ export const serverLayer = McpServer.layerStdio({
     McpProtocol.v2025_03_26,
     McpProtocol.v2024_11_05,
   ],
-}).pipe(
-  Layer.provide(McpServer.toolkit(ServerToolkit)),
+});
+
+export const serverLayer = mcpServerToolkitLayer.pipe(
+  Layer.provideMerge(mcpLayer),
   Layer.provide(serverToolkitLayer),
   Layer.provide(LocalStore.layerFromEnvironment),
   Layer.provide(NodeStdio.layer),

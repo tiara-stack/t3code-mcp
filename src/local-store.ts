@@ -14,11 +14,18 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as SqlError from "effect/unstable/sql/SqlError";
 import {
+  canonicalMutationInput,
   cachedConnectionLimitation,
   DEFAULT_PAGE_LIMIT,
   InstanceSummarySchema,
   MAX_PAGE_LIMIT,
   MAX_SERIALIZED_RESULT_BYTES,
+  EvidenceSchema,
+  OperationRecordSchema,
+  type Evidence,
+  type OperationRecord,
+  type OperationState,
+  type OperationStepState,
   makeToolSuccess,
   serializedByteLength,
   ToolFailureSchema,
@@ -29,6 +36,7 @@ import type { LocalStoreConfigValue } from "./config";
 import {
   MIGRATION_NAME,
   MIGRATION_TABLE,
+  CAPTURE_MIGRATION_NAME,
   LATEST_MIGRATION_NAME,
   migrations,
   SUPPORTED_SCHEMA_VERSION,
@@ -62,6 +70,52 @@ type CaptureItemRow = {
   readonly position: unknown;
   readonly payload: unknown;
   readonly item_bytes: unknown;
+};
+
+type RequestKeyRow = {
+  readonly request_id: unknown;
+  readonly tool: unknown;
+  readonly fingerprint: unknown;
+  readonly process_nonce: unknown;
+  readonly admitted_at: unknown;
+};
+
+type OperationRow = {
+  readonly request_id: unknown;
+  readonly tool: unknown;
+  readonly revision: unknown;
+  readonly state: unknown;
+  readonly admitted_at: unknown;
+  readonly updated_at: unknown;
+  readonly recoverable_until: unknown;
+  readonly intent_json: unknown;
+  readonly target_json: unknown;
+  readonly completion_means: unknown;
+  readonly dispatch: unknown;
+  readonly command_id: unknown;
+  readonly message_id: unknown;
+  readonly correlation_json: unknown;
+  readonly created_json: unknown;
+  readonly error_json: unknown;
+  readonly recovery: unknown;
+  readonly owner_process_nonce: unknown;
+};
+
+type OperationStepRow = {
+  readonly position: unknown;
+  readonly name: unknown;
+  readonly state: unknown;
+  readonly error_json: unknown;
+};
+
+type OperationEvidenceRow = {
+  readonly position: unknown;
+  readonly step_position: unknown;
+  readonly kind: unknown;
+  readonly observed_at: unknown;
+  readonly source_sequence: unknown;
+  readonly native_event_id: unknown;
+  readonly detail: unknown;
 };
 
 type CursorPayload = {
@@ -113,7 +167,11 @@ export type LocalStoreErrorKind =
   | "cursor_expired"
   | "cursor_mismatch"
   | "result_too_large"
-  | "capture_budget";
+  | "capture_budget"
+  | "request_id_conflict"
+  | "request_record_unavailable"
+  | "registration_removed"
+  | "registration_not_found";
 
 export class LocalStoreError extends Data.TaggedError("LocalStoreError")<{
   readonly kind: LocalStoreErrorKind;
@@ -139,7 +197,50 @@ export interface ListRegistrationsOptions {
   readonly maxBytes?: number;
 }
 
-export interface PutRegistrationInput extends InstanceSummary {}
+export interface PutRegistrationInput extends InstanceSummary {
+  readonly credential?: string;
+}
+
+export interface OperationAdmissionInput {
+  readonly requestId: string;
+  readonly tool: string;
+  readonly fingerprint: string;
+  readonly processNonce: string;
+  readonly admittedAt: string;
+  readonly intent: { readonly instanceId: string };
+  readonly completionMeans: OperationRecord["completionMeans"];
+}
+
+export type StoredOperation = {
+  readonly record: OperationRecord;
+  readonly intent: { readonly instanceId: string };
+  readonly ownerProcessNonce: string;
+};
+
+export interface OperationUpdate {
+  readonly now: string;
+  readonly state?: OperationState;
+  readonly dispatch?: OperationRecord["dispatch"];
+  readonly target?: OperationRecord["target"];
+  readonly stepState?: OperationStepState;
+  readonly stepError?: OperationRecord["error"];
+  readonly evidence?: ReadonlyArray<Evidence>;
+  readonly evidenceStepPosition?: number | null;
+  readonly error?: OperationRecord["error"];
+  readonly recovery?: OperationRecord["recovery"];
+  readonly recoverableUntil?: string | null;
+}
+
+export type RegistrationInspection =
+  | { readonly state: "present"; readonly registration: InstanceSummary }
+  | { readonly state: "removed"; readonly removedByRequestId: string | null }
+  | { readonly state: "absent" };
+
+export type RegistrationRemoval = {
+  readonly state: "removed" | "already_absent";
+  readonly registration: InstanceSummary | null;
+  readonly removedByRequestId: string | null;
+};
 
 export interface LocalStoreService {
   readonly listRegistrations: (
@@ -148,6 +249,33 @@ export interface LocalStoreService {
   readonly putRegistration: (
     registration: PutRegistrationInput,
   ) => Effect.Effect<void, LocalStoreError>;
+  readonly fingerprintRequest: (
+    tool: string,
+    input: unknown,
+  ) => Effect.Effect<string, LocalStoreError>;
+  readonly findRequest: (
+    requestId: string,
+  ) => Effect.Effect<{ readonly fingerprint: string } | null, LocalStoreError>;
+  readonly admitOperation: (
+    input: OperationAdmissionInput,
+  ) => Effect.Effect<
+    { readonly kind: "inserted" | "existing"; readonly operation: StoredOperation },
+    LocalStoreError
+  >;
+  readonly getOperation: (
+    requestId: string,
+  ) => Effect.Effect<StoredOperation | null, LocalStoreError>;
+  readonly updateOperation: (
+    requestId: string,
+    update: OperationUpdate,
+  ) => Effect.Effect<void, LocalStoreError>;
+  readonly inspectRegistration: (
+    instanceId: string,
+  ) => Effect.Effect<RegistrationInspection, LocalStoreError>;
+  readonly removeRegistration: (
+    instanceId: string,
+    requestId?: string,
+  ) => Effect.Effect<RegistrationRemoval, LocalStoreError>;
 }
 
 export class LocalStore extends Context.Service<LocalStore, LocalStoreService>()(
@@ -208,6 +336,7 @@ export class LocalStore extends Context.Service<LocalStore, LocalStoreService>()
         const sql = yield* SqlClient.SqlClient;
         const fileSystem = yield* FileSystem.FileSystem;
         const crypto = yield* Crypto.Crypto;
+        const verifySchemaForOperation = makeOperationalSchemaVerifier(sql);
         const databaseId = yield* readDatabaseId(sql).pipe(
           Effect.mapError(
             () =>
@@ -217,15 +346,69 @@ export class LocalStore extends Context.Service<LocalStore, LocalStoreService>()
               }),
           ),
         );
+        const fingerprintKey = yield* readFingerprintKey(sql).pipe(
+          Effect.mapError(
+            () =>
+              new LocalStoreStartupError({
+                kind: "incompatible_schema",
+                message: "The local store fingerprint key is malformed.",
+              }),
+          ),
+        );
         yield* protectDatabaseFiles(fileSystem, config.databasePath);
 
         const listRegistrations = (options: ListRegistrationsOptions) =>
-          listRegistrationsFromDatabase(sql, fileSystem, crypto, config, databaseId, options);
+          listRegistrationsFromDatabase(
+            sql,
+            fileSystem,
+            crypto,
+            config,
+            databaseId,
+            options,
+            verifySchemaForOperation,
+          );
 
         const putRegistration = (registration: PutRegistrationInput) =>
-          putRegistrationInDatabase(sql, fileSystem, config.databasePath, registration);
+          putRegistrationInDatabase(
+            sql,
+            fileSystem,
+            config.databasePath,
+            registration,
+            verifySchemaForOperation,
+          );
 
-        return LocalStore.of({ listRegistrations, putRegistration });
+        const fingerprintRequest = (tool: string, input: unknown) =>
+          fingerprintRequestInDatabase(crypto, fingerprintKey, tool, input);
+
+        const findRequest = (requestId: string) =>
+          findRequestInDatabase(sql, requestId, verifySchemaForOperation);
+
+        const admitOperation = (input: OperationAdmissionInput) =>
+          admitOperationInDatabase(sql, input, verifySchemaForOperation);
+
+        const getOperation = (requestId: string) =>
+          getOperationFromDatabase(sql, requestId, verifySchemaForOperation);
+
+        const updateOperation = (requestId: string, update: OperationUpdate) =>
+          updateOperationInDatabase(sql, requestId, update, verifySchemaForOperation);
+
+        const inspectRegistration = (instanceId: string) =>
+          inspectRegistrationInDatabase(sql, instanceId, verifySchemaForOperation);
+
+        const removeRegistration = (instanceId: string, requestId?: string) =>
+          removeRegistrationInDatabase(sql, instanceId, requestId, verifySchemaForOperation);
+
+        return LocalStore.of({
+          listRegistrations,
+          putRegistration,
+          fingerprintRequest,
+          findRequest,
+          admitOperation,
+          getOperation,
+          updateOperation,
+          inspectRegistration,
+          removeRegistration,
+        });
       }).pipe(
         Effect.mapError((error) =>
           error instanceof LocalStoreStartupError
@@ -345,7 +528,7 @@ const verifySchema = (
       "SELECT value FROM local_store_meta WHERE key = 'schema_version'",
     );
     const tables = yield* sql.unsafe<{ name: string }>(
-      "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('local_store_meta', 'registrations', 'captures', 'capture_items') ORDER BY name",
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('local_store_meta', 'registrations', 'captures', 'capture_items', 'registration_credentials', 'registration_tombstones', 'request_keys', 'operations', 'operation_steps', 'operation_evidence') ORDER BY name",
     );
     const metaColumns = yield* sql.unsafe<{ name: string }>("PRAGMA table_info(local_store_meta)");
     const registrationColumns = yield* sql.unsafe<{ name: string }>(
@@ -355,22 +538,64 @@ const verifySchema = (
     const captureItemColumns = yield* sql.unsafe<{ name: string }>(
       "PRAGMA table_info(capture_items)",
     );
-    const foreignKeys = yield* sql.unsafe<{ table: string; on_delete: string }>(
-      "PRAGMA foreign_key_list(capture_items)",
+    const credentialColumns = yield* sql.unsafe<{ name: string }>(
+      "PRAGMA table_info(registration_credentials)",
     );
+    const tombstoneColumns = yield* sql.unsafe<{ name: string }>(
+      "PRAGMA table_info(registration_tombstones)",
+    );
+    const requestKeyColumns = yield* sql.unsafe<{ name: string }>(
+      "PRAGMA table_info(request_keys)",
+    );
+    const operationColumns = yield* sql.unsafe<{ name: string }>("PRAGMA table_info(operations)");
+    const operationStepColumns = yield* sql.unsafe<{ name: string }>(
+      "PRAGMA table_info(operation_steps)",
+    );
+    const operationEvidenceColumns = yield* sql.unsafe<{ name: string }>(
+      "PRAGMA table_info(operation_evidence)",
+    );
+    const foreignKeys = [
+      ...(yield* sql.unsafe<{ table: string; on_delete: string }>(
+        "PRAGMA foreign_key_list(capture_items)",
+      )),
+      ...(yield* sql.unsafe<{ table: string; on_delete: string }>(
+        "PRAGMA foreign_key_list(registration_credentials)",
+      )),
+      ...(yield* sql.unsafe<{ table: string; on_delete: string }>(
+        "PRAGMA foreign_key_list(operations)",
+      )),
+      ...(yield* sql.unsafe<{ table: string; on_delete: string }>(
+        "PRAGMA foreign_key_list(operation_steps)",
+      )),
+      ...(yield* sql.unsafe<{ table: string; on_delete: string }>(
+        "PRAGMA foreign_key_list(operation_evidence)",
+      )),
+    ];
     const definitions = yield* sql.unsafe<{ name: string; sql: string | null }>(
-      "SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name IN ('registrations', 'capture_items')",
+      "SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name IN ('registrations', 'captures', 'capture_items', 'operations', 'operation_steps')",
     );
 
     const hasColumns = (actual: ReadonlyArray<{ name: string }>, expected: ReadonlyArray<string>) =>
       expected.every((name) => actual.some((column) => column.name === name));
 
+    const hasForeignKey = (
+      actual: ReadonlyArray<{ table: string; on_delete: string }>,
+      table: string,
+      onDelete: string,
+    ) =>
+      actual.some(
+        (foreignKey) =>
+          foreignKey.table === table && foreignKey.on_delete.toUpperCase() === onDelete,
+      );
+
     if (
       journal.length !== SUPPORTED_SCHEMA_VERSION ||
       journal[0]?.migration_id !== 1 ||
       journal[0]?.name !== MIGRATION_NAME ||
-      journal[1]?.migration_id !== SUPPORTED_SCHEMA_VERSION ||
-      journal[1]?.name !== LATEST_MIGRATION_NAME
+      journal[1]?.migration_id !== 2 ||
+      journal[1]?.name !== CAPTURE_MIGRATION_NAME ||
+      journal[2]?.migration_id !== SUPPORTED_SCHEMA_VERSION ||
+      journal[2]?.name !== LATEST_MIGRATION_NAME
     ) {
       return yield* Effect.fail(
         new LocalStoreStartupError({
@@ -386,7 +611,7 @@ const verifySchema = (
     if (
       userVersion[0]?.user_version !== SUPPORTED_SCHEMA_VERSION ||
       schemaMetadata[0]?.value !== String(SUPPORTED_SCHEMA_VERSION) ||
-      tables.length !== 4 ||
+      tables.length !== 10 ||
       !hasColumns(metaColumns, ["key", "value"]) ||
       !hasColumns(registrationColumns, [
         "instance_id",
@@ -411,13 +636,60 @@ const verifySchema = (
         "limitations_json",
       ]) ||
       !hasColumns(captureItemColumns, ["capture_id", "position", "payload", "item_bytes"]) ||
-      foreignKeys[0]?.table !== "captures" ||
-      foreignKeys[0]?.on_delete?.toUpperCase() !== "CASCADE" ||
+      !hasColumns(credentialColumns, ["instance_id", "credential", "updated_at"]) ||
+      !hasColumns(tombstoneColumns, ["instance_id", "removed_at", "removed_by_request_id"]) ||
+      !hasColumns(requestKeyColumns, [
+        "request_id",
+        "tool",
+        "fingerprint",
+        "process_nonce",
+        "admitted_at",
+      ]) ||
+      !hasColumns(operationColumns, [
+        "request_id",
+        "tool",
+        "revision",
+        "state",
+        "admitted_at",
+        "updated_at",
+        "recoverable_until",
+        "intent_json",
+        "target_json",
+        "completion_means",
+        "dispatch",
+        "command_id",
+        "message_id",
+        "correlation_json",
+        "created_json",
+        "error_json",
+        "recovery",
+        "owner_process_nonce",
+      ]) ||
+      !hasColumns(operationStepColumns, [
+        "request_id",
+        "position",
+        "name",
+        "state",
+        "error_json",
+      ]) ||
+      !hasColumns(operationEvidenceColumns, [
+        "request_id",
+        "position",
+        "step_position",
+        "kind",
+        "observed_at",
+        "source_sequence",
+        "native_event_id",
+        "detail",
+      ]) ||
+      !hasForeignKey(foreignKeys, "captures", "CASCADE") ||
+      !hasForeignKey(foreignKeys, "registrations", "CASCADE") ||
+      !hasForeignKey(foreignKeys, "request_keys", "NO ACTION") ||
       definitions.some((definition) => definition.sql === null || !definition.sql.includes("CHECK"))
     ) {
       return yield* Effect.fail(
         new LocalStoreStartupError({
-          kind: tables.length === 4 ? "incompatible_schema" : "migration_not_ready",
+          kind: tables.length === 10 ? "incompatible_schema" : "migration_not_ready",
           message: "The local store schema is not ready or is unsupported.",
         }),
       );
@@ -443,18 +715,80 @@ const readDatabaseId = (
     return databaseId;
   });
 
-const verifyOperationalSchema = (sql: SqlClient.SqlClient): Effect.Effect<void, LocalStoreError> =>
-  verifySchema(sql).pipe(
-    Effect.mapError((error) =>
-      (error instanceof LocalStoreStartupError && error.kind === "contention") ||
-      (SqlError.isSqlError(error) && error.reason._tag === "LockTimeoutError")
-        ? new LocalStoreError({ kind: "contention", message: "The local store is busy." })
-        : new LocalStoreError({
-            kind: "storage",
-            message: "The local store schema is unavailable or unsupported.",
-          }),
-    ),
-  );
+const readFingerprintKey = (
+  sql: SqlClient.SqlClient,
+): Effect.Effect<string, SqlError.SqlError | LocalStoreError> =>
+  Effect.gen(function* () {
+    const rows = yield* sql<{ key: string; value: string }>`
+      SELECT key, value FROM local_store_meta WHERE key = 'fingerprint_key'
+    `;
+    const fingerprintKey = rows[0]?.value;
+    if (typeof fingerprintKey !== "string" || !/^[0-9a-f]{64}$/i.test(fingerprintKey)) {
+      return yield* Effect.fail(
+        new LocalStoreError({
+          kind: "malformed_row",
+          message: "The local store fingerprint key is malformed.",
+        }),
+      );
+    }
+    return fingerprintKey;
+  });
+
+const bytesToHex = (bytes: Uint8Array): string =>
+  Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+
+const fingerprintRequestInDatabase = (
+  crypto: Crypto.Crypto,
+  fingerprintKey: string,
+  tool: string,
+  input: unknown,
+): Effect.Effect<string, LocalStoreError> =>
+  Effect.gen(function* () {
+    const canonical = yield* Effect.try({
+      try: () => canonicalMutationInput(tool, input),
+      catch: () =>
+        new LocalStoreError({
+          kind: "malformed_row",
+          message: "The mutation input could not be canonicalized.",
+        }),
+    });
+    const digest = yield* crypto
+      .digest("SHA-256", new TextEncoder().encode(`${fingerprintKey}:${canonical}`))
+      .pipe(
+        Effect.mapError(
+          () =>
+            new LocalStoreError({
+              kind: "storage",
+              message: "The local store could not fingerprint the mutation input.",
+            }),
+        ),
+      );
+    return bytesToHex(digest);
+  });
+
+type SchemaVerifier = () => Effect.Effect<void, LocalStoreError>;
+
+const toOperationalSchemaError = (error: unknown): LocalStoreError =>
+  (error instanceof LocalStoreStartupError && error.kind === "contention") ||
+  (SqlError.isSqlError(error) && error.reason._tag === "LockTimeoutError")
+    ? new LocalStoreError({ kind: "contention", message: "The local store is busy." })
+    : new LocalStoreError({
+        kind: "storage",
+        message: "The local store schema is unavailable or unsupported.",
+      });
+
+const makeOperationalSchemaVerifier = (sql: SqlClient.SqlClient): SchemaVerifier => {
+  let verifiedSchemaVersion: number | undefined;
+  return () =>
+    Effect.gen(function* () {
+      const rows = yield* sql.unsafe<{ schema_version: number }>("PRAGMA schema_version");
+      const schemaVersion = rows[0]?.schema_version;
+      if (typeof schemaVersion !== "number" || verifiedSchemaVersion !== schemaVersion) {
+        yield* verifySchema(sql);
+        verifiedSchemaVersion = schemaVersion;
+      }
+    }).pipe(Effect.mapError(toOperationalSchemaError));
+};
 
 const isSupportedSqliteVersion = (version: string): boolean => {
   const parts = version.split(".").map(Number);
@@ -513,12 +847,13 @@ const listRegistrationsFromDatabase = (
   config: Required<LocalStoreConfigValue>,
   databaseId: string,
   options: ListRegistrationsOptions,
+  verify: SchemaVerifier,
 ): Effect.Effect<InstanceListPage, LocalStoreError> => {
   const limit = Math.min(MAX_PAGE_LIMIT, Math.max(1, options.limit ?? DEFAULT_PAGE_LIMIT));
   const maxBytes = options.maxBytes ?? MAX_SERIALIZED_RESULT_BYTES;
 
   const effect = Effect.gen(function* () {
-    yield* verifyOperationalSchema(sql);
+    yield* verify();
     return yield* options.cursor === undefined
       ? publishAndReadFirstPage(sql, crypto, config, databaseId, limit, maxBytes)
       : readContinuationPage(sql, databaseId, options.cursor, limit, maxBytes);
@@ -881,6 +1216,7 @@ const putRegistrationInDatabase = (
   fileSystem: FileSystem.FileSystem,
   databasePath: string,
   registration: PutRegistrationInput,
+  verify: SchemaVerifier,
 ): Effect.Effect<void, LocalStoreError> => {
   const input = Schema.decodeUnknownEffect(InstanceSummarySchema)(registration).pipe(
     Effect.mapError(
@@ -894,27 +1230,606 @@ const putRegistrationInDatabase = (
   return retryStorage(
     Effect.gen(function* () {
       const value = yield* input;
-      yield* verifyOperationalSchema(sql);
+      const credential = registration.credential;
+      if (credential !== undefined && credential.length === 0) {
+        return yield* Effect.fail(
+          new LocalStoreError({
+            kind: "malformed_row",
+            message: "The registration credential fixture is malformed.",
+          }),
+        );
+      }
+      yield* verify();
       const now = yield* Clock.currentTimeMillis;
-      yield* sql.withTransaction(sql`
-        INSERT INTO registrations (
-          instance_id, alias, endpoint, environment_id, connection, last_observed_at, updated_at
-        ) VALUES (
-          ${value.instanceId}, ${value.alias}, ${value.endpoint}, ${value.environmentId},
-          ${value.connection}, ${value.lastObservedAt}, ${now}
-        )
-        ON CONFLICT(instance_id) DO UPDATE SET
-          alias = excluded.alias,
-          endpoint = excluded.endpoint,
-          environment_id = excluded.environment_id,
-          connection = excluded.connection,
-          last_observed_at = excluded.last_observed_at,
-          updated_at = excluded.updated_at
-      `);
+      yield* sql.withTransaction(
+        Effect.gen(function* () {
+          const tombstones = yield* sql<{ instance_id: string }>`
+            SELECT instance_id FROM registration_tombstones WHERE instance_id = ${value.instanceId}
+          `;
+          if (tombstones.length > 0) {
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: "registration_removed",
+                message: "The removed registration ID cannot be rebound.",
+              }),
+            );
+          }
+          yield* sql`
+            INSERT INTO registrations (
+              instance_id, alias, endpoint, environment_id, connection, last_observed_at, updated_at
+            ) VALUES (
+              ${value.instanceId}, ${value.alias}, ${value.endpoint}, ${value.environmentId},
+              ${value.connection}, ${value.lastObservedAt}, ${now}
+            )
+            ON CONFLICT(instance_id) DO UPDATE SET
+              alias = excluded.alias,
+              endpoint = excluded.endpoint,
+              environment_id = excluded.environment_id,
+              connection = excluded.connection,
+              last_observed_at = excluded.last_observed_at,
+              updated_at = excluded.updated_at
+          `;
+          if (credential !== undefined) {
+            yield* sql`
+          INSERT INTO registration_credentials (instance_id, credential, updated_at)
+          VALUES (${value.instanceId}, ${credential}, ${now})
+          ON CONFLICT(instance_id) DO UPDATE SET
+            credential = excluded.credential,
+            updated_at = excluded.updated_at
+            `;
+          }
+        }),
+      );
       yield* protectDatabaseFiles(fileSystem, databasePath);
     }).pipe(Effect.mapError(toStoreError)),
   );
 };
+
+const findRequestInDatabase = (
+  sql: SqlClient.SqlClient,
+  requestId: string,
+  verify: SchemaVerifier,
+): Effect.Effect<{ readonly fingerprint: string } | null, LocalStoreError> =>
+  retryStorage(
+    Effect.gen(function* () {
+      yield* verify();
+      const rows = yield* sql<RequestKeyRow>`
+        SELECT request_id, tool, fingerprint, process_nonce, admitted_at
+        FROM request_keys WHERE request_id = ${requestId}
+      `;
+      const row = rows[0];
+      if (row === undefined) return null;
+      if (typeof row.fingerprint !== "string" || row.fingerprint.length === 0) {
+        return yield* Effect.fail(
+          new LocalStoreError({
+            kind: "malformed_row",
+            message: "The mutation request key is malformed.",
+          }),
+        );
+      }
+      return { fingerprint: row.fingerprint };
+    }).pipe(Effect.mapError(toStoreError)),
+  );
+
+const admitOperationInDatabase = (
+  sql: SqlClient.SqlClient,
+  input: OperationAdmissionInput,
+  verify: SchemaVerifier,
+): Effect.Effect<
+  { readonly kind: "inserted" | "existing"; readonly operation: StoredOperation },
+  LocalStoreError
+> =>
+  retryStorage(
+    Effect.gen(function* () {
+      yield* verify();
+      return yield* sql.withTransaction(
+        Effect.gen(function* () {
+          const existingKeys = yield* sql<RequestKeyRow>`
+            SELECT request_id, tool, fingerprint, process_nonce, admitted_at
+            FROM request_keys WHERE request_id = ${input.requestId}
+          `;
+          const existingKey = existingKeys[0];
+          if (existingKey !== undefined) {
+            if (existingKey.fingerprint !== input.fingerprint) {
+              return yield* Effect.fail(
+                new LocalStoreError({
+                  kind: "request_id_conflict",
+                  message: "The request ID was already used for different mutation input.",
+                }),
+              );
+            }
+            const existing = yield* getStoredOperationInTransaction(sql, input.requestId);
+            if (existing === null) {
+              return yield* Effect.fail(
+                new LocalStoreError({
+                  kind: "request_record_unavailable",
+                  message: "The request key exists but its operation record is unavailable.",
+                }),
+              );
+            }
+            return { kind: "existing" as const, operation: existing };
+          }
+
+          const initialRecord: OperationRecord = {
+            requestId: input.requestId,
+            tool: input.tool,
+            revision: 0,
+            state: "admitted",
+            admittedAt: input.admittedAt,
+            updatedAt: input.admittedAt,
+            recoverableUntil: null,
+            target: null,
+            completionMeans: input.completionMeans,
+            dispatch: "not_dispatched",
+            commandId: null,
+            messageId: null,
+            correlation: null,
+            created: {},
+            steps: [
+              {
+                name: "remove_registration",
+                state: "not_started",
+                evidence: [],
+                error: null,
+              },
+            ],
+            evidence: [],
+            error: null,
+            recovery: "observe_operation",
+          };
+
+          yield* sql`
+            INSERT INTO request_keys (request_id, tool, fingerprint, process_nonce, admitted_at)
+            VALUES (
+              ${input.requestId}, ${input.tool}, ${input.fingerprint},
+              ${input.processNonce}, ${input.admittedAt}
+            )
+          `;
+          yield* sql`
+            INSERT INTO operations (
+              request_id, tool, revision, state, admitted_at, updated_at,
+              recoverable_until, intent_json, target_json, completion_means, dispatch,
+              command_id, message_id, correlation_json, created_json, error_json,
+              recovery, owner_process_nonce
+            ) VALUES (
+              ${input.requestId}, ${input.tool}, 0, 'admitted', ${input.admittedAt},
+              ${input.admittedAt}, NULL, ${JSON.stringify(input.intent)}, NULL,
+              ${input.completionMeans}, 'not_dispatched', NULL, NULL, NULL, '{}', NULL,
+              'observe_operation', ${input.processNonce}
+            )
+          `;
+          yield* sql`
+            INSERT INTO operation_steps (request_id, position, name, state, error_json)
+            VALUES (${input.requestId}, 0, 'remove_registration', 'not_started', NULL)
+          `;
+          return {
+            kind: "inserted" as const,
+            operation: {
+              record: initialRecord,
+              intent: input.intent,
+              ownerProcessNonce: input.processNonce,
+            },
+          };
+        }),
+      );
+    }).pipe(Effect.mapError(toStoreError)),
+  );
+
+const getOperationFromDatabase = (
+  sql: SqlClient.SqlClient,
+  requestId: string,
+  verify: SchemaVerifier,
+): Effect.Effect<StoredOperation | null, LocalStoreError> =>
+  retryStorage(
+    Effect.gen(function* () {
+      yield* verify();
+      return yield* sql.withTransaction(getStoredOperationInTransaction(sql, requestId));
+    }).pipe(Effect.mapError(toStoreError)),
+  );
+
+const updateOperationInDatabase = (
+  sql: SqlClient.SqlClient,
+  requestId: string,
+  update: OperationUpdate,
+  verify: SchemaVerifier,
+): Effect.Effect<void, LocalStoreError> =>
+  retryStorage(
+    Effect.gen(function* () {
+      yield* verify();
+      yield* sql.withTransaction(
+        // fallow-ignore-next-line complexity
+        Effect.gen(function* () {
+          const current = yield* sql<OperationRow>`
+            SELECT request_id, tool, revision, state, admitted_at, updated_at,
+              recoverable_until, intent_json, target_json, completion_means, dispatch,
+              command_id, message_id, correlation_json, created_json, error_json,
+              recovery, owner_process_nonce
+            FROM operations WHERE request_id = ${requestId}
+          `;
+          const row = current[0];
+          if (row === undefined) {
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: "request_record_unavailable",
+                message: "The mutation operation record is unavailable.",
+              }),
+            );
+          }
+
+          const targetJson =
+            update.target === undefined ? row.target_json : JSON.stringify(update.target);
+          const errorJson =
+            update.error === undefined || update.error === null
+              ? update.error === undefined
+                ? row.error_json
+                : null
+              : JSON.stringify(update.error);
+          const recoverableUntil =
+            update.recoverableUntil === undefined ? row.recoverable_until : update.recoverableUntil;
+          yield* sql`
+            UPDATE operations SET
+              revision = revision + 1,
+              state = ${update.state ?? row.state},
+              updated_at = ${update.now},
+              recoverable_until = ${recoverableUntil},
+              target_json = ${targetJson},
+              dispatch = ${update.dispatch ?? row.dispatch},
+              error_json = ${errorJson},
+              recovery = ${update.recovery ?? row.recovery}
+            WHERE request_id = ${requestId}
+          `;
+
+          if (update.stepState !== undefined || update.stepError !== undefined) {
+            const stepError =
+              update.stepError === undefined
+                ? undefined
+                : update.stepError === null
+                  ? null
+                  : JSON.stringify(update.stepError);
+            if (stepError === undefined) {
+              yield* sql`
+                UPDATE operation_steps
+                SET state = ${update.stepState}, error_json = error_json
+                WHERE request_id = ${requestId} AND position = 0
+              `;
+            } else {
+              yield* sql`
+                UPDATE operation_steps
+                SET state = COALESCE(${update.stepState ?? null}, state), error_json = ${stepError}
+                WHERE request_id = ${requestId} AND position = 0
+              `;
+            }
+          }
+
+          if (update.evidence !== undefined && update.evidence.length > 0) {
+            const positions = yield* sql<{ position: number }>`
+              SELECT COALESCE(MAX(position), -1) AS position
+              FROM operation_evidence WHERE request_id = ${requestId}
+            `;
+            let position = Number(positions[0]?.position ?? -1) + 1;
+            for (const evidence of update.evidence) {
+              yield* sql`
+                INSERT INTO operation_evidence (
+                  request_id, position, step_position, kind, observed_at,
+                  source_sequence, native_event_id, detail
+                ) VALUES (
+                  ${requestId}, ${position}, ${update.evidenceStepPosition ?? null}, ${evidence.kind}, ${evidence.observedAt},
+                  ${evidence.sourceSequence}, ${evidence.nativeEventId}, ${evidence.detail}
+                )
+              `;
+              position += 1;
+            }
+          }
+        }),
+      );
+    }).pipe(Effect.mapError(toStoreError)),
+  );
+
+const inspectRegistrationInDatabase = (
+  sql: SqlClient.SqlClient,
+  instanceId: string,
+  verify: SchemaVerifier,
+): Effect.Effect<RegistrationInspection, LocalStoreError> =>
+  retryStorage(
+    Effect.gen(function* () {
+      yield* verify();
+      const rows = yield* sql<RegistrationRow>`
+        SELECT instance_id, alias, endpoint, environment_id, connection, last_observed_at
+        FROM registrations WHERE instance_id = ${instanceId}
+      `;
+      const row = rows[0];
+      if (row !== undefined) {
+        const decoded = yield* decodeRegistrationRow(row);
+        if (decoded.item === null) {
+          return yield* Effect.fail(
+            new LocalStoreError({
+              kind: "malformed_row",
+              message: "The saved registration row is malformed.",
+            }),
+          );
+        }
+        return { state: "present" as const, registration: decoded.item };
+      }
+      const tombstones = yield* sql<{
+        readonly instance_id: string;
+        readonly removed_by_request_id: unknown;
+      }>`
+        SELECT instance_id, removed_by_request_id
+        FROM registration_tombstones WHERE instance_id = ${instanceId}
+      `;
+      const tombstone = tombstones[0];
+      return tombstone === undefined
+        ? { state: "absent" as const }
+        : {
+            state: "removed" as const,
+            removedByRequestId:
+              typeof tombstone.removed_by_request_id === "string"
+                ? tombstone.removed_by_request_id
+                : null,
+          };
+    }).pipe(Effect.mapError(toStoreError)),
+  );
+
+const removeRegistrationInDatabase = (
+  sql: SqlClient.SqlClient,
+  instanceId: string,
+  requestId: string | undefined,
+  verify: SchemaVerifier,
+): Effect.Effect<RegistrationRemoval, LocalStoreError> =>
+  retryStorage(
+    Effect.gen(function* () {
+      yield* verify();
+      const now = yield* Clock.currentTimeMillis;
+      return yield* sql.withTransaction(
+        // fallow-ignore-next-line complexity
+        Effect.gen(function* () {
+          const rows = yield* sql<RegistrationRow>`
+            SELECT instance_id, alias, endpoint, environment_id, connection, last_observed_at
+            FROM registrations WHERE instance_id = ${instanceId}
+          `;
+          const row = rows[0];
+          const registration = row === undefined ? null : (yield* decodeRegistrationRow(row)).item;
+          if (row !== undefined && registration === null) {
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: "malformed_row",
+                message: "The saved registration row is malformed.",
+              }),
+            );
+          }
+          const tombstones = yield* sql<{
+            readonly instance_id: string;
+            readonly removed_by_request_id: unknown;
+          }>`
+            SELECT instance_id, removed_by_request_id
+            FROM registration_tombstones WHERE instance_id = ${instanceId}
+          `;
+          if (row === undefined && tombstones.length === 0) {
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: "registration_not_found",
+                message: "The saved registration was not found.",
+              }),
+            );
+          }
+          if (row !== undefined) {
+            yield* sql`
+              INSERT INTO registration_tombstones (
+                instance_id, removed_at, removed_by_request_id
+              )
+              VALUES (${instanceId}, ${now}, ${requestId ?? null})
+              ON CONFLICT(instance_id) DO NOTHING
+            `;
+          }
+          yield* sql`DELETE FROM registration_credentials WHERE instance_id = ${instanceId}`;
+          yield* sql`DELETE FROM registrations WHERE instance_id = ${instanceId}`;
+          return {
+            state: row === undefined ? ("already_absent" as const) : ("removed" as const),
+            registration,
+            removedByRequestId:
+              row === undefined
+                ? typeof tombstones[0]?.removed_by_request_id === "string"
+                  ? tombstones[0].removed_by_request_id
+                  : null
+                : (requestId ?? null),
+          };
+        }),
+      );
+    }).pipe(Effect.mapError(toStoreError)),
+  );
+
+const parsePersistedJson = (
+  value: unknown,
+  nullable: boolean,
+  message: string,
+): Effect.Effect<unknown, LocalStoreError> => {
+  if (value === null && nullable) return Effect.succeed(null);
+  if (typeof value !== "string") {
+    return Effect.fail(new LocalStoreError({ kind: "malformed_row", message }));
+  }
+  return Effect.try({
+    try: () => JSON.parse(value),
+    catch: () => new LocalStoreError({ kind: "malformed_row", message }),
+  });
+};
+
+const getStoredOperationInTransaction = (
+  sql: SqlClient.SqlClient,
+  requestId: string,
+): Effect.Effect<StoredOperation | null, LocalStoreError | SqlError.SqlError> =>
+  Effect.gen(function* () {
+    const rows = yield* sql<OperationRow>`
+      SELECT request_id, tool, revision, state, admitted_at, updated_at,
+        recoverable_until, intent_json, target_json, completion_means, dispatch,
+        command_id, message_id, correlation_json, created_json, error_json,
+        recovery, owner_process_nonce
+      FROM operations WHERE request_id = ${requestId}
+    `;
+    const row = rows[0];
+    if (row === undefined) return null;
+
+    const stepRows = yield* sql<OperationStepRow>`
+      SELECT position, name, state, error_json
+      FROM operation_steps WHERE request_id = ${requestId}
+      ORDER BY position ASC
+    `;
+    const evidenceRows = yield* sql<OperationEvidenceRow>`
+      SELECT position, step_position, kind, observed_at, source_sequence, native_event_id, detail
+      FROM operation_evidence WHERE request_id = ${requestId}
+      ORDER BY position ASC
+    `;
+    const target = yield* parsePersistedJson(
+      row.target_json,
+      true,
+      "The mutation target is malformed.",
+    );
+    const correlation = yield* parsePersistedJson(
+      row.correlation_json,
+      true,
+      "The mutation correlation is malformed.",
+    );
+    const created = yield* parsePersistedJson(
+      row.created_json,
+      false,
+      "The mutation created references are malformed.",
+    );
+    const operationError = yield* parsePersistedJson(
+      row.error_json,
+      true,
+      "The mutation error is malformed.",
+    );
+    const intent = yield* parsePersistedJson(
+      row.intent_json,
+      false,
+      "The mutation intent is malformed.",
+    );
+    const decodedIntent = Schema.decodeUnknownResult(
+      Schema.Struct({ instanceId: Schema.NonEmptyString }),
+    )(intent);
+    if (decodedIntent._tag === "Failure") {
+      return yield* Effect.fail(
+        new LocalStoreError({
+          kind: "malformed_row",
+          message: "The mutation intent is malformed.",
+        }),
+      );
+    }
+
+    const evidence = yield* Effect.forEach(evidenceRows, (evidenceRow) => {
+      const decoded = Schema.decodeUnknownResult(EvidenceSchema)({
+        kind: evidenceRow.kind,
+        observedAt: evidenceRow.observed_at,
+        sourceSequence:
+          evidenceRow.source_sequence === null ? null : Number(evidenceRow.source_sequence),
+        nativeEventId: evidenceRow.native_event_id === null ? null : evidenceRow.native_event_id,
+        detail: evidenceRow.detail,
+      });
+      return decoded._tag === "Success"
+        ? Effect.succeed({
+            position: Number(evidenceRow.position),
+            stepPosition:
+              evidenceRow.step_position === null ? null : Number(evidenceRow.step_position),
+            value: decoded.success,
+          })
+        : Effect.fail(
+            new LocalStoreError({
+              kind: "malformed_row",
+              message: "The mutation evidence is malformed.",
+            }),
+          );
+    });
+    const evidenceByStep = new Map<number, Evidence[]>();
+    for (const item of evidence) {
+      if (item.stepPosition === null) continue;
+      const existing = evidenceByStep.get(item.stepPosition) ?? [];
+      existing.push(item.value);
+      evidenceByStep.set(item.stepPosition, existing);
+    }
+
+    const steps = yield* Effect.forEach(stepRows, (stepRow) =>
+      Effect.gen(function* () {
+        const stepError = yield* parsePersistedJson(
+          stepRow.error_json,
+          true,
+          "The mutation step error is malformed.",
+        );
+        const decoded = Schema.decodeUnknownResult(
+          Schema.Struct({
+            name: Schema.NonEmptyString,
+            state: Schema.Literals([
+              "not_started",
+              "pending",
+              "succeeded",
+              "already_absent",
+              "failed",
+              "skipped",
+              "outcome_unknown",
+            ]),
+            error: Schema.NullOr(ToolFailureSchema),
+          }),
+        )({
+          name: stepRow.name,
+          state: stepRow.state,
+          error: stepError,
+        });
+        return decoded._tag === "Success"
+          ? {
+              name: decoded.success.name,
+              state: decoded.success.state,
+              evidence: evidenceByStep.get(Number(stepRow.position)) ?? [],
+              error: decoded.success.error,
+            }
+          : yield* Effect.fail(
+              new LocalStoreError({
+                kind: "malformed_row",
+                message: "The mutation step is malformed.",
+              }),
+            );
+      }),
+    );
+
+    const decoded = Schema.decodeUnknownResult(OperationRecordSchema)({
+      requestId: row.request_id,
+      tool: row.tool,
+      revision: Number(row.revision),
+      state: row.state,
+      admittedAt: row.admitted_at,
+      updatedAt: row.updated_at,
+      recoverableUntil: row.recoverable_until,
+      target,
+      completionMeans: row.completion_means,
+      dispatch: row.dispatch,
+      commandId: row.command_id,
+      messageId: row.message_id,
+      correlation,
+      created,
+      steps,
+      evidence: evidence.map((item) => item.value),
+      error: operationError,
+      recovery: row.recovery,
+    });
+    if (decoded._tag === "Failure") {
+      return yield* Effect.fail(
+        new LocalStoreError({
+          kind: "malformed_row",
+          message: "The mutation operation record is malformed.",
+        }),
+      );
+    }
+    if (typeof row.owner_process_nonce !== "string" || row.owner_process_nonce.length === 0) {
+      return yield* Effect.fail(
+        new LocalStoreError({
+          kind: "malformed_row",
+          message: "The mutation owner process nonce is malformed.",
+        }),
+      );
+    }
+    return {
+      record: decoded.success,
+      intent: decodedIntent.success,
+      ownerProcessNonce: row.owner_process_nonce,
+    };
+  });
 
 const protectDatabaseFiles = (
   fileSystem: FileSystem.FileSystem,

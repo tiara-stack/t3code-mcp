@@ -10,6 +10,7 @@ const tsxCliPath = createRequire(import.meta.url).resolve("tsx/cli");
 type JsonRpcMessage = {
   readonly id?: number;
   readonly result?: {
+    readonly isError?: boolean;
     readonly tools?: ReadonlyArray<{
       readonly name: string;
       readonly inputSchema: Record<string, unknown>;
@@ -92,7 +93,14 @@ describe("stdio transport", () => {
       send(child, { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
       let toolsMessage = await nextMessage();
       while (toolsMessage.id !== 2) toolsMessage = await nextMessage();
-      expect(toolsMessage.result?.tools?.map((tool) => tool.name)).toEqual(["instance_list"]);
+      expect(toolsMessage.result?.tools?.map((tool) => tool.name)).toEqual([
+        "instance_list",
+        "instance_remove",
+        "operation_get",
+      ]);
+      for (const tool of toolsMessage.result?.tools ?? []) {
+        expect(tool.inputSchema).toMatchObject({ allOf: [{ additionalProperties: false }] });
+      }
       expect(toolsMessage.result?.tools?.[0]?.inputSchema).toMatchObject({
         allOf: [{ additionalProperties: false }],
       });
@@ -121,6 +129,29 @@ describe("stdio transport", () => {
       let invalidMessage = await nextMessage();
       while (invalidMessage.id !== 4) invalidMessage = await nextMessage();
       expect(invalidMessage.error?.code).toBe(-32602);
+
+      send(child, {
+        jsonrpc: "2.0",
+        id: 5,
+        method: "tools/call",
+        params: {
+          name: "instance_remove",
+          arguments: { requestId: "stdio-failed-remove", instanceId: "missing-instance" },
+        },
+      });
+      let failedRemoval = await nextMessage();
+      while (failedRemoval.id !== 5) failedRemoval = await nextMessage();
+      expect(failedRemoval.result?.isError).toBe(true);
+
+      send(child, {
+        jsonrpc: "2.0",
+        id: 6,
+        method: "tools/call",
+        params: { name: "operation_get", arguments: { requestId: "stdio-failed-remove" } },
+      });
+      let failedLookup = await nextMessage();
+      while (failedLookup.id !== 6) failedLookup = await nextMessage();
+      expect(failedLookup.result?.isError).toBe(false);
     } finally {
       const exit =
         child.exitCode !== null || child.signalCode !== null

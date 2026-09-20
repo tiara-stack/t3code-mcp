@@ -5,6 +5,10 @@ const nonEmptyString = Schema.NonEmptyString;
 export const DEFAULT_PAGE_LIMIT = 25;
 export const MAX_PAGE_LIMIT = 100;
 export const MAX_SERIALIZED_RESULT_BYTES = 128 * 1024;
+const MAX_REQUEST_ID_LENGTH = 128;
+export const MAX_OPERATION_WAIT_MILLIS = 30_000;
+export const MAX_OPERATION_CAPACITY = 128;
+export const OPERATION_DETAIL_RETENTION_MILLIS = 30 * 24 * 60 * 60 * 1000;
 
 const endpoint = Schema.String.check(
   Schema.makeFilter(
@@ -83,6 +87,86 @@ export const InstanceListInputSchema = Schema.declare<{
 
 export type InstanceListInput = typeof InstanceListInputSchema.Type;
 
+const requestId = Schema.String.check(
+  Schema.makeFilter((value) => value.length > 0 && value.length <= MAX_REQUEST_ID_LENGTH, {
+    message: `expected a request ID between 1 and ${MAX_REQUEST_ID_LENGTH} characters`,
+  }),
+);
+
+const instanceRemoveFields = Schema.Struct({
+  requestId,
+  instanceId: nonEmptyString,
+});
+
+const unknownInstanceRemoveField = Schema.String.check(
+  Schema.makeFilter((key) => key !== "requestId" && key !== "instanceId", {
+    message: "unknown instance_remove argument",
+  }),
+);
+
+const instanceRemoveRuntimeShape = Schema.StructWithRest(instanceRemoveFields, [
+  Schema.Record(unknownInstanceRemoveField, Schema.Never),
+]);
+
+const instanceRemoveJsonShape = Schema.StructWithRest(instanceRemoveFields, [
+  Schema.Record(Schema.String, Schema.Never),
+]);
+
+export const InstanceRemoveInputSchema = Schema.declare<{
+  readonly requestId: string;
+  readonly instanceId: string;
+}>(
+  (input): input is { readonly requestId: string; readonly instanceId: string } =>
+    Schema.is(instanceRemoveRuntimeShape)(input),
+  {
+    toCodecJson: () =>
+      Schema.link()(instanceRemoveJsonShape, {
+        decode: SchemaGetter.passthrough({ strict: false }),
+        encode: SchemaGetter.passthrough({ strict: false }),
+      } as never),
+  },
+);
+
+export type InstanceRemoveInput = typeof InstanceRemoveInputSchema.Type;
+
+const operationGetFields = Schema.Struct({
+  requestId,
+  waitMs: Schema.optionalKey(
+    Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: MAX_OPERATION_WAIT_MILLIS })),
+  ),
+});
+
+const unknownOperationGetField = Schema.String.check(
+  Schema.makeFilter((key) => key !== "requestId" && key !== "waitMs", {
+    message: "unknown operation_get argument",
+  }),
+);
+
+const operationGetRuntimeShape = Schema.StructWithRest(operationGetFields, [
+  Schema.Record(unknownOperationGetField, Schema.Never),
+]);
+
+const operationGetJsonShape = Schema.StructWithRest(operationGetFields, [
+  Schema.Record(Schema.String, Schema.Never),
+]);
+
+export const OperationGetInputSchema = Schema.declare<{
+  readonly requestId: string;
+  readonly waitMs?: number;
+}>(
+  (input): input is { readonly requestId: string; readonly waitMs?: number } =>
+    Schema.is(operationGetRuntimeShape)(input),
+  {
+    toCodecJson: () =>
+      Schema.link()(operationGetJsonShape, {
+        decode: SchemaGetter.passthrough({ strict: false }),
+        encode: SchemaGetter.passthrough({ strict: false }),
+      } as never),
+  },
+);
+
+export type OperationGetInput = typeof OperationGetInputSchema.Type;
+
 const instanceConnectionStates = [
   "connecting",
   "connected",
@@ -144,6 +228,169 @@ export const ToolFailureSchema = Schema.Struct({
 
 export type ToolFailure = typeof ToolFailureSchema.Type;
 
+const projectReferenceSchema = Schema.Struct({
+  instanceId: nonEmptyString,
+  projectId: nonEmptyString,
+});
+
+const threadReferenceSchema = Schema.Struct({
+  instanceId: nonEmptyString,
+  threadId: nonEmptyString,
+});
+
+const worktreeReferenceSchema = Schema.Struct({
+  instanceId: nonEmptyString,
+  repositoryPath: nonEmptyString,
+  worktreePath: nonEmptyString,
+});
+
+const evidenceKinds = [
+  "command_receipt",
+  "snapshot",
+  "event",
+  "rpc_result",
+  "local_registration",
+  "adapter_inference",
+] as const;
+
+export const EvidenceSchema = Schema.Struct({
+  kind: Schema.Literals(evidenceKinds),
+  observedAt: rfc3339Timestamp,
+  sourceSequence: Schema.NullOr(Schema.Natural),
+  nativeEventId: Schema.NullOr(Schema.String),
+  detail: Schema.String,
+});
+
+export type Evidence = typeof EvidenceSchema.Type;
+
+const turnReferenceSchema = Schema.Struct({
+  instanceId: nonEmptyString,
+  threadId: nonEmptyString,
+  turnId: nonEmptyString,
+});
+
+const correlationSchema = Schema.NullOr(
+  Schema.Union([
+    Schema.Struct({
+      kind: Schema.Literal("established"),
+      turn: turnReferenceSchema,
+      evidence: Schema.Array(EvidenceSchema),
+    }),
+    Schema.Struct({
+      kind: Schema.Literal("unestablished"),
+      reason: Schema.String,
+    }),
+  ]),
+);
+
+const operationStates = [
+  "admitted",
+  "pending",
+  "completed",
+  "failed",
+  "partial",
+  "outcome_unknown",
+] as const;
+
+const operationStepStates = [
+  "not_started",
+  "pending",
+  "succeeded",
+  "already_absent",
+  "failed",
+  "skipped",
+  "outcome_unknown",
+] as const;
+
+const OperationStateSchema = Schema.Literals(operationStates);
+const OperationStepStateSchema = Schema.Literals(operationStepStates);
+
+export type OperationState = (typeof operationStates)[number];
+export type OperationStepState = (typeof operationStepStates)[number];
+
+const operationTargetSchema = Schema.NullOr(
+  Schema.Union([
+    InstanceSummarySchema,
+    projectReferenceSchema,
+    threadReferenceSchema,
+    worktreeReferenceSchema,
+  ]),
+);
+
+const operationCreatedSchema = Schema.Struct({
+  instanceId: Schema.optionalKey(nonEmptyString),
+  thread: Schema.optionalKey(threadReferenceSchema),
+  threadConfiguration: Schema.optionalKey(Schema.JsonObject),
+  worktree: Schema.optionalKey(worktreeReferenceSchema),
+});
+
+const operationStepSchema = Schema.Struct({
+  name: nonEmptyString,
+  state: OperationStepStateSchema,
+  evidence: Schema.Array(EvidenceSchema),
+  error: Schema.NullOr(ToolFailureSchema),
+});
+
+const recoveryActions = [
+  "observe_operation",
+  "observe_thread",
+  "inspect_target",
+  "new_explicit_request",
+  "none",
+] as const;
+
+export const OperationRecordSchema = Schema.Struct({
+  requestId,
+  tool: nonEmptyString,
+  revision: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  state: OperationStateSchema,
+  admittedAt: rfc3339Timestamp,
+  updatedAt: rfc3339Timestamp,
+  recoverableUntil: Schema.NullOr(rfc3339Timestamp),
+  target: operationTargetSchema,
+  completionMeans: Schema.Literals([
+    "registration_saved",
+    "registration_updated",
+    "registration_removed",
+    "worktree_created",
+    "thread_created",
+    "submission_accepted",
+    "response_accepted",
+    "interruption_observed",
+    "session_shutdown_observed",
+    "settlement_observed",
+    "thread_absent",
+    "worktree_absent",
+  ]),
+  dispatch: Schema.Literals(["not_dispatched", "accepted", "rejected", "unknown"]),
+  commandId: Schema.NullOr(Schema.String),
+  messageId: Schema.NullOr(Schema.String),
+  correlation: correlationSchema,
+  created: operationCreatedSchema,
+  steps: Schema.Array(operationStepSchema),
+  evidence: Schema.Array(EvidenceSchema),
+  error: Schema.NullOr(ToolFailureSchema),
+  recovery: Schema.Literals(recoveryActions),
+});
+
+export type OperationRecord = typeof OperationRecordSchema.Type;
+
+const toolResultFields = <Value extends Schema.Constraint>(value: Value) =>
+  Schema.Struct({
+    result: Schema.Union([
+      Schema.Struct({
+        kind: Schema.Literal("ok"),
+        value,
+      }),
+      Schema.Struct({
+        kind: Schema.Literal("error"),
+        error: ToolFailureSchema,
+      }),
+    ]),
+    observations: Schema.Array(ObservationSchema),
+    warnings: Schema.Array(WarningSchema),
+  });
+
 // fallow-ignore-next-line unused-export
 export const InstanceListPageSchema = Schema.Struct({
   items: Schema.Array(InstanceSummarySchema),
@@ -178,22 +425,21 @@ export const WarningSchema = Schema.Struct({
   message: Schema.String,
 });
 
-export const ToolResultSchema = Schema.Struct({
-  result: Schema.Union([
-    Schema.Struct({
-      kind: Schema.Literal("ok"),
-      value: InstanceListPageSchema,
-    }),
-    Schema.Struct({
-      kind: Schema.Literal("error"),
-      error: ToolFailureSchema,
-    }),
-  ]),
-  observations: Schema.Array(ObservationSchema),
-  warnings: Schema.Array(WarningSchema),
+export const ToolResultSchema = toolResultFields(InstanceListPageSchema);
+
+export const OperationToolResultSchema = toolResultFields(OperationRecordSchema);
+
+const OperationGetValueSchema = Schema.Struct({
+  operation: OperationRecordSchema,
+  wait: Schema.Literals(["not_requested", "record_changed", "terminal", "timed_out"]),
 });
 
+export const OperationGetToolResultSchema = toolResultFields(OperationGetValueSchema);
+
 export type ToolResult = typeof ToolResultSchema.Type;
+export type OperationToolResult = typeof OperationToolResultSchema.Type;
+export type OperationGetValue = typeof OperationGetValueSchema.Type;
+export type OperationGetToolResult = typeof OperationGetToolResultSchema.Type;
 
 const cachedConnectionWarning = {
   code: "cached_connection_state",
@@ -218,3 +464,33 @@ export const makeToolSuccess = (value: InstanceListPage, observedAt: string): To
 
 export const serializedByteLength = (value: unknown): number =>
   new TextEncoder().encode(JSON.stringify(value)).byteLength;
+
+/**
+ * Serialize decoded JSON input with object keys in lexical order. The request
+ * fingerprint uses this representation so callers cannot create a new
+ * mutation by changing only JSON key order.
+ */
+const canonicalJson = (value: unknown): string => {
+  if (value === null || typeof value === "string" || typeof value === "boolean") {
+    return JSON.stringify(value);
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value))
+      throw new Error("canonical JSON cannot contain a non-finite number");
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalJson).join(",")}]`;
+  }
+  if (typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, entry]) => entry !== undefined)
+      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+      .map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry)}`);
+    return `{${entries.join(",")}}`;
+  }
+  throw new Error("canonical JSON cannot contain an unsupported value");
+};
+
+export const canonicalMutationInput = (tool: string, input: unknown): string =>
+  canonicalJson({ input, tool });
