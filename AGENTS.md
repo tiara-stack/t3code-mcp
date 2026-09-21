@@ -9,6 +9,18 @@ Effect.
 - Use `pnpm check`, `pnpm test`, `pnpm build`, and `pnpm fallow` to validate changes.
 - Load a relevant project skill from `.agents/skills/` before using that workflow.
 
+## Shared-machine resources
+
+This box is shared with running t3code/opencode infrastructure.
+
+- Run heavy commands (`pnpm test`, `pnpm checks`, `pnpm build`, disposable
+  `t3 serve`) one at a time, never in parallel tool calls.
+- Parallel tool calls are for lightweight independent reads only.
+- Clean up spawned servers and processes by exact PID. Never use
+  `pkill -f <pattern>` when the pattern also appears in your own command
+  line — it kills your own shell (use `kill <pid>` or a self-excluding
+  pattern such as `"[t]3 serve"`).
+
 ## Effect-first implementation
 
 Use Effect as the default for new application and library code whenever the
