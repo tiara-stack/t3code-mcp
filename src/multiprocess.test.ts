@@ -112,6 +112,7 @@ const startServer = async (databasePath: string): Promise<Server> => {
       "instance_get",
       "instance_pair",
       "instance_update",
+      "instance_pair_again",
       "instance_remove",
       "operation_get",
     ]);
@@ -138,7 +139,7 @@ const operationValue = (message: JsonRpcMessage) => {
 
 const seed = (
   databasePath: string,
-  registrations: ReadonlyArray<{ readonly instanceId: string }>,
+  registrations: ReadonlyArray<{ readonly instanceId: string; readonly endpoint?: string }>,
 ) =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -147,7 +148,7 @@ const seed = (
         yield* store.putRegistration({
           instanceId: registration.instanceId,
           alias: registration.instanceId,
-          endpoint: `https://${registration.instanceId}.test`,
+          endpoint: registration.endpoint ?? `https://${registration.instanceId}.test`,
           environmentId: `env-${registration.instanceId}`,
           connection: "connected",
           lastObservedAt: null,
@@ -443,6 +444,57 @@ describe("shared SQLite mutation admission", () => {
               },
             });
           }
+        }),
+      ),
+    60000,
+  );
+
+  it.live(
+    "recovers an unresolved re-pairing receipt across processes without secrets",
+    () =>
+      withServers("t3code-mcp-repair-recovery-", ({ databasePath, servers }) =>
+        Effect.gen(function* () {
+          yield* seed(databasePath, [
+            // A closed loopback port fails the one-use exchange deterministically
+            // without relying on DNS behavior for an unresolvable host.
+            { instanceId: "repair-restart", endpoint: "http://127.0.0.1:1" },
+          ]);
+          const first = yield* Effect.promise(() => startServer(databasePath));
+          servers.add(first);
+          const repair = yield* Effect.promise(() =>
+            call(first, 3, "instance_pair_again", {
+              requestId: "repair-request",
+              instanceId: "repair-restart",
+              pairingCode: "one-use-secret-code",
+            }),
+          );
+          expect(repair.result?.structuredContent).toMatchObject({
+            result: { kind: "ok", value: { state: "outcome_unknown" } },
+          });
+          expect(JSON.stringify(repair.result?.structuredContent)).not.toContain(
+            "one-use-secret-code",
+          );
+          yield* Effect.promise(() => stopServer(first));
+          servers.delete(first);
+
+          const second = yield* Effect.promise(() => startServer(databasePath));
+          servers.add(second);
+          const lookup = yield* Effect.promise(() =>
+            call(second, 3, "operation_get", { requestId: "repair-request" }),
+          );
+          expect(lookup.result?.structuredContent).toMatchObject({
+            result: {
+              kind: "ok",
+              value: { operation: { state: "outcome_unknown", recovery: "observe_operation" } },
+            },
+          });
+          expect(JSON.stringify(lookup.result?.structuredContent)).not.toContain(
+            "one-use-secret-code",
+          );
+          const list = yield* Effect.promise(() => call(second, 4, "instance_list", {}));
+          expect(list.result?.structuredContent).toMatchObject({
+            result: { kind: "ok", value: { items: [{ instanceId: "repair-restart" }] } },
+          });
         }),
       ),
     60000,

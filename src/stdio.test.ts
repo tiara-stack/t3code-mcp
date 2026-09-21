@@ -105,6 +105,7 @@ describe("stdio transport", () => {
               "instance_get",
               "instance_pair",
               "instance_update",
+              "instance_pair_again",
               "instance_remove",
               "operation_get",
             ]);

@@ -234,6 +234,49 @@ export const InstanceUpdateInputSchema = Schema.declare<{
 
 export type InstanceUpdateInput = typeof InstanceUpdateInputSchema.Type;
 
+const instancePairAgainFields = Schema.Struct({
+  requestId,
+  instanceId: nonEmptyString,
+  pairingCode: nonEmptyString,
+});
+
+const unknownInstancePairAgainField = Schema.String.check(
+  Schema.makeFilter((key) => key !== "requestId" && key !== "instanceId" && key !== "pairingCode", {
+    message: "unknown instance_pair_again argument",
+  }),
+);
+
+const instancePairAgainRuntimeShape = Schema.StructWithRest(instancePairAgainFields, [
+  Schema.Record(unknownInstancePairAgainField, Schema.Never),
+]);
+
+const instancePairAgainJsonShape = Schema.StructWithRest(instancePairAgainFields, [
+  Schema.Record(Schema.String, Schema.Never),
+]);
+
+export const InstancePairAgainInputSchema = Schema.declare<{
+  readonly requestId: string;
+  readonly instanceId: string;
+  readonly pairingCode: string;
+}>(
+  (
+    input,
+  ): input is {
+    readonly requestId: string;
+    readonly instanceId: string;
+    readonly pairingCode: string;
+  } => Schema.is(instancePairAgainRuntimeShape)(input),
+  {
+    toCodecJson: () =>
+      Schema.link()(instancePairAgainJsonShape, {
+        decode: SchemaGetter.passthrough({ strict: false }),
+        encode: SchemaGetter.passthrough({ strict: false }),
+      } as never),
+  },
+);
+
+export type InstancePairAgainInput = typeof InstancePairAgainInputSchema.Type;
+
 const instanceGetFields = Schema.Struct({
   instanceId: nonEmptyString,
   allowStale: Schema.optionalKey(Schema.Boolean),

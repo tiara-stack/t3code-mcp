@@ -16,9 +16,11 @@ import {
   InstanceListInputSchema,
   InstanceGetInputSchema,
   InstanceDetailsToolResultSchema,
+  InstancePairAgainInputSchema,
   InstancePairInputSchema,
   InstanceUpdateInputSchema,
   MAX_OPERATION_CAPACITY,
+  type OperationRecord,
   makeToolSuccess,
   MAX_SERIALIZED_RESULT_BYTES,
   OperationGetInputSchema,
@@ -56,45 +58,72 @@ const InstanceGetTool = Tool.make("instance_get", {
   .annotate(Tool.Idempotent, true)
   .annotate(Tool.OpenWorld, true);
 
-// fallow-ignore-next-line unused-export
-export const InstanceRemoveTool = Tool.make("instance_remove", {
-  description: "Remove a saved T3Code registration without changing upstream work.",
-  parameters: InstanceRemoveInputSchema,
-  success: OperationToolResultSchema,
-})
-  .addDependency(LocalStore)
-  .addDependency(Operations)
-  .annotate(Tool.Readonly, false)
-  .annotate(Tool.Destructive, true)
-  .annotate(Tool.Idempotent, true)
-  .annotate(Tool.OpenWorld, false);
+/**
+ * The registration mutations share one admission/supervision dependency set
+ * and differ only in their destructive and open-world hints.
+ */
+const asRegistrationMutation = <
+  Name extends string,
+  Config extends {
+    readonly parameters: Schema.Constraint;
+    readonly success: Schema.Constraint;
+    readonly failure: Schema.Constraint;
+    readonly failureMode: Tool.FailureMode;
+  },
+  Requirements,
+>(
+  tool: Tool.Tool<Name, Config, Requirements>,
+  hints: { readonly destructive: boolean; readonly openWorld: boolean },
+): Tool.Tool<Name, Config, Requirements | LocalStore | Operations> =>
+  tool
+    .addDependency(LocalStore)
+    .addDependency(Operations)
+    .annotate(Tool.Readonly, false)
+    .annotate(Tool.Destructive, hints.destructive)
+    .annotate(Tool.Idempotent, true)
+    .annotate(Tool.OpenWorld, hints.openWorld);
 
 // fallow-ignore-next-line unused-export
-export const InstancePairTool = Tool.make("instance_pair", {
-  description: "Pair an existing T3Code instance with a one-use bearer code.",
-  parameters: InstancePairInputSchema,
-  success: OperationToolResultSchema,
-})
-  .addDependency(LocalStore)
-  .addDependency(Operations)
-  .annotate(Tool.Readonly, false)
-  .annotate(Tool.Destructive, false)
-  .annotate(Tool.Idempotent, true)
-  .annotate(Tool.OpenWorld, true);
+export const InstanceRemoveTool = asRegistrationMutation(
+  Tool.make("instance_remove", {
+    description: "Remove a saved T3Code registration without changing upstream work.",
+    parameters: InstanceRemoveInputSchema,
+    success: OperationToolResultSchema,
+  }),
+  { destructive: true, openWorld: false },
+);
 
 // fallow-ignore-next-line unused-export
-export const InstanceUpdateTool = Tool.make("instance_update", {
-  description:
-    "Edit a saved T3Code registration's alias or endpoint, verifying the bound environment before publishing.",
-  parameters: InstanceUpdateInputSchema,
-  success: OperationToolResultSchema,
-})
-  .addDependency(LocalStore)
-  .addDependency(Operations)
-  .annotate(Tool.Readonly, false)
-  .annotate(Tool.Destructive, true)
-  .annotate(Tool.Idempotent, true)
-  .annotate(Tool.OpenWorld, true);
+export const InstancePairTool = asRegistrationMutation(
+  Tool.make("instance_pair", {
+    description: "Pair an existing T3Code instance with a one-use bearer code.",
+    parameters: InstancePairInputSchema,
+    success: OperationToolResultSchema,
+  }),
+  { destructive: false, openWorld: true },
+);
+
+// fallow-ignore-next-line unused-export
+export const InstanceUpdateTool = asRegistrationMutation(
+  Tool.make("instance_update", {
+    description:
+      "Edit a saved T3Code registration's alias or endpoint, verifying the bound environment before publishing.",
+    parameters: InstanceUpdateInputSchema,
+    success: OperationToolResultSchema,
+  }),
+  { destructive: true, openWorld: true },
+);
+
+// fallow-ignore-next-line unused-export
+export const InstancePairAgainTool = asRegistrationMutation(
+  Tool.make("instance_pair_again", {
+    description:
+      "Replace a saved registration's credentials with a new one-use pairing code after expiry or revocation, verifying the bound environment first.",
+    parameters: InstancePairAgainInputSchema,
+    success: OperationToolResultSchema,
+  }),
+  { destructive: true, openWorld: true },
+);
 
 // fallow-ignore-next-line unused-export
 export const OperationGetTool = Tool.make("operation_get", {
@@ -114,6 +143,7 @@ export const ServerToolkit = Toolkit.make(
   InstanceGetTool,
   InstancePairTool,
   InstanceUpdateTool,
+  InstancePairAgainTool,
   InstanceRemoveTool,
   OperationGetTool,
 );
@@ -203,6 +233,58 @@ const toToolFailure = (error: LocalStoreError | OperationServiceError | T3CodeAd
   }
 };
 
+const registrationMutationResult = (
+  operation: Effect.Effect<OperationRecord, LocalStoreError | OperationServiceError>,
+): Effect.Effect<
+  | {
+      readonly result: { readonly kind: "ok"; readonly value: OperationRecord };
+      readonly observations: ReadonlyArray<{
+        readonly instanceId: string;
+        readonly observedAt: string;
+        readonly freshness: "fresh";
+        readonly sourceSequence: null;
+        readonly coverage: "complete_for_query";
+        readonly limitations: ReadonlyArray<string>;
+      }>;
+      readonly warnings: ReadonlyArray<never>;
+    }
+  | {
+      readonly result: { readonly kind: "error"; readonly error: ToolFailure };
+      readonly observations: ReadonlyArray<never>;
+      readonly warnings: ReadonlyArray<never>;
+    },
+  never
+> =>
+  Effect.gen(function* () {
+    const value = yield* operation;
+    const observedAt = new Date(yield* Clock.currentTimeMillis).toISOString();
+    return {
+      result: { kind: "ok" as const, value },
+      observations:
+        value.target === null
+          ? []
+          : [
+              {
+                instanceId: value.target.instanceId,
+                observedAt,
+                freshness: "fresh" as const,
+                sourceSequence: null,
+                coverage: "complete_for_query" as const,
+                limitations: [],
+              },
+            ],
+      warnings: [],
+    };
+  }).pipe(
+    Effect.catch((error: LocalStoreError | OperationServiceError) =>
+      Effect.succeed({
+        result: { kind: "error" as const, error: toToolFailure(error) },
+        observations: [],
+        warnings: [],
+      }),
+    ),
+  );
+
 const serverToolHandlers = ServerToolkit.of({
   instance_list: ({ cursor, limit }) =>
     Effect.gen(function* () {
@@ -265,96 +347,23 @@ const serverToolHandlers = ServerToolkit.of({
   instance_remove: (input) =>
     Effect.gen(function* () {
       const operations = yield* Operations;
-      const operation = yield* operations.removeRegistration(input);
-      const observedAt = new Date(yield* Clock.currentTimeMillis).toISOString();
-      return {
-        result: { kind: "ok" as const, value: operation },
-        observations:
-          operation.target === null
-            ? []
-            : [
-                {
-                  instanceId: operation.target.instanceId,
-                  observedAt,
-                  freshness: "fresh" as const,
-                  sourceSequence: null,
-                  coverage: "complete_for_query" as const,
-                  limitations: [],
-                },
-              ],
-        warnings: [],
-      };
-    }).pipe(
-      Effect.catch((error: LocalStoreError | OperationServiceError) =>
-        Effect.succeed({
-          result: { kind: "error" as const, error: toToolFailure(error) },
-          observations: [],
-          warnings: [],
-        }),
-      ),
-    ),
+      return yield* registrationMutationResult(operations.removeRegistration(input));
+    }),
   instance_update: (input) =>
     Effect.gen(function* () {
       const operations = yield* Operations;
-      const operation = yield* operations.updateRegistration(input);
-      const observedAt = new Date(yield* Clock.currentTimeMillis).toISOString();
-      return {
-        result: { kind: "ok" as const, value: operation },
-        observations:
-          operation.target === null
-            ? []
-            : [
-                {
-                  instanceId: operation.target.instanceId,
-                  observedAt,
-                  freshness: "fresh" as const,
-                  sourceSequence: null,
-                  coverage: "complete_for_query" as const,
-                  limitations: [],
-                },
-              ],
-        warnings: [],
-      };
-    }).pipe(
-      Effect.catch((error: LocalStoreError | OperationServiceError) =>
-        Effect.succeed({
-          result: { kind: "error" as const, error: toToolFailure(error) },
-          observations: [],
-          warnings: [],
-        }),
-      ),
-    ),
+      return yield* registrationMutationResult(operations.updateRegistration(input));
+    }),
   instance_pair: (input) =>
     Effect.gen(function* () {
       const operations = yield* Operations;
-      const operation = yield* operations.pairInstance(input);
-      const observedAt = new Date(yield* Clock.currentTimeMillis).toISOString();
-      return {
-        result: { kind: "ok" as const, value: operation },
-        observations:
-          operation.target === null
-            ? []
-            : [
-                {
-                  instanceId: operation.target.instanceId,
-                  observedAt,
-                  freshness: "fresh" as const,
-                  sourceSequence: null,
-                  coverage: "complete_for_query" as const,
-                  limitations: [],
-                },
-              ],
-        warnings: [],
-      };
-    }).pipe(
-      Effect.catch((error: LocalStoreError | OperationServiceError) =>
-        Effect.succeed({
-          result: { kind: "error" as const, error: toToolFailure(error) },
-          observations: [],
-          warnings: [],
-        }),
-      ),
-    ),
+      return yield* registrationMutationResult(operations.pairInstance(input));
+    }),
+  instance_pair_again: (input) =>
+    Effect.gen(function* () {
+      const operations = yield* Operations;
+      return yield* registrationMutationResult(operations.pairInstanceAgain(input));
+    }),
   operation_get: (input) =>
     Effect.gen(function* () {
       const operations = yield* Operations;
@@ -406,7 +415,8 @@ const mutatorResultIsError = (toolName: string, value: unknown): boolean => {
   if (
     toolName !== "instance_remove" &&
     toolName !== "instance_pair" &&
-    toolName !== "instance_update"
+    toolName !== "instance_update" &&
+    toolName !== "instance_pair_again"
   )
     return false;
   const operation = (result as { value?: { state?: unknown } }).value;

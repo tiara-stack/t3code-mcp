@@ -13,6 +13,7 @@ import {
   OPERATION_DETAIL_RETENTION_MILLIS,
   STAGED_PAIRING_RETENTION_MILLIS,
   type Evidence,
+  type InstancePairAgainInput,
   type InstancePairInput,
   type InstanceRemoveInput,
   type InstanceUpdateInput,
@@ -34,6 +35,9 @@ export class OperationServiceError extends Data.TaggedError("OperationServiceErr
 export interface OperationsService {
   readonly pairInstance: (
     input: InstancePairInput,
+  ) => Effect.Effect<OperationRecord, LocalStoreError | OperationServiceError>;
+  readonly pairInstanceAgain: (
+    input: InstancePairAgainInput,
   ) => Effect.Effect<OperationRecord, LocalStoreError | OperationServiceError>;
   readonly removeRegistration: (
     input: InstanceRemoveInput,
@@ -324,12 +328,14 @@ export class Operations extends Context.Service<Operations, OperationsService>()
               "A restarted process observed an admitted pairing without a saved registration and will not exchange the one-use code again.";
             return yield* markOutcomeUnknown(stored, record, detail);
           }
-          if (record.tool === "instance_update") {
+          if (record.tool === "instance_update" || record.tool === "instance_pair_again") {
             if (!previousOwner) {
               return yield* markOutcomeUnknown(
                 stored,
                 record,
-                "The owning process is no longer executing this admitted update; its outcome is unknown and it will not be redispatched.",
+                record.tool === "instance_update"
+                  ? "The owning process is no longer executing this admitted update; its outcome is unknown and it will not be redispatched."
+                  : "The owning process is no longer executing this admitted re-pairing; its outcome is unknown, the one-use exchange will not be replayed, and an unfinished staged credential is never published automatically.",
               );
             }
             if (record.dispatch === "not_dispatched") {
@@ -337,14 +343,18 @@ export class Operations extends Context.Service<Operations, OperationsService>()
               return yield* markOutcomeUnknown(
                 stored,
                 record,
-                "A previous process left this admitted update without dispatch evidence; its outcome is unknown and it will not be redispatched.",
+                record.tool === "instance_update"
+                  ? "A previous process left this admitted update without dispatch evidence; its outcome is unknown and it will not be redispatched."
+                  : "A previous process left this admitted re-pairing without dispatch evidence; its outcome is unknown, the one-use exchange will not be replayed, and an unfinished staged credential is never published automatically.",
               );
             }
             if (!previousOwnerStale) return record;
             return yield* markOutcomeUnknown(
               stored,
               record,
-              "A previous process left this update without confirmed publication evidence; its outcome is unknown and it will not be redispatched.",
+              record.tool === "instance_update"
+                ? "A previous process left this update without confirmed publication evidence; its outcome is unknown and it will not be redispatched."
+                : "A previous process left this re-pairing without confirmed publication evidence; its outcome is unknown, the one-use exchange will not be replayed, and an unfinished staged credential is never published automatically.",
             );
           }
           if (record.tool !== "instance_remove") return record;
@@ -639,6 +649,237 @@ export class Operations extends Context.Service<Operations, OperationsService>()
                     Effect.andThen(
                       store.discardPairing(instanceId).pipe(Effect.catch(() => Effect.void)),
                     ),
+                    Effect.andThen(signalCompletion(input.requestId)),
+                    Effect.catch(() => Effect.void),
+                  );
+              }),
+            ),
+          ),
+          Effect.asVoid,
+        );
+      };
+
+      // fallow-ignore-next-line complexity
+      const executePairingAgain = (input: InstancePairAgainInput): Effect.Effect<void, never> => {
+        let stepPosition = 0;
+        let exchangeAccepted = false;
+        // fallow-ignore-next-line complexity
+        return Effect.gen(function* () {
+          const started = yield* evidence(
+            "Re-pairing admission was committed; the one-use exchange is owned by this process.",
+            "adapter_inference",
+          );
+          yield* store.updateOperation(input.requestId, {
+            now: started.observedAt,
+            intent: { instanceId: input.instanceId },
+            state: "pending",
+            dispatch: "unknown",
+            stepPosition,
+            stepState: "pending",
+            evidence: [started],
+            evidenceStepPosition: stepPosition,
+            recovery: "observe_operation",
+          });
+
+          const stored = yield* store.getRegistration(input.instanceId);
+          if (stored === null) {
+            const inspection = yield* store.inspectRegistration(input.instanceId);
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind:
+                  inspection.state === "removed"
+                    ? "registration_removed"
+                    : "registration_not_found",
+                message:
+                  inspection.state === "removed"
+                    ? "The saved registration was removed and cannot be re-paired."
+                    : "The saved registration was not found.",
+              }),
+            );
+          }
+          const endpoint = stored.registration.endpoint;
+
+          const staged = yield* connections.exchangePairingCode({
+            endpoint,
+            pairingCode: input.pairingCode,
+          });
+          exchangeAccepted = true;
+          const exchanged = yield* evidence(
+            "The T3Code re-pairing exchange returned a credential; the credential value is intentionally omitted.",
+            "rpc_result",
+          );
+          yield* store.updateOperation(input.requestId, {
+            now: exchanged.observedAt,
+            dispatch: "accepted",
+            stepPosition,
+            stepState: "succeeded",
+            evidence: [exchanged],
+            evidenceStepPosition: stepPosition,
+          });
+
+          stepPosition = 1;
+          const now = yield* Clock.currentTimeMillis;
+          const expiresAt = Math.min(
+            staged.expiresAtMillis ?? now + STAGED_PAIRING_RETENTION_MILLIS,
+            now + STAGED_PAIRING_RETENTION_MILLIS,
+          );
+          if (expiresAt <= now) {
+            return yield* Effect.fail(
+              new T3CodeAdapterError({
+                kind: "authorization",
+                message: "The pairing credential was already expired when it was returned.",
+                uncertain: false,
+                status: null,
+              }),
+            );
+          }
+          yield* store.stagePairing({
+            instanceId: input.instanceId,
+            alias: stored.registration.alias,
+            endpoint,
+            credential: staged.credential,
+            expiresAt,
+            replaceExisting: true,
+          });
+          const savedStage = yield* evidence(
+            "The returned credential was staged in private local storage before identity verification.",
+            "local_registration",
+          );
+          yield* store.updateOperation(input.requestId, {
+            now: savedStage.observedAt,
+            stepPosition,
+            stepState: "succeeded",
+            evidence: [savedStage],
+            evidenceStepPosition: stepPosition,
+          });
+
+          stepPosition = 2;
+          const verified = yield* connections.verifyCredential({
+            endpoint,
+            credential: staged.credential,
+          });
+          const verifiedEvidence = yield* evidence(
+            "The re-pairing credential was verified against the originally bound environment identity, authorization scopes, pinned version, and authenticated RPC probe.",
+            "rpc_result",
+          );
+          yield* store.updateOperation(input.requestId, {
+            now: verifiedEvidence.observedAt,
+            stepPosition,
+            stepState: "succeeded",
+            evidence: [verifiedEvidence],
+            evidenceStepPosition: stepPosition,
+          });
+          if (
+            stored.registration.environmentId !== null &&
+            stored.registration.environmentId !== verified.environmentId
+          ) {
+            return yield* Effect.fail(
+              new T3CodeAdapterError({
+                kind: "identity_mismatch",
+                message:
+                  "The re-pairing credential is bound to a different T3Code environment than the saved registration.",
+                uncertain: false,
+                status: null,
+              }),
+            );
+          }
+
+          stepPosition = 3;
+          const latest = yield* store.getRegistration(input.instanceId);
+          if (latest === null) {
+            const inspection = yield* store.inspectRegistration(input.instanceId);
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind:
+                  inspection.state === "removed"
+                    ? "registration_removed"
+                    : "registration_not_found",
+                message:
+                  inspection.state === "removed"
+                    ? "The saved registration was removed while re-pairing was in flight."
+                    : "The saved registration was not found while re-pairing was in flight.",
+              }),
+            );
+          }
+          const replaced = yield* store.replaceRegistrationCredentials({
+            instanceId: input.instanceId,
+            expectedRevision: latest.revision,
+            credential: staged.credential,
+            environmentId: verified.environmentId,
+            connection: "connected",
+            lastObservedAt: verifiedEvidence.observedAt,
+          });
+          yield* connections.invalidate(input.instanceId);
+          const completed = yield* evidence(
+            "The verified replacement credential was published atomically under compare-and-set; the registration identity and revision history are preserved.",
+            "local_registration",
+          );
+          yield* store.updateOperation(input.requestId, {
+            now: completed.observedAt,
+            state: "completed",
+            dispatch: "accepted",
+            target: replaced.registration,
+            stepPosition,
+            stepState: "succeeded",
+            evidence: [completed],
+            evidenceStepPosition: stepPosition,
+            error: null,
+            recovery: "none",
+            recoverableUntil: new Date(
+              Date.parse(completed.observedAt) + OPERATION_DETAIL_RETENTION_MILLIS,
+            ).toISOString(),
+          });
+          yield* signalCompletion(input.requestId);
+        }).pipe(
+          Effect.catch((error: LocalStoreError | T3CodeAdapterError) =>
+            nowIso.pipe(
+              // fallow-ignore-next-line complexity
+              Effect.flatMap((now) => {
+                const adapterFailure = error instanceof T3CodeAdapterError;
+                const knownFailure = adapterFailure
+                  ? !error.uncertain && error.kind !== "transport" && error.kind !== "timeout"
+                  : error.kind === "identity_conflict" ||
+                    error.kind === "identity_mismatch" ||
+                    error.kind === "registration_removed" ||
+                    error.kind === "registration_not_found" ||
+                    error.kind === "revision_conflict";
+                const state = knownFailure ? ("failed" as const) : ("outcome_unknown" as const);
+                const dispatch =
+                  adapterFailure &&
+                  (error.kind === "invalid_pairing_code" || error.kind === "pairing_code_used")
+                    ? ("rejected" as const)
+                    : exchangeAccepted
+                      ? ("accepted" as const)
+                      : ("unknown" as const);
+                const failure = adapterFailure ? pairingFailure(error) : operationFailure(error);
+                // An unfinished staged credential is left to its 24-hour expiry
+                // (or a later explicit re-pairing) rather than discarded here,
+                // where it may belong to a concurrent re-pairing attempt.
+                return store
+                  .updateOperation(input.requestId, {
+                    now,
+                    state,
+                    ...(!adapterFailure &&
+                    !exchangeAccepted &&
+                    error.kind === "registration_not_found"
+                      ? { dispatch: "rejected" as const }
+                      : { dispatch }),
+                    stepPosition,
+                    stepState: knownFailure ? "failed" : "outcome_unknown",
+                    stepError: failure,
+                    error: failure,
+                    recovery: knownFailure
+                      ? !adapterFailure &&
+                        !exchangeAccepted &&
+                        error.kind === "registration_not_found"
+                        ? "inspect_target"
+                        : "new_explicit_request"
+                      : "observe_operation",
+                    recoverableUntil: knownFailure
+                      ? new Date(Date.parse(now) + OPERATION_DETAIL_RETENTION_MILLIS).toISOString()
+                      : null,
+                  })
+                  .pipe(
                     Effect.andThen(signalCompletion(input.requestId)),
                     Effect.catch(() => Effect.void),
                   );
@@ -1063,6 +1304,49 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           });
         });
 
+      const pairInstanceAgain = (
+        input: InstancePairAgainInput,
+      ): Effect.Effect<OperationRecord, LocalStoreError | OperationServiceError> =>
+        Effect.gen(function* () {
+          const fingerprint = yield* store.fingerprintRequest("instance_pair_again", input);
+          const known = yield* store.findRequest(input.requestId);
+          if (known !== null) {
+            if (known.fingerprint !== fingerprint) {
+              return yield* Effect.fail(
+                new LocalStoreError({
+                  kind: "request_id_conflict",
+                  message: "The request ID was already used for different mutation input.",
+                }),
+              );
+            }
+            const existing = yield* store.getOperation(input.requestId);
+            if (existing === null) {
+              return yield* Effect.fail(
+                new LocalStoreError({
+                  kind: "request_record_unavailable",
+                  message: REQUEST_RECORD_UNAVAILABLE_MESSAGE,
+                }),
+              );
+            }
+            return yield* reconcile(existing);
+          }
+
+          return yield* admitAndRun({
+            requestId: input.requestId,
+            fingerprint,
+            tool: "instance_pair_again",
+            intent: { instanceId: input.instanceId },
+            completionMeans: "registration_updated",
+            steps: [
+              "exchange_pairing_code",
+              "stage_credential",
+              "verify_bound_environment",
+              "replace_credentials",
+            ],
+            execute: executePairingAgain(input),
+          });
+        });
+
       const removeRegistration = (
         input: InstanceRemoveInput,
       ): Effect.Effect<OperationRecord, LocalStoreError | OperationServiceError> =>
@@ -1168,6 +1452,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
 
       return Operations.of({
         pairInstance,
+        pairInstanceAgain,
         removeRegistration,
         updateRegistration,
         getOperation: readOperation,

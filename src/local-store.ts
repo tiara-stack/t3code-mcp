@@ -221,6 +221,20 @@ export interface StagePairingInput {
   readonly endpoint: string;
   readonly credential: string;
   readonly expiresAt: number;
+  /**
+   * Explicit re-pairing replaces an unpublished staged credential left by an
+   * earlier attempt; initial pairing keeps the conflict instead.
+   */
+  readonly replaceExisting?: boolean;
+}
+
+export interface ReplaceRegistrationCredentialsInput {
+  readonly instanceId: string;
+  readonly expectedRevision: number;
+  readonly credential: string;
+  readonly environmentId: string;
+  readonly connection: InstanceSummary["connection"];
+  readonly lastObservedAt: string | null;
 }
 
 export interface PublishPairingInput extends InstanceSummary {
@@ -316,6 +330,9 @@ export interface LocalStoreService {
   ) => Effect.Effect<InstanceSummary, LocalStoreError>;
   readonly updateRegistration: (
     input: UpdateRegistrationInput,
+  ) => Effect.Effect<UpdatedRegistration, LocalStoreError>;
+  readonly replaceRegistrationCredentials: (
+    input: ReplaceRegistrationCredentialsInput,
   ) => Effect.Effect<UpdatedRegistration, LocalStoreError>;
   readonly discardPairing: (instanceId: string) => Effect.Effect<void, LocalStoreError>;
   readonly getRegistration: (
@@ -497,6 +514,15 @@ export class LocalStore extends Context.Service<LocalStore, LocalStoreService>()
             verifySchemaForOperation,
           );
 
+        const replaceRegistrationCredentials = (input: ReplaceRegistrationCredentialsInput) =>
+          replaceRegistrationCredentialsInDatabase(
+            sql,
+            fileSystem,
+            config.databasePath,
+            input,
+            verifySchemaForOperation,
+          );
+
         const discardPairing = (instanceId: string) =>
           discardPairingInDatabase(sql, instanceId, verifySchemaForOperation);
 
@@ -541,6 +567,7 @@ export class LocalStore extends Context.Service<LocalStore, LocalStoreService>()
           stagePairing,
           publishPairing,
           updateRegistration,
+          replaceRegistrationCredentials,
           discardPairing,
           getRegistration,
           listRegistrationRevisions,
@@ -1580,7 +1607,7 @@ const stagePairingInDatabase = (
           const existing = yield* sql<{ instance_id: string }>`
             SELECT instance_id FROM staged_pairings WHERE instance_id = ${input.instanceId}
           `;
-          if (existing.length > 0) {
+          if (existing.length > 0 && input.replaceExisting !== true) {
             return yield* Effect.fail(
               new LocalStoreError({
                 kind: "identity_conflict",
@@ -1588,14 +1615,31 @@ const stagePairingInDatabase = (
               }),
             );
           }
-          yield* sql`
-            INSERT INTO staged_pairings (
-              instance_id, alias, endpoint, credential, expires_at, created_at
-            ) VALUES (
-              ${input.instanceId}, ${input.alias}, ${input.endpoint}, ${input.credential},
-              ${input.expiresAt}, ${now}
-            )
-          `;
+          if (input.replaceExisting === true) {
+            yield* sql`
+              INSERT INTO staged_pairings (
+                instance_id, alias, endpoint, credential, expires_at, created_at
+              ) VALUES (
+                ${input.instanceId}, ${input.alias}, ${input.endpoint}, ${input.credential},
+                ${input.expiresAt}, ${now}
+              )
+              ON CONFLICT(instance_id) DO UPDATE SET
+                alias = excluded.alias,
+                endpoint = excluded.endpoint,
+                credential = excluded.credential,
+                expires_at = excluded.expires_at,
+                created_at = excluded.created_at
+            `;
+          } else {
+            yield* sql`
+              INSERT INTO staged_pairings (
+                instance_id, alias, endpoint, credential, expires_at, created_at
+              ) VALUES (
+                ${input.instanceId}, ${input.alias}, ${input.endpoint}, ${input.credential},
+                ${input.expiresAt}, ${now}
+              )
+            `;
+          }
         }),
       );
       yield* protectDatabaseFiles(fileSystem, databasePath);
@@ -1822,6 +1866,155 @@ const updateRegistrationInDatabase = (
       );
       yield* protectDatabaseFiles(fileSystem, databasePath);
       return { registration: value, revision } satisfies UpdatedRegistration;
+    }).pipe(Effect.mapError(toStoreError)),
+  );
+
+const replaceRegistrationCredentialsInDatabase = (
+  sql: SqlClient.SqlClient,
+  fileSystem: FileSystem.FileSystem,
+  databasePath: string,
+  input: ReplaceRegistrationCredentialsInput,
+  verify: SchemaVerifier,
+): Effect.Effect<UpdatedRegistration, LocalStoreError> =>
+  retryStorage(
+    Effect.gen(function* () {
+      if (input.credential.length === 0) {
+        return yield* Effect.fail(
+          new LocalStoreError({
+            kind: "malformed_row",
+            message: "The replacement credential is malformed.",
+          }),
+        );
+      }
+      if (!Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 0) {
+        return yield* Effect.fail(
+          new LocalStoreError({
+            kind: "malformed_row",
+            message: "The credential replacement revision is malformed.",
+          }),
+        );
+      }
+      yield* verify();
+      const now = yield* Clock.currentTimeMillis;
+      const result = yield* sql.withTransaction(
+        // fallow-ignore-next-line complexity
+        Effect.gen(function* () {
+          yield* sql`DELETE FROM staged_pairings WHERE expires_at <= ${now}`;
+          const staged = yield* sql<{
+            readonly credential: string;
+            readonly expires_at: number;
+          }>`
+            SELECT credential, expires_at
+            FROM staged_pairings
+            WHERE instance_id = ${input.instanceId}
+          `;
+          if (staged[0] === undefined || staged[0].expires_at <= now) {
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: "identity_mismatch",
+                message: "The staged pairing credential is unavailable.",
+              }),
+            );
+          }
+          if (staged[0].credential !== input.credential) {
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: "identity_mismatch",
+                message: "The staged pairing credential does not match.",
+              }),
+            );
+          }
+          const rows = yield* sql<RegistrationRow>`
+            SELECT instance_id, alias, endpoint, environment_id, connection, last_observed_at, revision
+            FROM registrations WHERE instance_id = ${input.instanceId}
+          `;
+          const row = rows[0];
+          if (row === undefined) {
+            const tombstones = yield* sql<{ instance_id: string }>`
+              SELECT instance_id FROM registration_tombstones WHERE instance_id = ${input.instanceId}
+            `;
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: tombstones.length > 0 ? "registration_removed" : "registration_not_found",
+                message:
+                  tombstones.length > 0
+                    ? "The saved registration was removed and cannot be re-paired."
+                    : "The saved registration was not found.",
+              }),
+            );
+          }
+          const decoded = yield* decodeRegistrationRow(row);
+          if (decoded.item === null) {
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: "malformed_row",
+                message: "The saved registration row is malformed.",
+              }),
+            );
+          }
+          if (Number(row.revision) !== input.expectedRevision) {
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: "revision_conflict",
+                message:
+                  "The saved registration changed before the replacement could be published.",
+              }),
+            );
+          }
+          const duplicateIdentity = yield* sql<{ instance_id: string }>`
+            SELECT instance_id
+            FROM registrations
+            WHERE environment_id = ${input.environmentId}
+              AND instance_id <> ${input.instanceId}
+          `;
+          if (duplicateIdentity.length > 0) {
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: "identity_conflict",
+                message: "This T3Code environment is already registered.",
+              }),
+            );
+          }
+          const updated = yield* sql<{ revision: unknown }>`
+            UPDATE registrations SET
+              environment_id = ${input.environmentId},
+              connection = ${input.connection},
+              last_observed_at = ${input.lastObservedAt},
+              updated_at = ${now},
+              revision = revision + 1
+            WHERE instance_id = ${input.instanceId}
+              AND revision = ${input.expectedRevision}
+            RETURNING revision
+          `;
+          const updatedRevision = Number(updated[0]?.revision);
+          if (updated.length !== 1 || !Number.isSafeInteger(updatedRevision)) {
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: "revision_conflict",
+                message:
+                  "The saved registration changed before the replacement could be published.",
+              }),
+            );
+          }
+          yield* sql`
+            INSERT INTO registration_credentials (instance_id, credential, updated_at)
+            VALUES (${input.instanceId}, ${input.credential}, ${now})
+            ON CONFLICT(instance_id) DO UPDATE SET
+              credential = excluded.credential,
+              updated_at = excluded.updated_at
+          `;
+          yield* sql`DELETE FROM staged_pairings WHERE instance_id = ${input.instanceId}`;
+          const registration: InstanceSummary = {
+            ...decoded.item,
+            environmentId: input.environmentId,
+            connection: input.connection,
+            lastObservedAt: input.lastObservedAt,
+          };
+          return { registration, revision: updatedRevision } satisfies UpdatedRegistration;
+        }),
+      );
+      yield* protectDatabaseFiles(fileSystem, databasePath);
+      return result;
     }).pipe(Effect.mapError(toStoreError)),
   );
 

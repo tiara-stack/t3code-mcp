@@ -1,6 +1,8 @@
 import { describe, expect, it } from "@effect/vitest";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
@@ -15,6 +17,7 @@ import { T3CodeAdapter, T3CodeAdapterError } from "./t3code-adapter";
 import { ServerToolkit, serverToolkitLayer } from "./tools";
 
 const THIRTY_DAYS_MILLIS = 30 * 24 * 60 * 60 * 1000;
+const TWENTY_FOUR_HOURS_MILLIS = 24 * 60 * 60 * 1000;
 
 const makeDatabasePath = () => {
   const directory = mkdtempSync(join(tmpdir(), "t3code-mcp-tools-"));
@@ -1243,6 +1246,796 @@ describe("instance_update", () => {
         }),
       ),
   );
+});
+
+describe("instance_pair_again", () => {
+  // fallow-ignore-next-line complexity
+  const seedRepairRegistration = (
+    store: typeof LocalStore.Service,
+    overrides?: Partial<{
+      readonly instanceId: string;
+      readonly alias: string;
+      readonly endpoint: string;
+      readonly environmentId: string | null;
+      readonly credential: string;
+    }>,
+  ) =>
+    store.putRegistration({
+      instanceId: overrides?.instanceId ?? "instance-repair",
+      alias: overrides?.alias ?? "Repairable instance",
+      endpoint: overrides?.endpoint ?? "https://repair.test",
+      environmentId:
+        overrides === undefined || overrides.environmentId === undefined
+          ? "env-repair"
+          : overrides.environmentId,
+      connection: "connected",
+      lastObservedAt: "2026-09-21T00:00:00.000Z",
+      credential: overrides?.credential ?? "old-secret",
+    });
+
+  // fallow-ignore-next-line complexity
+  const rePairConnections = (options?: {
+    readonly environmentId?: string;
+    readonly rejectPairing?: boolean;
+    readonly rejectVerification?: boolean;
+    readonly onExchange?: () => void;
+    readonly seen?: Array<{ readonly endpoint: string; readonly pairingCode: string }>;
+  }) => {
+    const environmentId = options?.environmentId ?? "env-repair";
+    const verified = {
+      environmentId,
+      serverVersion: "0.0.38",
+      scopes: ["orchestration:read", "orchestration:operate"],
+      capabilities: {},
+    };
+    const exchangePairingCode = (_input: {
+      readonly endpoint: string;
+      readonly pairingCode: string;
+    }) =>
+      options?.rejectPairing
+        ? Effect.fail(
+            new T3CodeAdapterError({
+              kind: "invalid_pairing_code",
+              message: "The pairing code was rejected by the test instance.",
+              uncertain: false,
+              status: 400,
+            }),
+          )
+        : Effect.succeed({ credential: "secret-token", expiresAtMillis: null });
+    return InstanceConnections.layerTest({
+      exchangePairingCode: (input) =>
+        Effect.gen(function* () {
+          options?.seen?.push({
+            endpoint: input.endpoint,
+            pairingCode: input.pairingCode,
+          });
+          options?.onExchange?.();
+          return yield* exchangePairingCode(input);
+        }),
+      verifyCredential: () =>
+        options?.rejectVerification
+          ? Effect.fail(
+              new T3CodeAdapterError({
+                kind: "wire_incompatible",
+                message: "The test instance rejected the pinned wire contract.",
+                uncertain: false,
+                status: null,
+              }),
+            )
+          : Effect.succeed(verified),
+      inspectCredential: () =>
+        Effect.succeed({
+          environmentId,
+          serverVersion: "0.0.38",
+          authorization: { read: "allowed" as const, operate: "allowed" as const },
+          capabilities: [],
+        }),
+      pair: (input) =>
+        Effect.gen(function* () {
+          const staged = yield* exchangePairingCode(input);
+          return { ...staged, ...verified };
+        }),
+      acquire: () =>
+        Effect.fail(
+          new T3CodeAdapterError({
+            kind: "capacity",
+            message: "The test connection does not support acquisition.",
+            uncertain: false,
+            status: null,
+          }),
+        ),
+      inspect: (instanceId) =>
+        Effect.succeed({
+          details: {
+            registration: {
+              instanceId,
+              alias: "Repairable instance",
+              endpoint: "https://repair.test",
+              environmentId,
+              connection: "connected" as const,
+              lastObservedAt: "2026-09-21T00:00:00.000Z",
+            },
+            serverVersion: "0.0.38",
+            authorization: { read: "allowed" as const, operate: "allowed" as const },
+            capabilities: [],
+          },
+          observedAt: "2026-09-21T00:00:00.000Z",
+          freshness: "fresh" as const,
+          failure: null,
+        }),
+      invalidate: () => Effect.void,
+    });
+  };
+
+  const removeRegistrationRaw = (databasePath: string, instanceId: string) => {
+    const database = new DatabaseSync(databasePath);
+    try {
+      database.exec("PRAGMA busy_timeout = 5000");
+      database
+        .prepare(
+          "INSERT OR IGNORE INTO registration_tombstones (instance_id, removed_at, removed_by_request_id) VALUES (?, ?, NULL)",
+        )
+        .run(instanceId, Date.now());
+      database
+        .prepare("DELETE FROM registration_credentials WHERE instance_id = ?")
+        .run(instanceId);
+      database.prepare("DELETE FROM registrations WHERE instance_id = ?").run(instanceId);
+    } finally {
+      database.close();
+    }
+  };
+
+  it.live(
+    "replaces expired credentials for the bound environment, preserving identity and revision history",
+    () =>
+      withDatabasePath((databasePath) =>
+        Effect.gen(function* () {
+          const seen: Array<{ readonly endpoint: string; readonly pairingCode: string }> = [];
+          const result = yield* Effect.scoped(
+            Effect.gen(function* () {
+              const store = yield* LocalStore;
+              yield* seedRepairRegistration(store, {
+                endpoint: "https://expired-credentials.test",
+              });
+              const before = yield* store.getRegistration("instance-repair");
+              const repair = yield* callTool("instance_pair_again", {
+                requestId: "repair-1",
+                instanceId: "instance-repair",
+                pairingCode: "fresh-one-use-code",
+              });
+              const after = yield* store.getRegistration("instance-repair");
+              const lookup = yield* callTool("operation_get", { requestId: "repair-1" });
+              const list = yield* callList();
+              return { before, repair, after, lookup, list };
+            }).pipe(Effect.provide(appLayer(databasePath, rePairConnections({ seen })))),
+          );
+
+          // The exchange targets the saved registration's endpoint with the
+          // caller's one-use code, never an edited alias or endpoint.
+          expect(seen).toEqual([
+            { endpoint: "https://expired-credentials.test", pairingCode: "fresh-one-use-code" },
+          ]);
+
+          expect(result.before?.revision).toBe(0);
+          expect(result.before?.credential).toBe("old-secret");
+          expect(result.repair[0]?.result).toMatchObject({
+            result: {
+              kind: "ok",
+              value: {
+                requestId: "repair-1",
+                tool: "instance_pair_again",
+                state: "completed",
+                completionMeans: "registration_updated",
+                dispatch: "accepted",
+                target: {
+                  instanceId: "instance-repair",
+                  alias: "Repairable instance",
+                  endpoint: "https://expired-credentials.test",
+                  environmentId: "env-repair",
+                  connection: "connected",
+                },
+                steps: [
+                  { name: "exchange_pairing_code", state: "succeeded" },
+                  { name: "stage_credential", state: "succeeded" },
+                  { name: "verify_bound_environment", state: "succeeded" },
+                  { name: "replace_credentials", state: "succeeded" },
+                ],
+              },
+            },
+          });
+          expect(result.after?.revision).toBe(1);
+          expect(result.after?.credential).toBe("secret-token");
+          expect(result.after?.registration.instanceId).toBe("instance-repair");
+          expect(result.after?.registration.alias).toBe("Repairable instance");
+          expect(result.after?.registration.endpoint).toBe("https://expired-credentials.test");
+          expect(result.lookup[0]?.result).toMatchObject({
+            result: { kind: "ok", value: { operation: { state: "completed" } } },
+          });
+          // Receipts and list output must never carry pairing secrets; raw
+          // store reads above intentionally hold the private credential.
+          const serialized = JSON.stringify({
+            repair: result.repair,
+            lookup: result.lookup,
+            list: result.list,
+          });
+          expect(serialized).not.toContain("secret-token");
+          expect(serialized).not.toContain("old-secret");
+          expect(serialized).not.toContain("fresh-one-use-code");
+        }),
+      ),
+  );
+
+  it.live("rejects an invalid or consumed one-use code and retains the prior credential", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            const store = yield* LocalStore;
+            yield* seedRepairRegistration(store);
+            const repair = yield* callTool("instance_pair_again", {
+              requestId: "repair-invalid",
+              instanceId: "instance-repair",
+              pairingCode: "consumed-code",
+            });
+            const after = yield* store.getRegistration("instance-repair");
+            return { repair, after };
+          }).pipe(
+            Effect.provide(appLayer(databasePath, rePairConnections({ rejectPairing: true }))),
+          ),
+        );
+
+        expect(result.repair[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "failed",
+              dispatch: "rejected",
+              error: { code: "pairing_failed" },
+              recovery: "new_explicit_request",
+            },
+          },
+        });
+        expect(result.after?.revision).toBe(0);
+        expect(result.after?.credential).toBe("old-secret");
+      }),
+    ),
+  );
+
+  it.live("retains the prior record when the returned credential fails verification", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            const store = yield* LocalStore;
+            yield* seedRepairRegistration(store);
+            const repair = yield* callTool("instance_pair_again", {
+              requestId: "repair-unverified",
+              instanceId: "instance-repair",
+              pairingCode: "unverified-code",
+            });
+            const after = yield* store.getRegistration("instance-repair");
+            return { repair, after };
+          }).pipe(
+            Effect.provide(appLayer(databasePath, rePairConnections({ rejectVerification: true }))),
+          ),
+        );
+
+        expect(result.repair[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: { state: "failed", error: { code: "incompatible_instance" } },
+          },
+        });
+        expect(result.after?.revision).toBe(0);
+        expect(result.after?.credential).toBe("old-secret");
+      }),
+    ),
+  );
+
+  it.live("rejects a re-pairing credential bound to a different environment", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            const store = yield* LocalStore;
+            yield* seedRepairRegistration(store);
+            const repair = yield* callTool("instance_pair_again", {
+              requestId: "repair-mismatch",
+              instanceId: "instance-repair",
+              pairingCode: "other-environment-code",
+            });
+            const after = yield* store.getRegistration("instance-repair");
+            return { repair, after };
+          }).pipe(
+            Effect.provide(
+              appLayer(databasePath, rePairConnections({ environmentId: "env-other" })),
+            ),
+          ),
+        );
+
+        expect(result.repair[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "failed",
+              error: { code: "identity_mismatch" },
+              recovery: "new_explicit_request",
+              steps: [
+                { name: "exchange_pairing_code", state: "succeeded" },
+                { name: "stage_credential", state: "succeeded" },
+                { name: "verify_bound_environment", state: "failed" },
+                { name: "replace_credentials", state: "not_started" },
+              ],
+            },
+          },
+        });
+        expect(result.after?.revision).toBe(0);
+        expect(result.after?.credential).toBe("old-secret");
+      }),
+    ),
+  );
+
+  it.live("fails without resurrecting a registration removed during the exchange", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            const store = yield* LocalStore;
+            yield* seedRepairRegistration(store);
+            const repair = yield* callTool("instance_pair_again", {
+              requestId: "repair-removed",
+              instanceId: "instance-repair",
+              pairingCode: "racing-removal-code",
+            });
+            const after = yield* store.getRegistration("instance-repair");
+            const list = yield* callList();
+            const rebound = yield* Effect.exit(
+              store.putRegistration({
+                instanceId: "instance-repair",
+                alias: "Rebound",
+                endpoint: "https://rebound.test",
+                environmentId: "env-rebound",
+                connection: "connected",
+                lastObservedAt: null,
+              }),
+            );
+            return { repair, after, list, rebound };
+          }).pipe(
+            Effect.provide(
+              appLayer(
+                databasePath,
+                rePairConnections({
+                  onExchange: () => removeRegistrationRaw(databasePath, "instance-repair"),
+                }),
+              ),
+            ),
+          ),
+        );
+
+        expect(result.repair[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "failed",
+              error: { code: "stale_state" },
+              recovery: "new_explicit_request",
+            },
+          },
+        });
+        expect(result.after).toBeNull();
+        expect(result.list[0]?.result).toMatchObject({
+          result: { kind: "ok", value: { items: [] } },
+        });
+        expect(Exit.isFailure(result.rebound)).toBe(true);
+      }),
+    ),
+  );
+
+  it.live("publishes exactly one concurrent re-pairing and fails the loser explicitly", () =>
+    withDatabasePath((databasePath) =>
+      // fallow-ignore-next-line complexity
+      Effect.gen(function* () {
+        const gate = yield* Deferred.make<void>();
+        let exchanged = 0;
+        let verified = 0;
+        const gatedConnections = InstanceConnections.layerTest({
+          exchangePairingCode: () =>
+            Effect.sync(() => {
+              exchanged += 1;
+              return { credential: `token-${exchanged}`, expiresAtMillis: null };
+            }),
+          verifyCredential: () =>
+            Effect.gen(function* () {
+              verified += 1;
+              if (verified === 2) yield* Deferred.succeed(gate, undefined);
+              // Both re-pairings must stage before either publishes; the gate
+              // always opens here, and the timeout only bounds a broken test.
+              yield* Deferred.await(gate).pipe(
+                Effect.timeoutOrElse({
+                  duration: Duration.millis(5_000),
+                  orElse: () =>
+                    Effect.fail(
+                      new T3CodeAdapterError({
+                        kind: "capacity",
+                        message: "The concurrent re-pairing gate was not released.",
+                        uncertain: false,
+                        status: null,
+                      }),
+                    ),
+                }),
+              );
+              return {
+                environmentId: "env-repair",
+                serverVersion: "0.0.38",
+                scopes: ["orchestration:read", "orchestration:operate"],
+                capabilities: {},
+              };
+            }),
+          inspectCredential: () =>
+            Effect.succeed({
+              environmentId: "env-repair",
+              serverVersion: "0.0.38",
+              authorization: { read: "allowed" as const, operate: "allowed" as const },
+              capabilities: [],
+            }),
+          pair: () =>
+            Effect.fail(
+              new T3CodeAdapterError({
+                kind: "capacity",
+                message: "The gated test connection does not support pairing.",
+                uncertain: false,
+                status: null,
+              }),
+            ),
+          acquire: () =>
+            Effect.fail(
+              new T3CodeAdapterError({
+                kind: "capacity",
+                message: "The gated test connection does not support acquisition.",
+                uncertain: false,
+                status: null,
+              }),
+            ),
+          inspect: (instanceId) =>
+            Effect.succeed({
+              details: {
+                registration: {
+                  instanceId,
+                  alias: "Repairable instance",
+                  endpoint: "https://repair.test",
+                  environmentId: "env-repair",
+                  connection: "connected" as const,
+                  lastObservedAt: null,
+                },
+                serverVersion: "0.0.38",
+                authorization: { read: "allowed" as const, operate: "allowed" as const },
+                capabilities: [],
+              },
+              observedAt: "2026-09-21T00:00:00.000Z",
+              freshness: "fresh" as const,
+              failure: null,
+            }),
+          invalidate: () => Effect.void,
+        });
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            const store = yield* LocalStore;
+            yield* seedRepairRegistration(store);
+            const leftFiber = yield* Effect.forkScoped(
+              callTool("instance_pair_again", {
+                requestId: "repair-left",
+                instanceId: "instance-repair",
+                pairingCode: "code-left",
+              }),
+            );
+            const rightFiber = yield* Effect.forkScoped(
+              callTool("instance_pair_again", {
+                requestId: "repair-right",
+                instanceId: "instance-repair",
+                pairingCode: "code-right",
+              }),
+            );
+            const left = yield* Fiber.join(leftFiber);
+            const right = yield* Fiber.join(rightFiber);
+            const after = yield* store.getRegistration("instance-repair");
+            return { left, right, after };
+          }).pipe(Effect.provide(appLayer(databasePath, gatedConnections))),
+        );
+
+        const leftItem = result.left[0];
+        const rightItem = result.right[0];
+        const leftEnvelope =
+          leftItem === undefined
+            ? undefined
+            : (leftItem.result as {
+                result?: { value?: { state?: string; error?: { code?: string } } };
+              });
+        const rightEnvelope =
+          rightItem === undefined
+            ? undefined
+            : (rightItem.result as {
+                result?: { value?: { state?: string; error?: { code?: string } } };
+              });
+        const leftValue = leftEnvelope?.result?.value;
+        const rightValue = rightEnvelope?.result?.value;
+        expect(new Set([leftValue?.state, rightValue?.state])).toEqual(
+          new Set(["completed", "failed"]),
+        );
+        const loser = leftValue?.state === "failed" ? leftValue : rightValue;
+        expect(loser?.error?.code).toBe("identity_mismatch");
+        expect(result.after?.revision).toBe(1);
+        expect(["token-1", "token-2"]).toContain(result.after?.credential);
+        // The winning token must not leak into either operation receipt; the
+        // raw store read above intentionally holds the private credential.
+        const serialized = JSON.stringify({ left: result.left, right: result.right });
+        expect(serialized).not.toContain("token-1");
+        expect(serialized).not.toContain("token-2");
+      }),
+    ),
+  );
+
+  it.live("deduplicates equivalent re-pairing input and rejects conflicting request ID reuse", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            const store = yield* LocalStore;
+            yield* seedRepairRegistration(store);
+            const first = yield* callTool("instance_pair_again", {
+              requestId: "repair-dedup",
+              instanceId: "instance-repair",
+              pairingCode: "same-code",
+            });
+            const equivalent = yield* callTool("instance_pair_again", {
+              requestId: "repair-dedup",
+              instanceId: "instance-repair",
+              pairingCode: "same-code",
+            });
+            const conflict = yield* callTool("instance_pair_again", {
+              requestId: "repair-dedup",
+              instanceId: "instance-repair",
+              pairingCode: "different-code",
+            });
+            const after = yield* store.getRegistration("instance-repair");
+            return { first, equivalent, conflict, after };
+          }).pipe(Effect.provide(appLayer(databasePath, rePairConnections()))),
+        );
+
+        expect(result.first[0]?.result).toMatchObject({
+          result: { kind: "ok", value: { state: "completed" } },
+        });
+        expect(result.equivalent[0]?.result).toMatchObject({
+          result: { kind: "ok", value: { requestId: "repair-dedup", state: "completed" } },
+        });
+        expect(result.conflict[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "request_id_conflict" } },
+        });
+        expect(result.after?.revision).toBe(1);
+      }),
+    ),
+  );
+
+  it.live("rejects unknown input fields", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const exit = yield* Effect.exit(
+          Effect.scoped(
+            callTool("instance_pair_again", {
+              requestId: "repair-unknown",
+              instanceId: "instance-repair",
+              pairingCode: "code",
+              unexpected: true,
+            }).pipe(Effect.provide(appLayer(databasePath))),
+          ),
+        );
+
+        expect(Exit.isFailure(exit)).toBe(true);
+        if (Exit.isSuccess(exit)) return;
+        expect(String(exit.cause)).toContain("Invalid parameters for tool 'instance_pair_again'");
+      }),
+    ),
+  );
+
+  it.effect(
+    "never publishes an unfinished staged credential and lets a new explicit re-pairing replace it",
+    () => {
+      const startedAt = 7_000_000;
+      return withDatabasePath((databasePath) =>
+        Effect.gen(function* () {
+          yield* TestClock.setTime(startedAt);
+          yield* Effect.scoped(
+            Effect.gen(function* () {
+              const store = yield* LocalStore;
+              yield* seedRepairRegistration(store);
+              yield* store.stagePairing({
+                instanceId: "instance-repair",
+                alias: "Repairable instance",
+                endpoint: "https://repair.test",
+                credential: "staged-secret",
+                expiresAt: startedAt + TWENTY_FOUR_HOURS_MILLIS,
+                replaceExisting: true,
+              });
+            }).pipe(Effect.provide(LocalStore.layer({ databasePath }))),
+          );
+          const result = yield* Effect.scoped(
+            Effect.gen(function* () {
+              const store = yield* LocalStore;
+              const before = yield* store.getRegistration("instance-repair");
+              const list = yield* callList();
+              const repair = yield* callTool("instance_pair_again", {
+                requestId: "repair-after-crash",
+                instanceId: "instance-repair",
+                pairingCode: "fresh-code-after-crash",
+              });
+              const after = yield* store.getRegistration("instance-repair");
+              return { before, list, repair, after };
+            }).pipe(Effect.provide(appLayer(databasePath, rePairConnections()))),
+          );
+
+          expect(result.before?.revision).toBe(0);
+          expect(result.before?.credential).toBe("old-secret");
+          expect(JSON.stringify(result.list)).not.toContain("staged-secret");
+          expect(result.repair[0]?.result).toMatchObject({
+            result: { kind: "ok", value: { state: "completed" } },
+          });
+          expect(result.after?.revision).toBe(1);
+          expect(result.after?.credential).toBe("secret-token");
+        }),
+      );
+    },
+  );
+
+  it.effect("deletes unpublished staged credentials after 24 hours", () => {
+    const startedAt = 8_000_000;
+    return withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(startedAt);
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const store = yield* LocalStore;
+            yield* seedRepairRegistration(store);
+            yield* store.stagePairing({
+              instanceId: "instance-repair",
+              alias: "Repairable instance",
+              endpoint: "https://repair.test",
+              credential: "staged-secret",
+              expiresAt: startedAt + TWENTY_FOUR_HOURS_MILLIS,
+              replaceExisting: true,
+            });
+          }).pipe(Effect.provide(LocalStore.layer({ databasePath }))),
+        );
+        yield* TestClock.adjust(Duration.millis(TWENTY_FOUR_HOURS_MILLIS + 1));
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* LocalStore;
+          }).pipe(Effect.provide(LocalStore.layer({ databasePath }))),
+        );
+        const database = new DatabaseSync(databasePath);
+        let stagedCount: number;
+        let revision: number | undefined;
+        try {
+          stagedCount = (
+            database.prepare("SELECT COUNT(*) AS count FROM staged_pairings").get() as {
+              count: number;
+            }
+          ).count;
+          revision = (
+            database
+              .prepare("SELECT revision FROM registrations WHERE instance_id = 'instance-repair'")
+              .get() as { revision: number } | undefined
+          )?.revision;
+        } finally {
+          database.close();
+        }
+
+        expect(stagedCount).toBe(0);
+        expect(revision).toBe(0);
+      }),
+    );
+  });
+
+  it.live("fails a stale compare-and-set replacement without rebinding work", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            const store = yield* LocalStore;
+            yield* seedRepairRegistration(store);
+            yield* store.stagePairing({
+              instanceId: "instance-repair",
+              alias: "Repairable instance",
+              endpoint: "https://repair.test",
+              credential: "staged-secret",
+              expiresAt: Date.now() + TWENTY_FOUR_HOURS_MILLIS,
+              replaceExisting: true,
+            });
+            const stale = yield* Effect.exit(
+              store.replaceRegistrationCredentials({
+                instanceId: "instance-repair",
+                expectedRevision: 3,
+                credential: "staged-secret",
+                environmentId: "env-repair",
+                connection: "connected",
+                lastObservedAt: null,
+              }),
+            );
+            const replaced = yield* store.replaceRegistrationCredentials({
+              instanceId: "instance-repair",
+              expectedRevision: 0,
+              credential: "staged-secret",
+              environmentId: "env-repair",
+              connection: "connected",
+              lastObservedAt: "2026-09-21T01:00:00.000Z",
+            });
+            const after = yield* store.getRegistration("instance-repair");
+            return { stale, replaced, after };
+          }).pipe(Effect.provide(LocalStore.layer({ databasePath }))),
+        );
+
+        expect(Exit.isFailure(result.stale)).toBe(true);
+        expect(String(result.stale)).toContain("changed before the replacement could be published");
+        expect(result.replaced.revision).toBe(1);
+        expect(result.replaced.registration.instanceId).toBe("instance-repair");
+        expect(result.after?.credential).toBe("staged-secret");
+        expect(result.after?.revision).toBe(1);
+      }),
+    ),
+  );
+
+  it.effect("marks an admitted re-pairing outcome_unknown after the owning process stops", () => {
+    const startedAt = 9_000_000;
+    return withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(startedAt);
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const store = yield* LocalStore;
+            yield* seedRepairRegistration(store);
+            yield* store.admitOperation({
+              requestId: "repair-restart",
+              tool: "instance_pair_again",
+              fingerprint: "fingerprint",
+              processNonce: "previous-process",
+              admittedAt: new Date(startedAt).toISOString(),
+              intent: { instanceId: "instance-repair" },
+              completionMeans: "registration_updated",
+              steps: [
+                "exchange_pairing_code",
+                "stage_credential",
+                "verify_bound_environment",
+                "replace_credentials",
+              ],
+            });
+          }).pipe(Effect.provide(LocalStore.layer({ databasePath }))),
+        );
+        yield* TestClock.adjust(Duration.millis(60_000));
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            const store = yield* LocalStore;
+            const lookup = yield* callTool("operation_get", { requestId: "repair-restart" });
+            const after = yield* store.getRegistration("instance-repair");
+            return { lookup, after };
+          }).pipe(Effect.provide(appLayer(databasePath))),
+        );
+
+        expect(result.lookup[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              operation: {
+                state: "outcome_unknown",
+                dispatch: "unknown",
+                recovery: "observe_operation",
+              },
+            },
+          },
+        });
+        expect(JSON.stringify(result.lookup)).toContain("will not be replayed");
+        expect(result.after?.revision).toBe(0);
+        expect(result.after?.credential).toBe("old-secret");
+      }),
+    );
+  });
 });
 
 describe("instance_remove and operation_get", () => {
