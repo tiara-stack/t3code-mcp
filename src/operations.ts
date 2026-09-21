@@ -170,11 +170,25 @@ export class Operations extends Context.Service<Operations, OperationsService>()
               retry: "change_request",
               details: { reason: "authorization" },
             };
+          case "pairing_required":
+            return {
+              code: "pairing_failed",
+              message: error.message,
+              retry: "change_request",
+              details: { reason: "pairing_required" },
+            };
           case "identity_mismatch":
             return {
               code: "identity_mismatch",
               message: error.message,
               retry: "reconcile_first",
+              details: {},
+            };
+          case "identity_conflict":
+            return {
+              code: "identity_conflict",
+              message: error.message,
+              retry: "change_request",
               details: {},
             };
           case "invalid_pairing_code":

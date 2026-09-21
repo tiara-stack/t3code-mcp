@@ -186,6 +186,46 @@ export const InstancePairInputSchema = Schema.declare<{
 
 export type InstancePairInput = typeof InstancePairInputSchema.Type;
 
+const instanceGetFields = Schema.Struct({
+  instanceId: nonEmptyString,
+  allowStale: Schema.optionalKey(Schema.Boolean),
+});
+
+const unknownInstanceGetField = Schema.String.check(
+  Schema.makeFilter((key) => key !== "instanceId" && key !== "allowStale", {
+    message: "unknown instance_get argument",
+  }),
+);
+
+const instanceGetRuntimeShape = Schema.StructWithRest(instanceGetFields, [
+  Schema.Record(unknownInstanceGetField, Schema.Never),
+]);
+
+const instanceGetJsonShape = Schema.StructWithRest(instanceGetFields, [
+  Schema.Record(Schema.String, Schema.Never),
+]);
+
+export const InstanceGetInputSchema = Schema.declare<{
+  readonly instanceId: string;
+  readonly allowStale?: boolean;
+}>(
+  (
+    input,
+  ): input is {
+    readonly instanceId: string;
+    readonly allowStale?: boolean;
+  } => Schema.is(instanceGetRuntimeShape)(input),
+  {
+    toCodecJson: () =>
+      Schema.link()(instanceGetJsonShape, {
+        decode: SchemaGetter.passthrough({ strict: false }),
+        encode: SchemaGetter.passthrough({ strict: false }),
+      } as never),
+  },
+);
+
+export type InstanceGetInput = typeof InstanceGetInputSchema.Type;
+
 const operationGetFields = Schema.Struct({
   requestId,
   waitMs: Schema.optionalKey(
@@ -284,6 +324,46 @@ export const ToolFailureSchema = Schema.Struct({
 });
 
 export type ToolFailure = typeof ToolFailureSchema.Type;
+
+export const INSTANCE_CAPABILITY_NAMES = [
+  "steer_current",
+  "resume_retained",
+  "exact_turn_interrupt",
+  "authoritative_turn_outcomes",
+  "complete_worktree_inventory",
+  "complete_reference_checks",
+  "full_raw_output",
+] as const;
+
+export type InstanceCapabilityName = (typeof INSTANCE_CAPABILITY_NAMES)[number];
+
+// fallow-ignore-next-line unused-export
+export const CapabilitySchema = Schema.Struct({
+  name: Schema.Literals(INSTANCE_CAPABILITY_NAMES),
+  support: Schema.Literals(["supported", "unsupported", "unknown"]),
+  reason: Schema.NullOr(Schema.String),
+  limitations: Schema.Array(Schema.String),
+});
+
+export type Capability = typeof CapabilitySchema.Type;
+
+// fallow-ignore-next-line unused-export
+export const AuthorizationSchema = Schema.Struct({
+  read: Schema.Literals(["allowed", "denied", "unknown"]),
+  operate: Schema.Literals(["allowed", "denied", "unknown"]),
+});
+
+export type Authorization = typeof AuthorizationSchema.Type;
+
+// fallow-ignore-next-line unused-export
+export const InstanceDetailsSchema = Schema.Struct({
+  registration: InstanceSummarySchema,
+  serverVersion: Schema.NullOr(nonEmptyString),
+  authorization: AuthorizationSchema,
+  capabilities: Schema.Array(CapabilitySchema),
+});
+
+export type InstanceDetails = typeof InstanceDetailsSchema.Type;
 
 const projectReferenceSchema = Schema.Struct({
   instanceId: nonEmptyString,
@@ -483,6 +563,8 @@ export const WarningSchema = Schema.Struct({
 });
 
 export const ToolResultSchema = toolResultFields(InstanceListPageSchema);
+
+export const InstanceDetailsToolResultSchema = toolResultFields(InstanceDetailsSchema);
 
 export const OperationToolResultSchema = toolResultFields(OperationRecordSchema);
 

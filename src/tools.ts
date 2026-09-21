@@ -15,6 +15,8 @@ import { Tool, Toolkit } from "effect/unstable/ai";
 import {
   InstanceRemoveInputSchema,
   InstanceListInputSchema,
+  InstanceGetInputSchema,
+  InstanceDetailsToolResultSchema,
   InstancePairInputSchema,
   MAX_OPERATION_CAPACITY,
   makeToolSuccess,
@@ -27,6 +29,8 @@ import {
 import type { ToolFailure } from "./domain";
 import { LocalStore, LocalStoreError } from "./local-store";
 import { OperationServiceError, Operations } from "./operations";
+import { InstanceConnections } from "./instance-connections";
+import { T3CodeAdapterError } from "./t3code-adapter";
 
 // fallow-ignore-next-line unused-export
 export const InstanceListTool = Tool.make("instance_list", {
@@ -39,6 +43,18 @@ export const InstanceListTool = Tool.make("instance_list", {
   .annotate(Tool.Destructive, false)
   .annotate(Tool.Idempotent, true)
   .annotate(Tool.OpenWorld, false);
+
+const InstanceGetTool = Tool.make("instance_get", {
+  description:
+    "Inspect a saved T3Code registration and its current authorization and capabilities.",
+  parameters: InstanceGetInputSchema,
+  success: InstanceDetailsToolResultSchema,
+})
+  .addDependency(InstanceConnections)
+  .annotate(Tool.Readonly, true)
+  .annotate(Tool.Destructive, false)
+  .annotate(Tool.Idempotent, true)
+  .annotate(Tool.OpenWorld, true);
 
 // fallow-ignore-next-line unused-export
 export const InstanceRemoveTool = Tool.make("instance_remove", {
@@ -81,13 +97,45 @@ export const OperationGetTool = Tool.make("operation_get", {
 
 export const ServerToolkit = Toolkit.make(
   InstanceListTool,
+  InstanceGetTool,
   InstancePairTool,
   InstanceRemoveTool,
   OperationGetTool,
 );
 
+const makeToolFailure = (
+  message: string,
+  code: ToolFailure["code"],
+  retry: ToolFailure["retry"],
+  details: JsonObject = {},
+) => ({ code, message, retry, details });
+
 // fallow-ignore-next-line complexity
-const toToolFailure = (error: LocalStoreError | OperationServiceError) => {
+const toToolFailure = (error: LocalStoreError | OperationServiceError | T3CodeAdapterError) => {
+  if (error instanceof T3CodeAdapterError) {
+    switch (error.kind) {
+      case "pairing_required":
+        return makeToolFailure(error.message, "pairing_required", "change_request", {
+          action: "pair_instance",
+        });
+      case "incompatible_instance":
+      case "wire_incompatible":
+        return makeToolFailure(error.message, "incompatible_instance", "change_request");
+      case "authorization":
+        return makeToolFailure(error.message, "read_denied", "change_request");
+      case "identity_mismatch":
+        return makeToolFailure(error.message, "identity_mismatch", "reconcile_first");
+      case "identity_conflict":
+        return makeToolFailure(error.message, "identity_conflict", "change_request");
+      case "capacity":
+      case "timeout":
+      case "transport":
+        return makeToolFailure(error.message, "unavailable", "safe_read");
+      case "invalid_pairing_code":
+      case "pairing_code_used":
+        return makeToolFailure(error.message, "pairing_failed", "change_request");
+    }
+  }
   if (error instanceof OperationServiceError) {
     return {
       code: "unavailable" as const,
@@ -96,49 +144,43 @@ const toToolFailure = (error: LocalStoreError | OperationServiceError) => {
       details: { action: "retry_later", capacity: MAX_OPERATION_CAPACITY },
     };
   }
-  const failure = (
-    code: ToolFailure["code"],
-    retry: ToolFailure["retry"],
-    details: JsonObject = {},
-  ) => ({ code, message: error.message, retry, details });
-
   switch (error.kind) {
     case "cursor_expired":
-      return failure("cursor_expired", "safe_read", { action: "resync" });
+      return makeToolFailure(error.message, "cursor_expired", "safe_read", { action: "resync" });
     case "cursor_mismatch":
-      return failure("cursor_mismatch", "safe_read", { action: "resync" });
+      return makeToolFailure(error.message, "cursor_mismatch", "safe_read", { action: "resync" });
     case "result_too_large":
-      return failure("result_too_large", "change_request", {
+      return makeToolFailure(error.message, "result_too_large", "change_request", {
         action: "reduce_page_size",
         maxBytes: MAX_SERIALIZED_RESULT_BYTES,
       });
     case "capture_budget":
-      return failure("result_too_large", "change_request", {
+      return makeToolFailure(error.message, "result_too_large", "change_request", {
         action: "reduce_registration_count",
       });
     case "contention":
-      return failure("unavailable", "safe_read");
+      return makeToolFailure(error.message, "unavailable", "safe_read");
     case "disk":
     case "storage":
-      return failure("unavailable", "safe_read");
+      return makeToolFailure(error.message, "unavailable", "safe_read");
     case "malformed_row":
-      return failure("stale_state", "reconcile_first");
+      return makeToolFailure(error.message, "stale_state", "reconcile_first");
     case "request_id_conflict":
-      return failure("request_id_conflict", "change_request", { action: "use_new_request_id" });
+      return makeToolFailure(error.message, "request_id_conflict", "change_request", {
+        action: "use_new_request_id",
+      });
     case "request_record_unavailable":
-      return failure("request_record_unavailable", "reconcile_first", {
+      return makeToolFailure(error.message, "request_record_unavailable", "reconcile_first", {
         action: "retry_operation_get",
       });
     case "registration_removed":
-      return failure("stale_state", "reconcile_first");
+      return makeToolFailure(error.message, "stale_state", "reconcile_first");
     case "registration_not_found":
-      return failure("registration_not_found", "none");
+      return makeToolFailure(error.message, "registration_not_found", "none");
     case "identity_conflict":
-      return failure("identity_conflict", "change_request");
+      return makeToolFailure(error.message, "identity_conflict", "change_request");
     case "identity_mismatch":
-      return failure("identity_mismatch", "reconcile_first");
-    default:
-      return failure("unavailable", "safe_read");
+      return makeToolFailure(error.message, "identity_mismatch", "reconcile_first");
   }
 };
 
@@ -154,6 +196,46 @@ const serverToolHandlers = ServerToolkit.of({
       return makeToolSuccess(page, observedAt);
     }).pipe(
       Effect.catchTag("LocalStoreError", (error) =>
+        Effect.succeed({
+          result: { kind: "error" as const, error: toToolFailure(error) },
+          observations: [],
+          warnings: [],
+        }),
+      ),
+    ),
+  instance_get: ({ instanceId, allowStale }) =>
+    Effect.gen(function* () {
+      const connections = yield* InstanceConnections;
+      const inspection = yield* connections.inspect(instanceId, allowStale ?? false);
+      const limitations =
+        inspection.failure === null
+          ? []
+          : ["Fresh diagnostics could not be obtained; the returned details are cached."];
+      return {
+        result: { kind: "ok" as const, value: inspection.details },
+        observations: [
+          {
+            instanceId,
+            observedAt: inspection.observedAt,
+            freshness: inspection.freshness,
+            sourceSequence: null,
+            coverage:
+              inspection.failure === null ? ("complete_for_query" as const) : ("partial" as const),
+            limitations,
+          },
+        ],
+        warnings:
+          inspection.failure === null
+            ? []
+            : [
+                {
+                  code: "fresh_probe_failed",
+                  message: inspection.failure.message,
+                },
+              ],
+      };
+    }).pipe(
+      Effect.catch((error: LocalStoreError | T3CodeAdapterError) =>
         Effect.succeed({
           result: { kind: "error" as const, error: toToolFailure(error) },
           observations: [],

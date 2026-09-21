@@ -109,6 +109,7 @@ const startServer = async (databasePath: string): Promise<Server> => {
     while (listed.id !== 2) listed = await next();
     expect(listed.result?.tools?.map((tool) => tool.name)).toEqual([
       "instance_list",
+      "instance_get",
       "instance_pair",
       "instance_remove",
       "operation_get",

@@ -16,7 +16,14 @@ import * as Semaphore from "effect/Semaphore";
 import * as Socket from "effect/unstable/socket/Socket";
 import * as HttpClient from "effect/unstable/http/HttpClient";
 import * as HttpClientRequest from "effect/unstable/http/HttpClientRequest";
-import { MAX_TOTAL_RPC_CAPACITY, MUTATION_RPC_DEADLINE_MILLIS } from "./domain";
+import {
+  INSTANCE_CAPABILITY_NAMES,
+  MAX_TOTAL_RPC_CAPACITY,
+  MUTATION_RPC_DEADLINE_MILLIS,
+  type Authorization,
+  type Capability,
+  type InstanceCapabilityName,
+} from "./domain";
 
 /**
  * Wire schemas are intentionally local to the adapter. They describe the
@@ -72,6 +79,77 @@ const PINNED_T3CODE_VERSION = "0.0.38";
 const REQUIRED_T3CODE_SCOPES = ["orchestration:read", "orchestration:operate"] as const;
 const MAX_INCOMING_WEBSOCKET_MESSAGE_BYTES = 16 * 1024 * 1024;
 
+const capabilityKeys: Record<InstanceCapabilityName, ReadonlyArray<string>> = {
+  steer_current: ["steer_current", "steerCurrent"],
+  resume_retained: ["resume_retained", "resumeRetained"],
+  exact_turn_interrupt: ["exact_turn_interrupt", "exactTurnInterrupt"],
+  authoritative_turn_outcomes: ["authoritative_turn_outcomes", "authoritativeTurnOutcomes"],
+  complete_worktree_inventory: ["complete_worktree_inventory", "completeWorktreeInventory"],
+  complete_reference_checks: ["complete_reference_checks", "completeReferenceChecks"],
+  full_raw_output: ["full_raw_output", "fullRawOutput"],
+};
+
+const capabilityFromDescriptor = (
+  name: InstanceCapabilityName,
+  advertised: Readonly<Record<string, unknown>>,
+): Capability => {
+  const value = capabilityKeys[name]
+    .map((key) => advertised[key])
+    .find(
+      (candidate) =>
+        typeof candidate === "boolean" ||
+        (typeof candidate === "object" &&
+          candidate !== null &&
+          typeof (candidate as { supported?: unknown }).supported === "boolean"),
+    );
+  const supported =
+    typeof value === "boolean"
+      ? value
+      : typeof value === "object" && value !== null
+        ? (value as { supported: boolean }).supported
+        : undefined;
+  if (supported === true) {
+    return {
+      name,
+      support: "unknown",
+      reason: "The instance advertised this capability, but the adapter has not verified it.",
+      limitations: ["Capability support has not been independently verified."],
+    };
+  }
+  if (supported === false) {
+    return {
+      name,
+      support: "unknown",
+      reason:
+        "The instance advertised that this capability is unavailable, but the adapter has not verified it.",
+      limitations: ["Capability support has not been independently verified."],
+    };
+  }
+  return {
+    name,
+    support: "unknown",
+    reason: "The instance did not provide verified evidence for this capability.",
+    limitations: ["Capability support has not been verified for this instance."],
+  };
+};
+
+const capabilitiesFromDescriptor = (
+  advertised: Readonly<Record<string, unknown>>,
+): ReadonlyArray<Capability> =>
+  INSTANCE_CAPABILITY_NAMES.map((name) => capabilityFromDescriptor(name, advertised));
+
+const authorizationFromSession = (
+  authenticated: boolean,
+  scopes: ReadonlyArray<string> | undefined,
+): Authorization => {
+  if (!authenticated) return { read: "denied", operate: "denied" };
+  if (scopes === undefined) return { read: "unknown", operate: "unknown" };
+  return {
+    read: scopes.includes("orchestration:read") ? "allowed" : "denied",
+    operate: scopes.includes("orchestration:operate") ? "allowed" : "denied",
+  };
+};
+
 const websocketMessageBytes = (data: unknown): number => {
   if (typeof data === "string") return new TextEncoder().encode(data).byteLength;
   if (data instanceof Uint8Array) return data.byteLength;
@@ -123,10 +201,12 @@ const boundedWebSocket = (websocket: Socket.WebSocketLike): Socket.WebSocketLike
 export type T3CodeAdapterErrorKind =
   | "invalid_pairing_code"
   | "pairing_code_used"
+  | "pairing_required"
   | "transport"
   | "timeout"
   | "authorization"
   | "identity_mismatch"
+  | "identity_conflict"
   | "incompatible_instance"
   | "wire_incompatible"
   | "capacity";
@@ -155,6 +235,13 @@ export interface VerifiedInstance {
   readonly capabilities: Readonly<Record<string, unknown>>;
 }
 
+export interface InstanceDiagnostics {
+  readonly environmentId: string;
+  readonly serverVersion: string;
+  readonly authorization: Authorization;
+  readonly capabilities: ReadonlyArray<Capability>;
+}
+
 export interface T3CodeAdapterService {
   readonly exchangePairingCode: (
     input: PairingExchangeInput,
@@ -163,6 +250,10 @@ export interface T3CodeAdapterService {
     readonly endpoint: string;
     readonly credential: string;
   }) => Effect.Effect<VerifiedInstance, T3CodeAdapterError>;
+  readonly inspectCredential: (input: {
+    readonly endpoint: string;
+    readonly credential: string;
+  }) => Effect.Effect<InstanceDiagnostics, T3CodeAdapterError>;
 }
 
 export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterService>()(
@@ -228,9 +319,24 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
           });
         }
         if (phase === "session" || phase === "ticket") {
+          return authorizationResponseError(phase, status);
+        }
+        return new T3CodeAdapterError({
+          kind: "transport",
+          message: `The T3Code ${phase} request returned an unexpected response.`,
+          uncertain: phase === "exchange" && status >= 500,
+          status,
+        });
+      };
+
+      const authorizationResponseError = (
+        phase: "session" | "ticket",
+        status: number,
+      ): T3CodeAdapterError => {
+        if (status === 401 || status === 403) {
           return new T3CodeAdapterError({
-            kind: "authorization",
-            message: "The staged credential is not authorized for T3Code orchestration.",
+            kind: "pairing_required",
+            message: "The saved T3Code credential is expired or revoked.",
             uncertain: false,
             status,
           });
@@ -238,7 +344,7 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
         return new T3CodeAdapterError({
           kind: "transport",
           message: `The T3Code ${phase} request returned an unexpected response.`,
-          uncertain: phase === "exchange" && status >= 500,
+          uncertain: false,
           status,
         });
       };
@@ -376,10 +482,7 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
           }),
         );
 
-      const verifyCredential = (input: {
-        readonly endpoint: string;
-        readonly credential: string;
-      }) =>
+      const probeCredential = (input: { readonly endpoint: string; readonly credential: string }) =>
         withCapacity(
           Effect.gen(function* () {
             const descriptor = yield* json(
@@ -405,19 +508,33 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
               AuthSessionWireSchema,
               "session",
             );
-            const scopes = session.scopes ?? [];
-            if (
-              !session.authenticated ||
-              REQUIRED_T3CODE_SCOPES.some((required) => !scopes.includes(required))
-            ) {
+            const scopes = session.scopes;
+            if (!session.authenticated) {
               return yield* Effect.fail(
                 new T3CodeAdapterError({
-                  kind: "authorization",
-                  message: "The pairing credential lacks the required orchestration scopes.",
+                  kind: "pairing_required",
+                  message: "The saved T3Code credential is expired or revoked.",
                   uncertain: false,
                   status: null,
                 }),
               );
+            }
+            const authorization = authorizationFromSession(session.authenticated, scopes);
+            const diagnostics = {
+              environmentId: descriptor.environmentId,
+              serverVersion: descriptor.serverVersion,
+              authorization,
+              capabilities: capabilitiesFromDescriptor(descriptor.capabilities),
+            } satisfies InstanceDiagnostics;
+
+            // A read-denied credential can still produce useful authorization and
+            // capability diagnostics, but it cannot open the read RPC channel.
+            if (authorization.read !== "allowed") {
+              return {
+                diagnostics,
+                scopes: scopes ?? [],
+                advertisedCapabilities: descriptor.capabilities,
+              };
             }
 
             const ticket = yield* json(
@@ -475,15 +592,46 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
             );
 
             return {
-              environmentId: descriptor.environmentId,
-              serverVersion: descriptor.serverVersion,
-              scopes,
-              capabilities: descriptor.capabilities,
-            } satisfies VerifiedInstance;
+              diagnostics,
+              scopes: scopes ?? [],
+              advertisedCapabilities: descriptor.capabilities,
+            };
           }),
         );
 
-      return T3CodeAdapter.of({ exchangePairingCode, verifyCredential });
+      const inspectCredential = (input: {
+        readonly endpoint: string;
+        readonly credential: string;
+      }) => probeCredential(input).pipe(Effect.map(({ diagnostics }) => diagnostics));
+
+      const verifyCredential = (input: {
+        readonly endpoint: string;
+        readonly credential: string;
+      }) =>
+        Effect.gen(function* () {
+          const probe = yield* probeCredential(input);
+          if (
+            probe.diagnostics.authorization.read !== "allowed" ||
+            probe.diagnostics.authorization.operate !== "allowed"
+          ) {
+            return yield* Effect.fail(
+              new T3CodeAdapterError({
+                kind: "authorization",
+                message: "The pairing credential lacks the required orchestration scopes.",
+                uncertain: false,
+                status: null,
+              }),
+            );
+          }
+          return {
+            environmentId: probe.diagnostics.environmentId,
+            serverVersion: probe.diagnostics.serverVersion,
+            scopes: probe.scopes,
+            capabilities: probe.advertisedCapabilities,
+          } satisfies VerifiedInstance;
+        });
+
+      return T3CodeAdapter.of({ exchangePairingCode, verifyCredential, inspectCredential });
     }),
   ).pipe(Layer.provide(NodeHttpClient.layerUndici), Layer.provide(NodeCrypto.layer));
 }

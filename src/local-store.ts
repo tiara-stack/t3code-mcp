@@ -299,6 +299,10 @@ export interface LocalStoreService {
   readonly getRegistration: (
     instanceId: string,
   ) => Effect.Effect<StoredRegistration | null, LocalStoreError>;
+  readonly findRegistrationByEnvironment: (
+    environmentId: string,
+    excludeInstanceId?: string,
+  ) => Effect.Effect<InstanceSummary | null, LocalStoreError>;
   readonly fingerprintRequest: (
     tool: string,
     input: unknown,
@@ -464,6 +468,14 @@ export class LocalStore extends Context.Service<LocalStore, LocalStoreService>()
         const getRegistration = (instanceId: string) =>
           getRegistrationInDatabase(sql, instanceId, verifySchemaForOperation);
 
+        const findRegistrationByEnvironment = (environmentId: string, excludeInstanceId?: string) =>
+          findRegistrationByEnvironmentInDatabase(
+            sql,
+            environmentId,
+            excludeInstanceId,
+            verifySchemaForOperation,
+          );
+
         const fingerprintRequest = (tool: string, input: unknown) =>
           fingerprintRequestInDatabase(crypto, fingerprintKey, tool, input);
 
@@ -492,6 +504,7 @@ export class LocalStore extends Context.Service<LocalStore, LocalStoreService>()
           publishPairing,
           discardPairing,
           getRegistration,
+          findRegistrationByEnvironment,
           fingerprintRequest,
           findRequest,
           admitOperation,
@@ -1703,6 +1716,38 @@ const getRegistrationInDatabase = (
         revision: Number(row.revision),
         credential: credential ?? null,
       } satisfies StoredRegistration;
+    }).pipe(Effect.mapError(toStoreError)),
+  );
+
+const findRegistrationByEnvironmentInDatabase = (
+  sql: SqlClient.SqlClient,
+  environmentId: string,
+  excludeInstanceId: string | undefined,
+  verify: SchemaVerifier,
+): Effect.Effect<InstanceSummary | null, LocalStoreError> =>
+  retryStorage(
+    Effect.gen(function* () {
+      yield* verify();
+      const rows = yield* sql<RegistrationRow>`
+        SELECT instance_id, alias, endpoint, environment_id, connection, last_observed_at, revision
+        FROM registrations
+        WHERE environment_id = ${environmentId}
+          AND (${excludeInstanceId ?? null} IS NULL OR instance_id <> ${excludeInstanceId ?? null})
+        ORDER BY instance_id ASC
+        LIMIT 1
+      `;
+      const row = rows[0];
+      if (row === undefined) return null;
+      const decoded = yield* decodeRegistrationRow(row);
+      if (decoded.item === null) {
+        return yield* Effect.fail(
+          new LocalStoreError({
+            kind: "malformed_row",
+            message: "The saved registration row is malformed.",
+          }),
+        );
+      }
+      return decoded.item;
     }).pipe(Effect.mapError(toStoreError)),
   );
 

@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { LocalStore } from "./local-store";
 import { InstanceConnections } from "./instance-connections";
-import { T3CodeAdapterError } from "./t3code-adapter";
+import { T3CodeAdapter, T3CodeAdapterError } from "./t3code-adapter";
 import { ServerToolkit, serverToolkitLayer } from "./tools";
 
 const THIRTY_DAYS_MILLIS = 30 * 24 * 60 * 60 * 1000;
@@ -33,6 +33,25 @@ const fakeConnections = (options?: {
   readonly environmentId?: string;
   readonly rejectPairing?: boolean;
   readonly rejectVerification?: boolean;
+  readonly inspection?: {
+    readonly serverVersion?: string | null;
+    readonly read?: "allowed" | "denied" | "unknown";
+    readonly operate?: "allowed" | "denied" | "unknown";
+    readonly capabilities?: ReadonlyArray<{
+      readonly name:
+        | "steer_current"
+        | "resume_retained"
+        | "exact_turn_interrupt"
+        | "authoritative_turn_outcomes"
+        | "complete_worktree_inventory"
+        | "complete_reference_checks"
+        | "full_raw_output";
+      readonly support: "supported" | "unsupported" | "unknown";
+      readonly reason: string | null;
+      readonly limitations: ReadonlyArray<string>;
+    }>;
+  };
+  readonly inspectFailure?: T3CodeAdapterError;
 }) => {
   const environmentId = options?.environmentId ?? "environment-paired";
   const exchangePairingCode = (_input: {
@@ -65,9 +84,42 @@ const fakeConnections = (options?: {
           scopes: ["orchestration:read", "orchestration:operate"],
           capabilities: {},
         });
+  const inspectCredential = (_input: { readonly endpoint: string; readonly credential: string }) =>
+    Effect.succeed({
+      environmentId,
+      serverVersion: "0.0.38",
+      authorization: { read: "allowed" as const, operate: "allowed" as const },
+      capabilities: [],
+    });
+  // fallow-ignore-next-line complexity
+  const inspect = (instanceId: string, _allowStale: boolean) =>
+    options?.inspectFailure
+      ? Effect.fail(options.inspectFailure)
+      : Effect.succeed({
+          details: {
+            registration: {
+              instanceId,
+              alias: "Inspectable instance",
+              endpoint: "https://inspect.test",
+              environmentId,
+              connection: "connected" as const,
+              lastObservedAt: "2026-09-21T00:00:00.000Z",
+            },
+            serverVersion: options?.inspection?.serverVersion ?? "0.0.38",
+            authorization: {
+              read: options?.inspection?.read ?? "allowed",
+              operate: options?.inspection?.operate ?? "allowed",
+            },
+            capabilities: options?.inspection?.capabilities ?? [],
+          },
+          observedAt: "2026-09-21T00:00:00.000Z",
+          freshness: "fresh" as const,
+          failure: null,
+        });
   return InstanceConnections.layerTest({
     exchangePairingCode,
     verifyCredential,
+    inspectCredential,
     pair: (input) =>
       Effect.gen(function* () {
         const staged = yield* exchangePairingCode(input);
@@ -85,9 +137,35 @@ const fakeConnections = (options?: {
           status: null,
         }),
       ),
+    inspect,
     invalidate: () => Effect.void,
   });
 };
+
+const fakeAdapterLayer = (
+  failure: { current: T3CodeAdapterError | null },
+  environmentByEndpoint: Readonly<Record<string, string>> = {},
+) =>
+  Layer.succeed(T3CodeAdapter, {
+    exchangePairingCode: () =>
+      Effect.succeed({ credential: "secret-token", expiresAtMillis: null }),
+    verifyCredential: () =>
+      Effect.succeed({
+        environmentId: "environment-a",
+        serverVersion: "0.0.38",
+        scopes: ["orchestration:read", "orchestration:operate"],
+        capabilities: {},
+      }),
+    inspectCredential: ({ endpoint }: { readonly endpoint: string }) =>
+      failure.current === null
+        ? Effect.succeed({
+            environmentId: environmentByEndpoint[endpoint] ?? "environment-a",
+            serverVersion: "0.0.38",
+            authorization: { read: "allowed" as const, operate: "allowed" as const },
+            capabilities: [],
+          })
+        : Effect.fail(failure.current),
+  });
 
 const callList = (input: unknown = {}) =>
   Effect.gen(function* () {
@@ -196,6 +274,316 @@ describe("instance_list", () => {
       );
       expect(second[0]?.result).toMatchObject({
         result: { kind: "ok", value: { items: [{ instanceId: "instance-b" }], nextCursor: null } },
+      });
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("instance_get", () => {
+  it("reports a typed failure when the requested registration is missing", async () => {
+    const { directory, databasePath } = makeDatabasePath();
+    try {
+      const result = await Effect.runPromise(
+        Effect.scoped(
+          callTool("instance_get", { instanceId: "missing-instance" }).pipe(
+            Effect.provide(appLayer(databasePath)),
+          ),
+        ),
+      );
+
+      expect(result[0]?.result).toMatchObject({
+        result: {
+          kind: "error",
+          error: { code: "registration_not_found" },
+        },
+      });
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects unknown input fields", async () => {
+    const { directory, databasePath } = makeDatabasePath();
+    try {
+      const exit = await Effect.runPromise(
+        Effect.exit(
+          Effect.scoped(
+            callTool("instance_get", { instanceId: "instance-a", unexpected: true }).pipe(
+              Effect.provide(appLayer(databasePath)),
+            ),
+          ),
+        ),
+      );
+
+      expect(exit._tag).toBe("Failure");
+      if (exit._tag === "Failure") {
+        expect(String(exit.cause)).toContain("Invalid parameters for tool 'instance_get'");
+      }
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("reports pairing_required for a saved registration without a credential", async () => {
+    const { directory, databasePath } = makeDatabasePath();
+    try {
+      const result = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const store = yield* LocalStore;
+            yield* store.putRegistration({
+              instanceId: "instance-a",
+              alias: "Unpaired instance",
+              endpoint: "http://127.0.0.1:3773",
+              environmentId: null,
+              connection: "pairing_required",
+              lastObservedAt: null,
+            });
+            return yield* callTool("instance_get", { instanceId: "instance-a" });
+          }).pipe(Effect.provide(appLayer(databasePath))),
+        ),
+      );
+
+      expect(result[0]?.result).toMatchObject({
+        result: { kind: "error", error: { code: "pairing_required" } },
+      });
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("returns fresh identity, authorization, and the stable capability catalog", async () => {
+    const { directory, databasePath } = makeDatabasePath();
+    try {
+      const result = await Effect.runPromise(
+        Effect.scoped(
+          callTool("instance_get", { instanceId: "instance-a" }).pipe(
+            Effect.provide(
+              appLayer(
+                databasePath,
+                fakeConnections({
+                  environmentId: "environment-a",
+                  inspection: {
+                    read: "allowed",
+                    operate: "denied",
+                    capabilities: [
+                      {
+                        name: "resume_retained",
+                        support: "unsupported",
+                        reason: "The provider does not retain context after a session closes.",
+                        limitations: [],
+                      },
+                    ],
+                  },
+                }),
+              ),
+            ),
+          ),
+        ),
+      );
+
+      expect(result[0]?.result).toMatchObject({
+        result: {
+          kind: "ok",
+          value: {
+            registration: {
+              instanceId: "instance-a",
+              environmentId: "environment-a",
+            },
+            serverVersion: "0.0.38",
+            authorization: { read: "allowed", operate: "denied" },
+            capabilities: [
+              {
+                name: "resume_retained",
+                support: "unsupported",
+              },
+            ],
+          },
+        },
+        observations: [{ instanceId: "instance-a", freshness: "fresh" }],
+        warnings: [],
+      });
+      expect(result[0]?.encodedResult).toEqual(result[0]?.result);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("returns explicitly stale cached diagnostics when allowStale is requested", async () => {
+    const { directory, databasePath } = makeDatabasePath();
+    const failure = { current: null as T3CodeAdapterError | null };
+    try {
+      const result = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const store = yield* LocalStore;
+            yield* store.putRegistration({
+              instanceId: "instance-a",
+              alias: "Inspectable instance",
+              endpoint: "https://inspect.test",
+              environmentId: "environment-a",
+              connection: "connected",
+              lastObservedAt: "2026-09-21T00:00:00.000Z",
+              credential: "secret-token",
+            });
+            const fresh = yield* callTool("instance_get", { instanceId: "instance-a" });
+            failure.current = new T3CodeAdapterError({
+              kind: "transport",
+              message: "The fresh diagnostic probe was unavailable.",
+              uncertain: false,
+              status: null,
+            });
+            const stale = yield* callTool("instance_get", {
+              instanceId: "instance-a",
+              allowStale: true,
+            });
+            failure.current = new T3CodeAdapterError({
+              kind: "identity_mismatch",
+              message: "The endpoint identifies a different environment.",
+              uncertain: false,
+              status: null,
+            });
+            const identityFailure = yield* callTool("instance_get", {
+              instanceId: "instance-a",
+              allowStale: true,
+            });
+            return { fresh, stale, identityFailure };
+          }).pipe(
+            Effect.provide(
+              appLayer(
+                databasePath,
+                InstanceConnections.layerWithAdapter(fakeAdapterLayer(failure)),
+              ),
+            ),
+          ),
+        ),
+      );
+
+      expect(result.fresh[0]?.result).toMatchObject({
+        result: { kind: "ok" },
+        observations: [{ freshness: "fresh" }],
+      });
+      expect(result.stale[0]?.result).toMatchObject({ result: { kind: "ok" } });
+      expect(result.stale[0]?.result).toMatchObject({
+        observations: [
+          {
+            instanceId: "instance-a",
+            freshness: "stale",
+            limitations: [
+              "Fresh diagnostics could not be obtained; the returned details are cached.",
+            ],
+          },
+        ],
+        warnings: [
+          { code: "fresh_probe_failed", message: "The fresh diagnostic probe was unavailable." },
+        ],
+      });
+      expect(result.identityFailure[0]?.result).toMatchObject({
+        result: { kind: "error", error: { code: "identity_mismatch" } },
+      });
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    [
+      "revoked credentials require pairing",
+      "pairing_required" as const,
+      "pairing_required" as const,
+    ],
+    [
+      "matching versions with an incompatible wire contract are rejected",
+      "wire_incompatible" as const,
+      "incompatible_instance" as const,
+    ],
+    [
+      "an identity change is never treated as a healthy connection",
+      "identity_mismatch" as const,
+      "identity_mismatch" as const,
+    ],
+  ])("returns the %s failure without failover", async (_name, adapterKind, failureCode) => {
+    const { directory, databasePath } = makeDatabasePath();
+    try {
+      const result = await Effect.runPromise(
+        Effect.scoped(
+          callTool("instance_get", { instanceId: "instance-a" }).pipe(
+            Effect.provide(
+              appLayer(
+                databasePath,
+                fakeConnections({
+                  inspectFailure: new T3CodeAdapterError({
+                    kind: adapterKind,
+                    message: "The selected instance could not be verified.",
+                    uncertain: false,
+                    status: null,
+                  }),
+                }),
+              ),
+            ),
+          ),
+        ),
+      );
+
+      expect(result[0]?.result).toMatchObject({
+        result: { kind: "error", error: { code: failureCode } },
+      });
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps diagnostics for independent registrations separate", async () => {
+    const { directory, databasePath } = makeDatabasePath();
+    const failure = { current: null as T3CodeAdapterError | null };
+    try {
+      const layer = appLayer(
+        databasePath,
+        InstanceConnections.layerWithAdapter(
+          fakeAdapterLayer(failure, {
+            "https://instance-a.test": "environment-a",
+            "https://instance-b.test": "environment-b",
+          }),
+        ),
+      );
+      const result = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const store = yield* LocalStore;
+            yield* store.putRegistration({
+              instanceId: "instance-a",
+              alias: "Instance A",
+              endpoint: "https://instance-a.test",
+              environmentId: "environment-a",
+              connection: "connected",
+              lastObservedAt: "2026-09-21T00:00:00.000Z",
+              credential: "secret-a",
+            });
+            yield* store.putRegistration({
+              instanceId: "instance-b",
+              alias: "Instance B",
+              endpoint: "https://instance-b.test",
+              environmentId: "environment-b",
+              connection: "connected",
+              lastObservedAt: "2026-09-21T00:00:00.000Z",
+              credential: "secret-b",
+            });
+            const first = yield* callTool("instance_get", { instanceId: "instance-a" });
+            const second = yield* callTool("instance_get", { instanceId: "instance-b" });
+            return { first, second };
+          }).pipe(Effect.provide(layer)),
+        ),
+      );
+
+      expect(result.first[0]?.result).toMatchObject({
+        result: { kind: "ok", value: { registration: { instanceId: "instance-a" } } },
+        observations: [{ instanceId: "instance-a", freshness: "fresh" }],
+      });
+      expect(result.second[0]?.result).toMatchObject({
+        result: { kind: "ok", value: { registration: { instanceId: "instance-b" } } },
+        observations: [{ instanceId: "instance-b", freshness: "fresh" }],
       });
     } finally {
       rmSync(directory, { recursive: true, force: true });
