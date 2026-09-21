@@ -9,6 +9,8 @@ import * as Effect from "effect/Effect";
 import * as Encoding from "effect/Encoding";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Predicate from "effect/Predicate";
+import * as Result from "effect/Result";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
@@ -1062,7 +1064,7 @@ const toStartupError = (error: unknown): LocalStoreStartupError => {
           message: "The local store could not complete startup.",
         });
   }
-  if (typeof error === "object" && error !== null && "kind" in error && error.kind === "Locked") {
+  if (Predicate.hasProperty(error, "kind") && error.kind === "Locked") {
     return new LocalStoreStartupError({
       kind: "contention",
       message: "Another process is migrating the local store.",
@@ -1075,9 +1077,7 @@ const toStartupError = (error: unknown): LocalStoreStartupError => {
 };
 
 const sqliteCauseProperty = (cause: unknown, property: "code" | "message"): unknown =>
-  typeof cause === "object" && cause !== null && property in cause
-    ? (cause as Record<string, unknown>)[property]
-    : undefined;
+  Predicate.hasProperty(cause, property) ? cause[property] : undefined;
 
 const isDiskFullSqlError = (error: SqlError.SqlError): boolean => {
   const cause = error.reason.cause;
@@ -1389,7 +1389,7 @@ const decodeRegistrationRow = (row: RegistrationRow): Effect.Effect<Registration
       connection: row.connection,
       lastObservedAt: row.last_observed_at,
     });
-    if (result._tag === "Success") return { item: result.success, failure: null, malformed: false };
+    if (Result.isSuccess(result)) return { item: result.success, failure: null, malformed: false };
 
     const instanceId =
       typeof row.instance_id === "string" && row.instance_id.length > 0 ? row.instance_id : null;
@@ -2413,7 +2413,7 @@ const getStoredOperationInTransaction = (
     const decodedIntentRecord = Schema.decodeUnknownResult(
       Schema.Record(Schema.String, Schema.Unknown),
     )(intent);
-    if (decodedIntent._tag === "Failure" || decodedIntentRecord._tag === "Failure") {
+    if (Result.isFailure(decodedIntent) || Result.isFailure(decodedIntentRecord)) {
       return yield* Effect.fail(
         new LocalStoreError({
           kind: "malformed_row",
@@ -2431,7 +2431,7 @@ const getStoredOperationInTransaction = (
         nativeEventId: evidenceRow.native_event_id === null ? null : evidenceRow.native_event_id,
         detail: evidenceRow.detail,
       });
-      return decoded._tag === "Success"
+      return Result.isSuccess(decoded)
         ? Effect.succeed({
             position: Number(evidenceRow.position),
             stepPosition:
@@ -2479,7 +2479,7 @@ const getStoredOperationInTransaction = (
           state: stepRow.state,
           error: stepError,
         });
-        return decoded._tag === "Success"
+        return Result.isSuccess(decoded)
           ? {
               name: decoded.success.name,
               state: decoded.success.state,
@@ -2515,7 +2515,7 @@ const getStoredOperationInTransaction = (
       error: operationError,
       recovery: row.recovery,
     });
-    if (decoded._tag === "Failure") {
+    if (Result.isFailure(decoded)) {
       return yield* Effect.fail(
         new LocalStoreError({
           kind: "malformed_row",
@@ -2586,7 +2586,7 @@ const encodeCursor = (payload: CursorPayload): string =>
 const decodeCursor = (value: string): Effect.Effect<CursorPayload, LocalStoreError> => {
   try {
     const decodedText = Encoding.decodeBase64UrlString(value);
-    if (decodedText._tag === "Failure") {
+    if (Result.isFailure(decodedText)) {
       return Effect.fail(
         new LocalStoreError({
           kind: "cursor_mismatch",
@@ -2596,7 +2596,7 @@ const decodeCursor = (value: string): Effect.Effect<CursorPayload, LocalStoreErr
     }
     const decoded = JSON.parse(decodedText.success);
     const result = Schema.decodeUnknownResult(CursorPayloadSchema)(decoded);
-    return result._tag === "Success"
+    return Result.isSuccess(result)
       ? Effect.succeed(result.success)
       : Effect.fail(
           new LocalStoreError({

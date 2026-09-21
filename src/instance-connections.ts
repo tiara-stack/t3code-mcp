@@ -1,6 +1,7 @@
 import * as Context from "effect/Context";
 import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Semaphore from "effect/Semaphore";
@@ -124,7 +125,7 @@ export class InstanceConnections extends Context.Service<
                 return;
               }
               const outcome = yield* Effect.exit(store.listRegistrationRevisions());
-              if (outcome._tag === "Failure") {
+              if (Exit.isFailure(outcome)) {
                 for (const instanceId of [...cached.keys(), ...cachedInspections.keys()]) {
                   evictCached(instanceId);
                 }

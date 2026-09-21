@@ -22,6 +22,9 @@ importers:
         specifier: 4.0.0-rc.115
         version: 4.0.0-rc.115
     devDependencies:
+      '@effect/vitest':
+        specifier: 4.0.0-rc.115
+        version: 4.0.0-rc.115(effect@4.0.0-rc.115)(vitest@4.1.11)
       '@types/node':
         specifier: 26.6.1
         version: 26.6.1
@@ -75,6 +78,12 @@ packages:
     resolution: {integrity: sha512-53n3Kbwush7K/8/G1CDz638ClEoMvnUOT5BltCxMZ8TqcxeNoMv+nty08ZdrJ7P6m1q1RIeWlqdy5J9ZDICpbw==}
     peerDependencies:
       effect: ^4.0.0-rc.115
+
+  '@effect/vitest@4.0.0-rc.115':
+    resolution: {integrity: sha512-DJR0hfdr3HNXAkzW8AzfvUz6VmrNFLrKk9tZGDURi33faMyxkc7ZewxELMMZwGpOTGN4mfqYVbX2CXgI+ZJBeQ==}
+    peerDependencies:
+      effect: ^4.0.0-rc.115
+      vitest: 4.1.11
 
   '@esbuild/aix-ppc64@0.28.2':
     resolution: {integrity: sha512-XExcO+dvLKvVtNTibSTBej1NCAbaGhWn9Ww1ZPx80qsahhPFe/8jgWP0IchNe0F3HwkU7n8ejhH8bjonqht8mQ==}
@@ -1588,6 +1597,11 @@ snapshots:
   '@effect/sql-sqlite-node@4.0.0-rc.115(effect@4.0.0-rc.115)':
     dependencies:
       effect: 4.0.0-rc.115
+
+  '@effect/vitest@4.0.0-rc.115(effect@4.0.0-rc.115)(vitest@4.1.11)':
+    dependencies:
+      effect: 4.0.0-rc.115
+      vitest: 4.1.11(@types/node@26.6.1)(@vitest/browser-preview@4.1.11)(vite@8.3.0(@types/node@26.6.1)(esbuild@0.28.2)(tsx@4.23.13))
 
   '@esbuild/aix-ppc64@0.28.2':
     optional: true

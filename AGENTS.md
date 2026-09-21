@@ -34,6 +34,15 @@ Linear issue URLs. See `docs/agents/issue-tracker.md`.
 Use the default labels: `needs-triage`, `needs-info`, `ready-for-agent`,
 `ready-for-human`, and `wontfix`. See `docs/agents/triage-labels.md`.
 
+### Testing
+
+Write Effect tests with `@effect/vitest` (`it.effect` / `it.live`). See
+`docs/agents/testing.md`.
+
+### Effect conventions
+
+Follow `docs/agents/effect-guidelines.md` for Effect and library usage rules.
+
 ### Domain docs
 
 This is a single-context repo; read `CONTEXT.md` when present and relevant

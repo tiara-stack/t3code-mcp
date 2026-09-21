@@ -1,5 +1,4 @@
 import { NodeCrypto } from "@effect/platform-node";
-import * as AiError from "effect/unstable/ai/AiError";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Clock from "effect/Clock";
@@ -485,15 +484,9 @@ export const mcpServerToolkitLayer: Layer.Layer<never, never, ServerToolkitRequi
                   }),
               ),
               Effect.provideContext(services),
-              Effect.catch((error: unknown) => {
-                if (AiError.isAiError(error)) {
-                  const reason = error.reason;
-                  if (reason._tag === "ToolParameterValidationError") {
-                    return Effect.fail(new McpSchema.InvalidParams({ message: reason.message }));
-                  }
-                }
-                return Effect.fail(error);
-              }),
+              Effect.catchReason("AiError", "ToolParameterValidationError", (reason) =>
+                Effect.fail(new McpSchema.InvalidParams({ message: reason.message })),
+              ),
             ) as unknown as Effect.Effect<
               McpSchema.CallToolResult,
               McpSchema.InternalError | McpSchema.InvalidParams,

@@ -7,6 +7,8 @@ import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Predicate from "effect/Predicate";
+import * as Result from "effect/Result";
 import * as Rpc from "effect/unstable/rpc/Rpc";
 import * as RpcClient from "effect/unstable/rpc/RpcClient";
 import * as RpcGroup from "effect/unstable/rpc/RpcGroup";
@@ -98,15 +100,13 @@ const capabilityFromDescriptor = (
     .find(
       (candidate) =>
         typeof candidate === "boolean" ||
-        (typeof candidate === "object" &&
-          candidate !== null &&
-          typeof (candidate as { supported?: unknown }).supported === "boolean"),
+        (Predicate.hasProperty(candidate, "supported") && typeof candidate.supported === "boolean"),
     );
   const supported =
     typeof value === "boolean"
       ? value
-      : typeof value === "object" && value !== null
-        ? (value as { supported: boolean }).supported
+      : Predicate.hasProperty(value, "supported") && typeof value.supported === "boolean"
+        ? value.supported
         : undefined;
   if (supported === true) {
     return {
@@ -394,7 +394,7 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
             ),
           );
           const decoded = Schema.decodeUnknownResult(schema)(body);
-          if (decoded._tag === "Failure") {
+          if (Result.isFailure(decoded)) {
             return yield* Effect.fail(
               new T3CodeAdapterError({
                 kind: "wire_incompatible",

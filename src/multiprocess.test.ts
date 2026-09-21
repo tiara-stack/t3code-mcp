@@ -1,11 +1,11 @@
+import { describe, expect, it } from "@effect/vitest";
+import * as Effect from "effect/Effect";
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import * as Effect from "effect/Effect";
-import { describe, expect, it } from "vitest";
 import { LocalStore } from "./local-store";
 
 const tsxCliPath = createRequire(import.meta.url).resolve("tsx/cli");
@@ -136,26 +136,24 @@ const operationValue = (message: JsonRpcMessage) => {
   return (content["result"] as { value?: { state?: string; error?: { code?: string } } }).value;
 };
 
-const seed = async (
+const seed = (
   databasePath: string,
   registrations: ReadonlyArray<{ readonly instanceId: string }>,
 ) =>
-  Effect.runPromise(
-    Effect.scoped(
-      Effect.gen(function* () {
-        const store = yield* LocalStore;
-        for (const registration of registrations) {
-          yield* store.putRegistration({
-            instanceId: registration.instanceId,
-            alias: registration.instanceId,
-            endpoint: `https://${registration.instanceId}.test`,
-            environmentId: `env-${registration.instanceId}`,
-            connection: "connected",
-            lastObservedAt: null,
-          });
-        }
-      }).pipe(Effect.provide(LocalStore.layer({ databasePath }))),
-    ),
+  Effect.scoped(
+    Effect.gen(function* () {
+      const store = yield* LocalStore;
+      for (const registration of registrations) {
+        yield* store.putRegistration({
+          instanceId: registration.instanceId,
+          alias: registration.instanceId,
+          endpoint: `https://${registration.instanceId}.test`,
+          environmentId: `env-${registration.instanceId}`,
+          connection: "connected",
+          lastObservedAt: null,
+        });
+      }
+    }).pipe(Effect.provide(LocalStore.layer({ databasePath }))),
   );
 
 const expireResolvedOperation = (databasePath: string, requestId: string) => {
@@ -174,283 +172,345 @@ const expireResolvedOperation = (databasePath: string, requestId: string) => {
   }
 };
 
+const withServers = <A, E, R>(
+  prefix: string,
+  use: (fixture: {
+    readonly databasePath: string;
+    readonly servers: Set<Server>;
+  }) => Effect.Effect<A, E, R>,
+): Effect.Effect<A, E, R> =>
+  Effect.acquireUseRelease(
+    Effect.sync(() => {
+      const directory = mkdtempSync(join(tmpdir(), prefix));
+      return {
+        directory,
+        databasePath: join(directory, "state.sqlite"),
+        servers: new Set<Server>(),
+      };
+    }),
+    use,
+    ({ directory, servers }) =>
+      Effect.promise(async () => {
+        for (const server of servers) await stopServer(server);
+        rmSync(directory, { recursive: true, force: true });
+      }),
+  );
+
 describe("shared SQLite mutation admission", () => {
-  it("does not reuse an expired request ID while lookup and admission race across processes", async () => {
-    const directory = mkdtempSync(join(tmpdir(), "t3code-mcp-expiry-race-"));
-    const databasePath = join(directory, "state.sqlite");
-    let left: Server | undefined;
-    let right: Server | undefined;
-    try {
-      await seed(databasePath, [
-        { instanceId: "expired-process" },
-        { instanceId: "fresh-process" },
-      ]);
-      left = await startServer(databasePath);
-      const initialRemoval = await call(left, 3, "instance_remove", {
-        requestId: "expired-process-request",
-        instanceId: "expired-process",
-      });
-      expect(initialRemoval.result?.structuredContent).toMatchObject({
-        result: { kind: "ok", value: { state: "completed" } },
-      });
-      right = await startServer(databasePath);
-      expireResolvedOperation(databasePath, "expired-process-request");
+  it.live(
+    "does not reuse an expired request ID while lookup and admission race across processes",
+    () =>
+      withServers("t3code-mcp-expiry-race-", ({ databasePath, servers }) =>
+        Effect.gen(function* () {
+          yield* seed(databasePath, [
+            { instanceId: "expired-process" },
+            { instanceId: "fresh-process" },
+          ]);
+          const left = yield* Effect.promise(() => startServer(databasePath));
+          servers.add(left);
+          const initialRemoval = yield* Effect.promise(() =>
+            call(left, 3, "instance_remove", {
+              requestId: "expired-process-request",
+              instanceId: "expired-process",
+            }),
+          );
+          expect(initialRemoval.result?.structuredContent).toMatchObject({
+            result: { kind: "ok", value: { state: "completed" } },
+          });
+          const right = yield* Effect.promise(() => startServer(databasePath));
+          servers.add(right);
+          expireResolvedOperation(databasePath, "expired-process-request");
 
-      const raced = await Promise.all([
-        call(left, 4, "operation_get", { requestId: "expired-process-request" }),
-        call(right, 4, "instance_remove", {
-          requestId: "expired-process-request",
-          instanceId: "expired-process",
+          const raced = yield* Effect.promise(() =>
+            Promise.all([
+              call(left, 4, "operation_get", { requestId: "expired-process-request" }),
+              call(right, 4, "instance_remove", {
+                requestId: "expired-process-request",
+                instanceId: "expired-process",
+              }),
+            ]),
+          );
+          for (const response of raced) {
+            expect(response.result?.structuredContent).toMatchObject({
+              result: { kind: "error", error: { code: "request_record_unavailable" } },
+            });
+          }
+
+          const conflict = yield* Effect.promise(() =>
+            call(left, 5, "instance_remove", {
+              requestId: "expired-process-request",
+              instanceId: "fresh-process",
+            }),
+          );
+          expect(conflict.result?.structuredContent).toMatchObject({
+            result: { kind: "error", error: { code: "request_id_conflict" } },
+          });
+
+          const fresh = yield* Effect.promise(() =>
+            call(right, 6, "instance_remove", {
+              requestId: "fresh-process-request",
+              instanceId: "fresh-process",
+            }),
+          );
+          expect(fresh.result?.structuredContent).toMatchObject({
+            result: {
+              kind: "ok",
+              value: { requestId: "fresh-process-request", state: "completed" },
+            },
+          });
         }),
-      ]);
-      for (const response of raced) {
-        expect(response.result?.structuredContent).toMatchObject({
-          result: { kind: "error", error: { code: "request_record_unavailable" } },
-        });
-      }
+      ),
+    60000,
+  );
 
-      const conflict = await call(left, 5, "instance_remove", {
-        requestId: "expired-process-request",
-        instanceId: "fresh-process",
-      });
-      expect(conflict.result?.structuredContent).toMatchObject({
-        result: { kind: "error", error: { code: "request_id_conflict" } },
-      });
+  it.live(
+    "admits the same request ID once across OS processes",
+    () =>
+      withServers("t3code-mcp-multiprocess-", ({ databasePath, servers }) =>
+        Effect.gen(function* () {
+          yield* seed(databasePath, [
+            { instanceId: "process-a" },
+            { instanceId: "process-b" },
+            { instanceId: "process-shared" },
+          ]);
+          const [left, right] = yield* Effect.promise(() =>
+            Promise.all([startServer(databasePath), startServer(databasePath)]),
+          );
+          servers.add(left);
+          servers.add(right);
+          const responses = yield* Effect.promise(() =>
+            Promise.all([
+              call(left, 3, "instance_remove", {
+                requestId: "shared-request",
+                instanceId: "process-a",
+              }),
+              call(right, 3, "instance_remove", {
+                requestId: "shared-request",
+                instanceId: "process-b",
+              }),
+            ]),
+          );
+          const values = responses.map((response) => response.result?.structuredContent);
+          expect(
+            values.filter(
+              (value) => (value?.result as { kind?: string } | undefined)?.kind === "error",
+            ),
+          ).toHaveLength(1);
+          expect(
+            values.filter(
+              (value) => (value?.result as { kind?: string } | undefined)?.kind === "ok",
+            ),
+          ).toHaveLength(1);
+          expect(
+            values.find((value) => (value?.result as { kind?: string } | undefined)?.kind === "ok"),
+          ).toMatchObject({ result: { kind: "ok", value: { requestId: "shared-request" } } });
 
-      const fresh = await call(right, 6, "instance_remove", {
-        requestId: "fresh-process-request",
-        instanceId: "fresh-process",
-      });
-      expect(fresh.result?.structuredContent).toMatchObject({
-        result: { kind: "ok", value: { requestId: "fresh-process-request", state: "completed" } },
-      });
-    } finally {
-      if (left !== undefined) await stopServer(left);
-      if (right !== undefined) await stopServer(right);
-      rmSync(directory, { recursive: true, force: true });
-    }
-  }, 60000);
+          const equalResponses = yield* Effect.promise(() =>
+            Promise.all([
+              call(left, 5, "instance_remove", {
+                requestId: "equal-request",
+                instanceId: "process-shared",
+              }),
+              call(right, 5, "instance_remove", {
+                requestId: "equal-request",
+                instanceId: "process-shared",
+              }),
+            ]),
+          );
+          expect(equalResponses.map((response) => response.result?.structuredContent)).toEqual(
+            expect.arrayContaining([
+              expect.objectContaining({ result: expect.objectContaining({ kind: "ok" }) }),
+              expect.objectContaining({ result: expect.objectContaining({ kind: "ok" }) }),
+            ]),
+          );
 
-  it("admits the same request ID once across OS processes", async () => {
-    const directory = mkdtempSync(join(tmpdir(), "t3code-mcp-multiprocess-"));
-    const databasePath = join(directory, "state.sqlite");
-    let left: Server | undefined;
-    let right: Server | undefined;
-    try {
-      await seed(databasePath, [
-        { instanceId: "process-a" },
-        { instanceId: "process-b" },
-        { instanceId: "process-shared" },
-      ]);
-      [left, right] = await Promise.all([startServer(databasePath), startServer(databasePath)]);
-      const responses = await Promise.all([
-        call(left, 3, "instance_remove", {
-          requestId: "shared-request",
-          instanceId: "process-a",
+          const lookup = yield* Effect.promise(() =>
+            call(left, 6, "operation_get", { requestId: "shared-request" }),
+          );
+          expect(lookup.result?.structuredContent).toMatchObject({
+            result: { kind: "ok", value: { operation: { requestId: "shared-request" } } },
+          });
         }),
-        call(right, 3, "instance_remove", {
-          requestId: "shared-request",
-          instanceId: "process-b",
+      ),
+    60000,
+  );
+
+  it.live(
+    "recovers a completed receipt after the originating process exits",
+    () =>
+      withServers("t3code-mcp-recovery-", ({ databasePath, servers }) =>
+        Effect.gen(function* () {
+          yield* seed(databasePath, [{ instanceId: "restart-instance" }]);
+          const first = yield* Effect.promise(() => startServer(databasePath));
+          servers.add(first);
+          const removal = yield* Effect.promise(() =>
+            call(first, 3, "instance_remove", {
+              requestId: "restart-request",
+              instanceId: "restart-instance",
+            }),
+          );
+          expect(removal.result?.structuredContent).toMatchObject({
+            result: { kind: "ok", value: { state: "completed" } },
+          });
+          yield* Effect.promise(() => stopServer(first));
+          servers.delete(first);
+
+          const second = yield* Effect.promise(() => startServer(databasePath));
+          servers.add(second);
+          const lookup = yield* Effect.promise(() =>
+            call(second, 3, "operation_get", {
+              requestId: "restart-request",
+              waitMs: 1000,
+            }),
+          );
+          expect(lookup.result?.structuredContent).toMatchObject({
+            result: {
+              kind: "ok",
+              value: { operation: { state: "completed" }, wait: "terminal" },
+            },
+          });
+          const list = yield* Effect.promise(() => call(second, 4, "instance_list", {}));
+          expect(list.result?.structuredContent).toMatchObject({
+            result: { kind: "ok", value: { items: [] } },
+          });
         }),
-      ]);
-      const values = responses.map((response) => response.result?.structuredContent);
-      expect(
-        values.filter(
-          (value) => (value?.result as { kind?: string } | undefined)?.kind === "error",
-        ),
-      ).toHaveLength(1);
-      expect(
-        values.filter((value) => (value?.result as { kind?: string } | undefined)?.kind === "ok"),
-      ).toHaveLength(1);
-      expect(
-        values.find((value) => (value?.result as { kind?: string } | undefined)?.kind === "ok"),
-      ).toMatchObject({ result: { kind: "ok", value: { requestId: "shared-request" } } });
-
-      const equalResponses = await Promise.all([
-        call(left, 5, "instance_remove", {
-          requestId: "equal-request",
-          instanceId: "process-shared",
-        }),
-        call(right, 5, "instance_remove", {
-          requestId: "equal-request",
-          instanceId: "process-shared",
-        }),
-      ]);
-      expect(equalResponses.map((response) => response.result?.structuredContent)).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({ result: expect.objectContaining({ kind: "ok" }) }),
-          expect.objectContaining({ result: expect.objectContaining({ kind: "ok" }) }),
-        ]),
-      );
-
-      const lookup = await call(left, 6, "operation_get", { requestId: "shared-request" });
-      expect(lookup.result?.structuredContent).toMatchObject({
-        result: { kind: "ok", value: { operation: { requestId: "shared-request" } } },
-      });
-    } finally {
-      if (left !== undefined) await stopServer(left);
-      if (right !== undefined) await stopServer(right);
-      rmSync(directory, { recursive: true, force: true });
-    }
-  }, 60000);
-
-  it("recovers a completed receipt after the originating process exits", async () => {
-    const directory = mkdtempSync(join(tmpdir(), "t3code-mcp-recovery-"));
-    const databasePath = join(directory, "state.sqlite");
-    let first: Server | undefined;
-    let second: Server | undefined;
-    try {
-      await seed(databasePath, [{ instanceId: "restart-instance" }]);
-      first = await startServer(databasePath);
-      const removal = await call(first, 3, "instance_remove", {
-        requestId: "restart-request",
-        instanceId: "restart-instance",
-      });
-      expect(removal.result?.structuredContent).toMatchObject({
-        result: { kind: "ok", value: { state: "completed" } },
-      });
-      await stopServer(first);
-      first = undefined;
-
-      second = await startServer(databasePath);
-      const lookup = await call(second, 3, "operation_get", {
-        requestId: "restart-request",
-        waitMs: 1000,
-      });
-      expect(lookup.result?.structuredContent).toMatchObject({
-        result: {
-          kind: "ok",
-          value: { operation: { state: "completed" }, wait: "terminal" },
-        },
-      });
-      const list = await call(second, 4, "instance_list", {});
-      expect(list.result?.structuredContent).toMatchObject({
-        result: { kind: "ok", value: { items: [] } },
-      });
-    } finally {
-      if (first !== undefined) await stopServer(first);
-      if (second !== undefined) await stopServer(second);
-      rmSync(directory, { recursive: true, force: true });
-    }
-  }, 60000);
+      ),
+    60000,
+  );
 
   // fallow-ignore-next-line complexity
-  it("applies concurrent alias updates from two processes without a torn registration", async () => {
-    const directory = mkdtempSync(join(tmpdir(), "t3code-mcp-update-race-"));
-    const databasePath = join(directory, "state.sqlite");
-    let left: Server | undefined;
-    let right: Server | undefined;
-    try {
-      await seed(databasePath, [{ instanceId: "race-update" }]);
-      [left, right] = await Promise.all([startServer(databasePath), startServer(databasePath)]);
-      const responses = await Promise.all([
-        call(left, 3, "instance_update", {
-          requestId: "update-left",
-          instanceId: "race-update",
-          alias: "Left alias",
+  it.live(
+    "applies concurrent alias updates from two processes without a torn registration",
+    () =>
+      withServers("t3code-mcp-update-race-", ({ databasePath, servers }) =>
+        // fallow-ignore-next-line complexity
+        Effect.gen(function* () {
+          yield* seed(databasePath, [{ instanceId: "race-update" }]);
+          const [left, right] = yield* Effect.promise(() =>
+            Promise.all([startServer(databasePath), startServer(databasePath)]),
+          );
+          servers.add(left);
+          servers.add(right);
+          const responses = yield* Effect.promise(() =>
+            Promise.all([
+              call(left, 3, "instance_update", {
+                requestId: "update-left",
+                instanceId: "race-update",
+                alias: "Left alias",
+              }),
+              call(right, 3, "instance_update", {
+                requestId: "update-right",
+                instanceId: "race-update",
+                alias: "Right alias",
+              }),
+            ]),
+          );
+
+          const values = responses.map((response) => response.result?.structuredContent);
+          for (const value of values) {
+            expect(value).toMatchObject({ result: { kind: "ok" } });
+          }
+          const operations = responses.map(operationValue);
+          for (const operation of operations) {
+            if (operation?.state === "failed") {
+              expect(operation.error?.code).toBe("stale_state");
+            } else {
+              expect(operation?.state).toBe("completed");
+            }
+          }
+          expect(operations.some((operation) => operation?.state === "completed")).toBe(true);
+
+          const list = yield* Effect.promise(() => call(left, 4, "instance_list", {}));
+          expect(list.result?.structuredContent).toMatchObject({
+            result: { kind: "ok", value: { items: [{ instanceId: "race-update" }] } },
+          });
+          const items = (
+            operationValue(list) as { items?: ReadonlyArray<{ alias?: string }> } | undefined
+          )?.items;
+          expect(["Left alias", "Right alias"]).toContain(items?.[0]?.alias);
+
+          const receipts = yield* Effect.promise(() =>
+            Promise.all([
+              call(left, 5, "operation_get", { requestId: "update-left" }),
+              call(right, 5, "operation_get", { requestId: "update-right" }),
+            ]),
+          );
+          for (const receipt of receipts) {
+            expect(receipt.result?.structuredContent).toMatchObject({
+              result: {
+                kind: "ok",
+                value: { operation: { completionMeans: "registration_updated" } },
+              },
+            });
+          }
         }),
-        call(right, 3, "instance_update", {
-          requestId: "update-right",
-          instanceId: "race-update",
-          alias: "Right alias",
-        }),
-      ]);
-
-      const values = responses.map((response) => response.result?.structuredContent);
-      for (const value of values) {
-        expect(value).toMatchObject({ result: { kind: "ok" } });
-      }
-      const operations = responses.map(operationValue);
-      for (const operation of operations) {
-        if (operation?.state === "failed") {
-          expect(operation.error?.code).toBe("stale_state");
-        } else {
-          expect(operation?.state).toBe("completed");
-        }
-      }
-      expect(operations.some((operation) => operation?.state === "completed")).toBe(true);
-
-      const list = await call(left, 4, "instance_list", {});
-      expect(list.result?.structuredContent).toMatchObject({
-        result: { kind: "ok", value: { items: [{ instanceId: "race-update" }] } },
-      });
-      const items = (
-        operationValue(list) as { items?: ReadonlyArray<{ alias?: string }> } | undefined
-      )?.items;
-      expect(["Left alias", "Right alias"]).toContain(items?.[0]?.alias);
-
-      const receipts = await Promise.all([
-        call(left, 5, "operation_get", { requestId: "update-left" }),
-        call(right, 5, "operation_get", { requestId: "update-right" }),
-      ]);
-      for (const receipt of receipts) {
-        expect(receipt.result?.structuredContent).toMatchObject({
-          result: { kind: "ok", value: { operation: { completionMeans: "registration_updated" } } },
-        });
-      }
-    } finally {
-      if (left !== undefined) await stopServer(left);
-      if (right !== undefined) await stopServer(right);
-      rmSync(directory, { recursive: true, force: true });
-    }
-  }, 60000);
+      ),
+    60000,
+  );
 
   // fallow-ignore-next-line complexity
-  it("never lets a stale update overwrite or resurrect a concurrently removed registration", async () => {
-    const directory = mkdtempSync(join(tmpdir(), "t3code-mcp-update-remove-"));
-    const databasePath = join(directory, "state.sqlite");
-    let left: Server | undefined;
-    let right: Server | undefined;
-    try {
-      await seed(databasePath, [{ instanceId: "race-victim" }]);
-      [left, right] = await Promise.all([startServer(databasePath), startServer(databasePath)]);
-      const [update, removal] = await Promise.all([
-        call(left, 3, "instance_update", {
-          requestId: "update-race-victim",
-          instanceId: "race-victim",
-          alias: "Racing alias",
+  it.live(
+    "never lets a stale update overwrite or resurrect a concurrently removed registration",
+    () =>
+      withServers("t3code-mcp-update-remove-", ({ databasePath, servers }) =>
+        Effect.gen(function* () {
+          yield* seed(databasePath, [{ instanceId: "race-victim" }]);
+          const [left, right] = yield* Effect.promise(() =>
+            Promise.all([startServer(databasePath), startServer(databasePath)]),
+          );
+          servers.add(left);
+          servers.add(right);
+          const [update, removal] = yield* Effect.promise(() =>
+            Promise.all([
+              call(left, 3, "instance_update", {
+                requestId: "update-race-victim",
+                instanceId: "race-victim",
+                alias: "Racing alias",
+              }),
+              call(right, 3, "instance_remove", {
+                requestId: "remove-race-victim",
+                instanceId: "race-victim",
+              }),
+            ]),
+          );
+
+          expect(removal.result?.structuredContent).toMatchObject({
+            result: { kind: "ok", value: { state: "completed" } },
+          });
+          const updateValue = operationValue(update);
+          if (updateValue?.state === "failed") {
+            expect(["stale_state", "registration_not_found"]).toContain(updateValue.error?.code);
+          } else {
+            expect(updateValue?.state).toBe("completed");
+          }
+
+          const list = yield* Effect.promise(() => call(left, 4, "instance_list", {}));
+          expect(list.result?.structuredContent).toMatchObject({
+            result: { kind: "ok", value: { items: [] } },
+          });
+
+          const resurrect = yield* Effect.promise(() =>
+            call(right, 4, "instance_update", {
+              requestId: "update-after-remove",
+              instanceId: "race-victim",
+              alias: "Resurrected",
+            }),
+          );
+          expect(resurrect.result?.structuredContent).toMatchObject({
+            result: {
+              kind: "ok",
+              value: { state: "failed", error: { code: "stale_state" } },
+            },
+          });
+
+          const receipt = yield* Effect.promise(() =>
+            call(left, 5, "operation_get", { requestId: "update-race-victim" }),
+          );
+          expect(receipt.result?.structuredContent).toMatchObject({
+            result: { kind: "ok", value: { operation: { requestId: "update-race-victim" } } },
+          });
         }),
-        call(right, 3, "instance_remove", {
-          requestId: "remove-race-victim",
-          instanceId: "race-victim",
-        }),
-      ]);
-
-      expect(removal.result?.structuredContent).toMatchObject({
-        result: { kind: "ok", value: { state: "completed" } },
-      });
-      const updateValue = operationValue(update);
-      if (updateValue?.state === "failed") {
-        expect(["stale_state", "registration_not_found"]).toContain(updateValue.error?.code);
-      } else {
-        expect(updateValue?.state).toBe("completed");
-      }
-
-      const list = await call(left, 4, "instance_list", {});
-      expect(list.result?.structuredContent).toMatchObject({
-        result: { kind: "ok", value: { items: [] } },
-      });
-
-      const resurrect = await call(right, 4, "instance_update", {
-        requestId: "update-after-remove",
-        instanceId: "race-victim",
-        alias: "Resurrected",
-      });
-      expect(resurrect.result?.structuredContent).toMatchObject({
-        result: {
-          kind: "ok",
-          value: { state: "failed", error: { code: "stale_state" } },
-        },
-      });
-
-      const receipt = await call(left, 5, "operation_get", { requestId: "update-race-victim" });
-      expect(receipt.result?.structuredContent).toMatchObject({
-        result: { kind: "ok", value: { operation: { requestId: "update-race-victim" } } },
-      });
-    } finally {
-      if (left !== undefined) await stopServer(left);
-      if (right !== undefined) await stopServer(right);
-      rmSync(directory, { recursive: true, force: true });
-    }
-  }, 60000);
+      ),
+    60000,
+  );
 });

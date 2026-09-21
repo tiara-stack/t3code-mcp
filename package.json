@@ -29,6 +29,7 @@
     "effect": "4.0.0-rc.115"
   },
   "devDependencies": {
+    "@effect/vitest": "4.0.0-rc.115",
     "@types/node": "26.6.1",
     "fallow": "3.27.0",
     "tsx": "4.23.13",
