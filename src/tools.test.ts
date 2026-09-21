@@ -766,6 +766,557 @@ describe("instance_pair", () => {
   });
 });
 
+describe("instance_update", () => {
+  // fallow-ignore-next-line complexity
+  const seedRegistration = (
+    store: typeof LocalStore.Service,
+    overrides?: Partial<{
+      readonly instanceId: string;
+      readonly alias: string;
+      readonly endpoint: string;
+      readonly environmentId: string | null;
+      readonly credential: string;
+    }>,
+  ) =>
+    store.putRegistration({
+      instanceId: overrides?.instanceId ?? "instance-update",
+      alias: overrides?.alias ?? "Original alias",
+      endpoint: overrides?.endpoint ?? "https://original.test",
+      environmentId:
+        overrides === undefined || overrides.environmentId === undefined
+          ? "env-update"
+          : overrides.environmentId,
+      connection: "connected",
+      lastObservedAt: "2026-09-21T00:00:00.000Z",
+      credential: overrides?.credential ?? "secret-token",
+    });
+
+  it("applies an alias-only edit locally, preserving identity and incrementing the revision", async () => {
+    const { directory, databasePath } = makeDatabasePath();
+    try {
+      const result = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const store = yield* LocalStore;
+            yield* seedRegistration(store);
+            const before = yield* store.getRegistration("instance-update");
+            const update = yield* callTool("instance_update", {
+              requestId: "update-alias",
+              instanceId: "instance-update",
+              alias: "Renamed alias",
+            });
+            const after = yield* store.getRegistration("instance-update");
+            const lookup = yield* callTool("operation_get", { requestId: "update-alias" });
+            return { before, after, update, lookup };
+          }).pipe(Effect.provide(appLayer(databasePath))),
+        ),
+      );
+
+      expect(result.update[0]?.result).toMatchObject({
+        result: {
+          kind: "ok",
+          value: {
+            requestId: "update-alias",
+            tool: "instance_update",
+            state: "completed",
+            completionMeans: "registration_updated",
+            dispatch: "accepted",
+            target: {
+              instanceId: "instance-update",
+              alias: "Renamed alias",
+              endpoint: "https://original.test",
+              environmentId: "env-update",
+            },
+            steps: [{ name: "update_registration", state: "succeeded" }],
+          },
+        },
+      });
+      expect(result.before?.revision).toBe(0);
+      expect(result.after?.revision).toBe(1);
+      expect(result.after?.registration.alias).toBe("Renamed alias");
+      expect(result.lookup[0]?.result).toMatchObject({
+        result: { kind: "ok", value: { operation: { state: "completed" } } },
+      });
+      expect(JSON.stringify(result.lookup)).not.toContain("secret-token");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects empty updates and no-op edits without admitting an operation", async () => {
+    const { directory, databasePath } = makeDatabasePath();
+    try {
+      const result = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const store = yield* LocalStore;
+            yield* seedRegistration(store);
+            const empty = yield* callTool("instance_update", {
+              requestId: "update-empty",
+              instanceId: "instance-update",
+            });
+            const noop = yield* callTool("instance_update", {
+              requestId: "update-noop",
+              instanceId: "instance-update",
+              alias: "Original alias",
+            });
+            const sameEndpoint = yield* callTool("instance_update", {
+              requestId: "update-same-endpoint",
+              instanceId: "instance-update",
+              endpoint: "https://original.test",
+            });
+            const emptyLookup = yield* callTool("operation_get", { requestId: "update-empty" });
+            const noopLookup = yield* callTool("operation_get", { requestId: "update-noop" });
+            return { empty, noop, sameEndpoint, emptyLookup, noopLookup };
+          }).pipe(Effect.provide(appLayer(databasePath))),
+        ),
+      );
+
+      for (const response of [result.empty, result.noop, result.sameEndpoint]) {
+        expect(response[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "invalid_argument" } },
+        });
+      }
+      for (const lookup of [result.emptyLookup, result.noopLookup]) {
+        expect(lookup[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "request_record_unavailable" } },
+        });
+      }
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects unknown input fields", async () => {
+    const { directory, databasePath } = makeDatabasePath();
+    try {
+      const exit = await Effect.runPromise(
+        Effect.exit(
+          Effect.scoped(
+            callTool("instance_update", {
+              requestId: "update-unknown",
+              instanceId: "instance-update",
+              unexpected: true,
+            }).pipe(Effect.provide(appLayer(databasePath))),
+          ),
+        ),
+      );
+
+      expect(exit._tag).toBe("Failure");
+      if (exit._tag === "Failure") {
+        expect(String(exit.cause)).toContain("Invalid parameters for tool 'instance_update'");
+      }
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("publishes a verified same-identity endpoint edit through the public tool", async () => {
+    const { directory, databasePath } = makeDatabasePath();
+    try {
+      const result = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const store = yield* LocalStore;
+            yield* seedRegistration(store);
+            const update = yield* callTool("instance_update", {
+              requestId: "update-endpoint",
+              instanceId: "instance-update",
+              endpoint: "https://replacement.test",
+            });
+            const after = yield* store.getRegistration("instance-update");
+            return { update, after };
+          }).pipe(
+            Effect.provide(
+              appLayer(databasePath, fakeConnections({ environmentId: "env-update" })),
+            ),
+          ),
+        ),
+      );
+
+      expect(result.update[0]?.result).toMatchObject({
+        result: {
+          kind: "ok",
+          value: {
+            state: "completed",
+            completionMeans: "registration_updated",
+            target: {
+              instanceId: "instance-update",
+              endpoint: "https://replacement.test",
+              environmentId: "env-update",
+              connection: "connected",
+            },
+            steps: [
+              { name: "verify_endpoint_environment", state: "succeeded" },
+              { name: "publish_registration_update", state: "succeeded" },
+            ],
+          },
+        },
+      });
+      expect(result.after?.revision).toBe(1);
+      expect(result.after?.registration.endpoint).toBe("https://replacement.test");
+      expect(result.after?.registration.alias).toBe("Original alias");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("leaves the prior registration intact when endpoint verification fails", async () => {
+    const { directory, databasePath } = makeDatabasePath();
+    try {
+      const result = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const store = yield* LocalStore;
+            yield* seedRegistration(store);
+            const update = yield* callTool("instance_update", {
+              requestId: "update-unverified",
+              instanceId: "instance-update",
+              endpoint: "https://unverified.test",
+            });
+            const after = yield* store.getRegistration("instance-update");
+            return { update, after };
+          }).pipe(
+            Effect.provide(appLayer(databasePath, fakeConnections({ rejectVerification: true }))),
+          ),
+        ),
+      );
+
+      expect(result.update[0]?.result).toMatchObject({
+        result: {
+          kind: "ok",
+          value: {
+            state: "failed",
+            error: { code: "incompatible_instance" },
+            steps: [
+              { name: "verify_endpoint_environment", state: "failed" },
+              { name: "publish_registration_update", state: "not_started" },
+            ],
+          },
+        },
+      });
+      expect(result.after?.revision).toBe(0);
+      expect(result.after?.registration.endpoint).toBe("https://original.test");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a replacement endpoint bound to a different environment", async () => {
+    const { directory, databasePath } = makeDatabasePath();
+    try {
+      const result = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const store = yield* LocalStore;
+            yield* seedRegistration(store);
+            const update = yield* callTool("instance_update", {
+              requestId: "update-mismatch",
+              instanceId: "instance-update",
+              endpoint: "https://other-environment.test",
+            });
+            const after = yield* store.getRegistration("instance-update");
+            return { update, after };
+          }).pipe(
+            Effect.provide(appLayer(databasePath, fakeConnections({ environmentId: "env-other" }))),
+          ),
+        ),
+      );
+
+      expect(result.update[0]?.result).toMatchObject({
+        result: { kind: "ok", value: { state: "failed", error: { code: "identity_mismatch" } } },
+      });
+      expect(result.after?.revision).toBe(0);
+      expect(result.after?.registration.endpoint).toBe("https://original.test");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a replacement endpoint whose environment is already registered elsewhere", async () => {
+    const { directory, databasePath } = makeDatabasePath();
+    try {
+      const result = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const store = yield* LocalStore;
+            yield* seedRegistration(store, {
+              instanceId: "instance-taken",
+              endpoint: "https://taken.test",
+              environmentId: "env-taken",
+            });
+            yield* seedRegistration(store, { environmentId: null });
+            const update = yield* callTool("instance_update", {
+              requestId: "update-duplicate",
+              instanceId: "instance-update",
+              endpoint: "https://duplicate.test",
+            });
+            const after = yield* store.getRegistration("instance-update");
+            return { update, after };
+          }).pipe(
+            Effect.provide(appLayer(databasePath, fakeConnections({ environmentId: "env-taken" }))),
+          ),
+        ),
+      );
+
+      expect(result.update[0]?.result).toMatchObject({
+        result: { kind: "ok", value: { state: "failed", error: { code: "identity_conflict" } } },
+      });
+      expect(result.after?.revision).toBe(0);
+      expect(result.after?.registration.endpoint).toBe("https://original.test");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("deduplicates equivalent updates and rejects conflicting request ID reuse", async () => {
+    const { directory, databasePath } = makeDatabasePath();
+    try {
+      const result = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const store = yield* LocalStore;
+            yield* seedRegistration(store);
+            const first = yield* callTool("instance_update", {
+              requestId: "update-dedup",
+              instanceId: "instance-update",
+              alias: "Deduped alias",
+            });
+            const equivalent = yield* callTool("instance_update", {
+              instanceId: "instance-update",
+              requestId: "update-dedup",
+              alias: "Deduped alias",
+            });
+            const conflict = yield* callTool("instance_update", {
+              requestId: "update-dedup",
+              instanceId: "instance-update",
+              alias: "Conflicting alias",
+            });
+            const after = yield* store.getRegistration("instance-update");
+            return { first, equivalent, conflict, after };
+          }).pipe(Effect.provide(appLayer(databasePath))),
+        ),
+      );
+
+      expect(result.first[0]?.result).toMatchObject({
+        result: { kind: "ok", value: { state: "completed" } },
+      });
+      expect(result.equivalent[0]?.result).toMatchObject({
+        result: { kind: "ok", value: { requestId: "update-dedup", state: "completed" } },
+      });
+      expect(result.conflict[0]?.result).toMatchObject({
+        result: { kind: "error", error: { code: "request_id_conflict" } },
+      });
+      expect(result.after?.revision).toBe(1);
+      expect(result.after?.registration.alias).toBe("Deduped alias");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a failed receipt when the registration is missing", async () => {
+    const { directory, databasePath } = makeDatabasePath();
+    try {
+      const result = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const update = yield* callTool("instance_update", {
+              requestId: "update-missing",
+              instanceId: "never-registered",
+              alias: "Missing",
+            });
+            const lookup = yield* callTool("operation_get", { requestId: "update-missing" });
+            return { update, lookup };
+          }).pipe(Effect.provide(appLayer(databasePath))),
+        ),
+      );
+
+      expect(result.update[0]?.result).toMatchObject({
+        result: {
+          kind: "ok",
+          value: {
+            state: "failed",
+            dispatch: "rejected",
+            error: { code: "registration_not_found" },
+          },
+        },
+      });
+      expect(result.lookup[0]?.result).toMatchObject({
+        result: { kind: "ok", value: { operation: { state: "failed" } } },
+      });
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("fails a stale compare-and-set edit without resurrecting a removed registration", async () => {
+    const { directory, databasePath } = makeDatabasePath();
+    try {
+      const result = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const store = yield* LocalStore;
+            yield* seedRegistration(store);
+            const stale = yield* Effect.exit(
+              store.updateRegistration({
+                instanceId: "instance-update",
+                expectedRevision: 7,
+                alias: "Stale alias",
+                endpoint: "https://original.test",
+                environmentId: "env-update",
+                connection: "connected",
+                lastObservedAt: null,
+              }),
+            );
+            yield* store.removeRegistration("instance-update", "remove-for-cas");
+            const removed = yield* Effect.exit(
+              store.updateRegistration({
+                instanceId: "instance-update",
+                expectedRevision: 0,
+                alias: "Resurrected",
+                endpoint: "https://resurrected.test",
+                environmentId: "env-update",
+                connection: "connected",
+                lastObservedAt: null,
+              }),
+            );
+            const after = yield* store.getRegistration("instance-update");
+            const list = yield* callList();
+            return { stale, removed, after, list };
+          }).pipe(Effect.provide(appLayer(databasePath))),
+        ),
+      );
+
+      expect(result.stale._tag).toBe("Failure");
+      expect(String(result.stale)).toContain("changed before the update could be published");
+      expect(result.removed._tag).toBe("Failure");
+      expect(String(result.removed)).toContain("removed");
+      expect(result.after).toBeNull();
+      expect(result.list[0]?.result).toMatchObject({
+        result: { kind: "ok", value: { items: [] } },
+      });
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("marks an admitted update outcome_unknown after the owning process stops", async () => {
+    const { directory, databasePath } = makeDatabasePath();
+    const startedAt = 4_000_000;
+    try {
+      const result = await Effect.runPromise(
+        Effect.gen(function* () {
+          yield* TestClock.setTime(startedAt);
+          yield* Effect.scoped(
+            Effect.gen(function* () {
+              const store = yield* LocalStore;
+              yield* store.putRegistration({
+                instanceId: "instance-restart",
+                alias: "Restart",
+                endpoint: "https://restart.test",
+                environmentId: "env-restart",
+                connection: "connected",
+                lastObservedAt: null,
+              });
+              yield* store.admitOperation({
+                requestId: "update-restart",
+                tool: "instance_update",
+                fingerprint: "fingerprint",
+                processNonce: "previous-process",
+                admittedAt: new Date(startedAt).toISOString(),
+                intent: { instanceId: "instance-restart" },
+                completionMeans: "registration_updated",
+                steps: ["update_registration"],
+              });
+            }).pipe(Effect.provide(LocalStore.layer({ databasePath }))),
+          );
+          yield* TestClock.adjust(Duration.millis(60_000));
+          return yield* Effect.scoped(
+            Effect.gen(function* () {
+              const store = yield* LocalStore;
+              const lookup = yield* callTool("operation_get", { requestId: "update-restart" });
+              const after = yield* store.getRegistration("instance-restart");
+              return { lookup, after };
+            }).pipe(Effect.provide(appLayer(databasePath))),
+          );
+        }).pipe(Effect.provide(TestClock.layer())),
+      );
+
+      expect(result.lookup[0]?.result).toMatchObject({
+        result: {
+          kind: "ok",
+          value: { operation: { state: "outcome_unknown", dispatch: "unknown" } },
+        },
+      });
+      expect(result.after?.revision).toBe(0);
+      expect(result.after?.registration.alias).toBe("Restart");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("invalidates cached connections and inspections when the registration revision changes", async () => {
+    const { directory, databasePath } = makeDatabasePath();
+    const failure = { current: null as T3CodeAdapterError | null };
+    try {
+      const result = await Effect.runPromise(
+        Effect.gen(function* () {
+          yield* TestClock.setTime(5_000_000);
+          const outcome = yield* Effect.scoped(
+            Effect.gen(function* () {
+              const store = yield* LocalStore;
+              const connections = yield* InstanceConnections;
+              yield* store.putRegistration({
+                instanceId: "instance-watched",
+                alias: "Watched",
+                endpoint: "https://watched.test",
+                environmentId: "environment-a",
+                connection: "connected",
+                lastObservedAt: null,
+                credential: "secret-token",
+              });
+              yield* connections.inspect("instance-watched", false);
+              yield* store.putRegistration({
+                instanceId: "instance-watched",
+                alias: "Edited elsewhere",
+                endpoint: "https://watched.test",
+                environmentId: "environment-a",
+                connection: "connected",
+                lastObservedAt: null,
+              });
+              failure.current = new T3CodeAdapterError({
+                kind: "transport",
+                message: "The fresh diagnostic probe was unavailable.",
+                uncertain: false,
+                status: null,
+              });
+              const beforePoll = yield* Effect.exit(connections.inspect("instance-watched", true));
+              yield* TestClock.adjust(Duration.millis(2_000));
+              const afterPoll = yield* Effect.exit(connections.inspect("instance-watched", true));
+              return { beforePoll, afterPoll };
+            }).pipe(
+              Effect.provide(
+                appLayer(
+                  databasePath,
+                  InstanceConnections.layerWithAdapter(fakeAdapterLayer(failure)),
+                ),
+              ),
+            ),
+          );
+          return outcome;
+        }).pipe(Effect.provide(TestClock.layer())),
+      );
+
+      expect(String(result.beforePoll)).toContain(
+        "Cached diagnostics belong to an older registration revision",
+      );
+      expect(String(result.afterPoll)).toContain("The fresh diagnostic probe was unavailable");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("instance_remove and operation_get", () => {
   it("expires resolved details at thirty days while retaining the request tombstone", async () => {
     const { directory, databasePath } = makeDatabasePath();

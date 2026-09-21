@@ -111,6 +111,7 @@ const startServer = async (databasePath: string): Promise<Server> => {
       "instance_list",
       "instance_get",
       "instance_pair",
+      "instance_update",
       "instance_remove",
       "operation_get",
     ]);
@@ -127,6 +128,12 @@ const stopServer = async (server: Server) => {
     server.child.once("exit", () => resolve());
     server.child.kill("SIGTERM");
   });
+};
+
+const operationValue = (message: JsonRpcMessage) => {
+  const content = message.result?.structuredContent;
+  if (content === undefined) return undefined;
+  return (content["result"] as { value?: { state?: string; error?: { code?: string } } }).value;
 };
 
 const seed = async (
@@ -323,6 +330,126 @@ describe("shared SQLite mutation admission", () => {
     } finally {
       if (first !== undefined) await stopServer(first);
       if (second !== undefined) await stopServer(second);
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }, 60000);
+
+  // fallow-ignore-next-line complexity
+  it("applies concurrent alias updates from two processes without a torn registration", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "t3code-mcp-update-race-"));
+    const databasePath = join(directory, "state.sqlite");
+    let left: Server | undefined;
+    let right: Server | undefined;
+    try {
+      await seed(databasePath, [{ instanceId: "race-update" }]);
+      [left, right] = await Promise.all([startServer(databasePath), startServer(databasePath)]);
+      const responses = await Promise.all([
+        call(left, 3, "instance_update", {
+          requestId: "update-left",
+          instanceId: "race-update",
+          alias: "Left alias",
+        }),
+        call(right, 3, "instance_update", {
+          requestId: "update-right",
+          instanceId: "race-update",
+          alias: "Right alias",
+        }),
+      ]);
+
+      const values = responses.map((response) => response.result?.structuredContent);
+      for (const value of values) {
+        expect(value).toMatchObject({ result: { kind: "ok" } });
+      }
+      const operations = responses.map(operationValue);
+      for (const operation of operations) {
+        if (operation?.state === "failed") {
+          expect(operation.error?.code).toBe("stale_state");
+        } else {
+          expect(operation?.state).toBe("completed");
+        }
+      }
+      expect(operations.some((operation) => operation?.state === "completed")).toBe(true);
+
+      const list = await call(left, 4, "instance_list", {});
+      expect(list.result?.structuredContent).toMatchObject({
+        result: { kind: "ok", value: { items: [{ instanceId: "race-update" }] } },
+      });
+      const items = (
+        operationValue(list) as { items?: ReadonlyArray<{ alias?: string }> } | undefined
+      )?.items;
+      expect(["Left alias", "Right alias"]).toContain(items?.[0]?.alias);
+
+      const receipts = await Promise.all([
+        call(left, 5, "operation_get", { requestId: "update-left" }),
+        call(right, 5, "operation_get", { requestId: "update-right" }),
+      ]);
+      for (const receipt of receipts) {
+        expect(receipt.result?.structuredContent).toMatchObject({
+          result: { kind: "ok", value: { operation: { completionMeans: "registration_updated" } } },
+        });
+      }
+    } finally {
+      if (left !== undefined) await stopServer(left);
+      if (right !== undefined) await stopServer(right);
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }, 60000);
+
+  // fallow-ignore-next-line complexity
+  it("never lets a stale update overwrite or resurrect a concurrently removed registration", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "t3code-mcp-update-remove-"));
+    const databasePath = join(directory, "state.sqlite");
+    let left: Server | undefined;
+    let right: Server | undefined;
+    try {
+      await seed(databasePath, [{ instanceId: "race-victim" }]);
+      [left, right] = await Promise.all([startServer(databasePath), startServer(databasePath)]);
+      const [update, removal] = await Promise.all([
+        call(left, 3, "instance_update", {
+          requestId: "update-race-victim",
+          instanceId: "race-victim",
+          alias: "Racing alias",
+        }),
+        call(right, 3, "instance_remove", {
+          requestId: "remove-race-victim",
+          instanceId: "race-victim",
+        }),
+      ]);
+
+      expect(removal.result?.structuredContent).toMatchObject({
+        result: { kind: "ok", value: { state: "completed" } },
+      });
+      const updateValue = operationValue(update);
+      if (updateValue?.state === "failed") {
+        expect(["stale_state", "registration_not_found"]).toContain(updateValue.error?.code);
+      } else {
+        expect(updateValue?.state).toBe("completed");
+      }
+
+      const list = await call(left, 4, "instance_list", {});
+      expect(list.result?.structuredContent).toMatchObject({
+        result: { kind: "ok", value: { items: [] } },
+      });
+
+      const resurrect = await call(right, 4, "instance_update", {
+        requestId: "update-after-remove",
+        instanceId: "race-victim",
+        alias: "Resurrected",
+      });
+      expect(resurrect.result?.structuredContent).toMatchObject({
+        result: {
+          kind: "ok",
+          value: { state: "failed", error: { code: "stale_state" } },
+        },
+      });
+
+      const receipt = await call(left, 5, "operation_get", { requestId: "update-race-victim" });
+      expect(receipt.result?.structuredContent).toMatchObject({
+        result: { kind: "ok", value: { operation: { requestId: "update-race-victim" } } },
+      });
+    } finally {
+      if (left !== undefined) await stopServer(left);
+      if (right !== undefined) await stopServer(right);
       rmSync(directory, { recursive: true, force: true });
     }
   }, 60000);

@@ -14,6 +14,7 @@ export const MUTATION_RPC_DEADLINE_MILLIS = 30_000;
 export const LIVE_EFFECT_OBSERVATION_MILLIS = 60_000;
 export const STAGED_PAIRING_RETENTION_MILLIS = 24 * 60 * 60 * 1000;
 export const OPERATION_DETAIL_RETENTION_MILLIS = 30 * 24 * 60 * 60 * 1000;
+export const REVISION_POLL_INTERVAL_MILLIS = 1_000;
 
 // fallow-ignore-next-line complexity
 const endpoint = Schema.String.check(
@@ -185,6 +186,53 @@ export const InstancePairInputSchema = Schema.declare<{
 );
 
 export type InstancePairInput = typeof InstancePairInputSchema.Type;
+
+const instanceUpdateFields = Schema.Struct({
+  requestId,
+  instanceId: nonEmptyString,
+  alias: Schema.optionalKey(nonEmptyString),
+  endpoint: Schema.optionalKey(endpoint),
+});
+
+const unknownInstanceUpdateField = Schema.String.check(
+  Schema.makeFilter(
+    (key) => key !== "requestId" && key !== "instanceId" && key !== "alias" && key !== "endpoint",
+    { message: "unknown instance_update argument" },
+  ),
+);
+
+const instanceUpdateRuntimeShape = Schema.StructWithRest(instanceUpdateFields, [
+  Schema.Record(unknownInstanceUpdateField, Schema.Never),
+]);
+
+const instanceUpdateJsonShape = Schema.StructWithRest(instanceUpdateFields, [
+  Schema.Record(Schema.String, Schema.Never),
+]);
+
+export const InstanceUpdateInputSchema = Schema.declare<{
+  readonly requestId: string;
+  readonly instanceId: string;
+  readonly alias?: string;
+  readonly endpoint?: string;
+}>(
+  (
+    input,
+  ): input is {
+    readonly requestId: string;
+    readonly instanceId: string;
+    readonly alias?: string;
+    readonly endpoint?: string;
+  } => Schema.is(instanceUpdateRuntimeShape)(input),
+  {
+    toCodecJson: () =>
+      Schema.link()(instanceUpdateJsonShape, {
+        decode: SchemaGetter.passthrough({ strict: false }),
+        encode: SchemaGetter.passthrough({ strict: false }),
+      } as never),
+  },
+);
+
+export type InstanceUpdateInput = typeof InstanceUpdateInputSchema.Type;
 
 const instanceGetFields = Schema.Struct({
   instanceId: nonEmptyString,

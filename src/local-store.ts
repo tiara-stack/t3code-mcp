@@ -169,6 +169,7 @@ type RegistrationRowDecode = {
 export type LocalStoreErrorKind =
   | "contention"
   | "disk"
+  | "invalid_argument"
   | "malformed_row"
   | "storage"
   | "cursor_expired"
@@ -179,6 +180,7 @@ export type LocalStoreErrorKind =
   | "request_record_unavailable"
   | "registration_removed"
   | "registration_not_found"
+  | "revision_conflict"
   | "identity_conflict"
   | "identity_mismatch";
 
@@ -221,6 +223,21 @@ export interface StagePairingInput {
 
 export interface PublishPairingInput extends InstanceSummary {
   readonly credential: string;
+}
+
+export interface UpdateRegistrationInput {
+  readonly instanceId: string;
+  readonly expectedRevision: number;
+  readonly alias: string;
+  readonly endpoint: string;
+  readonly environmentId: string | null;
+  readonly connection: InstanceSummary["connection"];
+  readonly lastObservedAt: string | null;
+}
+
+export interface UpdatedRegistration {
+  readonly registration: InstanceSummary;
+  readonly revision: number;
 }
 
 export interface StoredRegistration {
@@ -295,10 +312,17 @@ export interface LocalStoreService {
   readonly publishPairing: (
     input: PublishPairingInput,
   ) => Effect.Effect<InstanceSummary, LocalStoreError>;
+  readonly updateRegistration: (
+    input: UpdateRegistrationInput,
+  ) => Effect.Effect<UpdatedRegistration, LocalStoreError>;
   readonly discardPairing: (instanceId: string) => Effect.Effect<void, LocalStoreError>;
   readonly getRegistration: (
     instanceId: string,
   ) => Effect.Effect<StoredRegistration | null, LocalStoreError>;
+  readonly listRegistrationRevisions: () => Effect.Effect<
+    ReadonlyMap<string, number>,
+    LocalStoreError
+  >;
   readonly findRegistrationByEnvironment: (
     environmentId: string,
     excludeInstanceId?: string,
@@ -462,11 +486,23 @@ export class LocalStore extends Context.Service<LocalStore, LocalStoreService>()
             verifySchemaForOperation,
           );
 
+        const updateRegistration = (input: UpdateRegistrationInput) =>
+          updateRegistrationInDatabase(
+            sql,
+            fileSystem,
+            config.databasePath,
+            input,
+            verifySchemaForOperation,
+          );
+
         const discardPairing = (instanceId: string) =>
           discardPairingInDatabase(sql, instanceId, verifySchemaForOperation);
 
         const getRegistration = (instanceId: string) =>
           getRegistrationInDatabase(sql, instanceId, verifySchemaForOperation);
+
+        const listRegistrationRevisions = () =>
+          listRegistrationRevisionsInDatabase(sql, verifySchemaForOperation);
 
         const findRegistrationByEnvironment = (environmentId: string, excludeInstanceId?: string) =>
           findRegistrationByEnvironmentInDatabase(
@@ -502,8 +538,10 @@ export class LocalStore extends Context.Service<LocalStore, LocalStoreService>()
           putRegistration,
           stagePairing,
           publishPairing,
+          updateRegistration,
           discardPairing,
           getRegistration,
+          listRegistrationRevisions,
           findRegistrationByEnvironment,
           fingerprintRequest,
           findRequest,
@@ -1676,6 +1714,117 @@ const publishPairingInDatabase = (
     }).pipe(Effect.mapError(toStoreError)),
   );
 
+const updateRegistrationInDatabase = (
+  sql: SqlClient.SqlClient,
+  fileSystem: FileSystem.FileSystem,
+  databasePath: string,
+  input: UpdateRegistrationInput,
+  verify: SchemaVerifier,
+): Effect.Effect<UpdatedRegistration, LocalStoreError> =>
+  retryStorage(
+    Effect.gen(function* () {
+      const value = yield* Schema.decodeUnknownEffect(InstanceSummarySchema)({
+        instanceId: input.instanceId,
+        alias: input.alias,
+        endpoint: input.endpoint,
+        environmentId: input.environmentId,
+        connection: input.connection,
+        lastObservedAt: input.lastObservedAt,
+      }).pipe(
+        Effect.mapError(
+          () =>
+            new LocalStoreError({
+              kind: "malformed_row",
+              message: "The registration update is malformed.",
+            }),
+        ),
+      );
+      if (!Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 0) {
+        return yield* Effect.fail(
+          new LocalStoreError({
+            kind: "malformed_row",
+            message: "The registration update revision is malformed.",
+          }),
+        );
+      }
+      yield* verify();
+      const now = yield* Clock.currentTimeMillis;
+      const revision = yield* sql.withTransaction(
+        // fallow-ignore-next-line complexity
+        Effect.gen(function* () {
+          const rows = yield* sql<RegistrationRow>`
+            SELECT instance_id, alias, endpoint, environment_id, connection, last_observed_at, revision
+            FROM registrations WHERE instance_id = ${value.instanceId}
+          `;
+          const row = rows[0];
+          if (row === undefined) {
+            const tombstones = yield* sql<{ instance_id: string }>`
+              SELECT instance_id FROM registration_tombstones WHERE instance_id = ${value.instanceId}
+            `;
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: tombstones.length > 0 ? "registration_removed" : "registration_not_found",
+                message:
+                  tombstones.length > 0
+                    ? "The saved registration was removed and cannot be updated."
+                    : "The saved registration was not found.",
+              }),
+            );
+          }
+          if (Number(row.revision) !== input.expectedRevision) {
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: "revision_conflict",
+                message: "The saved registration changed before the update could be published.",
+              }),
+            );
+          }
+          if (value.environmentId !== null) {
+            const duplicateIdentity = yield* sql<{ instance_id: string }>`
+              SELECT instance_id
+              FROM registrations
+              WHERE environment_id = ${value.environmentId}
+                AND instance_id <> ${value.instanceId}
+            `;
+            if (duplicateIdentity.length > 0) {
+              return yield* Effect.fail(
+                new LocalStoreError({
+                  kind: "identity_conflict",
+                  message: "This T3Code environment is already registered.",
+                }),
+              );
+            }
+          }
+          const updated = yield* sql<{ revision: unknown }>`
+            UPDATE registrations SET
+              alias = ${value.alias},
+              endpoint = ${value.endpoint},
+              environment_id = ${value.environmentId},
+              connection = ${value.connection},
+              last_observed_at = ${value.lastObservedAt},
+              updated_at = ${now},
+              revision = revision + 1
+            WHERE instance_id = ${value.instanceId}
+              AND revision = ${input.expectedRevision}
+            RETURNING revision
+          `;
+          const updatedRevision = Number(updated[0]?.revision);
+          if (updated.length !== 1 || !Number.isSafeInteger(updatedRevision)) {
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: "revision_conflict",
+                message: "The saved registration changed before the update could be published.",
+              }),
+            );
+          }
+          return updatedRevision;
+        }),
+      );
+      yield* protectDatabaseFiles(fileSystem, databasePath);
+      return { registration: value, revision } satisfies UpdatedRegistration;
+    }).pipe(Effect.mapError(toStoreError)),
+  );
+
 const getRegistrationInDatabase = (
   sql: SqlClient.SqlClient,
   instanceId: string,
@@ -1716,6 +1865,33 @@ const getRegistrationInDatabase = (
         revision: Number(row.revision),
         credential: credential ?? null,
       } satisfies StoredRegistration;
+    }).pipe(Effect.mapError(toStoreError)),
+  );
+
+const listRegistrationRevisionsInDatabase = (
+  sql: SqlClient.SqlClient,
+  verify: SchemaVerifier,
+): Effect.Effect<ReadonlyMap<string, number>, LocalStoreError> =>
+  retryStorage(
+    Effect.gen(function* () {
+      yield* verify();
+      const rows = yield* sql<{ instance_id: unknown; revision: unknown }>`
+        SELECT instance_id, revision FROM registrations
+      `;
+      const revisions = new Map<string, number>();
+      for (const row of rows) {
+        const revision = Number(row.revision);
+        if (typeof row.instance_id !== "string" || !Number.isSafeInteger(revision)) {
+          return yield* Effect.fail(
+            new LocalStoreError({
+              kind: "malformed_row",
+              message: "A saved registration revision row is malformed.",
+            }),
+          );
+        }
+        revisions.set(row.instance_id, revision);
+      }
+      return revisions;
     }).pipe(Effect.mapError(toStoreError)),
   );
 

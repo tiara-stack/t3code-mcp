@@ -15,6 +15,7 @@ import {
   type Evidence,
   type InstancePairInput,
   type InstanceRemoveInput,
+  type InstanceUpdateInput,
   type OperationGetInput,
   type OperationGetValue,
   type OperationRecord,
@@ -36,6 +37,9 @@ export interface OperationsService {
   ) => Effect.Effect<OperationRecord, LocalStoreError | OperationServiceError>;
   readonly removeRegistration: (
     input: InstanceRemoveInput,
+  ) => Effect.Effect<OperationRecord, LocalStoreError | OperationServiceError>;
+  readonly updateRegistration: (
+    input: InstanceUpdateInput,
   ) => Effect.Effect<OperationRecord, LocalStoreError | OperationServiceError>;
   readonly getOperation: (
     input: OperationGetInput,
@@ -119,6 +123,13 @@ export class Operations extends Context.Service<Operations, OperationsService>()
               code: "registration_not_found",
               message: error.message,
               retry: "none",
+              details: {},
+            };
+          case "revision_conflict":
+            return {
+              code: "stale_state",
+              message: error.message,
+              retry: "reconcile_first",
               details: {},
             };
           case "identity_conflict":
@@ -312,6 +323,29 @@ export class Operations extends Context.Service<Operations, OperationsService>()
             const detail =
               "A restarted process observed an admitted pairing without a saved registration and will not exchange the one-use code again.";
             return yield* markOutcomeUnknown(stored, record, detail);
+          }
+          if (record.tool === "instance_update") {
+            if (!previousOwner) {
+              return yield* markOutcomeUnknown(
+                stored,
+                record,
+                "The owning process is no longer executing this admitted update; its outcome is unknown and it will not be redispatched.",
+              );
+            }
+            if (record.dispatch === "not_dispatched") {
+              if (!previousOwnerStale) return record;
+              return yield* markOutcomeUnknown(
+                stored,
+                record,
+                "A previous process left this admitted update without dispatch evidence; its outcome is unknown and it will not be redispatched.",
+              );
+            }
+            if (!previousOwnerStale) return record;
+            return yield* markOutcomeUnknown(
+              stored,
+              record,
+              "A previous process left this update without confirmed publication evidence; its outcome is unknown and it will not be redispatched.",
+            );
           }
           if (record.tool !== "instance_remove") return record;
           if (previousOwner && record.dispatch === "not_dispatched") {
@@ -712,6 +746,182 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           Effect.asVoid,
         );
 
+      // fallow-ignore-next-line complexity
+      const executeUpdate = (
+        input: InstanceUpdateInput,
+        endpoint: string | null,
+      ): Effect.Effect<void, never> => {
+        let stepPosition = 0;
+        return Effect.gen(function* () {
+          const started = yield* evidence(
+            "Registration update admission was committed; the edit is owned by this process.",
+            "adapter_inference",
+          );
+          yield* store.updateOperation(input.requestId, {
+            now: started.observedAt,
+            intent: { instanceId: input.instanceId },
+            state: "pending",
+            dispatch: "unknown",
+            stepPosition,
+            stepState: "pending",
+            evidence: [started],
+            evidenceStepPosition: stepPosition,
+            recovery: "observe_operation",
+          });
+
+          const stored = yield* store.getRegistration(input.instanceId);
+          if (stored === null) {
+            const inspection = yield* store.inspectRegistration(input.instanceId);
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind:
+                  inspection.state === "removed"
+                    ? "registration_removed"
+                    : "registration_not_found",
+                message:
+                  inspection.state === "removed"
+                    ? "The saved registration was removed and cannot be updated."
+                    : "The saved registration was not found.",
+              }),
+            );
+          }
+
+          const publish = (verified: {
+            readonly environmentId: string | null;
+            readonly connection: typeof stored.registration.connection;
+            readonly lastObservedAt: string | null;
+          }) =>
+            store.updateRegistration({
+              instanceId: input.instanceId,
+              expectedRevision: stored.revision,
+              alias: input.alias ?? stored.registration.alias,
+              endpoint: endpoint ?? stored.registration.endpoint,
+              environmentId: verified.environmentId,
+              connection: verified.connection,
+              lastObservedAt: verified.lastObservedAt,
+            });
+
+          const updated = yield* endpoint === null
+            ? publish({
+                environmentId: stored.registration.environmentId,
+                connection: stored.registration.connection,
+                lastObservedAt: stored.registration.lastObservedAt,
+              })
+            : Effect.gen(function* () {
+                const credential = stored.credential;
+                if (credential === null) {
+                  return yield* Effect.fail(
+                    new T3CodeAdapterError({
+                      kind: "pairing_required",
+                      message:
+                        "The saved registration requires pairing before its endpoint can be verified.",
+                      uncertain: false,
+                      status: null,
+                    }),
+                  );
+                }
+                const verified = yield* connections.verifyCredential({ endpoint, credential });
+                const verifiedEvidence = yield* evidence(
+                  "The replacement endpoint's bound environment identity, authorization, pinned version, and wire contract were verified.",
+                  "rpc_result",
+                );
+                yield* store.updateOperation(input.requestId, {
+                  now: verifiedEvidence.observedAt,
+                  dispatch: "accepted",
+                  stepPosition,
+                  stepState: "succeeded",
+                  evidence: [verifiedEvidence],
+                  evidenceStepPosition: stepPosition,
+                });
+                if (
+                  stored.registration.environmentId !== null &&
+                  stored.registration.environmentId !== verified.environmentId
+                ) {
+                  return yield* Effect.fail(
+                    new T3CodeAdapterError({
+                      kind: "identity_mismatch",
+                      message:
+                        "The replacement endpoint identifies a different T3Code environment.",
+                      uncertain: false,
+                      status: null,
+                    }),
+                  );
+                }
+                stepPosition = 1;
+                return yield* publish({
+                  environmentId: verified.environmentId,
+                  connection: "connected",
+                  lastObservedAt: verifiedEvidence.observedAt,
+                });
+              });
+          yield* connections.invalidate(input.instanceId);
+
+          const completed = yield* evidence(
+            "The verified registration update was published atomically under compare-and-set.",
+            "local_registration",
+          );
+          yield* store.updateOperation(input.requestId, {
+            now: completed.observedAt,
+            state: "completed",
+            dispatch: "accepted",
+            target: updated.registration,
+            stepPosition,
+            stepState: "succeeded",
+            evidence: [completed],
+            evidenceStepPosition: stepPosition,
+            error: null,
+            recovery: "none",
+            recoverableUntil: new Date(
+              Date.parse(completed.observedAt) + OPERATION_DETAIL_RETENTION_MILLIS,
+            ).toISOString(),
+          });
+          yield* signalCompletion(input.requestId);
+        }).pipe(
+          Effect.catch((error: LocalStoreError | T3CodeAdapterError) =>
+            nowIso.pipe(
+              // fallow-ignore-next-line complexity
+              Effect.flatMap((now) => {
+                const adapterFailure = error instanceof T3CodeAdapterError;
+                const knownFailure = adapterFailure
+                  ? !error.uncertain && error.kind !== "transport" && error.kind !== "timeout"
+                  : error.kind === "identity_conflict" ||
+                    error.kind === "identity_mismatch" ||
+                    error.kind === "registration_removed" ||
+                    error.kind === "registration_not_found" ||
+                    error.kind === "revision_conflict";
+                const state = knownFailure ? ("failed" as const) : ("outcome_unknown" as const);
+                const failure = adapterFailure ? pairingFailure(error) : operationFailure(error);
+                return store
+                  .updateOperation(input.requestId, {
+                    now,
+                    state,
+                    ...(!adapterFailure && error.kind === "registration_not_found"
+                      ? { dispatch: "rejected" as const }
+                      : {}),
+                    stepPosition,
+                    stepState: knownFailure ? ("failed" as const) : ("outcome_unknown" as const),
+                    stepError: failure,
+                    error: failure,
+                    recovery: knownFailure
+                      ? !adapterFailure && error.kind === "registration_not_found"
+                        ? ("inspect_target" as const)
+                        : ("new_explicit_request" as const)
+                      : ("observe_operation" as const),
+                    recoverableUntil: knownFailure
+                      ? new Date(Date.parse(now) + OPERATION_DETAIL_RETENTION_MILLIS).toISOString()
+                      : null,
+                  })
+                  .pipe(
+                    Effect.andThen(signalCompletion(input.requestId)),
+                    Effect.catch(() => Effect.void),
+                  );
+              }),
+            ),
+          ),
+          Effect.asVoid,
+        );
+      };
+
       type AdmitAndRunInput = {
         readonly requestId: string;
         readonly fingerprint: string;
@@ -890,9 +1100,76 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           });
         });
 
+      const updateRegistration = (
+        input: InstanceUpdateInput,
+      ): Effect.Effect<OperationRecord, LocalStoreError | OperationServiceError> =>
+        // fallow-ignore-next-line complexity
+        Effect.gen(function* () {
+          const fingerprint = yield* store.fingerprintRequest("instance_update", input);
+          const known = yield* store.findRequest(input.requestId);
+          if (known !== null) {
+            if (known.fingerprint !== fingerprint) {
+              return yield* Effect.fail(
+                new LocalStoreError({
+                  kind: "request_id_conflict",
+                  message: "The request ID was already used for different mutation input.",
+                }),
+              );
+            }
+            const existing = yield* store.getOperation(input.requestId);
+            if (existing === null) {
+              return yield* Effect.fail(
+                new LocalStoreError({
+                  kind: "request_record_unavailable",
+                  message: REQUEST_RECORD_UNAVAILABLE_MESSAGE,
+                }),
+              );
+            }
+            return yield* reconcile(existing);
+          }
+
+          if (input.alias === undefined && input.endpoint === undefined) {
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: "invalid_argument",
+                message: "An instance update requires at least one of alias or endpoint.",
+              }),
+            );
+          }
+          const current = yield* store.getRegistration(input.instanceId);
+          const endpointChange =
+            input.endpoint !== undefined &&
+            (current === null || input.endpoint !== current.registration.endpoint);
+          if (
+            current !== null &&
+            (input.alias === undefined || input.alias === current.registration.alias) &&
+            !endpointChange
+          ) {
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: "invalid_argument",
+                message: "An instance update requires at least one changed field.",
+              }),
+            );
+          }
+
+          return yield* admitAndRun({
+            requestId: input.requestId,
+            fingerprint,
+            tool: "instance_update",
+            intent: { instanceId: input.instanceId },
+            completionMeans: "registration_updated",
+            steps: endpointChange
+              ? ["verify_endpoint_environment", "publish_registration_update"]
+              : ["update_registration"],
+            execute: executeUpdate(input, endpointChange ? (input.endpoint ?? null) : null),
+          });
+        });
+
       return Operations.of({
         pairInstance,
         removeRegistration,
+        updateRegistration,
         getOperation: readOperation,
       });
     }),

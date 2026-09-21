@@ -5,7 +5,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Semaphore from "effect/Semaphore";
 import type { InstanceDetails } from "./domain";
-import { MAX_INSTANCE_RPC_CAPACITY } from "./domain";
+import { MAX_INSTANCE_RPC_CAPACITY, REVISION_POLL_INTERVAL_MILLIS } from "./domain";
 import { LocalStore, LocalStoreError } from "./local-store";
 import {
   T3CodeAdapter,
@@ -71,6 +71,7 @@ export class InstanceConnections extends Context.Service<
       Effect.gen(function* () {
         const adapter = yield* T3CodeAdapter;
         const store = yield* LocalStore;
+        const scope = yield* Effect.scope;
         const exchangePairingCode = adapter.exchangePairingCode;
         const verifyCredential = adapter.verifyCredential;
         const inspectCredential = adapter.inspectCredential;
@@ -79,6 +80,66 @@ export class InstanceConnections extends Context.Service<
           string,
           Pick<InstanceInspection, "details" | "observedAt"> & { readonly revision: number }
         >();
+        const watchers = { active: false };
+        // Cached connections and inspections belong to one registration
+        // revision. A single shared watcher polls all stored revisions once
+        // per second so a local edit or removal invalidates the cache even
+        // while no dispatch is in flight. Already dispatched RPCs are not
+        // fenced; they finish under the original identity.
+        const evictCached = (instanceId: string) => {
+          cached.delete(instanceId);
+          cachedInspections.delete(instanceId);
+        };
+        const watchedRevisions = () => {
+          const watched = new Map<string, number>();
+          for (const [instanceId, connection] of cached) {
+            watched.set(instanceId, connection.revision);
+          }
+          for (const [instanceId, inspection] of cachedInspections) {
+            const connectionRevision = watched.get(instanceId);
+            if (connectionRevision !== undefined && connectionRevision !== inspection.revision) {
+              evictCached(instanceId);
+              watched.delete(instanceId);
+              continue;
+            }
+            if (connectionRevision === undefined) watched.set(instanceId, inspection.revision);
+          }
+          return watched;
+        };
+        const evictStaleRevisions = (
+          watched: ReadonlyMap<string, number>,
+          current: ReadonlyMap<string, number>,
+        ) => {
+          for (const [instanceId, revision] of watched) {
+            if (current.get(instanceId) !== revision) evictCached(instanceId);
+          }
+        };
+        const pollRevisions = (): Effect.Effect<void, never> =>
+          Effect.gen(function* () {
+            while (true) {
+              yield* Effect.sleep(REVISION_POLL_INTERVAL_MILLIS);
+              const watched = watchedRevisions();
+              if (watched.size === 0) {
+                watchers.active = false;
+                return;
+              }
+              const outcome = yield* Effect.exit(store.listRegistrationRevisions());
+              if (outcome._tag === "Failure") {
+                for (const instanceId of [...cached.keys(), ...cachedInspections.keys()]) {
+                  evictCached(instanceId);
+                }
+                watchers.active = false;
+                return;
+              }
+              evictStaleRevisions(watched, outcome.value);
+            }
+          });
+        const ensureWatcher = (): Effect.Effect<void, never> =>
+          Effect.suspend(() => {
+            if (watchers.active) return Effect.void;
+            watchers.active = true;
+            return pollRevisions().pipe(Effect.forkIn(scope), Effect.asVoid);
+          });
         const capacities = new Map<string, Semaphore.Semaphore>();
         const capacityFor = (instanceId: string) => {
           let semaphore = capacities.get(instanceId);
@@ -119,11 +180,7 @@ export class InstanceConnections extends Context.Service<
             });
             return { ...staged, ...verified } satisfies VerifiedPairing;
           });
-        const invalidate = (instanceId: string) =>
-          Effect.sync(() => {
-            cached.delete(instanceId);
-            cachedInspections.delete(instanceId);
-          });
+        const invalidate = (instanceId: string) => Effect.sync(() => evictCached(instanceId));
 
         const inspectFresh = (
           instanceId: string,
@@ -207,6 +264,7 @@ export class InstanceConnections extends Context.Service<
               observedAt,
               revision: registration.revision,
             });
+            yield* ensureWatcher();
             return { details, observedAt, freshness: "fresh" as const, failure: null };
           });
 
@@ -334,6 +392,7 @@ export class InstanceConnections extends Context.Service<
               verified,
             } satisfies InstanceConnection;
             cached.set(instanceId, connection);
+            yield* ensureWatcher();
             return connection;
           });
         return InstanceConnections.of({

@@ -18,6 +18,7 @@ import {
   InstanceGetInputSchema,
   InstanceDetailsToolResultSchema,
   InstancePairInputSchema,
+  InstanceUpdateInputSchema,
   MAX_OPERATION_CAPACITY,
   makeToolSuccess,
   MAX_SERIALIZED_RESULT_BYTES,
@@ -83,6 +84,20 @@ export const InstancePairTool = Tool.make("instance_pair", {
   .annotate(Tool.OpenWorld, true);
 
 // fallow-ignore-next-line unused-export
+export const InstanceUpdateTool = Tool.make("instance_update", {
+  description:
+    "Edit a saved T3Code registration's alias or endpoint, verifying the bound environment before publishing.",
+  parameters: InstanceUpdateInputSchema,
+  success: OperationToolResultSchema,
+})
+  .addDependency(LocalStore)
+  .addDependency(Operations)
+  .annotate(Tool.Readonly, false)
+  .annotate(Tool.Destructive, true)
+  .annotate(Tool.Idempotent, true)
+  .annotate(Tool.OpenWorld, true);
+
+// fallow-ignore-next-line unused-export
 export const OperationGetTool = Tool.make("operation_get", {
   description: "Recover an admitted mutation receipt by request ID.",
   parameters: OperationGetInputSchema,
@@ -99,6 +114,7 @@ export const ServerToolkit = Toolkit.make(
   InstanceListTool,
   InstanceGetTool,
   InstancePairTool,
+  InstanceUpdateTool,
   InstanceRemoveTool,
   OperationGetTool,
 );
@@ -145,6 +161,8 @@ const toToolFailure = (error: LocalStoreError | OperationServiceError | T3CodeAd
     };
   }
   switch (error.kind) {
+    case "invalid_argument":
+      return makeToolFailure(error.message, "invalid_argument", "change_request");
     case "cursor_expired":
       return makeToolFailure(error.message, "cursor_expired", "safe_read", { action: "resync" });
     case "cursor_mismatch":
@@ -174,6 +192,8 @@ const toToolFailure = (error: LocalStoreError | OperationServiceError | T3CodeAd
         action: "retry_operation_get",
       });
     case "registration_removed":
+      return makeToolFailure(error.message, "stale_state", "reconcile_first");
+    case "revision_conflict":
       return makeToolFailure(error.message, "stale_state", "reconcile_first");
     case "registration_not_found":
       return makeToolFailure(error.message, "registration_not_found", "none");
@@ -247,6 +267,37 @@ const serverToolHandlers = ServerToolkit.of({
     Effect.gen(function* () {
       const operations = yield* Operations;
       const operation = yield* operations.removeRegistration(input);
+      const observedAt = new Date(yield* Clock.currentTimeMillis).toISOString();
+      return {
+        result: { kind: "ok" as const, value: operation },
+        observations:
+          operation.target === null
+            ? []
+            : [
+                {
+                  instanceId: operation.target.instanceId,
+                  observedAt,
+                  freshness: "fresh" as const,
+                  sourceSequence: null,
+                  coverage: "complete_for_query" as const,
+                  limitations: [],
+                },
+              ],
+        warnings: [],
+      };
+    }).pipe(
+      Effect.catch((error: LocalStoreError | OperationServiceError) =>
+        Effect.succeed({
+          result: { kind: "error" as const, error: toToolFailure(error) },
+          observations: [],
+          warnings: [],
+        }),
+      ),
+    ),
+  instance_update: (input) =>
+    Effect.gen(function* () {
+      const operations = yield* Operations;
+      const operation = yield* operations.updateRegistration(input);
       const observedAt = new Date(yield* Clock.currentTimeMillis).toISOString();
       return {
         result: { kind: "ok" as const, value: operation },
@@ -353,7 +404,12 @@ const mutatorResultIsError = (toolName: string, value: unknown): boolean => {
   const result = (value as { result?: unknown }).result;
   if (typeof result !== "object" || result === null) return false;
   if ((result as { kind?: unknown }).kind === "error") return true;
-  if (toolName !== "instance_remove" && toolName !== "instance_pair") return false;
+  if (
+    toolName !== "instance_remove" &&
+    toolName !== "instance_pair" &&
+    toolName !== "instance_update"
+  )
+    return false;
   const operation = (result as { value?: { state?: unknown } }).value;
   return (
     (result as { kind?: unknown }).kind === "ok" &&
