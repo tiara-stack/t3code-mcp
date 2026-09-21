@@ -114,6 +114,7 @@ const startServer = async (databasePath: string): Promise<Server> => {
       "instance_update",
       "instance_pair_again",
       "instance_remove",
+      "project_list",
       "operation_get",
     ]);
     return server;

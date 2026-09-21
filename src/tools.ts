@@ -20,19 +20,37 @@ import {
   InstancePairInputSchema,
   InstanceUpdateInputSchema,
   MAX_OPERATION_CAPACITY,
+  MAX_TOTAL_RPC_CAPACITY,
   type OperationRecord,
   makeToolSuccess,
+  makeProjectListToolSuccess,
+  staleProjectReadLimitation,
   MAX_SERIALIZED_RESULT_BYTES,
   OperationGetInputSchema,
   OperationGetToolResultSchema,
   OperationToolResultSchema,
+  ProjectListInputSchema,
+  ProjectListToolResultSchema,
   ToolResultSchema,
+  type Observation,
+  type ProjectListPage,
+  type ProjectListScope,
 } from "./domain";
 import type { ToolFailure } from "./domain";
-import { LocalStore, LocalStoreError } from "./local-store";
+import {
+  LocalStore,
+  LocalStoreError,
+  type LocalStoreService,
+  type ProjectCaptureMetadata,
+  type RetainedProjectCapture,
+} from "./local-store";
 import { OperationServiceError, Operations } from "./operations";
-import { InstanceConnections } from "./instance-connections";
-import { T3CodeAdapterError } from "./t3code-adapter";
+import {
+  InstanceConnections,
+  type DiscoveredProjects,
+  type InstanceConnectionsService,
+} from "./instance-connections";
+import { T3CodeAdapterError, type DiscoveredModelSelection } from "./t3code-adapter";
 
 // fallow-ignore-next-line unused-export
 export const InstanceListTool = Tool.make("instance_list", {
@@ -52,6 +70,20 @@ const InstanceGetTool = Tool.make("instance_get", {
   parameters: InstanceGetInputSchema,
   success: InstanceDetailsToolResultSchema,
 })
+  .addDependency(InstanceConnections)
+  .annotate(Tool.Readonly, true)
+  .annotate(Tool.Destructive, false)
+  .annotate(Tool.Idempotent, true)
+  .annotate(Tool.OpenWorld, true);
+
+// fallow-ignore-next-line unused-export
+export const ProjectListTool = Tool.make("project_list", {
+  description:
+    "List existing projects on one saved T3Code instance or across all saved instances, with per-instance failures.",
+  parameters: ProjectListInputSchema,
+  success: ProjectListToolResultSchema,
+})
+  .addDependency(LocalStore)
   .addDependency(InstanceConnections)
   .annotate(Tool.Readonly, true)
   .annotate(Tool.Destructive, false)
@@ -145,6 +177,7 @@ export const ServerToolkit = Toolkit.make(
   InstanceUpdateTool,
   InstancePairAgainTool,
   InstanceRemoveTool,
+  ProjectListTool,
   OperationGetTool,
 );
 
@@ -285,6 +318,195 @@ const registrationMutationResult = (
     ),
   );
 
+const compareProjectSummaries = (
+  left: { readonly project: { readonly instanceId: string; readonly projectId: string } },
+  right: { readonly project: { readonly instanceId: string; readonly projectId: string } },
+): number =>
+  left.project.instanceId < right.project.instanceId
+    ? -1
+    : left.project.instanceId > right.project.instanceId
+      ? 1
+      : left.project.projectId < right.project.projectId
+        ? -1
+        : left.project.projectId > right.project.projectId
+          ? 1
+          : 0;
+
+interface GatheredInstance {
+  readonly kind: "healthy" | "failed";
+  readonly instanceId: string;
+  readonly discovered?: DiscoveredProjects;
+  readonly error?: LocalStoreError | T3CodeAdapterError;
+}
+
+interface ClassifiedDiscovery {
+  readonly items: Array<{
+    readonly project: { readonly instanceId: string; readonly projectId: string };
+    readonly title: string;
+    readonly repositoryPath: string;
+    readonly defaultModel: DiscoveredModelSelection | null;
+  }>;
+  readonly failures: Array<ProjectListPage["failures"][number]>;
+  readonly observations: Array<Observation>;
+  readonly firstFailure: LocalStoreError | T3CodeAdapterError | null;
+}
+
+const healthyItems = (entry: GatheredInstance): ClassifiedDiscovery["items"] =>
+  (entry.discovered?.projects ?? []).map((project) => ({
+    project: { instanceId: entry.instanceId, projectId: project.projectId },
+    title: project.title,
+    repositoryPath: project.repositoryPath,
+    defaultModel: project.defaultModel,
+  }));
+
+const healthyObservation = (entry: GatheredInstance, fallbackObservedAt: string): Observation => ({
+  instanceId: entry.instanceId,
+  observedAt: entry.discovered?.observedAt ?? fallbackObservedAt,
+  freshness: "fresh",
+  sourceSequence: entry.discovered?.snapshotSequence ?? null,
+  coverage: "complete_for_query",
+  limitations: [],
+});
+
+const retainedForFailed = (
+  entry: GatheredInstance,
+  retained: RetainedProjectCapture | null,
+  fallbackObservedAt: string,
+): { readonly items: ClassifiedDiscovery["items"]; readonly observation: Observation } | null => {
+  if (retained === null) return null;
+  const items = retained.items.filter((item) => item.project.instanceId === entry.instanceId);
+  if (items.length === 0) return null;
+  const retainedObservation = retained.observations.find(
+    (observation) => observation.instanceId === entry.instanceId,
+  );
+  return {
+    items,
+    observation: {
+      instanceId: entry.instanceId,
+      observedAt: retainedObservation?.observedAt ?? fallbackObservedAt,
+      freshness: "stale",
+      sourceSequence: retainedObservation?.sourceSequence ?? null,
+      coverage: "partial",
+      limitations: [`${staleProjectReadLimitation} (${entry.error?.message ?? "unknown"})`],
+    },
+  };
+};
+
+const aggregateCoverage = (failures: number, served: boolean): ProjectListPage["coverage"] =>
+  failures === 0 ? "complete_for_query" : served ? "partial" : "unknown";
+
+const aggregateLimitations = (failures: number, served: boolean): ReadonlyArray<string> =>
+  failures === 0
+    ? []
+    : served
+      ? ["One or more target instances could not be discovered."]
+      : ["No target instance could be discovered."];
+
+const classifyDiscovery = (input: {
+  readonly gathered: ReadonlyArray<GatheredInstance>;
+  readonly retained: RetainedProjectCapture | null;
+  readonly allowStale: boolean;
+  readonly fallbackObservedAt: string;
+}): ClassifiedDiscovery => {
+  const { gathered, retained, allowStale, fallbackObservedAt } = input;
+  let items: ClassifiedDiscovery["items"] = [];
+  const failures: ClassifiedDiscovery["failures"] = [];
+  const observations: ClassifiedDiscovery["observations"] = [];
+  let firstFailure: LocalStoreError | T3CodeAdapterError | null = null;
+  for (const entry of gathered) {
+    if (entry.kind === "healthy") {
+      items = items.concat(healthyItems(entry));
+      observations.push(healthyObservation(entry, fallbackObservedAt));
+      continue;
+    }
+    const retainedResult = allowStale
+      ? retainedForFailed(entry, retained, fallbackObservedAt)
+      : null;
+    if (retainedResult !== null) {
+      items = items.concat(retainedResult.items);
+      observations.push(retainedResult.observation);
+      continue;
+    }
+    if (firstFailure === null) firstFailure = entry.error ?? null;
+    if (entry.error !== undefined) {
+      failures.push({ instanceId: entry.instanceId, error: toToolFailure(entry.error) });
+    }
+  }
+  return { items, failures, observations, firstFailure };
+};
+
+const discoverProjectPage = (options: {
+  readonly store: LocalStoreService;
+  readonly connections: InstanceConnectionsService;
+  readonly scope: ProjectListScope;
+  readonly limit: number | undefined;
+  readonly allowStale: boolean;
+}): Effect.Effect<
+  ReturnType<typeof makeProjectListToolSuccess>,
+  LocalStoreError | T3CodeAdapterError
+> =>
+  Effect.gen(function* () {
+    const { store, connections, scope, limit, allowStale } = options;
+    const targets =
+      scope.kind === "instance"
+        ? [scope.instanceId]
+        : (yield* store.listAllRegistrations()).map((registration) => registration.instanceId);
+
+    const gathered = yield* Effect.forEach(
+      targets,
+      (instanceId) =>
+        Effect.gen(function* () {
+          const discovered = yield* connections.discoverProjects(instanceId);
+          return { kind: "healthy" as const, instanceId, discovered };
+        }).pipe(
+          Effect.catch((error: LocalStoreError | T3CodeAdapterError) =>
+            Effect.succeed({ kind: "failed" as const, instanceId, error }),
+          ),
+        ),
+      { concurrency: MAX_TOTAL_RPC_CAPACITY },
+    );
+
+    const retained =
+      allowStale && gathered.some((entry) => entry.kind === "failed")
+        ? yield* store.findRetainedProjectCapture(scope)
+        : null;
+    const fallbackObservedAt = new Date(yield* Clock.currentTimeMillis).toISOString();
+
+    const classified = classifyDiscovery({
+      gathered,
+      retained,
+      allowStale,
+      fallbackObservedAt,
+    });
+    const { failures, observations, firstFailure } = classified;
+    let { items } = classified;
+
+    // A targeted read never fails over to another registration; its typed
+    // failure is the result unless an explicit stale read found retained data.
+    if (scope.kind === "instance" && firstFailure !== null && failures.length > 0) {
+      return yield* Effect.fail(firstFailure);
+    }
+
+    const served = items.length > 0;
+    const coverage: ProjectListPage["coverage"] = aggregateCoverage(failures.length, served);
+    const limitations = [...aggregateLimitations(failures.length, served)];
+    items = items.slice().sort(compareProjectSummaries);
+
+    const metadata: ProjectCaptureMetadata = {
+      failures,
+      coverage,
+      limitations,
+      observations,
+    };
+    const captured = yield* store.captureProjectPage({
+      scope,
+      items,
+      metadata,
+      ...(limit === undefined ? {} : { limit }),
+    });
+    return makeProjectListToolSuccess(captured.page, captured.observations);
+  });
+
 const serverToolHandlers = ServerToolkit.of({
   instance_list: ({ cursor, limit }) =>
     Effect.gen(function* () {
@@ -349,6 +571,34 @@ const serverToolHandlers = ServerToolkit.of({
       const operations = yield* Operations;
       return yield* registrationMutationResult(operations.removeRegistration(input));
     }),
+  project_list: ({ scope, cursor, limit, allowStale }) =>
+    Effect.gen(function* () {
+      const store = yield* LocalStore;
+      const connections = yield* InstanceConnections;
+      if (cursor !== undefined) {
+        const captured = yield* store.readProjectPage({
+          scope,
+          cursor,
+          ...(limit === undefined ? {} : { limit }),
+        });
+        return makeProjectListToolSuccess(captured.page, captured.observations);
+      }
+      return yield* discoverProjectPage({
+        store,
+        connections,
+        scope,
+        limit,
+        allowStale: allowStale ?? false,
+      });
+    }).pipe(
+      Effect.catch((error: LocalStoreError | T3CodeAdapterError) =>
+        Effect.succeed({
+          result: { kind: "error" as const, error: toToolFailure(error) },
+          observations: [],
+          warnings: [],
+        }),
+      ),
+    ),
   instance_update: (input) =>
     Effect.gen(function* () {
       const operations = yield* Operations;

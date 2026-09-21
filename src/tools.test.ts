@@ -151,6 +151,15 @@ const fakeConnections = (options?: {
         }),
       ),
     inspect,
+    discoverProjects: () =>
+      Effect.fail(
+        new T3CodeAdapterError({
+          kind: "capacity",
+          message: "The test connection does not support project discovery.",
+          uncertain: false,
+          status: null,
+        }),
+      ),
     invalidate: () => Effect.void,
   });
 };
@@ -178,6 +187,15 @@ const fakeAdapterLayer = (
             capabilities: [],
           })
         : Effect.fail(failure.current),
+    listProjects: () =>
+      Effect.fail(
+        new T3CodeAdapterError({
+          kind: "capacity",
+          message: "The test adapter does not support project listing.",
+          uncertain: false,
+          status: null,
+        }),
+      ),
   });
 
 const callList = (input: unknown = {}) =>
@@ -1363,6 +1381,15 @@ describe("instance_pair_again", () => {
           freshness: "fresh" as const,
           failure: null,
         }),
+      discoverProjects: () =>
+        Effect.fail(
+          new T3CodeAdapterError({
+            kind: "capacity",
+            message: "The test connection does not support project discovery.",
+            uncertain: false,
+            status: null,
+          }),
+        ),
       invalidate: () => Effect.void,
     });
   };
@@ -1715,6 +1742,15 @@ describe("instance_pair_again", () => {
               freshness: "fresh" as const,
               failure: null,
             }),
+          discoverProjects: () =>
+            Effect.fail(
+              new T3CodeAdapterError({
+                kind: "capacity",
+                message: "The test connection does not support project discovery.",
+                uncertain: false,
+                status: null,
+              }),
+            ),
           invalidate: () => Effect.void,
         });
         const result = yield* Effect.scoped(
@@ -2432,6 +2468,704 @@ describe("instance_remove and operation_get", () => {
             kind: "ok",
             value: { operation: { state: "failed" }, wait: "not_requested" },
           },
+        });
+      }),
+    ),
+  );
+});
+
+const okPageValue = (result: unknown): { nextCursor: string | null } =>
+  (
+    result as {
+      result: { kind: "ok"; value: { nextCursor: string | null } };
+    }
+  ).result.value;
+
+const projectFixtures = (
+  projectsByEndpoint: Readonly<
+    Record<string, ReadonlyArray<{ readonly projectId: string; readonly title: string }>>
+  >,
+  failures: { current: Readonly<Record<string, T3CodeAdapterError>> },
+) =>
+  Layer.succeed(T3CodeAdapter, {
+    exchangePairingCode: () =>
+      Effect.fail(
+        new T3CodeAdapterError({
+          kind: "capacity",
+          message: "The project test adapter does not pair.",
+          uncertain: false,
+          status: null,
+        }),
+      ),
+    verifyCredential: ({ endpoint }: { readonly endpoint: string }) =>
+      failures.current[endpoint] !== undefined
+        ? Effect.fail(failures.current[endpoint]!)
+        : Effect.succeed({
+            environmentId: "environment-project",
+            serverVersion: "0.0.38",
+            scopes: ["orchestration:read", "orchestration:operate"],
+            capabilities: {},
+          }),
+    inspectCredential: () =>
+      Effect.fail(
+        new T3CodeAdapterError({
+          kind: "capacity",
+          message: "The project test adapter does not inspect.",
+          uncertain: false,
+          status: null,
+        }),
+      ),
+    listProjects: ({ endpoint }: { readonly endpoint: string }) => {
+      const failure = failures.current[endpoint];
+      if (failure !== undefined) return Effect.fail(failure);
+      const projects = projectsByEndpoint[endpoint];
+      if (projects === undefined) {
+        return Effect.fail(
+          new T3CodeAdapterError({
+            kind: "transport",
+            message: "The project test adapter has no fixture for this endpoint.",
+            uncertain: false,
+            status: null,
+          }),
+        );
+      }
+      return Effect.succeed({
+        snapshotSequence: 17,
+        projects: projects.map((project, index) => ({
+          ...project,
+          repositoryPath: `/srv/${project.projectId}`,
+          defaultModel:
+            index === 0
+              ? null
+              : {
+                  providerInstanceId: "provider-main",
+                  model: "model-a",
+                  options: [{ id: "effort", value: "high" }],
+                },
+        })),
+      });
+    },
+  });
+
+const seedProjectRegistration = (instanceId: string, endpoint: string, credential?: string) =>
+  Effect.gen(function* () {
+    const store = yield* LocalStore;
+    yield* store.putRegistration({
+      instanceId,
+      alias: `Instance ${instanceId}`,
+      endpoint,
+      environmentId: null,
+      connection: credential === undefined ? "pairing_required" : "connected",
+      lastObservedAt: null,
+      ...(credential === undefined ? {} : { credential }),
+    });
+  });
+
+describe("project_list", () => {
+  it.live("discovers existing projects with nullable defaults on a targeted instance", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const layer = appLayer(
+          databasePath,
+          InstanceConnections.layerWithAdapter(
+            projectFixtures(
+              {
+                "https://a.test": [
+                  { projectId: "ui-project", title: "UI-created project" },
+                  { projectId: "second-project", title: "Second project" },
+                ],
+              },
+              { current: {} },
+            ),
+          ),
+        );
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("project_list", {
+              scope: { kind: "instance", instanceId: "instance-a" },
+            });
+          }).pipe(Effect.provide(layer)),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              items: [
+                {
+                  project: { instanceId: "instance-a", projectId: "second-project" },
+                  title: "Second project",
+                  repositoryPath: "/srv/second-project",
+                  defaultModel: {
+                    providerInstanceId: "provider-main",
+                    model: "model-a",
+                    options: [{ id: "effort", value: "high" }],
+                  },
+                },
+                {
+                  project: { instanceId: "instance-a", projectId: "ui-project" },
+                  title: "UI-created project",
+                  repositoryPath: "/srv/ui-project",
+                  defaultModel: null,
+                },
+              ],
+              nextCursor: null,
+              coverage: "complete_for_query",
+              failures: [],
+            },
+          },
+          observations: [
+            {
+              instanceId: "instance-a",
+              freshness: "fresh",
+              sourceSequence: 17,
+              coverage: "complete_for_query",
+            },
+          ],
+          warnings: [],
+        });
+        expect(result[0]?.encodedResult).toEqual(result[0]?.result);
+      }),
+    ),
+  );
+
+  it.live("rejects unknown argument fields in the scope and at the top level", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const layer = appLayer(
+          databasePath,
+          InstanceConnections.layerWithAdapter(projectFixtures({}, { current: {} })),
+        );
+        const unexpected = yield* Effect.exit(
+          Effect.scoped(
+            callTool("project_list", {
+              scope: { kind: "all_instances" },
+              unexpected: true,
+            }).pipe(Effect.provide(layer)),
+          ),
+        );
+        expect(Exit.isFailure(unexpected)).toBe(true);
+        if (Exit.isSuccess(unexpected)) return;
+        expect(String(unexpected.cause)).toContain("Invalid parameters for tool 'project_list'");
+
+        const scopeField = yield* Effect.exit(
+          Effect.scoped(
+            callTool("project_list", {
+              scope: { kind: "all_instances", extra: 1 },
+            }).pipe(Effect.provide(layer)),
+          ),
+        );
+        expect(Exit.isFailure(scopeField)).toBe(true);
+        if (Exit.isSuccess(scopeField)) return;
+        expect(String(scopeField.cause)).toContain("Invalid parameters for tool 'project_list'");
+      }),
+    ),
+  );
+
+  it.live("returns typed failures for a missing or unpaired targeted registration", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const layer = appLayer(
+          databasePath,
+          InstanceConnections.layerWithAdapter(projectFixtures({}, { current: {} })),
+        );
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-unpaired", "https://unpaired.test");
+            const missing = yield* callTool("project_list", {
+              scope: { kind: "instance", instanceId: "missing-instance" },
+            });
+            const unpaired = yield* callTool("project_list", {
+              scope: { kind: "instance", instanceId: "instance-unpaired" },
+            });
+            return { missing, unpaired };
+          }).pipe(Effect.provide(layer)),
+        );
+
+        expect(result.missing[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "registration_not_found" } },
+        });
+        expect(result.unpaired[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "pairing_required" } },
+        });
+      }),
+    ),
+  );
+
+  it.live("aggregates healthy results with typed per-instance failures", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const failures: { current: Readonly<Record<string, T3CodeAdapterError>> } = { current: {} };
+        const layer = appLayer(
+          databasePath,
+          InstanceConnections.layerWithAdapter(
+            projectFixtures(
+              {
+                "https://a.test": [{ projectId: "project-a", title: "Project A" }],
+                "https://b.test": [{ projectId: "project-b", title: "Project B" }],
+              },
+              failures,
+            ),
+          ),
+        );
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            yield* seedProjectRegistration("instance-b", "https://b.test", "secret-b");
+            yield* seedProjectRegistration("instance-c", "https://c.test", "secret-c");
+            failures.current = {
+              "https://b.test": new T3CodeAdapterError({
+                kind: "transport",
+                message: "The instance is unreachable.",
+                uncertain: true,
+                status: null,
+              }),
+              "https://c.test": new T3CodeAdapterError({
+                kind: "wire_incompatible",
+                message: "The instance rejected the pinned wire contract.",
+                uncertain: false,
+                status: null,
+              }),
+            };
+            return yield* callTool("project_list", { scope: { kind: "all_instances" } });
+          }).pipe(Effect.provide(layer)),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              items: [
+                {
+                  project: { instanceId: "instance-a", projectId: "project-a" },
+                  title: "Project A",
+                },
+              ],
+              coverage: "partial",
+              failures: [
+                { instanceId: "instance-b", error: { code: "unavailable", retry: "safe_read" } },
+                {
+                  instanceId: "instance-c",
+                  error: { code: "incompatible_instance", retry: "change_request" },
+                },
+              ],
+            },
+          },
+          observations: [{ instanceId: "instance-a", freshness: "fresh" }],
+          warnings: [],
+        });
+      }),
+    ),
+  );
+
+  it.live("keeps colliding project IDs qualified across instances", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const layer = appLayer(
+          databasePath,
+          InstanceConnections.layerWithAdapter(
+            projectFixtures(
+              {
+                "https://a.test": [{ projectId: "same-id", title: "Project on A" }],
+                "https://b.test": [{ projectId: "same-id", title: "Project on B" }],
+              },
+              { current: {} },
+            ),
+          ),
+        );
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            yield* seedProjectRegistration("instance-b", "https://b.test", "secret-b");
+            return yield* callTool("project_list", { scope: { kind: "all_instances" } });
+          }).pipe(Effect.provide(layer)),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              items: [
+                {
+                  project: { instanceId: "instance-a", projectId: "same-id" },
+                  title: "Project on A",
+                },
+                {
+                  project: { instanceId: "instance-b", projectId: "same-id" },
+                  title: "Project on B",
+                },
+              ],
+              coverage: "complete_for_query",
+              failures: [],
+            },
+          },
+          observations: [
+            { instanceId: "instance-a", freshness: "fresh" },
+            { instanceId: "instance-b", freshness: "fresh" },
+          ],
+        });
+      }),
+    ),
+  );
+
+  it.live("reports coverage unknown when every instance fails in aggregate scope", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const failures: { current: Readonly<Record<string, T3CodeAdapterError>> } = {
+          current: {
+            "https://a.test": new T3CodeAdapterError({
+              kind: "transport",
+              message: "The instance is unreachable.",
+              uncertain: true,
+              status: null,
+            }),
+          },
+        };
+        const layer = appLayer(
+          databasePath,
+          InstanceConnections.layerWithAdapter(projectFixtures({}, failures)),
+        );
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("project_list", { scope: { kind: "all_instances" } });
+          }).pipe(Effect.provide(layer)),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              items: [],
+              coverage: "unknown",
+              limitations: ["No target instance could be discovered."],
+              failures: [{ instanceId: "instance-a", error: { code: "unavailable" } }],
+            },
+          },
+          observations: [],
+        });
+      }),
+    ),
+  );
+
+  it.live("serves immutable continuation pages that survive a database reopen", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const layer = () =>
+          appLayer(
+            databasePath,
+            InstanceConnections.layerWithAdapter(
+              projectFixtures(
+                {
+                  "https://a.test": [
+                    { projectId: "project-1", title: "Project 1" },
+                    { projectId: "project-2", title: "Project 2" },
+                    { projectId: "project-3", title: "Project 3" },
+                  ],
+                },
+                { current: {} },
+              ),
+            ),
+          );
+        const first = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("project_list", {
+              scope: { kind: "instance", instanceId: "instance-a" },
+              limit: 2,
+            });
+          }).pipe(Effect.provide(layer())),
+        );
+
+        const firstPage = okPageValue(first[0]?.result);
+        expect(firstPage.nextCursor).toEqual(expect.any(String));
+        expect(first[0]?.result).toMatchObject({
+          observations: [{ instanceId: "instance-a", freshness: "fresh", sourceSequence: 17 }],
+        });
+
+        const second = yield* Effect.scoped(
+          callTool("project_list", {
+            scope: { kind: "instance", instanceId: "instance-a" },
+            cursor: firstPage.nextCursor,
+            limit: 2,
+          }).pipe(Effect.provide(layer())),
+        );
+        expect(second[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              items: [{ project: { projectId: "project-3" } }],
+              nextCursor: null,
+              coverage: "complete_for_query",
+            },
+          },
+          observations: [{ instanceId: "instance-a", freshness: "fresh", sourceSequence: 17 }],
+          warnings: [],
+        });
+      }),
+    ),
+  );
+
+  it.live("returns cursor_mismatch when a cursor is used with a different scope", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const layer = appLayer(
+          databasePath,
+          InstanceConnections.layerWithAdapter(
+            projectFixtures(
+              {
+                "https://a.test": [
+                  { projectId: "project-1", title: "Project 1" },
+                  { projectId: "project-2", title: "Project 2" },
+                ],
+              },
+              { current: {} },
+            ),
+          ),
+        );
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const first = yield* callTool("project_list", {
+              scope: { kind: "all_instances" },
+              limit: 1,
+            });
+            const cursor = okPageValue(first[0]?.result).nextCursor;
+            const wrongScope = yield* callTool("project_list", {
+              scope: { kind: "instance", instanceId: "instance-a" },
+              cursor: cursor ?? undefined,
+            });
+            const malformed = yield* callTool("project_list", {
+              scope: { kind: "all_instances" },
+              cursor: "not-a-cursor",
+            });
+            return { wrongScope, malformed };
+          }).pipe(Effect.provide(layer)),
+        );
+
+        expect(result.wrongScope[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "cursor_mismatch", retry: "safe_read" } },
+        });
+        expect(result.malformed[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "cursor_mismatch", retry: "safe_read" } },
+        });
+      }),
+    ),
+  );
+
+  it.live("expires retained captures after the capture retention window", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const connections = InstanceConnections.layerWithAdapter(
+          projectFixtures(
+            {
+              "https://a.test": [
+                { projectId: "project-1", title: "Project 1" },
+                { projectId: "project-2", title: "Project 2" },
+              ],
+            },
+            { current: {} },
+          ),
+        );
+        const shortRetention = serverToolkitLayer.pipe(
+          Layer.provideMerge(connections),
+          Layer.provideMerge(LocalStore.layer({ databasePath, captureRetentionMillis: 25 })),
+        );
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const first = yield* callTool("project_list", {
+              scope: { kind: "instance", instanceId: "instance-a" },
+              limit: 1,
+            });
+            const cursor = okPageValue(first[0]?.result).nextCursor;
+            yield* Effect.sleep("60 millis");
+            const expired = yield* callTool("project_list", {
+              scope: { kind: "instance", instanceId: "instance-a" },
+              cursor: cursor ?? undefined,
+            });
+            return { first, expired };
+          }).pipe(Effect.provide(shortRetention)),
+        );
+
+        expect(result.first[0]?.result).toMatchObject({ result: { kind: "ok" } });
+        expect(result.expired[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "cursor_expired", retry: "safe_read" } },
+        });
+      }),
+    ),
+  );
+
+  it.live("marks explicit stale reads after a fresh failure and never fails over", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const failures: { current: Readonly<Record<string, T3CodeAdapterError>> } = {
+          current: {},
+        };
+        const layer = appLayer(
+          databasePath,
+          InstanceConnections.layerWithAdapter(
+            projectFixtures(
+              {
+                "https://a.test": [
+                  { projectId: "project-1", title: "Project 1" },
+                  { projectId: "project-2", title: "Project 2" },
+                ],
+              },
+              failures,
+            ),
+          ),
+        );
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const fresh = yield* callTool("project_list", {
+              scope: { kind: "instance", instanceId: "instance-a" },
+            });
+            failures.current = {
+              "https://a.test": new T3CodeAdapterError({
+                kind: "transport",
+                message: "The instance is unreachable.",
+                uncertain: true,
+                status: null,
+              }),
+            };
+            const plain = yield* callTool("project_list", {
+              scope: { kind: "instance", instanceId: "instance-a" },
+            });
+            const stale = yield* callTool("project_list", {
+              scope: { kind: "instance", instanceId: "instance-a" },
+              allowStale: true,
+            });
+            return { fresh, plain, stale };
+          }).pipe(Effect.provide(layer)),
+        );
+
+        expect(result.fresh[0]?.result).toMatchObject({
+          result: { kind: "ok", value: { coverage: "complete_for_query" } },
+          observations: [{ instanceId: "instance-a", freshness: "fresh" }],
+        });
+        expect(result.plain[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "unavailable", retry: "safe_read" } },
+        });
+        expect(result.stale[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              items: [
+                { project: { projectId: "project-1" } },
+                { project: { projectId: "project-2" } },
+              ],
+              coverage: "complete_for_query",
+              failures: [],
+            },
+          },
+          observations: [
+            {
+              instanceId: "instance-a",
+              freshness: "stale",
+              coverage: "partial",
+              limitations: [expect.stringContaining("retained capture")],
+            },
+          ],
+          warnings: [{ code: "fresh_read_failed" }],
+        });
+      }),
+    ),
+  );
+
+  it.live("serves unavailable peers from retained captures in aggregate stale reads", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const failures: { current: Readonly<Record<string, T3CodeAdapterError>> } = {
+          current: {},
+        };
+        const layer = appLayer(
+          databasePath,
+          InstanceConnections.layerWithAdapter(
+            projectFixtures(
+              {
+                "https://a.test": [{ projectId: "project-a", title: "Project A" }],
+                "https://b.test": [{ projectId: "project-b", title: "Project B" }],
+              },
+              failures,
+            ),
+          ),
+        );
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            yield* seedProjectRegistration("instance-b", "https://b.test", "secret-b");
+            yield* callTool("project_list", { scope: { kind: "all_instances" } });
+            failures.current = {
+              "https://b.test": new T3CodeAdapterError({
+                kind: "transport",
+                message: "The instance is unreachable.",
+                uncertain: true,
+                status: null,
+              }),
+            };
+            return yield* callTool("project_list", {
+              scope: { kind: "all_instances" },
+              allowStale: true,
+            });
+          }).pipe(Effect.provide(layer)),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              items: [
+                { project: { instanceId: "instance-a", projectId: "project-a" } },
+                { project: { instanceId: "instance-b", projectId: "project-b" } },
+              ],
+              coverage: "complete_for_query",
+              failures: [],
+            },
+          },
+          observations: [
+            { instanceId: "instance-a", freshness: "fresh" },
+            { instanceId: "instance-b", freshness: "stale" },
+          ],
+          warnings: [{ code: "fresh_read_failed" }],
+        });
+      }),
+    ),
+  );
+
+  it.live("returns the typed failure when no retained capture exists for a stale read", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const failures: { current: Readonly<Record<string, T3CodeAdapterError>> } = {
+          current: {
+            "https://a.test": new T3CodeAdapterError({
+              kind: "transport",
+              message: "The instance is unreachable.",
+              uncertain: true,
+              status: null,
+            }),
+          },
+        };
+        const layer = appLayer(
+          databasePath,
+          InstanceConnections.layerWithAdapter(projectFixtures({}, failures)),
+        );
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("project_list", {
+              scope: { kind: "instance", instanceId: "instance-a" },
+              allowStale: true,
+            });
+          }).pipe(Effect.provide(layer)),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "unavailable", retry: "safe_read" } },
+          observations: [],
+          warnings: [],
         });
       }),
     ),

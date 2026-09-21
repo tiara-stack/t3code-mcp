@@ -11,10 +11,13 @@ import * as Predicate from "effect/Predicate";
 import * as Result from "effect/Result";
 import * as Rpc from "effect/unstable/rpc/Rpc";
 import * as RpcClient from "effect/unstable/rpc/RpcClient";
+import * as RpcClientError from "effect/unstable/rpc/RpcClientError";
 import * as RpcGroup from "effect/unstable/rpc/RpcGroup";
 import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization";
 import * as Schema from "effect/Schema";
+import * as Filter from "effect/Filter";
 import * as Semaphore from "effect/Semaphore";
+import * as Stream from "effect/Stream";
 import * as Socket from "effect/unstable/socket/Socket";
 import * as HttpClient from "effect/unstable/http/HttpClient";
 import * as HttpClientRequest from "effect/unstable/http/HttpClientRequest";
@@ -69,13 +72,102 @@ const WebSocketTicketWireSchema = Schema.Struct({
   expiresAt: Schema.String,
 });
 
+const trimmedNonEmptyWireString = Schema.String.check(
+  Schema.makeFilter((value) => value.length > 0 && value.trim() === value, {
+    message: "expected a trimmed non-empty string",
+  }),
+);
+
+const ModelSelectionOptionWireSchema = Schema.Struct({
+  id: trimmedNonEmptyWireString,
+  value: Schema.Union([Schema.String, Schema.Boolean]),
+});
+
+const ModelSelectionWireSchema = Schema.Struct({
+  instanceId: trimmedNonEmptyWireString,
+  model: trimmedNonEmptyWireString,
+  options: Schema.optionalKey(Schema.Array(ModelSelectionOptionWireSchema)),
+});
+
+const ProjectShellWireSchema = Schema.Struct({
+  id: trimmedNonEmptyWireString,
+  title: trimmedNonEmptyWireString,
+  workspaceRoot: trimmedNonEmptyWireString,
+  defaultModelSelection: Schema.NullOr(ModelSelectionWireSchema),
+});
+
+const ProjectSnapshotWireSchema = Schema.Struct({
+  snapshotSequence: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  projects: Schema.Array(ProjectShellWireSchema),
+});
+
+const nonNegativeWireInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0));
+
+const SubscribeShellInputWireSchema = Schema.Struct({
+  afterSequence: Schema.optionalKey(nonNegativeWireInt),
+  requestCompletionMarker: Schema.optionalKey(Schema.Boolean),
+});
+
+const ShellStreamItemWireSchema = Schema.Union([
+  Schema.Struct({
+    kind: Schema.Literal("synchronized"),
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("snapshot"),
+    snapshot: ProjectSnapshotWireSchema,
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("project-upserted"),
+    sequence: nonNegativeWireInt,
+    project: ProjectShellWireSchema,
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("project-removed"),
+    sequence: nonNegativeWireInt,
+    projectId: trimmedNonEmptyWireString,
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("thread-upserted"),
+    sequence: nonNegativeWireInt,
+    thread: Schema.Unknown,
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("thread-removed"),
+    sequence: nonNegativeWireInt,
+    threadId: trimmedNonEmptyWireString,
+  }),
+]);
+
+const EnvironmentAuthorizationErrorWireSchema = Schema.Struct({
+  _tag: Schema.Literal("EnvironmentAuthorizationError"),
+  message: Schema.String,
+  requiredScope: Schema.String,
+});
+
+const GetSnapshotErrorWireSchema = Schema.Struct({
+  _tag: Schema.Literal("OrchestrationGetSnapshotError"),
+  message: Schema.String,
+});
+
 const ServerProbeRpc = Rpc.make("server.probe", {
   payload: Schema.Struct({}),
   success: Schema.Struct({}),
   error: Schema.Unknown,
 });
 
-const AdapterRpcGroup = RpcGroup.make(ServerProbeRpc);
+const SubscribeShellRpc = Rpc.make("orchestration.subscribeShell", {
+  payload: SubscribeShellInputWireSchema,
+  success: ShellStreamItemWireSchema,
+  error: Schema.Union([GetSnapshotErrorWireSchema, EnvironmentAuthorizationErrorWireSchema]),
+  stream: true,
+});
+
+const AdapterRpcGroup = RpcGroup.make(ServerProbeRpc, SubscribeShellRpc);
+
+type AdapterRpcClient = RpcClient.RpcClient<
+  RpcGroup.Rpcs<typeof AdapterRpcGroup>,
+  RpcClientError.RpcClientError
+>;
 
 const PINNED_T3CODE_VERSION = "0.0.38";
 const REQUIRED_T3CODE_SCOPES = ["orchestration:read", "orchestration:operate"] as const;
@@ -242,6 +334,24 @@ export interface InstanceDiagnostics {
   readonly capabilities: ReadonlyArray<Capability>;
 }
 
+export interface DiscoveredModelSelection {
+  readonly providerInstanceId: string;
+  readonly model: string;
+  readonly options?: ReadonlyArray<{ readonly id: string; readonly value: string | boolean }>;
+}
+
+export interface DiscoveredProject {
+  readonly projectId: string;
+  readonly title: string;
+  readonly repositoryPath: string;
+  readonly defaultModel: DiscoveredModelSelection | null;
+}
+
+export interface ProjectListing {
+  readonly snapshotSequence: number;
+  readonly projects: ReadonlyArray<DiscoveredProject>;
+}
+
 export interface T3CodeAdapterService {
   readonly exchangePairingCode: (
     input: PairingExchangeInput,
@@ -254,6 +364,10 @@ export interface T3CodeAdapterService {
     readonly endpoint: string;
     readonly credential: string;
   }) => Effect.Effect<InstanceDiagnostics, T3CodeAdapterError>;
+  readonly listProjects: (input: {
+    readonly endpoint: string;
+    readonly credential: string;
+  }) => Effect.Effect<ProjectListing, T3CodeAdapterError>;
 }
 
 export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterService>()(
@@ -482,44 +596,140 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
           }),
         );
 
+      const withAuthenticatedRpc = <A>(
+        endpoint: string,
+        credential: string,
+        use: (client: AdapterRpcClient) => Effect.Effect<A, unknown>,
+      ): Effect.Effect<A, T3CodeAdapterError> =>
+        Effect.gen(function* () {
+          const ticket = yield* json(
+            HttpClientRequest.post(endpointUrl(endpoint, "/api/auth/websocket-ticket")).pipe(
+              HttpClientRequest.bearerToken(credential),
+            ),
+            WebSocketTicketWireSchema,
+            "ticket",
+          );
+
+          const boundedWebSocketConstructor = Layer.effect(
+            Socket.WebSocketConstructor,
+            Effect.gen(function* () {
+              const makeWebSocket = yield* Socket.WebSocketConstructor;
+              return (url: string, options?: Socket.WebSocketConstructorOptions) =>
+                boundedWebSocket(makeWebSocket(url, options));
+            }),
+          ).pipe(Layer.provide(NodeSocket.layerWebSocketConstructorWS));
+          const socketLayer = Socket.layerWebSocket(websocketUrl(endpoint, ticket.ticket), {
+            openTimeout: Duration.millis(MUTATION_RPC_DEADLINE_MILLIS),
+          }).pipe(Layer.provide(boundedWebSocketConstructor));
+
+          return yield* Effect.scoped(
+            Effect.gen(function* () {
+              const client = yield* RpcClient.make(AdapterRpcGroup);
+              return yield* use(client);
+            }).pipe(
+              Effect.provide(RpcClient.layerProtocolSocket({ retryTransientErrors: false })),
+              Effect.provide(RpcSerialization.layerJson),
+              Effect.provide(socketLayer),
+            ),
+          );
+        }).pipe(
+          Effect.timeoutOrElse({
+            duration: Duration.millis(MUTATION_RPC_DEADLINE_MILLIS),
+            orElse: () =>
+              Effect.fail(
+                new T3CodeAdapterError({
+                  kind: "timeout",
+                  message: "The authenticated T3Code RPC request timed out.",
+                  uncertain: false,
+                  status: null,
+                }),
+              ),
+          }),
+          Effect.mapError((error): T3CodeAdapterError => {
+            if (error instanceof T3CodeAdapterError) return error;
+            if (error instanceof RpcClientError.RpcClientError) {
+              const tag = Predicate.hasProperty(error.reason, "_tag")
+                ? String(error.reason._tag)
+                : "";
+              return tag.startsWith("Socket")
+                ? new T3CodeAdapterError({
+                    kind: "transport",
+                    message: "The authenticated T3Code RPC channel dropped.",
+                    uncertain: true,
+                    status: null,
+                  })
+                : new T3CodeAdapterError({
+                    kind: "wire_incompatible",
+                    message: "The T3Code authenticated WebSocket RPC contract was rejected.",
+                    uncertain: false,
+                    status: null,
+                  });
+            }
+            return new T3CodeAdapterError({
+              kind: "wire_incompatible",
+              message: "The T3Code authenticated WebSocket RPC contract was rejected.",
+              uncertain: false,
+              status: null,
+            });
+          }),
+        );
+
+      const verifyEnvironmentSession = (input: {
+        readonly endpoint: string;
+        readonly credential: string;
+      }): Effect.Effect<
+        {
+          readonly descriptor: Schema.Schema.Type<typeof EnvironmentDescriptorWireSchema>;
+          readonly scopes: ReadonlyArray<string> | undefined;
+          readonly authorization: Authorization;
+        },
+        T3CodeAdapterError
+      > =>
+        Effect.gen(function* () {
+          const descriptor = yield* json(
+            HttpClientRequest.get(endpointUrl(input.endpoint, "/.well-known/t3/environment")),
+            EnvironmentDescriptorWireSchema,
+            "descriptor",
+          );
+          if (descriptor.serverVersion !== PINNED_T3CODE_VERSION) {
+            return yield* Effect.fail(
+              new T3CodeAdapterError({
+                kind: "incompatible_instance",
+                message: `The T3Code instance is not pinned to version ${PINNED_T3CODE_VERSION}.`,
+                uncertain: false,
+                status: null,
+              }),
+            );
+          }
+
+          const session = yield* json(
+            HttpClientRequest.get(endpointUrl(input.endpoint, "/api/auth/session")).pipe(
+              HttpClientRequest.bearerToken(input.credential),
+            ),
+            AuthSessionWireSchema,
+            "session",
+          );
+          if (!session.authenticated) {
+            return yield* Effect.fail(
+              new T3CodeAdapterError({
+                kind: "pairing_required",
+                message: "The saved T3Code credential is expired or revoked.",
+                uncertain: false,
+                status: null,
+              }),
+            );
+          }
+          return {
+            descriptor,
+            scopes: session.scopes,
+            authorization: authorizationFromSession(session.authenticated, session.scopes),
+          };
+        });
+
       const probeCredential = (input: { readonly endpoint: string; readonly credential: string }) =>
         withCapacity(
           Effect.gen(function* () {
-            const descriptor = yield* json(
-              HttpClientRequest.get(endpointUrl(input.endpoint, "/.well-known/t3/environment")),
-              EnvironmentDescriptorWireSchema,
-              "descriptor",
-            );
-            if (descriptor.serverVersion !== PINNED_T3CODE_VERSION) {
-              return yield* Effect.fail(
-                new T3CodeAdapterError({
-                  kind: "incompatible_instance",
-                  message: `The T3Code instance is not pinned to version ${PINNED_T3CODE_VERSION}.`,
-                  uncertain: false,
-                  status: null,
-                }),
-              );
-            }
-
-            const session = yield* json(
-              HttpClientRequest.get(endpointUrl(input.endpoint, "/api/auth/session")).pipe(
-                HttpClientRequest.bearerToken(input.credential),
-              ),
-              AuthSessionWireSchema,
-              "session",
-            );
-            const scopes = session.scopes;
-            if (!session.authenticated) {
-              return yield* Effect.fail(
-                new T3CodeAdapterError({
-                  kind: "pairing_required",
-                  message: "The saved T3Code credential is expired or revoked.",
-                  uncertain: false,
-                  status: null,
-                }),
-              );
-            }
-            const authorization = authorizationFromSession(session.authenticated, scopes);
+            const { descriptor, scopes, authorization } = yield* verifyEnvironmentSession(input);
             const diagnostics = {
               environmentId: descriptor.environmentId,
               serverVersion: descriptor.serverVersion,
@@ -537,58 +747,8 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
               };
             }
 
-            const ticket = yield* json(
-              HttpClientRequest.post(
-                endpointUrl(input.endpoint, "/api/auth/websocket-ticket"),
-              ).pipe(HttpClientRequest.bearerToken(input.credential)),
-              WebSocketTicketWireSchema,
-              "ticket",
-            );
-
-            const boundedWebSocketConstructor = Layer.effect(
-              Socket.WebSocketConstructor,
-              Effect.gen(function* () {
-                const makeWebSocket = yield* Socket.WebSocketConstructor;
-                return (url: string, options?: Socket.WebSocketConstructorOptions) =>
-                  boundedWebSocket(makeWebSocket(url, options));
-              }),
-            ).pipe(Layer.provide(NodeSocket.layerWebSocketConstructorWS));
-            const socketLayer = Socket.layerWebSocket(websocketUrl(input.endpoint, ticket.ticket), {
-              openTimeout: Duration.millis(MUTATION_RPC_DEADLINE_MILLIS),
-            }).pipe(Layer.provide(boundedWebSocketConstructor));
-
-            yield* Effect.scoped(
-              Effect.gen(function* () {
-                const client = yield* RpcClient.make(AdapterRpcGroup);
-                yield* client["server.probe"]({});
-              }).pipe(
-                Effect.provide(RpcClient.layerProtocolSocket({ retryTransientErrors: false })),
-                Effect.provide(RpcSerialization.layerJson),
-                Effect.provide(socketLayer),
-              ),
-            ).pipe(
-              Effect.timeoutOrElse({
-                duration: Duration.millis(MUTATION_RPC_DEADLINE_MILLIS),
-                orElse: () =>
-                  Effect.fail(
-                    new T3CodeAdapterError({
-                      kind: "timeout",
-                      message: "The authenticated T3Code RPC probe timed out.",
-                      uncertain: false,
-                      status: null,
-                    }),
-                  ),
-              }),
-              Effect.mapError((error) =>
-                error instanceof T3CodeAdapterError
-                  ? error
-                  : new T3CodeAdapterError({
-                      kind: "wire_incompatible",
-                      message: "The T3Code authenticated WebSocket RPC contract was rejected.",
-                      uncertain: false,
-                      status: null,
-                    }),
-              ),
+            yield* withAuthenticatedRpc(input.endpoint, input.credential, (client) =>
+              client["server.probe"]({}),
             );
 
             return {
@@ -603,6 +763,99 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
         readonly endpoint: string;
         readonly credential: string;
       }) => probeCredential(input).pipe(Effect.map(({ diagnostics }) => diagnostics));
+
+      const snapshotProjects = (input: {
+        readonly endpoint: string;
+        readonly credential: string;
+      }): Effect.Effect<ProjectListing, T3CodeAdapterError> =>
+        withAuthenticatedRpc(input.endpoint, input.credential, (client) =>
+          Effect.gen(function* () {
+            const stream: Stream.Stream<
+              typeof ShellStreamItemWireSchema.Type,
+              | typeof GetSnapshotErrorWireSchema.Type
+              | typeof EnvironmentAuthorizationErrorWireSchema.Type
+              | RpcClientError.RpcClientError
+            > = client["orchestration.subscribeShell"]({});
+            const snapshots = yield* Stream.runCollect(
+              Stream.filterMap(
+                stream,
+                Filter.fromPredicateOption((item) =>
+                  item.kind === "snapshot" ? Option.some(item.snapshot) : Option.none(),
+                ),
+              ).pipe(Stream.take(1)),
+            );
+            const snapshot = snapshots[0];
+            if (snapshot === undefined) {
+              return yield* Effect.fail(
+                new T3CodeAdapterError({
+                  kind: "transport",
+                  message: "The T3Code shell snapshot stream ended before a snapshot frame.",
+                  uncertain: true,
+                  status: null,
+                }),
+              );
+            }
+            return {
+              snapshotSequence: snapshot.snapshotSequence,
+              projects: snapshot.projects.map((project) => ({
+                projectId: project.id,
+                title: project.title,
+                repositoryPath: project.workspaceRoot,
+                defaultModel:
+                  project.defaultModelSelection === null
+                    ? null
+                    : {
+                        providerInstanceId: project.defaultModelSelection.instanceId,
+                        model: project.defaultModelSelection.model,
+                        ...(project.defaultModelSelection.options === undefined
+                          ? {}
+                          : { options: project.defaultModelSelection.options }),
+                      },
+              })),
+            } satisfies ProjectListing;
+          }).pipe(
+            Effect.mapError((error): T3CodeAdapterError | RpcClientError.RpcClientError => {
+              if (error instanceof T3CodeAdapterError) return error;
+              if (error instanceof RpcClientError.RpcClientError) return error;
+              if (error._tag === "EnvironmentAuthorizationError") {
+                return new T3CodeAdapterError({
+                  kind: "authorization",
+                  message: `The T3Code credential lacks the required ${error.requiredScope} scope.`,
+                  uncertain: false,
+                  status: null,
+                });
+              }
+              return new T3CodeAdapterError({
+                kind: "transport",
+                message: `The T3Code project snapshot was unavailable: ${error.message}`,
+                uncertain: false,
+                status: null,
+              });
+            }),
+          ),
+        );
+
+      const listProjects = (input: {
+        readonly endpoint: string;
+        readonly credential: string;
+      }): Effect.Effect<ProjectListing, T3CodeAdapterError> =>
+        withCapacity(
+          Effect.gen(function* () {
+            const { authorization } = yield* verifyEnvironmentSession(input);
+            if (authorization.read !== "allowed") {
+              return yield* Effect.fail(
+                new T3CodeAdapterError({
+                  kind: "authorization",
+                  message: "The saved T3Code credential lacks the orchestration read scope.",
+                  uncertain: false,
+                  status: null,
+                }),
+              );
+            }
+
+            return yield* snapshotProjects(input);
+          }),
+        );
 
       const verifyCredential = (input: {
         readonly endpoint: string;
@@ -631,7 +884,12 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
           } satisfies VerifiedInstance;
         });
 
-      return T3CodeAdapter.of({ exchangePairingCode, verifyCredential, inspectCredential });
+      return T3CodeAdapter.of({
+        exchangePairingCode,
+        verifyCredential,
+        inspectCredential,
+        listProjects,
+      });
     }),
   ).pipe(Layer.provide(NodeHttpClient.layerUndici), Layer.provide(NodeCrypto.layer));
 }

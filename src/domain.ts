@@ -317,6 +317,120 @@ export const InstanceGetInputSchema = Schema.declare<{
 
 export type InstanceGetInput = typeof InstanceGetInputSchema.Type;
 
+const projectScopeInstanceRuntimeShape = Schema.StructWithRest(
+  Schema.Struct({
+    kind: Schema.Literal("instance"),
+    instanceId: nonEmptyString,
+  }),
+  [
+    Schema.Record(
+      Schema.String.check(
+        Schema.makeFilter((key) => key !== "kind" && key !== "instanceId", {
+          message: "unknown project_list scope argument",
+        }),
+      ),
+      Schema.Never,
+    ),
+  ],
+);
+
+const projectScopeInstanceJsonShape = Schema.StructWithRest(
+  Schema.Struct({
+    kind: Schema.Literal("instance"),
+    instanceId: nonEmptyString,
+  }),
+  [Schema.Record(Schema.String, Schema.Never)],
+);
+
+const projectScopeAllRuntimeShape = Schema.StructWithRest(
+  Schema.Struct({
+    kind: Schema.Literal("all_instances"),
+  }),
+  [
+    Schema.Record(
+      Schema.String.check(
+        Schema.makeFilter((key) => key !== "kind", {
+          message: "unknown project_list scope argument",
+        }),
+      ),
+      Schema.Never,
+    ),
+  ],
+);
+
+const projectScopeAllJsonShape = Schema.StructWithRest(
+  Schema.Struct({
+    kind: Schema.Literal("all_instances"),
+  }),
+  [Schema.Record(Schema.String, Schema.Never)],
+);
+
+const projectListScopeRuntimeShape = Schema.Union([
+  projectScopeInstanceRuntimeShape,
+  projectScopeAllRuntimeShape,
+]);
+
+const projectListScopeJsonShape = Schema.Union([
+  projectScopeInstanceJsonShape,
+  projectScopeAllJsonShape,
+]);
+
+const projectListFields = Schema.Struct({
+  scope: projectListScopeRuntimeShape,
+  cursor: Schema.optionalKey(nonEmptyString),
+  limit: Schema.optionalKey(pageLimit),
+  allowStale: Schema.optionalKey(Schema.Boolean),
+});
+
+const projectListJsonFields = Schema.Struct({
+  scope: projectListScopeJsonShape,
+  cursor: Schema.optionalKey(nonEmptyString),
+  limit: Schema.optionalKey(pageLimit),
+  allowStale: Schema.optionalKey(Schema.Boolean),
+});
+
+const unknownProjectListField = Schema.String.check(
+  Schema.makeFilter(
+    (key) => key !== "scope" && key !== "cursor" && key !== "limit" && key !== "allowStale",
+    {
+      message: "unknown project_list argument",
+    },
+  ),
+);
+
+const projectListRuntimeShape = Schema.StructWithRest(projectListFields, [
+  Schema.Record(unknownProjectListField, Schema.Never),
+]);
+
+const projectListJsonShape = Schema.StructWithRest(projectListJsonFields, [
+  Schema.Record(Schema.String, Schema.Never),
+]);
+
+export const ProjectListInputSchema = Schema.declare<{
+  readonly scope: ProjectListScope;
+  readonly cursor?: string;
+  readonly limit?: number;
+  readonly allowStale?: boolean;
+}>(
+  (
+    input,
+  ): input is {
+    readonly scope: ProjectListScope;
+    readonly cursor?: string;
+    readonly limit?: number;
+    readonly allowStale?: boolean;
+  } => Schema.is(projectListRuntimeShape)(input),
+  {
+    toCodecJson: () =>
+      Schema.link()(projectListJsonShape, {
+        decode: SchemaGetter.passthrough({ strict: false }),
+        encode: SchemaGetter.passthrough({ strict: false }),
+      } as never),
+  },
+);
+
+export type ProjectListInput = typeof ProjectListInputSchema.Type;
+
 const operationGetFields = Schema.Struct({
   requestId,
   waitMs: Schema.optionalKey(
@@ -460,6 +574,11 @@ const projectReferenceSchema = Schema.Struct({
   instanceId: nonEmptyString,
   projectId: nonEmptyString,
 });
+
+// fallow-ignore-next-line unused-export
+export const ProjectReferenceSchema = projectReferenceSchema;
+
+export type ProjectReference = typeof ProjectReferenceSchema.Type;
 
 const threadReferenceSchema = Schema.Struct({
   instanceId: nonEmptyString,
@@ -635,7 +754,6 @@ export const InstanceListPageSchema = Schema.Struct({
 
 export type InstanceListPage = typeof InstanceListPageSchema.Type;
 
-// fallow-ignore-next-line unused-export
 export const ObservationSchema = Schema.Struct({
   instanceId: nonEmptyString,
   observedAt: nonEmptyString,
@@ -666,6 +784,55 @@ const OperationGetValueSchema = Schema.Struct({
 
 export const OperationGetToolResultSchema = toolResultFields(OperationGetValueSchema);
 
+const modelOptionSchema = Schema.Struct({
+  id: nonEmptyString,
+  value: Schema.Union([Schema.String, Schema.Boolean]),
+});
+
+// fallow-ignore-next-line unused-export
+export const ModelSelectionSchema = Schema.Struct({
+  providerInstanceId: nonEmptyString,
+  model: nonEmptyString,
+  options: Schema.optionalKey(Schema.Array(modelOptionSchema)),
+});
+
+export type ModelSelection = typeof ModelSelectionSchema.Type;
+
+export const ProjectSummarySchema = Schema.Struct({
+  project: projectReferenceSchema,
+  title: nonEmptyString,
+  repositoryPath: nonEmptyString,
+  defaultModel: Schema.NullOr(ModelSelectionSchema),
+});
+
+export type ProjectSummary = typeof ProjectSummarySchema.Type;
+
+const projectPageFailuresSchema = Schema.Array(
+  Schema.Struct({
+    instanceId: nonEmptyString,
+    error: ToolFailureSchema,
+  }),
+);
+
+// fallow-ignore-next-line unused-export
+export const ProjectListPageSchema = Schema.Struct({
+  items: Schema.Array(ProjectSummarySchema),
+  nextCursor: Schema.NullOr(nonEmptyString),
+  coverage: Schema.Literals(coverageStates),
+  limitations: Schema.Array(Schema.String),
+  failures: projectPageFailuresSchema,
+});
+
+export type ProjectListPage = typeof ProjectListPageSchema.Type;
+
+export const ProjectListToolResultSchema = toolResultFields(ProjectListPageSchema);
+
+export type ProjectListToolResult = typeof ProjectListToolResultSchema.Type;
+
+export type ProjectListScope =
+  | { readonly kind: "instance"; readonly instanceId: string }
+  | { readonly kind: "all_instances" };
+
 export type ToolResult = typeof ToolResultSchema.Type;
 export type OperationToolResult = typeof OperationToolResultSchema.Type;
 export type OperationGetValue = typeof OperationGetValueSchema.Type;
@@ -690,6 +857,27 @@ export const makeToolSuccess = (value: InstanceListPage, observedAt: string): To
     limitations: value.limitations,
   })),
   warnings: [cachedConnectionWarning],
+});
+
+export const staleProjectReadLimitation =
+  "Served from a retained capture after a fresh read failed.";
+
+export const makeProjectListToolSuccess = (
+  value: ProjectListPage,
+  observations: ReadonlyArray<Observation>,
+): ProjectListToolResult => ({
+  result: { kind: "ok" as const, value },
+  observations,
+  warnings: observations.flatMap((observation) =>
+    observation.freshness === "stale"
+      ? [
+          {
+            code: "fresh_read_failed" as const,
+            message: observation.limitations[0] ?? staleProjectReadLimitation,
+          },
+        ]
+      : [],
+  ),
 });
 
 export const serializedByteLength = (value: unknown): number =>

@@ -11,6 +11,7 @@ import { LocalStore, LocalStoreError } from "./local-store";
 import {
   T3CodeAdapter,
   T3CodeAdapterError,
+  type DiscoveredProject,
   type PairingExchangeInput,
   type StagedPairingToken,
   type T3CodeAdapterService,
@@ -18,6 +19,12 @@ import {
 } from "./t3code-adapter";
 
 export type VerifiedPairing = StagedPairingToken & VerifiedInstance;
+
+export interface DiscoveredProjects {
+  readonly snapshotSequence: number;
+  readonly projects: ReadonlyArray<DiscoveredProject>;
+  readonly observedAt: string;
+}
 
 export interface InstanceConnection {
   readonly instanceId: string;
@@ -49,6 +56,9 @@ export interface InstanceConnectionsService {
     instanceId: string,
     allowStale: boolean,
   ) => Effect.Effect<InstanceInspection, LocalStoreError | T3CodeAdapterError>;
+  readonly discoverProjects: (
+    instanceId: string,
+  ) => Effect.Effect<DiscoveredProjects, LocalStoreError | T3CodeAdapterError>;
   readonly invalidate: (instanceId: string) => Effect.Effect<void>;
 }
 
@@ -182,6 +192,41 @@ export class InstanceConnections extends Context.Service<
             return { ...staged, ...verified } satisfies VerifiedPairing;
           });
         const invalidate = (instanceId: string) => Effect.sync(() => evictCached(instanceId));
+
+        const discoverProjects = (
+          instanceId: string,
+        ): Effect.Effect<DiscoveredProjects, LocalStoreError | T3CodeAdapterError> =>
+          Effect.gen(function* () {
+            const registration = yield* store.getRegistration(instanceId);
+            if (registration === null) {
+              return yield* Effect.fail(
+                new LocalStoreError({
+                  kind: "registration_not_found",
+                  message: "The saved registration was not found.",
+                }),
+              );
+            }
+            if (registration.credential === null) {
+              return yield* Effect.fail(
+                new T3CodeAdapterError({
+                  kind: "pairing_required",
+                  message: "The saved registration requires pairing before projects can be listed.",
+                  uncertain: false,
+                  status: null,
+                }),
+              );
+            }
+            const connection = yield* acquire(instanceId);
+            const listing = yield* withInstanceCapacity(
+              instanceId,
+              adapter.listProjects({
+                endpoint: connection.endpoint,
+                credential: connection.credential,
+              }),
+            );
+            const observedAt = new Date(yield* Clock.currentTimeMillis).toISOString();
+            return { ...listing, observedAt };
+          });
 
         const inspectFresh = (
           instanceId: string,
@@ -403,6 +448,7 @@ export class InstanceConnections extends Context.Service<
           pair,
           acquire,
           inspect,
+          discoverProjects,
           invalidate,
         });
       }),
