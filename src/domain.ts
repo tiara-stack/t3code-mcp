@@ -431,6 +431,67 @@ export const ProjectListInputSchema = Schema.declare<{
 
 export type ProjectListInput = typeof ProjectListInputSchema.Type;
 
+const modelListFields = Schema.Struct({
+  instanceId: nonEmptyString,
+  providerInstanceId: Schema.optionalKey(nonEmptyString),
+  cursor: Schema.optionalKey(nonEmptyString),
+  limit: Schema.optionalKey(pageLimit),
+  allowStale: Schema.optionalKey(Schema.Boolean),
+});
+
+const unknownModelListField = Schema.String.check(
+  Schema.makeFilter(
+    (key) =>
+      key !== "instanceId" &&
+      key !== "providerInstanceId" &&
+      key !== "cursor" &&
+      key !== "limit" &&
+      key !== "allowStale",
+    {
+      message: "unknown model_list argument",
+    },
+  ),
+);
+
+const modelListRuntimeShape = Schema.StructWithRest(modelListFields, [
+  Schema.Record(unknownModelListField, Schema.Never),
+]);
+
+const modelListJsonShape = Schema.StructWithRest(modelListFields, [
+  Schema.Record(Schema.String, Schema.Never),
+]);
+
+/**
+ * The model list accepts only the contract fields for one saved instance
+ * registration and rejects unknown arguments like every other tool input.
+ */
+export const ModelListInputSchema = Schema.declare<{
+  readonly instanceId: string;
+  readonly providerInstanceId?: string;
+  readonly cursor?: string;
+  readonly limit?: number;
+  readonly allowStale?: boolean;
+}>(
+  (
+    input,
+  ): input is {
+    readonly instanceId: string;
+    readonly providerInstanceId?: string;
+    readonly cursor?: string;
+    readonly limit?: number;
+    readonly allowStale?: boolean;
+  } => Schema.is(modelListRuntimeShape)(input),
+  {
+    toCodecJson: () =>
+      Schema.link()(modelListJsonShape, {
+        decode: SchemaGetter.passthrough({ strict: false }),
+        encode: SchemaGetter.passthrough({ strict: false }),
+      } as never),
+  },
+);
+
+export type ModelListInput = typeof ModelListInputSchema.Type;
+
 const operationGetFields = Schema.Struct({
   requestId,
   waitMs: Schema.optionalKey(
@@ -833,6 +894,60 @@ export type ProjectListScope =
   | { readonly kind: "instance"; readonly instanceId: string }
   | { readonly kind: "all_instances" };
 
+const modelSelectOptionSchema = Schema.Struct({
+  kind: Schema.Literal("select"),
+  id: nonEmptyString,
+  values: Schema.Array(Schema.String),
+  defaultValue: Schema.NullOr(Schema.String),
+});
+
+const modelBooleanOptionSchema = Schema.Struct({
+  kind: Schema.Literal("boolean"),
+  id: nonEmptyString,
+  defaultValue: Schema.NullOr(Schema.Boolean),
+});
+
+const modelListingOptionSchema = Schema.Union([modelSelectOptionSchema, modelBooleanOptionSchema]);
+
+export const ModelSummarySchema = Schema.Struct({
+  instanceId: nonEmptyString,
+  providerInstanceId: nonEmptyString,
+  providerName: nonEmptyString,
+  model: nonEmptyString,
+  displayName: nonEmptyString,
+  availability: Schema.Literals(["available", "unavailable", "unknown"]),
+  unavailableReason: Schema.NullOr(Schema.String),
+  capabilities: Schema.Array(CapabilitySchema),
+  options: Schema.Array(modelListingOptionSchema),
+});
+
+export type ModelSummary = typeof ModelSummarySchema.Type;
+
+// fallow-ignore-next-line unused-export
+export const ModelListPageSchema = Schema.Struct({
+  items: Schema.Array(ModelSummarySchema),
+  nextCursor: Schema.NullOr(nonEmptyString),
+  coverage: Schema.Literals(coverageStates),
+  limitations: Schema.Array(Schema.String),
+  failures: projectPageFailuresSchema,
+});
+
+export type ModelListPage = typeof ModelListPageSchema.Type;
+
+export const ModelListToolResultSchema = toolResultFields(ModelListPageSchema);
+
+export type ModelListToolResult = typeof ModelListToolResultSchema.Type;
+
+/**
+ * A model list binds one saved instance registration and an optional native
+ * provider instance filter. It never mixes registrations with native provider
+ * identities.
+ */
+export type ModelListQuery = {
+  readonly instanceId: string;
+  readonly providerInstanceId?: string;
+};
+
 export type ToolResult = typeof ToolResultSchema.Type;
 export type OperationToolResult = typeof OperationToolResultSchema.Type;
 export type OperationGetValue = typeof OperationGetValueSchema.Type;
@@ -862,6 +977,25 @@ export const makeToolSuccess = (value: InstanceListPage, observedAt: string): To
 export const staleProjectReadLimitation =
   "Served from a retained capture after a fresh read failed.";
 
+export const staleModelReadLimitation = staleProjectReadLimitation;
+
+/**
+ * The conditional guarantees reported for a provider/model. The pinned
+ * T3Code 0.0.38 server configuration does not advertise per-model steering or
+ * retained-context behavior, so every guarantee stays unknown rather than
+ * claiming unverified support.
+ */
+const MODEL_CAPABILITY_NAMES = ["steer_current", "resume_retained"] as const;
+
+export const unknownModelCapabilities = (): ReadonlyArray<Capability> =>
+  MODEL_CAPABILITY_NAMES.map((name) => ({
+    name,
+    support: "unknown" as const,
+    reason:
+      "The pinned T3Code 0.0.38 server configuration does not advertise this conditional guarantee for the provider/model.",
+    limitations: ["Capability support has not been verified for this provider/model."],
+  }));
+
 export const makeProjectListToolSuccess = (
   value: ProjectListPage,
   observations: ReadonlyArray<Observation>,
@@ -874,6 +1008,24 @@ export const makeProjectListToolSuccess = (
           {
             code: "fresh_read_failed" as const,
             message: observation.limitations[0] ?? staleProjectReadLimitation,
+          },
+        ]
+      : [],
+  ),
+});
+
+export const makeModelListToolSuccess = (
+  value: ModelListPage,
+  observations: ReadonlyArray<Observation>,
+): ModelListToolResult => ({
+  result: { kind: "ok" as const, value },
+  observations,
+  warnings: observations.flatMap((observation) =>
+    observation.freshness === "stale"
+      ? [
+          {
+            code: "fresh_read_failed" as const,
+            message: observation.limitations[0] ?? staleModelReadLimitation,
           },
         ]
       : [],

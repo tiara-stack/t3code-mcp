@@ -144,15 +144,91 @@ const EnvironmentAuthorizationErrorWireSchema = Schema.Struct({
   requiredScope: Schema.String,
 });
 
+// The pinned tagged errors carry extra fields the adapter does not consume;
+// only the discriminating tag is required.
+const KeybindingsConfigErrorWireSchema = Schema.Struct({
+  _tag: Schema.Literal("KeybindingsConfigParseError"),
+});
+
+const ServerSettingsErrorWireSchema = Schema.Struct({
+  _tag: Schema.Literal("ServerSettingsError"),
+});
+
 const GetSnapshotErrorWireSchema = Schema.Struct({
   _tag: Schema.Literal("OrchestrationGetSnapshotError"),
   message: Schema.String,
+});
+
+/**
+ * Provider/model entries tolerate elements the pinned server already filters
+ * with ForwardCompatibleArray semantics: each provider, model, option choice,
+ * and option descriptor decodes individually so one malformed upstream element
+ * is skipped instead of failing the whole configuration read.
+ */
+const ServerProviderChoiceWireSchema = Schema.Struct({
+  id: trimmedNonEmptyWireString,
+  isDefault: Schema.optionalKey(Schema.Boolean),
+});
+
+const SelectProviderOptionDescriptorWireSchema = Schema.Struct({
+  type: Schema.Literal("select"),
+  id: trimmedNonEmptyWireString,
+  options: Schema.Array(Schema.Unknown),
+  currentValue: Schema.optionalKey(trimmedNonEmptyWireString),
+});
+
+const BooleanProviderOptionDescriptorWireSchema = Schema.Struct({
+  type: Schema.Literal("boolean"),
+  id: trimmedNonEmptyWireString,
+  currentValue: Schema.optionalKey(Schema.Boolean),
+});
+
+const ProviderOptionDescriptorWireSchema = Schema.Union([
+  SelectProviderOptionDescriptorWireSchema,
+  BooleanProviderOptionDescriptorWireSchema,
+]);
+
+const ModelCapabilitiesWireSchema = Schema.Struct({
+  optionDescriptors: Schema.optionalKey(Schema.Array(Schema.Unknown)),
+});
+
+const ServerProviderModelWireSchema = Schema.Struct({
+  slug: trimmedNonEmptyWireString,
+  name: trimmedNonEmptyWireString,
+  capabilities: Schema.optionalKey(Schema.NullOr(ModelCapabilitiesWireSchema)),
+});
+
+const ServerProviderWireSchema = Schema.Struct({
+  instanceId: trimmedNonEmptyWireString,
+  driver: trimmedNonEmptyWireString,
+  displayName: Schema.optionalKey(trimmedNonEmptyWireString),
+  availability: Schema.optionalKey(Schema.Literals(["available", "unavailable"])),
+  unavailableReason: Schema.optionalKey(trimmedNonEmptyWireString),
+  models: Schema.Array(Schema.Unknown),
+});
+
+/**
+ * Only the providers portion of the pinned ServerConfig is consumed; unknown
+ * top-level fields are ignored by the struct decoder.
+ */
+const ServerConfigWireSchema = Schema.Struct({
+  providers: Schema.Array(Schema.Unknown),
 });
 
 const ServerProbeRpc = Rpc.make("server.probe", {
   payload: Schema.Struct({}),
   success: Schema.Struct({}),
   error: Schema.Unknown,
+});
+
+const ServerGetConfigRpc = Rpc.make("server.getConfig", {
+  payload: Schema.Struct({}),
+  success: ServerConfigWireSchema,
+  error: Schema.Union([
+    KeybindingsConfigErrorWireSchema,
+    ServerSettingsErrorWireSchema,
+    EnvironmentAuthorizationErrorWireSchema,
+  ]),
 });
 
 const SubscribeShellRpc = Rpc.make("orchestration.subscribeShell", {
@@ -162,7 +238,7 @@ const SubscribeShellRpc = Rpc.make("orchestration.subscribeShell", {
   stream: true,
 });
 
-const AdapterRpcGroup = RpcGroup.make(ServerProbeRpc, SubscribeShellRpc);
+const AdapterRpcGroup = RpcGroup.make(ServerProbeRpc, ServerGetConfigRpc, SubscribeShellRpc);
 
 type AdapterRpcClient = RpcClient.RpcClient<
   RpcGroup.Rpcs<typeof AdapterRpcGroup>,
@@ -352,6 +428,42 @@ export interface ProjectListing {
   readonly projects: ReadonlyArray<DiscoveredProject>;
 }
 
+export type DiscoveredModelOption =
+  | {
+      readonly kind: "select";
+      readonly id: string;
+      readonly values: ReadonlyArray<string>;
+      readonly defaultValue: string | null;
+    }
+  | {
+      readonly kind: "boolean";
+      readonly id: string;
+      readonly defaultValue: boolean | null;
+    };
+
+export interface DiscoveredProviderModel {
+  readonly slug: string;
+  readonly displayName: string;
+  readonly options: ReadonlyArray<DiscoveredModelOption>;
+}
+
+export interface DiscoveredProvider {
+  readonly providerInstanceId: string;
+  readonly providerName: string;
+  readonly availability: "available" | "unavailable";
+  readonly unavailableReason: string | null;
+  readonly models: ReadonlyArray<DiscoveredProviderModel>;
+}
+
+export interface ProviderModelListing {
+  readonly providers: ReadonlyArray<DiscoveredProvider>;
+  /**
+   * Limitations describe upstream configuration elements that were skipped as
+   * malformed; the listed providers and models are exactly what decoded.
+   */
+  readonly limitations: ReadonlyArray<string>;
+}
+
 export interface T3CodeAdapterService {
   readonly exchangePairingCode: (
     input: PairingExchangeInput,
@@ -368,7 +480,173 @@ export interface T3CodeAdapterService {
     readonly endpoint: string;
     readonly credential: string;
   }) => Effect.Effect<ProjectListing, T3CodeAdapterError>;
+  readonly listProviderModels: (input: {
+    readonly endpoint: string;
+    readonly credential: string;
+  }) => Effect.Effect<ProviderModelListing, T3CodeAdapterError>;
 }
+
+const decodeSelectOptionValues = (
+  descriptor: typeof SelectProviderOptionDescriptorWireSchema.Type,
+): { readonly values: Array<string>; readonly defaultValue: string | null } => {
+  const values: Array<string> = [];
+  let markedDefault: string | null = null;
+  for (const choiceElement of descriptor.options) {
+    const choiceResult = Schema.decodeUnknownResult(ServerProviderChoiceWireSchema)(choiceElement);
+    if (Result.isFailure(choiceResult)) continue;
+    values.push(choiceResult.success.id);
+    if (choiceResult.success.isDefault === true && markedDefault === null) {
+      markedDefault = choiceResult.success.id;
+    }
+  }
+  return { values, defaultValue: descriptor.currentValue ?? markedDefault };
+};
+
+const decodeProviderModelOptions = (
+  descriptors: ReadonlyArray<unknown> | undefined,
+): { readonly options: Array<DiscoveredModelOption>; readonly skipped: number } => {
+  const options: Array<DiscoveredModelOption> = [];
+  let skipped = 0;
+  if (descriptors === undefined) return { options, skipped };
+  for (const descriptorElement of descriptors) {
+    const descriptorResult = Schema.decodeUnknownResult(ProviderOptionDescriptorWireSchema)(
+      descriptorElement,
+    );
+    if (Result.isFailure(descriptorResult)) {
+      skipped += 1;
+      continue;
+    }
+    const descriptor = descriptorResult.success;
+    if (descriptor.type === "boolean") {
+      options.push({
+        kind: "boolean",
+        id: descriptor.id,
+        defaultValue: descriptor.currentValue ?? null,
+      });
+      continue;
+    }
+    const select = decodeSelectOptionValues(descriptor);
+    const skippedChoices = descriptor.options.length - select.values.length;
+    skipped += skippedChoices;
+    options.push({ kind: "select", id: descriptor.id, ...select });
+  }
+  return { options, skipped };
+};
+
+const decodeProviderModel = (
+  modelElement: unknown,
+): { readonly model: DiscoveredProviderModel | null; readonly skippedOptions: number } => {
+  const modelResult = Schema.decodeUnknownResult(ServerProviderModelWireSchema)(modelElement);
+  if (Result.isFailure(modelResult)) return { model: null, skippedOptions: 0 };
+  const model = modelResult.success;
+  const decodedOptions = decodeProviderModelOptions(model.capabilities?.optionDescriptors);
+  return {
+    model: { slug: model.slug, displayName: model.name, options: decodedOptions.options },
+    skippedOptions: decodedOptions.skipped,
+  };
+};
+
+const decodeProviderEntry = (
+  providerElement: unknown,
+): {
+  readonly provider: DiscoveredProvider | null;
+  readonly skippedModels: number;
+  readonly skippedOptions: number;
+} => {
+  const providerResult = Schema.decodeUnknownResult(ServerProviderWireSchema)(providerElement);
+  if (Result.isFailure(providerResult)) {
+    return { provider: null, skippedModels: 0, skippedOptions: 0 };
+  }
+  const provider = providerResult.success;
+  let skippedModels = 0;
+  let skippedOptions = 0;
+  const models: Array<DiscoveredProviderModel> = [];
+  for (const modelElement of provider.models) {
+    const decoded = decodeProviderModel(modelElement);
+    if (decoded.model === null) {
+      skippedModels += 1;
+      continue;
+    }
+    models.push(decoded.model);
+    skippedOptions += decoded.skippedOptions;
+  }
+  return {
+    provider: {
+      providerInstanceId: provider.instanceId,
+      providerName: provider.displayName ?? provider.driver,
+      // The pinned contract treats absent availability as available.
+      availability: provider.availability ?? "available",
+      unavailableReason: provider.unavailableReason ?? null,
+      models,
+    },
+    skippedModels,
+    skippedOptions,
+  };
+};
+
+const malformedConfigurationLimitations = (
+  skippedProviders: number,
+  skippedModels: number,
+  skippedOptions: number,
+): Array<string> => {
+  const limitations: Array<string> = [];
+  if (skippedProviders > 0) {
+    limitations.push(
+      `Skipped ${skippedProviders} malformed provider element(s) from the T3Code server configuration.`,
+    );
+  }
+  if (skippedModels > 0) {
+    limitations.push(
+      `Skipped ${skippedModels} malformed model element(s) from the T3Code server configuration.`,
+    );
+  }
+  if (skippedOptions > 0) {
+    limitations.push(
+      `Skipped ${skippedOptions} malformed option element(s) from the T3Code server configuration.`,
+    );
+  }
+  return limitations;
+};
+
+const decodeProviderModels = (
+  config: Schema.Schema.Type<typeof ServerConfigWireSchema>,
+): ProviderModelListing => {
+  let skippedProviders = 0;
+  let skippedModels = 0;
+  let skippedOptions = 0;
+  const providers: Array<DiscoveredProvider> = [];
+  for (const providerElement of config.providers) {
+    const decoded = decodeProviderEntry(providerElement);
+    if (decoded.provider === null) {
+      skippedProviders += 1;
+      continue;
+    }
+    providers.push(decoded.provider);
+    skippedModels += decoded.skippedModels;
+    skippedOptions += decoded.skippedOptions;
+  }
+  return {
+    providers,
+    limitations: malformedConfigurationLimitations(skippedProviders, skippedModels, skippedOptions),
+  };
+};
+
+/**
+ * Decode the pinned server.getConfig providers payload into provider/model
+ * choices. Malformed upstream elements are skipped and reported as
+ * limitations instead of failing the listing; a configuration that does not
+ * decode at all yields an empty listing with an explicit limitation.
+ */
+export const decodeProviderModelListing = (config: unknown): ProviderModelListing => {
+  const decoded = Schema.decodeUnknownResult(ServerConfigWireSchema)(config);
+  if (Result.isFailure(decoded)) {
+    return {
+      providers: [],
+      limitations: ["The T3Code server configuration could not be decoded."],
+    };
+  }
+  return decodeProviderModels(decoded.success);
+};
 
 export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterService>()(
   "t3code-mcp/T3CodeAdapter",
@@ -857,6 +1135,58 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
           }),
         );
 
+      const loadProviderModels = (input: {
+        readonly endpoint: string;
+        readonly credential: string;
+      }): Effect.Effect<ProviderModelListing, T3CodeAdapterError> =>
+        withAuthenticatedRpc(input.endpoint, input.credential, (client) =>
+          Effect.gen(function* () {
+            const config = yield* client["server.getConfig"]({});
+            return decodeProviderModelListing(config);
+          }).pipe(
+            Effect.mapError((error): T3CodeAdapterError | RpcClientError.RpcClientError => {
+              if (error instanceof T3CodeAdapterError) return error;
+              if (error instanceof RpcClientError.RpcClientError) return error;
+              if (error._tag === "EnvironmentAuthorizationError") {
+                return new T3CodeAdapterError({
+                  kind: "authorization",
+                  message: `The T3Code credential lacks the required ${error.requiredScope} scope.`,
+                  uncertain: false,
+                  status: null,
+                });
+              }
+              return new T3CodeAdapterError({
+                kind: "transport",
+                message: "The T3Code server configuration was unavailable.",
+                uncertain: false,
+                status: null,
+              });
+            }),
+          ),
+        );
+
+      const listProviderModels = (input: {
+        readonly endpoint: string;
+        readonly credential: string;
+      }): Effect.Effect<ProviderModelListing, T3CodeAdapterError> =>
+        withCapacity(
+          Effect.gen(function* () {
+            const { authorization } = yield* verifyEnvironmentSession(input);
+            if (authorization.read !== "allowed") {
+              return yield* Effect.fail(
+                new T3CodeAdapterError({
+                  kind: "authorization",
+                  message: "The saved T3Code credential lacks the orchestration read scope.",
+                  uncertain: false,
+                  status: null,
+                }),
+              );
+            }
+
+            return yield* loadProviderModels(input);
+          }),
+        );
+
       const verifyCredential = (input: {
         readonly endpoint: string;
         readonly credential: string;
@@ -889,6 +1219,7 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
         verifyCredential,
         inspectCredential,
         listProjects,
+        listProviderModels,
       });
     }),
   ).pipe(Layer.provide(NodeHttpClient.layerUndici), Layer.provide(NodeCrypto.layer));

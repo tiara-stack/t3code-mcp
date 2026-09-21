@@ -13,7 +13,12 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { LocalStore } from "./local-store";
 import { InstanceConnections } from "./instance-connections";
-import { T3CodeAdapter, T3CodeAdapterError } from "./t3code-adapter";
+import {
+  T3CodeAdapter,
+  T3CodeAdapterError,
+  decodeProviderModelListing,
+  type DiscoveredProvider,
+} from "./t3code-adapter";
 import { ServerToolkit, serverToolkitLayer } from "./tools";
 
 const THIRTY_DAYS_MILLIS = 30 * 24 * 60 * 60 * 1000;
@@ -160,6 +165,15 @@ const fakeConnections = (options?: {
           status: null,
         }),
       ),
+    discoverModels: () =>
+      Effect.fail(
+        new T3CodeAdapterError({
+          kind: "capacity",
+          message: "The test connection does not support model discovery.",
+          uncertain: false,
+          status: null,
+        }),
+      ),
     invalidate: () => Effect.void,
   });
 };
@@ -192,6 +206,15 @@ const fakeAdapterLayer = (
         new T3CodeAdapterError({
           kind: "capacity",
           message: "The test adapter does not support project listing.",
+          uncertain: false,
+          status: null,
+        }),
+      ),
+    listProviderModels: () =>
+      Effect.fail(
+        new T3CodeAdapterError({
+          kind: "capacity",
+          message: "The test adapter does not support model listing.",
           uncertain: false,
           status: null,
         }),
@@ -1390,6 +1413,15 @@ describe("instance_pair_again", () => {
             status: null,
           }),
         ),
+      discoverModels: () =>
+        Effect.fail(
+          new T3CodeAdapterError({
+            kind: "capacity",
+            message: "The test connection does not support model discovery.",
+            uncertain: false,
+            status: null,
+          }),
+        ),
       invalidate: () => Effect.void,
     });
   };
@@ -1747,6 +1779,15 @@ describe("instance_pair_again", () => {
               new T3CodeAdapterError({
                 kind: "capacity",
                 message: "The test connection does not support project discovery.",
+                uncertain: false,
+                status: null,
+              }),
+            ),
+          discoverModels: () =>
+            Effect.fail(
+              new T3CodeAdapterError({
+                kind: "capacity",
+                message: "The test connection does not support model discovery.",
                 uncertain: false,
                 status: null,
               }),
@@ -2545,6 +2586,15 @@ const projectFixtures = (
         })),
       });
     },
+    listProviderModels: () =>
+      Effect.fail(
+        new T3CodeAdapterError({
+          kind: "capacity",
+          message: "The project test adapter does not list models.",
+          uncertain: false,
+          status: null,
+        }),
+      ),
   });
 
 const seedProjectRegistration = (instanceId: string, endpoint: string, credential?: string) =>
@@ -3169,5 +3219,819 @@ describe("project_list", () => {
         });
       }),
     ),
+  );
+});
+
+const modelFixtures = (
+  providersByEndpoint: Readonly<Record<string, ReadonlyArray<DiscoveredProvider>>>,
+  failures: { current: Readonly<Record<string, T3CodeAdapterError>> },
+) =>
+  Layer.succeed(T3CodeAdapter, {
+    exchangePairingCode: () =>
+      Effect.fail(
+        new T3CodeAdapterError({
+          kind: "capacity",
+          message: "The model test adapter does not pair.",
+          uncertain: false,
+          status: null,
+        }),
+      ),
+    verifyCredential: () =>
+      Effect.succeed({
+        environmentId: "environment-model",
+        serverVersion: "0.0.38",
+        scopes: ["orchestration:read", "orchestration:operate"],
+        capabilities: {},
+      }),
+    inspectCredential: () =>
+      Effect.fail(
+        new T3CodeAdapterError({
+          kind: "capacity",
+          message: "The model test adapter does not inspect.",
+          uncertain: false,
+          status: null,
+        }),
+      ),
+    listProjects: () =>
+      Effect.fail(
+        new T3CodeAdapterError({
+          kind: "capacity",
+          message: "The model test adapter does not list projects.",
+          uncertain: false,
+          status: null,
+        }),
+      ),
+    listProviderModels: ({ endpoint }: { readonly endpoint: string }) => {
+      const failure = failures.current[endpoint];
+      if (failure !== undefined) return Effect.fail(failure);
+      const providers = providersByEndpoint[endpoint];
+      if (providers === undefined) {
+        return Effect.fail(
+          new T3CodeAdapterError({
+            kind: "transport",
+            message: "The model test adapter has no fixture for this endpoint.",
+            uncertain: false,
+            status: null,
+          }),
+        );
+      }
+      return Effect.succeed({ providers, limitations: [] });
+    },
+  });
+
+const fixtureProviders = (): ReadonlyArray<DiscoveredProvider> => [
+  {
+    providerInstanceId: "provider-a",
+    providerName: "Provider A",
+    availability: "available",
+    unavailableReason: null,
+    models: [
+      {
+        slug: "model-a1",
+        displayName: "Model A1",
+        options: [
+          { kind: "select", id: "effort", values: ["low", "high"], defaultValue: "high" },
+          { kind: "boolean", id: "verbose", defaultValue: true },
+        ],
+      },
+      { slug: "model-a2", displayName: "Model A2", options: [] },
+    ],
+  },
+  {
+    providerInstanceId: "provider-b",
+    providerName: "Provider B",
+    availability: "unavailable",
+    unavailableReason: "The provider driver is not installed.",
+    models: [{ slug: "model-b1", displayName: "Model B1", options: [] }],
+  },
+];
+
+const unknownModelCapabilityEntries = [
+  {
+    name: "steer_current",
+    support: "unknown",
+    reason:
+      "The pinned T3Code 0.0.38 server configuration does not advertise this conditional guarantee for the provider/model.",
+    limitations: ["Capability support has not been verified for this provider/model."],
+  },
+  {
+    name: "resume_retained",
+    support: "unknown",
+    reason:
+      "The pinned T3Code 0.0.38 server configuration does not advertise this conditional guarantee for the provider/model.",
+    limitations: ["Capability support has not been verified for this provider/model."],
+  },
+];
+
+describe("model_list", () => {
+  it.live(
+    "discovers provider/model choices with options, availability, and unknown capabilities",
+    () =>
+      withDatabasePath((databasePath) =>
+        Effect.gen(function* () {
+          const layer = appLayer(
+            databasePath,
+            InstanceConnections.layerWithAdapter(
+              modelFixtures({ "https://a.test": fixtureProviders() }, { current: {} }),
+            ),
+          );
+          const result = yield* Effect.scoped(
+            Effect.gen(function* () {
+              yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+              return yield* callTool("model_list", { instanceId: "instance-a" });
+            }).pipe(Effect.provide(layer)),
+          );
+
+          expect(result[0]?.result).toMatchObject({
+            result: {
+              kind: "ok",
+              value: {
+                items: [
+                  {
+                    instanceId: "instance-a",
+                    providerInstanceId: "provider-a",
+                    providerName: "Provider A",
+                    model: "model-a1",
+                    displayName: "Model A1",
+                    availability: "available",
+                    unavailableReason: null,
+                    capabilities: unknownModelCapabilityEntries,
+                    options: [
+                      {
+                        kind: "select",
+                        id: "effort",
+                        values: ["low", "high"],
+                        defaultValue: "high",
+                      },
+                      { kind: "boolean", id: "verbose", defaultValue: true },
+                    ],
+                  },
+                  {
+                    instanceId: "instance-a",
+                    providerInstanceId: "provider-a",
+                    model: "model-a2",
+                    options: [],
+                    capabilities: unknownModelCapabilityEntries,
+                  },
+                  {
+                    instanceId: "instance-a",
+                    providerInstanceId: "provider-b",
+                    model: "model-b1",
+                    availability: "unavailable",
+                    unavailableReason: "The provider driver is not installed.",
+                    capabilities: unknownModelCapabilityEntries,
+                  },
+                ],
+                nextCursor: null,
+                coverage: "complete_for_query",
+                failures: [],
+              },
+            },
+            observations: [
+              {
+                instanceId: "instance-a",
+                freshness: "fresh",
+                sourceSequence: null,
+                coverage: "complete_for_query",
+              },
+            ],
+            warnings: [],
+          });
+          expect(result[0]?.encodedResult).toEqual(result[0]?.result);
+        }),
+      ),
+  );
+
+  it.live("filters models by providerInstanceId as observed without substituting providers", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const layer = appLayer(
+          databasePath,
+          InstanceConnections.layerWithAdapter(
+            modelFixtures({ "https://a.test": fixtureProviders() }, { current: {} }),
+          ),
+        );
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const filtered = yield* callTool("model_list", {
+              instanceId: "instance-a",
+              providerInstanceId: "provider-a",
+            });
+            const missing = yield* callTool("model_list", {
+              instanceId: "instance-a",
+              providerInstanceId: "provider-missing",
+            });
+            return { filtered, missing };
+          }).pipe(Effect.provide(layer)),
+        );
+
+        expect(result.filtered[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              items: [
+                { providerInstanceId: "provider-a", model: "model-a1" },
+                { providerInstanceId: "provider-a", model: "model-a2" },
+              ],
+              coverage: "complete_for_query",
+              failures: [],
+            },
+          },
+        });
+        expect(result.missing[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: { items: [], coverage: "complete_for_query", failures: [] },
+          },
+        });
+      }),
+    ),
+  );
+
+  it.live("rejects unknown argument fields", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const layer = appLayer(
+          databasePath,
+          InstanceConnections.layerWithAdapter(modelFixtures({}, { current: {} })),
+        );
+        const exit = yield* Effect.exit(
+          Effect.scoped(
+            callTool("model_list", {
+              instanceId: "instance-a",
+              unexpected: true,
+            }).pipe(Effect.provide(layer)),
+          ),
+        );
+        expect(Exit.isFailure(exit)).toBe(true);
+        if (Exit.isSuccess(exit)) return;
+        expect(String(exit.cause)).toContain("Invalid parameters for tool 'model_list'");
+      }),
+    ),
+  );
+
+  it.live("returns typed failures for a missing or unpaired targeted registration", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const layer = appLayer(
+          databasePath,
+          InstanceConnections.layerWithAdapter(modelFixtures({}, { current: {} })),
+        );
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-unpaired", "https://unpaired.test");
+            const missing = yield* callTool("model_list", { instanceId: "missing-instance" });
+            const unpaired = yield* callTool("model_list", { instanceId: "instance-unpaired" });
+            return { missing, unpaired };
+          }).pipe(Effect.provide(layer)),
+        );
+
+        expect(result.missing[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "registration_not_found" } },
+        });
+        expect(result.unpaired[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "pairing_required" } },
+        });
+      }),
+    ),
+  );
+
+  it.live("keeps colliding provider instance IDs qualified per MCP instance registration", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const sharedProvider = (model: string): ReadonlyArray<DiscoveredProvider> => [
+          {
+            providerInstanceId: "shared-provider",
+            providerName: "Shared Provider",
+            availability: "available",
+            unavailableReason: null,
+            models: [{ slug: model, displayName: model, options: [] }],
+          },
+        ];
+        const layer = appLayer(
+          databasePath,
+          InstanceConnections.layerWithAdapter(
+            modelFixtures(
+              {
+                "https://a.test": sharedProvider("model-on-a"),
+                "https://b.test": sharedProvider("model-on-b"),
+              },
+              { current: {} },
+            ),
+          ),
+        );
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            yield* seedProjectRegistration("instance-b", "https://b.test", "secret-b");
+            const onA = yield* callTool("model_list", { instanceId: "instance-a" });
+            const filteredOnB = yield* callTool("model_list", {
+              instanceId: "instance-b",
+              providerInstanceId: "shared-provider",
+            });
+            return { onA, filteredOnB };
+          }).pipe(Effect.provide(layer)),
+        );
+
+        expect(result.onA[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              items: [
+                {
+                  instanceId: "instance-a",
+                  providerInstanceId: "shared-provider",
+                  model: "model-on-a",
+                },
+              ],
+            },
+          },
+        });
+        expect(result.filteredOnB[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              items: [
+                {
+                  instanceId: "instance-b",
+                  providerInstanceId: "shared-provider",
+                  model: "model-on-b",
+                },
+              ],
+            },
+          },
+        });
+      }),
+    ),
+  );
+
+  it.live("serves immutable continuation pages that survive a database reopen", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const providers: ReadonlyArray<DiscoveredProvider> = [
+          {
+            providerInstanceId: "provider-a",
+            providerName: "Provider A",
+            availability: "available",
+            unavailableReason: null,
+            models: [
+              { slug: "model-1", displayName: "Model 1", options: [] },
+              { slug: "model-2", displayName: "Model 2", options: [] },
+              { slug: "model-3", displayName: "Model 3", options: [] },
+            ],
+          },
+        ];
+        const layer = () =>
+          appLayer(
+            databasePath,
+            InstanceConnections.layerWithAdapter(
+              modelFixtures({ "https://a.test": providers }, { current: {} }),
+            ),
+          );
+        const first = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("model_list", {
+              instanceId: "instance-a",
+              limit: 2,
+            });
+          }).pipe(Effect.provide(layer())),
+        );
+
+        const firstPage = okPageValue(first[0]?.result);
+        expect(firstPage.nextCursor).toEqual(expect.any(String));
+        expect(first[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              items: [{ model: "model-1" }, { model: "model-2" }],
+            },
+          },
+        });
+
+        const second = yield* Effect.scoped(
+          callTool("model_list", {
+            instanceId: "instance-a",
+            cursor: firstPage.nextCursor,
+            limit: 2,
+          }).pipe(Effect.provide(layer())),
+        );
+        expect(second[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              items: [{ model: "model-3" }],
+              nextCursor: null,
+              coverage: "complete_for_query",
+            },
+          },
+          observations: [{ instanceId: "instance-a", freshness: "fresh" }],
+          warnings: [],
+        });
+      }),
+    ),
+  );
+
+  it.live("returns cursor_mismatch when a cursor is used with a different query binding", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const layer = appLayer(
+          databasePath,
+          InstanceConnections.layerWithAdapter(
+            modelFixtures({ "https://a.test": fixtureProviders() }, { current: {} }),
+          ),
+        );
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const first = yield* callTool("model_list", {
+              instanceId: "instance-a",
+              providerInstanceId: "provider-a",
+              limit: 1,
+            });
+            const cursor = okPageValue(first[0]?.result).nextCursor;
+            const unfiltered = yield* callTool("model_list", {
+              instanceId: "instance-a",
+              cursor: cursor ?? undefined,
+            });
+            const otherInstance = yield* callTool("model_list", {
+              instanceId: "instance-b",
+              providerInstanceId: "provider-a",
+              cursor: cursor ?? undefined,
+            });
+            const malformed = yield* callTool("model_list", {
+              instanceId: "instance-a",
+              cursor: "not-a-cursor",
+            });
+            return { unfiltered, otherInstance, malformed };
+          }).pipe(Effect.provide(layer)),
+        );
+
+        expect(result.unfiltered[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "cursor_mismatch", retry: "safe_read" } },
+        });
+        expect(result.otherInstance[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "cursor_mismatch", retry: "safe_read" } },
+        });
+        expect(result.malformed[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "cursor_mismatch", retry: "safe_read" } },
+        });
+      }),
+    ),
+  );
+
+  it.live("expires retained captures after the capture retention window", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const connections = InstanceConnections.layerWithAdapter(
+          modelFixtures({ "https://a.test": fixtureProviders() }, { current: {} }),
+        );
+        const shortRetention = serverToolkitLayer.pipe(
+          Layer.provideMerge(connections),
+          Layer.provideMerge(LocalStore.layer({ databasePath, captureRetentionMillis: 25 })),
+        );
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const first = yield* callTool("model_list", {
+              instanceId: "instance-a",
+              limit: 1,
+            });
+            const cursor = okPageValue(first[0]?.result).nextCursor;
+            yield* Effect.sleep("60 millis");
+            const expired = yield* callTool("model_list", {
+              instanceId: "instance-a",
+              cursor: cursor ?? undefined,
+            });
+            return { first, expired };
+          }).pipe(Effect.provide(shortRetention)),
+        );
+
+        expect(result.first[0]?.result).toMatchObject({ result: { kind: "ok" } });
+        expect(result.expired[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "cursor_expired", retry: "safe_read" } },
+        });
+      }),
+    ),
+  );
+
+  it.live("marks explicit stale reads after a fresh failure and never fails over", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const failures: { current: Readonly<Record<string, T3CodeAdapterError>> } = {
+          current: {},
+        };
+        const layer = appLayer(
+          databasePath,
+          InstanceConnections.layerWithAdapter(
+            modelFixtures({ "https://a.test": fixtureProviders() }, failures),
+          ),
+        );
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const fresh = yield* callTool("model_list", { instanceId: "instance-a" });
+            failures.current = {
+              "https://a.test": new T3CodeAdapterError({
+                kind: "transport",
+                message: "The instance is unreachable.",
+                uncertain: true,
+                status: null,
+              }),
+            };
+            const plain = yield* callTool("model_list", { instanceId: "instance-a" });
+            const stale = yield* callTool("model_list", {
+              instanceId: "instance-a",
+              allowStale: true,
+            });
+            return { fresh, plain, stale };
+          }).pipe(Effect.provide(layer)),
+        );
+
+        expect(result.fresh[0]?.result).toMatchObject({
+          result: { kind: "ok", value: { coverage: "complete_for_query" } },
+          observations: [{ instanceId: "instance-a", freshness: "fresh" }],
+        });
+        expect(result.plain[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "unavailable", retry: "safe_read" } },
+        });
+        expect(result.stale[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              items: [
+                { providerInstanceId: "provider-a", model: "model-a1" },
+                { providerInstanceId: "provider-a", model: "model-a2" },
+                { providerInstanceId: "provider-b", model: "model-b1" },
+              ],
+              coverage: "complete_for_query",
+              failures: [],
+            },
+          },
+          observations: [
+            {
+              instanceId: "instance-a",
+              freshness: "stale",
+              coverage: "partial",
+              limitations: [expect.stringContaining("retained capture")],
+            },
+          ],
+          warnings: [{ code: "fresh_read_failed" }],
+        });
+      }),
+    ),
+  );
+
+  it.live("surfaces malformed-upstream limitations on an otherwise healthy listing", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const limitations: ReadonlyArray<string> = [
+          "Skipped 1 malformed provider element(s) from the T3Code server configuration.",
+        ];
+        const layer = appLayer(
+          databasePath,
+          InstanceConnections.layerWithAdapter(
+            Layer.succeed(T3CodeAdapter, {
+              exchangePairingCode: () =>
+                Effect.fail(
+                  new T3CodeAdapterError({
+                    kind: "capacity",
+                    message: "The model test adapter does not pair.",
+                    uncertain: false,
+                    status: null,
+                  }),
+                ),
+              verifyCredential: () =>
+                Effect.succeed({
+                  environmentId: "environment-model",
+                  serverVersion: "0.0.38",
+                  scopes: ["orchestration:read", "orchestration:operate"],
+                  capabilities: {},
+                }),
+              inspectCredential: () =>
+                Effect.fail(
+                  new T3CodeAdapterError({
+                    kind: "capacity",
+                    message: "The model test adapter does not inspect.",
+                    uncertain: false,
+                    status: null,
+                  }),
+                ),
+              listProjects: () =>
+                Effect.fail(
+                  new T3CodeAdapterError({
+                    kind: "capacity",
+                    message: "The model test adapter does not list projects.",
+                    uncertain: false,
+                    status: null,
+                  }),
+                ),
+              listProviderModels: () => Effect.succeed({ providers: [], limitations }),
+            }),
+          ),
+        );
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("model_list", { instanceId: "instance-a" });
+          }).pipe(Effect.provide(layer)),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              items: [],
+              coverage: "complete_for_query",
+              limitations: [
+                "Skipped 1 malformed provider element(s) from the T3Code server configuration.",
+              ],
+            },
+          },
+        });
+      }),
+    ),
+  );
+});
+
+describe("model listing wire decode", () => {
+  it.effect(
+    "maps observed defaults, driver fallback names, and available-by-default availability",
+    () =>
+      Effect.sync(() => {
+        const listing = decodeProviderModelListing({
+          providers: [
+            {
+              instanceId: "provider-a",
+              driver: "codex",
+              displayName: "Codex",
+              models: [
+                {
+                  slug: "gpt-5",
+                  name: "GPT-5",
+                  capabilities: {
+                    optionDescriptors: [
+                      {
+                        type: "select",
+                        id: "effort",
+                        label: "Effort",
+                        options: [
+                          { id: "low", label: "Low", isDefault: true },
+                          { id: "high", label: "High" },
+                        ],
+                      },
+                      {
+                        type: "select",
+                        id: "reasoning",
+                        label: "Reasoning",
+                        currentValue: "medium",
+                        options: [{ id: "low", label: "Low" }],
+                      },
+                      { type: "boolean", id: "verbose", label: "Verbose", currentValue: false },
+                    ],
+                  },
+                },
+                { slug: "gpt-5-mini", name: "GPT-5 Mini", capabilities: null },
+              ],
+            },
+            {
+              instanceId: "provider-b",
+              driver: "claudeAgent",
+              models: [{ slug: "claude", name: "Claude" }],
+            },
+          ],
+        });
+
+        expect(listing).toEqual({
+          providers: [
+            {
+              providerInstanceId: "provider-a",
+              providerName: "Codex",
+              availability: "available",
+              unavailableReason: null,
+              models: [
+                {
+                  slug: "gpt-5",
+                  displayName: "GPT-5",
+                  options: [
+                    {
+                      kind: "select",
+                      id: "effort",
+                      values: ["low", "high"],
+                      defaultValue: "low",
+                    },
+                    {
+                      kind: "select",
+                      id: "reasoning",
+                      values: ["low"],
+                      defaultValue: "medium",
+                    },
+                    { kind: "boolean", id: "verbose", defaultValue: false },
+                  ],
+                },
+                { slug: "gpt-5-mini", displayName: "GPT-5 Mini", options: [] },
+              ],
+            },
+            {
+              providerInstanceId: "provider-b",
+              providerName: "claudeAgent",
+              availability: "available",
+              unavailableReason: null,
+              models: [{ slug: "claude", displayName: "Claude", options: [] }],
+            },
+          ],
+          limitations: [],
+        });
+      }),
+  );
+
+  it.effect("reports unavailable providers with their observed reason", () =>
+    Effect.sync(() => {
+      const listing = decodeProviderModelListing({
+        providers: [
+          {
+            instanceId: "provider-a",
+            driver: "forkDriver",
+            availability: "unavailable",
+            unavailableReason: "Driver not shipped in this build.",
+            models: [{ slug: "model-a", name: "Model A" }],
+          },
+        ],
+      });
+
+      expect(listing.providers[0]).toMatchObject({
+        availability: "unavailable",
+        unavailableReason: "Driver not shipped in this build.",
+      });
+    }),
+  );
+
+  it.effect("skips malformed provider, model, and option elements with limitations", () =>
+    Effect.sync(() => {
+      const listing = decodeProviderModelListing({
+        providers: [
+          { driver: "missing-instance-id", models: [] },
+          {
+            instanceId: "provider-a",
+            driver: "codex",
+            models: [
+              { name: "Missing slug" },
+              {
+                slug: "model-a",
+                name: "Model A",
+                capabilities: {
+                  optionDescriptors: [
+                    { type: "number", id: "temperature" },
+                    {
+                      type: "select",
+                      id: "effort",
+                      options: [{ label: "Missing id" }, { id: "low", label: "Low" }],
+                      currentValue: "low",
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+        ],
+      });
+
+      expect(listing).toEqual({
+        providers: [
+          {
+            providerInstanceId: "provider-a",
+            providerName: "codex",
+            availability: "available",
+            unavailableReason: null,
+            models: [
+              {
+                slug: "model-a",
+                displayName: "Model A",
+                options: [{ kind: "select", id: "effort", values: ["low"], defaultValue: "low" }],
+              },
+            ],
+          },
+        ],
+        limitations: [
+          "Skipped 1 malformed provider element(s) from the T3Code server configuration.",
+          "Skipped 1 malformed model element(s) from the T3Code server configuration.",
+          "Skipped 2 malformed option element(s) from the T3Code server configuration.",
+        ],
+      });
+    }),
+  );
+
+  it.effect("returns an explicit limitation when the configuration does not decode", () =>
+    Effect.sync(() => {
+      expect(decodeProviderModelListing({ providers: "not-an-array" })).toEqual({
+        providers: [],
+        limitations: ["The T3Code server configuration could not be decoded."],
+      });
+      expect(decodeProviderModelListing(null)).toEqual({
+        providers: [],
+        limitations: ["The T3Code server configuration could not be decoded."],
+      });
+    }),
   );
 });

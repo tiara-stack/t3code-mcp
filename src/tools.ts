@@ -23,15 +23,23 @@ import {
   MAX_TOTAL_RPC_CAPACITY,
   type OperationRecord,
   makeToolSuccess,
+  makeModelListToolSuccess,
   makeProjectListToolSuccess,
+  staleModelReadLimitation,
   staleProjectReadLimitation,
+  unknownModelCapabilities,
   MAX_SERIALIZED_RESULT_BYTES,
+  ModelListInputSchema,
+  ModelListToolResultSchema,
   OperationGetInputSchema,
   OperationGetToolResultSchema,
   OperationToolResultSchema,
   ProjectListInputSchema,
   ProjectListToolResultSchema,
   ToolResultSchema,
+  type ModelListPage,
+  type ModelListQuery,
+  type ModelSummary,
   type Observation,
   type ProjectListPage,
   type ProjectListScope,
@@ -41,12 +49,15 @@ import {
   LocalStore,
   LocalStoreError,
   type LocalStoreService,
+  type ModelCaptureMetadata,
   type ProjectCaptureMetadata,
+  type RetainedModelCapture,
   type RetainedProjectCapture,
 } from "./local-store";
 import { OperationServiceError, Operations } from "./operations";
 import {
   InstanceConnections,
+  type DiscoveredModels,
   type DiscoveredProjects,
   type InstanceConnectionsService,
 } from "./instance-connections";
@@ -82,6 +93,20 @@ export const ProjectListTool = Tool.make("project_list", {
     "List existing projects on one saved T3Code instance or across all saved instances, with per-instance failures.",
   parameters: ProjectListInputSchema,
   success: ProjectListToolResultSchema,
+})
+  .addDependency(LocalStore)
+  .addDependency(InstanceConnections)
+  .annotate(Tool.Readonly, true)
+  .annotate(Tool.Destructive, false)
+  .annotate(Tool.Idempotent, true)
+  .annotate(Tool.OpenWorld, true);
+
+// fallow-ignore-next-line unused-export
+export const ModelListTool = Tool.make("model_list", {
+  description:
+    "List the provider/model choices, option descriptors, availability, and verified capability limits for one saved T3Code instance.",
+  parameters: ModelListInputSchema,
+  success: ModelListToolResultSchema,
 })
   .addDependency(LocalStore)
   .addDependency(InstanceConnections)
@@ -178,6 +203,7 @@ export const ServerToolkit = Toolkit.make(
   InstancePairAgainTool,
   InstanceRemoveTool,
   ProjectListTool,
+  ModelListTool,
   OperationGetTool,
 );
 
@@ -507,6 +533,171 @@ const discoverProjectPage = (options: {
     return makeProjectListToolSuccess(captured.page, captured.observations);
   });
 
+const compareModelSummaries = (
+  left: { readonly providerInstanceId: string; readonly model: string },
+  right: { readonly providerInstanceId: string; readonly model: string },
+): number =>
+  left.providerInstanceId < right.providerInstanceId
+    ? -1
+    : left.providerInstanceId > right.providerInstanceId
+      ? 1
+      : left.model < right.model
+        ? -1
+        : left.model > right.model
+          ? 1
+          : 0;
+
+interface GatheredModels {
+  readonly kind: "healthy" | "failed";
+  readonly instanceId: string;
+  readonly discovered?: DiscoveredModels;
+  readonly error?: LocalStoreError | T3CodeAdapterError;
+}
+
+interface ClassifiedModelDiscovery {
+  readonly items: Array<ModelSummary>;
+  readonly failures: Array<ModelListPage["failures"][number]>;
+  readonly observations: Array<Observation>;
+  readonly firstFailure: LocalStoreError | T3CodeAdapterError | null;
+  readonly limitations: ReadonlyArray<string>;
+}
+
+const healthyModelItems = (
+  entry: GatheredModels,
+  providerInstanceId: string | undefined,
+): Array<ModelSummary> =>
+  (entry.discovered?.providers ?? []).flatMap((provider) =>
+    providerInstanceId !== undefined && provider.providerInstanceId !== providerInstanceId
+      ? []
+      : provider.models.map((model) => ({
+          instanceId: entry.instanceId,
+          providerInstanceId: provider.providerInstanceId,
+          providerName: provider.providerName,
+          model: model.slug,
+          displayName: model.displayName,
+          availability: provider.availability,
+          unavailableReason: provider.unavailableReason,
+          capabilities: unknownModelCapabilities(),
+          options: model.options,
+        })),
+  );
+
+// fallow-ignore-next-line complexity
+const classifyModelDiscovery = (input: {
+  readonly gathered: GatheredModels;
+  readonly query: ModelListQuery;
+  readonly retained: RetainedModelCapture | null;
+  readonly allowStale: boolean;
+  readonly fallbackObservedAt: string;
+}): ClassifiedModelDiscovery => {
+  const { gathered, query, retained, allowStale, fallbackObservedAt } = input;
+  if (gathered.kind === "healthy") {
+    return {
+      items: healthyModelItems(gathered, query.providerInstanceId),
+      failures: [],
+      observations: [
+        {
+          instanceId: gathered.instanceId,
+          observedAt: gathered.discovered?.observedAt ?? fallbackObservedAt,
+          freshness: "fresh",
+          sourceSequence: null,
+          coverage: "complete_for_query",
+          limitations: [],
+        },
+      ],
+      firstFailure: null,
+      limitations: gathered.discovered?.limitations ?? [],
+    };
+  }
+  if (allowStale && retained !== null && retained.items.length > 0) {
+    const retainedObservation = retained.observations.find(
+      (observation) => observation.instanceId === gathered.instanceId,
+    );
+    return {
+      items: [...retained.items],
+      failures: [],
+      observations: [
+        {
+          instanceId: gathered.instanceId,
+          observedAt: retainedObservation?.observedAt ?? fallbackObservedAt,
+          freshness: "stale",
+          sourceSequence: retainedObservation?.sourceSequence ?? null,
+          coverage: "partial",
+          limitations: [`${staleModelReadLimitation} (${gathered.error?.message ?? "unknown"})`],
+        },
+      ],
+      firstFailure: null,
+      limitations: [],
+    };
+  }
+  return {
+    items: [],
+    failures:
+      gathered.error === undefined
+        ? []
+        : [{ instanceId: gathered.instanceId, error: toToolFailure(gathered.error) }],
+    observations: [],
+    firstFailure: gathered.error ?? null,
+    limitations: [],
+  };
+};
+
+const discoverModelPage = (options: {
+  readonly store: LocalStoreService;
+  readonly connections: InstanceConnectionsService;
+  readonly query: ModelListQuery;
+  readonly limit: number | undefined;
+  readonly allowStale: boolean;
+}): Effect.Effect<
+  ReturnType<typeof makeModelListToolSuccess>,
+  LocalStoreError | T3CodeAdapterError
+> =>
+  Effect.gen(function* () {
+    const { store, connections, query, limit, allowStale } = options;
+    const gathered = yield* Effect.gen(function* () {
+      const discovered = yield* connections.discoverModels(query.instanceId);
+      return { kind: "healthy" as const, instanceId: query.instanceId, discovered };
+    }).pipe(
+      Effect.catch((error: LocalStoreError | T3CodeAdapterError) =>
+        Effect.succeed({ kind: "failed" as const, instanceId: query.instanceId, error }),
+      ),
+    );
+
+    const retained =
+      allowStale && gathered.kind === "failed"
+        ? yield* store.findRetainedModelCapture(query)
+        : null;
+    const fallbackObservedAt = new Date(yield* Clock.currentTimeMillis).toISOString();
+    const classified = classifyModelDiscovery({
+      gathered,
+      query,
+      retained,
+      allowStale,
+      fallbackObservedAt,
+    });
+
+    // A targeted read never fails over to another registration; its typed
+    // failure is the result unless an explicit stale read found retained data.
+    if (classified.firstFailure !== null && classified.failures.length > 0) {
+      return yield* Effect.fail(classified.firstFailure);
+    }
+
+    const items = classified.items.slice().sort(compareModelSummaries);
+    const metadata: ModelCaptureMetadata = {
+      failures: classified.failures,
+      coverage: "complete_for_query",
+      limitations: [...classified.limitations],
+      observations: classified.observations,
+    };
+    const captured = yield* store.captureModelPage({
+      query,
+      items,
+      metadata,
+      ...(limit === undefined ? {} : { limit }),
+    });
+    return makeModelListToolSuccess(captured.page, captured.observations);
+  });
+
 const serverToolHandlers = ServerToolkit.of({
   instance_list: ({ cursor, limit }) =>
     Effect.gen(function* () {
@@ -587,6 +778,38 @@ const serverToolHandlers = ServerToolkit.of({
         store,
         connections,
         scope,
+        limit,
+        allowStale: allowStale ?? false,
+      });
+    }).pipe(
+      Effect.catch((error: LocalStoreError | T3CodeAdapterError) =>
+        Effect.succeed({
+          result: { kind: "error" as const, error: toToolFailure(error) },
+          observations: [],
+          warnings: [],
+        }),
+      ),
+    ),
+  model_list: ({ instanceId, providerInstanceId, cursor, limit, allowStale }) =>
+    Effect.gen(function* () {
+      const store = yield* LocalStore;
+      const connections = yield* InstanceConnections;
+      const query: ModelListQuery = {
+        instanceId,
+        ...(providerInstanceId === undefined ? {} : { providerInstanceId }),
+      };
+      if (cursor !== undefined) {
+        const captured = yield* store.readModelPage({
+          query,
+          cursor,
+          ...(limit === undefined ? {} : { limit }),
+        });
+        return makeModelListToolSuccess(captured.page, captured.observations);
+      }
+      return yield* discoverModelPage({
+        store,
+        connections,
+        query,
         limit,
         allowStale: allowStale ?? false,
       });

@@ -24,10 +24,14 @@ import {
   MAX_SERIALIZED_RESULT_BYTES,
   OPERATION_DETAIL_RETENTION_MILLIS,
   EvidenceSchema,
+  ModelSummarySchema,
   ObservationSchema,
   OperationRecordSchema,
   ProjectSummarySchema,
   type Evidence,
+  type ModelListPage,
+  type ModelListQuery,
+  type ModelSummary,
   type Observation,
   type OperationRecord,
   type OperationState,
@@ -36,6 +40,7 @@ import {
   type ProjectListScope,
   type ProjectSummary,
   makeToolSuccess,
+  makeModelListToolSuccess,
   makeProjectListToolSuccess,
   serializedByteLength,
   ToolFailureSchema,
@@ -58,6 +63,8 @@ const CAPTURE_SCOPE = "instance_list";
 const CAPTURE_ORDER = "instance_id_asc";
 const PROJECT_CAPTURE_SCOPE = "project_list";
 const PROJECT_CAPTURE_ORDER = "instance_id_project_id_asc";
+const MODEL_CAPTURE_SCOPE = "model_list";
+const MODEL_CAPTURE_ORDER = "provider_instance_id_model_asc";
 const OPERATION_DETAIL_CLEANUP_BATCH_SIZE = 64;
 
 const projectScopeKey = (scope: ProjectListScope): string =>
@@ -69,6 +76,16 @@ const projectScopesEqual = (left: ProjectListScope, right: ProjectListScope): bo
   left.kind === "all_instances"
     ? right.kind === "all_instances"
     : right.kind === "instance" && right.instanceId === left.instanceId;
+
+const modelScopeKey = (query: ModelListQuery): string =>
+  JSON.stringify([
+    MODEL_CAPTURE_SCOPE,
+    query.instanceId,
+    query.providerInstanceId === undefined ? null : query.providerInstanceId,
+  ]);
+
+const modelQueriesEqual = (left: ModelListQuery, right: ModelListQuery): boolean =>
+  left.instanceId === right.instanceId && left.providerInstanceId === right.providerInstanceId;
 
 export const REQUEST_RECORD_UNAVAILABLE_MESSAGE =
   "The mutation receipt details are unavailable; the request ID remains permanently reserved.";
@@ -194,6 +211,29 @@ const ProjectCursorPayloadSchema = Schema.Struct({
   position: Schema.Natural,
 });
 
+type ModelCursorPayload = {
+  readonly version: 1;
+  readonly databaseId: string;
+  readonly captureId: string;
+  readonly scope: typeof MODEL_CAPTURE_SCOPE;
+  readonly order: typeof MODEL_CAPTURE_ORDER;
+  readonly query: ModelListQuery;
+  readonly position: number;
+};
+
+const ModelCursorPayloadSchema = Schema.Struct({
+  version: Schema.Literal(1),
+  databaseId: Schema.NonEmptyString,
+  captureId: Schema.NonEmptyString,
+  scope: Schema.Literal(MODEL_CAPTURE_SCOPE),
+  order: Schema.Literal(MODEL_CAPTURE_ORDER),
+  query: Schema.Struct({
+    instanceId: Schema.NonEmptyString,
+    providerInstanceId: Schema.optionalKey(Schema.NonEmptyString),
+  }),
+  position: Schema.Natural,
+});
+
 const CaptureMetadataSchema = Schema.Struct({
   failures: Schema.Array(
     Schema.Struct({
@@ -205,7 +245,7 @@ const CaptureMetadataSchema = Schema.Struct({
   limitations: Schema.Array(Schema.String),
 });
 
-const ProjectCaptureMetadataSchema = Schema.Struct({
+const ListCaptureMetadataSchema = Schema.Struct({
   failures: Schema.Array(
     Schema.Struct({
       instanceId: Schema.NonEmptyString,
@@ -224,26 +264,33 @@ type CaptureMetadata = {
 };
 
 /**
- * Project discovery captures additionally retain the per-instance observation
+ * Discovery captures additionally retain the per-instance observation
  * metadata so a continuation page or an explicit stale read preserves the
  * freshness evidence of the captured view.
  */
-export interface ProjectCaptureMetadata {
+export interface ListCaptureMetadata {
   readonly failures: ProjectListPage["failures"];
   readonly coverage: ProjectListPage["coverage"];
   readonly limitations: ProjectListPage["limitations"];
   readonly observations: ReadonlyArray<Observation>;
 }
 
-export interface ProjectCapturePage {
-  readonly page: ProjectListPage;
+export interface ListCapturePage<Page> {
+  readonly page: Page;
   readonly observations: ReadonlyArray<Observation>;
 }
 
-export interface RetainedProjectCapture {
-  readonly items: ReadonlyArray<ProjectSummary>;
+export interface RetainedCapture<Items> {
+  readonly items: ReadonlyArray<Items>;
   readonly observations: ReadonlyArray<Observation>;
 }
+
+export type ProjectCaptureMetadata = ListCaptureMetadata;
+export type ProjectCapturePage = ListCapturePage<ProjectListPage>;
+export type RetainedProjectCapture = RetainedCapture<ProjectSummary>;
+export type ModelCaptureMetadata = ListCaptureMetadata;
+export type ModelCapturePage = ListCapturePage<ModelListPage>;
+export type RetainedModelCapture = RetainedCapture<ModelSummary>;
 
 type RegistrationRowDecode = {
   readonly item: InstanceSummary | null;
@@ -424,6 +471,22 @@ export interface LocalStoreService {
   readonly findRetainedProjectCapture: (
     scope: ProjectListScope,
   ) => Effect.Effect<RetainedProjectCapture | null, LocalStoreError>;
+  readonly captureModelPage: (input: {
+    readonly query: ModelListQuery;
+    readonly items: ReadonlyArray<ModelSummary>;
+    readonly metadata: ModelCaptureMetadata;
+    readonly limit?: number;
+    readonly maxBytes?: number;
+  }) => Effect.Effect<ModelCapturePage, LocalStoreError>;
+  readonly readModelPage: (options: {
+    readonly query: ModelListQuery;
+    readonly cursor: string;
+    readonly limit?: number;
+    readonly maxBytes?: number;
+  }) => Effect.Effect<ModelCapturePage, LocalStoreError>;
+  readonly findRetainedModelCapture: (
+    query: ModelListQuery,
+  ) => Effect.Effect<RetainedModelCapture | null, LocalStoreError>;
   readonly putRegistration: (
     registration: PutRegistrationInput,
   ) => Effect.Effect<void, LocalStoreError>;
@@ -610,6 +673,32 @@ export class LocalStore extends Context.Service<LocalStore, LocalStoreService>()
         const findRetainedProjectCapture = (scope: ProjectListScope) =>
           findRetainedProjectCaptureInDatabase(sql, scope, verifySchemaForOperation);
 
+        const captureModelPage = (input: {
+          readonly query: ModelListQuery;
+          readonly items: ReadonlyArray<ModelSummary>;
+          readonly metadata: ModelCaptureMetadata;
+          readonly limit?: number;
+          readonly maxBytes?: number;
+        }) =>
+          captureModelPageInDatabase(
+            sql,
+            crypto,
+            config,
+            databaseId,
+            input,
+            verifySchemaForOperation,
+          );
+
+        const readModelPage = (options: {
+          readonly query: ModelListQuery;
+          readonly cursor: string;
+          readonly limit?: number;
+          readonly maxBytes?: number;
+        }) => readModelPageFromDatabase(sql, databaseId, options, verifySchemaForOperation);
+
+        const findRetainedModelCapture = (query: ModelListQuery) =>
+          findRetainedModelCaptureInDatabase(sql, query, verifySchemaForOperation);
+
         const putRegistration = (registration: PutRegistrationInput) =>
           putRegistrationInDatabase(
             sql,
@@ -699,6 +788,9 @@ export class LocalStore extends Context.Service<LocalStore, LocalStoreService>()
           captureProjectPage,
           readProjectPage,
           findRetainedProjectCapture,
+          captureModelPage,
+          readModelPage,
+          findRetainedModelCapture,
           putRegistration,
           stagePairing,
           publishPairing,
@@ -1336,23 +1428,25 @@ const listAllRegistrationsFromDatabase = (
 const projectPageLimit = (limit: number | undefined): number =>
   Math.min(MAX_PAGE_LIMIT, Math.max(1, limit ?? DEFAULT_PAGE_LIMIT));
 
-const captureProjectPageInDatabase = (
+const captureListPageInDatabase = <Items, Page>(
   sql: SqlClient.SqlClient,
   crypto: Crypto.Crypto,
   config: Required<LocalStoreConfigValue>,
   databaseId: string,
   input: {
-    readonly scope: ProjectListScope;
-    readonly items: ReadonlyArray<ProjectSummary>;
-    readonly metadata: ProjectCaptureMetadata;
+    readonly scopeKey: string;
+    readonly order: string;
+    readonly captureKind: string;
+    readonly items: ReadonlyArray<Items>;
+    readonly metadata: ListCaptureMetadata;
     readonly limit?: number;
     readonly maxBytes?: number;
   },
+  codec: CapturePageCodec<Items, ListCaptureMetadata, Page>,
   verify: SchemaVerifier,
-): Effect.Effect<ProjectCapturePage, LocalStoreError> => {
+): Effect.Effect<ListCapturePage<Page>, LocalStoreError> => {
   const limit = projectPageLimit(input.limit);
   const maxBytes = input.maxBytes ?? MAX_SERIALIZED_RESULT_BYTES;
-  const scopeKey = projectScopeKey(input.scope);
   const effect = Effect.gen(function* () {
     yield* verify();
     return yield* sql.withTransaction(
@@ -1362,7 +1456,7 @@ const captureProjectPageInDatabase = (
             () =>
               new LocalStoreError({
                 kind: "storage",
-                message: "Could not create a project capture.",
+                message: `Could not create a ${input.captureKind} capture.`,
               }),
           ),
         );
@@ -1371,8 +1465,8 @@ const captureProjectPageInDatabase = (
           sql,
           config,
           databaseId,
-          scopeKey,
-          PROJECT_CAPTURE_ORDER,
+          input.scopeKey,
+          input.order,
           captureId,
           now,
           input.items,
@@ -1387,10 +1481,128 @@ const captureProjectPageInDatabase = (
           0,
           limit,
           maxBytes,
-          scopeKey,
-          projectCaptureCodec(input.scope),
+          input.scopeKey,
+          codec,
         );
-        return { page, observations: input.metadata.observations } satisfies ProjectCapturePage;
+        return { page, observations: input.metadata.observations } satisfies ListCapturePage<Page>;
+      }),
+    );
+  });
+  return retryStorage(effect.pipe(Effect.mapError(toStoreError)));
+};
+
+const captureProjectPageInDatabase = (
+  sql: SqlClient.SqlClient,
+  crypto: Crypto.Crypto,
+  config: Required<LocalStoreConfigValue>,
+  databaseId: string,
+  input: {
+    readonly scope: ProjectListScope;
+    readonly items: ReadonlyArray<ProjectSummary>;
+    readonly metadata: ProjectCaptureMetadata;
+    readonly limit?: number;
+    readonly maxBytes?: number;
+  },
+  verify: SchemaVerifier,
+): Effect.Effect<ProjectCapturePage, LocalStoreError> =>
+  captureListPageInDatabase(
+    sql,
+    crypto,
+    config,
+    databaseId,
+    {
+      scopeKey: projectScopeKey(input.scope),
+      order: PROJECT_CAPTURE_ORDER,
+      captureKind: "project",
+      items: input.items,
+      metadata: input.metadata,
+      ...(input.limit === undefined ? {} : { limit: input.limit }),
+      ...(input.maxBytes === undefined ? {} : { maxBytes: input.maxBytes }),
+    },
+    projectCaptureCodec(input.scope),
+    verify,
+  );
+
+const captureModelPageInDatabase = (
+  sql: SqlClient.SqlClient,
+  crypto: Crypto.Crypto,
+  config: Required<LocalStoreConfigValue>,
+  databaseId: string,
+  input: {
+    readonly query: ModelListQuery;
+    readonly items: ReadonlyArray<ModelSummary>;
+    readonly metadata: ModelCaptureMetadata;
+    readonly limit?: number;
+    readonly maxBytes?: number;
+  },
+  verify: SchemaVerifier,
+): Effect.Effect<ModelCapturePage, LocalStoreError> =>
+  captureListPageInDatabase(
+    sql,
+    crypto,
+    config,
+    databaseId,
+    {
+      scopeKey: modelScopeKey(input.query),
+      order: MODEL_CAPTURE_ORDER,
+      captureKind: "model",
+      items: input.items,
+      metadata: input.metadata,
+      ...(input.limit === undefined ? {} : { limit: input.limit }),
+      ...(input.maxBytes === undefined ? {} : { maxBytes: input.maxBytes }),
+    },
+    modelCaptureCodec(input.query),
+    verify,
+  );
+
+const readListPageFromDatabase = <
+  Payload extends { readonly captureId: string; readonly position: number },
+  Items,
+  Page,
+>(
+  sql: SqlClient.SqlClient,
+  databaseId: string,
+  options: {
+    readonly scopeKey: string;
+    readonly cursor: string;
+    readonly limit?: number;
+    readonly maxBytes?: number;
+  },
+  decodePayload: (cursor: string) => Effect.Effect<Payload, LocalStoreError>,
+  payloadMatches: (payload: Payload) => boolean,
+  mismatchMessage: string,
+  codec: CapturePageCodec<Items, ListCaptureMetadata, Page>,
+  verify: SchemaVerifier,
+): Effect.Effect<ListCapturePage<Page>, LocalStoreError> => {
+  const limit = projectPageLimit(options.limit);
+  const maxBytes = options.maxBytes ?? MAX_SERIALIZED_RESULT_BYTES;
+  const effect = Effect.gen(function* () {
+    yield* verify();
+    const payload = yield* decodePayload(options.cursor);
+    if (!payloadMatches(payload)) {
+      return yield* Effect.fail(
+        new LocalStoreError({
+          kind: "cursor_mismatch",
+          message: mismatchMessage,
+        }),
+      );
+    }
+    const now = yield* Clock.currentTimeMillis;
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        yield* sql`DELETE FROM captures WHERE expires_at <= ${now}`;
+        const { page, metadata } = yield* readCapturePage(
+          sql,
+          databaseId,
+          payload.captureId,
+          now,
+          payload.position,
+          limit,
+          maxBytes,
+          options.scopeKey,
+          codec,
+        );
+        return { page, observations: metadata.observations } satisfies ListCapturePage<Page>;
       }),
     );
   });
@@ -1407,53 +1619,65 @@ const readProjectPageFromDatabase = (
     readonly maxBytes?: number;
   },
   verify: SchemaVerifier,
-): Effect.Effect<ProjectCapturePage, LocalStoreError> => {
-  const limit = projectPageLimit(options.limit);
-  const maxBytes = options.maxBytes ?? MAX_SERIALIZED_RESULT_BYTES;
-  const scopeKey = projectScopeKey(options.scope);
-  const effect = Effect.gen(function* () {
-    yield* verify();
-    const payload = yield* decodeProjectCursor(options.cursor);
-    if (
-      payload.databaseId !== databaseId ||
-      payload.scope !== PROJECT_CAPTURE_SCOPE ||
-      payload.order !== PROJECT_CAPTURE_ORDER ||
-      !projectScopesEqual(payload.query, options.scope)
-    ) {
-      return yield* Effect.fail(
-        new LocalStoreError({
-          kind: "cursor_mismatch",
-          message: "The project cursor does not match this list.",
-        }),
-      );
-    }
-    const now = yield* Clock.currentTimeMillis;
-    return yield* sql.withTransaction(
-      Effect.gen(function* () {
-        yield* sql`DELETE FROM captures WHERE expires_at <= ${now}`;
-        const { page, metadata } = yield* readCapturePage(
-          sql,
-          databaseId,
-          payload.captureId,
-          now,
-          payload.position,
-          limit,
-          maxBytes,
-          scopeKey,
-          projectCaptureCodec(options.scope),
-        );
-        return { page, observations: metadata.observations } satisfies ProjectCapturePage;
-      }),
-    );
-  });
-  return retryStorage(effect.pipe(Effect.mapError(toStoreError)));
-};
+): Effect.Effect<ProjectCapturePage, LocalStoreError> =>
+  readListPageFromDatabase(
+    sql,
+    databaseId,
+    {
+      scopeKey: projectScopeKey(options.scope),
+      cursor: options.cursor,
+      ...(options.limit === undefined ? {} : { limit: options.limit }),
+      ...(options.maxBytes === undefined ? {} : { maxBytes: options.maxBytes }),
+    },
+    decodeProjectCursor,
+    (payload) =>
+      payload.databaseId === databaseId &&
+      payload.scope === PROJECT_CAPTURE_SCOPE &&
+      payload.order === PROJECT_CAPTURE_ORDER &&
+      projectScopesEqual(payload.query, options.scope),
+    "The project cursor does not match this list.",
+    projectCaptureCodec(options.scope),
+    verify,
+  );
 
-const findRetainedProjectCaptureInDatabase = (
+const readModelPageFromDatabase = (
   sql: SqlClient.SqlClient,
-  scope: ProjectListScope,
+  databaseId: string,
+  options: {
+    readonly query: ModelListQuery;
+    readonly cursor: string;
+    readonly limit?: number;
+    readonly maxBytes?: number;
+  },
   verify: SchemaVerifier,
-): Effect.Effect<RetainedProjectCapture | null, LocalStoreError> =>
+): Effect.Effect<ModelCapturePage, LocalStoreError> =>
+  readListPageFromDatabase(
+    sql,
+    databaseId,
+    {
+      scopeKey: modelScopeKey(options.query),
+      cursor: options.cursor,
+      ...(options.limit === undefined ? {} : { limit: options.limit }),
+      ...(options.maxBytes === undefined ? {} : { maxBytes: options.maxBytes }),
+    },
+    decodeModelCursor,
+    (payload) =>
+      payload.databaseId === databaseId &&
+      payload.scope === MODEL_CAPTURE_SCOPE &&
+      payload.order === MODEL_CAPTURE_ORDER &&
+      modelQueriesEqual(payload.query, options.query),
+    "The model cursor does not match this list.",
+    modelCaptureCodec(options.query),
+    verify,
+  );
+
+const findRetainedCaptureInDatabase = <Items>(
+  sql: SqlClient.SqlClient,
+  scopeKey: string,
+  order: string,
+  decodeItem: (payload: unknown) => Effect.Effect<Items, LocalStoreError>,
+  verify: SchemaVerifier,
+): Effect.Effect<RetainedCapture<Items> | null, LocalStoreError> =>
   retryStorage(
     Effect.gen(function* () {
       yield* verify();
@@ -1462,24 +1686,50 @@ const findRetainedProjectCaptureInDatabase = (
         SELECT capture_id, database_id, scope, order_key, expires_at, item_count,
           failures_json, coverage, limitations_json, observations_json
         FROM captures
-        WHERE scope = ${projectScopeKey(scope)}
-          AND order_key = ${PROJECT_CAPTURE_ORDER}
+        WHERE scope = ${scopeKey}
+          AND order_key = ${order}
           AND expires_at > ${now}
         ORDER BY created_at DESC, capture_id DESC
         LIMIT 1
       `;
       const capture = captures[0];
       if (capture === undefined) return null;
-      const metadata = yield* decodeProjectCaptureMetadata(capture);
+      const metadata = yield* decodeListCaptureMetadata(capture);
       const rows = yield* sql<CaptureItemRow>`
         SELECT position, payload, item_bytes
         FROM capture_items
         WHERE capture_id = ${capture.capture_id}
         ORDER BY position ASC
       `;
-      const items = yield* Effect.forEach(rows, (row) => decodeProjectCaptureItem(row.payload));
-      return { items, observations: metadata.observations } satisfies RetainedProjectCapture;
+      const items = yield* Effect.forEach(rows, (row) => decodeItem(row.payload));
+      return { items, observations: metadata.observations } satisfies RetainedCapture<Items>;
     }).pipe(Effect.mapError(toStoreError)),
+  );
+
+const findRetainedProjectCaptureInDatabase = (
+  sql: SqlClient.SqlClient,
+  scope: ProjectListScope,
+  verify: SchemaVerifier,
+): Effect.Effect<RetainedProjectCapture | null, LocalStoreError> =>
+  findRetainedCaptureInDatabase(
+    sql,
+    projectScopeKey(scope),
+    PROJECT_CAPTURE_ORDER,
+    decodeProjectCaptureItem,
+    verify,
+  );
+
+const findRetainedModelCaptureInDatabase = (
+  sql: SqlClient.SqlClient,
+  query: ModelListQuery,
+  verify: SchemaVerifier,
+): Effect.Effect<RetainedModelCapture | null, LocalStoreError> =>
+  findRetainedCaptureInDatabase(
+    sql,
+    modelScopeKey(query),
+    MODEL_CAPTURE_ORDER,
+    decodeModelCaptureItem,
+    verify,
   );
 
 const publishAndReadFirstPage = (
@@ -1689,16 +1939,30 @@ const instanceCaptureCodec = (): CapturePageCodec<
 
 const projectCaptureCodec = (
   scope: ProjectListScope,
-): CapturePageCodec<ProjectSummary, ProjectCaptureMetadata, ProjectListPage> => ({
+): CapturePageCodec<ProjectSummary, ListCaptureMetadata, ProjectListPage> => ({
   order: PROJECT_CAPTURE_ORDER,
   cursorKind: "project",
-  decodeMetadata: decodeProjectCaptureMetadata,
+  decodeMetadata: decodeListCaptureMetadata,
   decodeItem: decodeProjectCaptureItem,
-  buildPage: (items, nextCursor, metadata) => makeProjectListPage(items, nextCursor, metadata),
+  buildPage: (items, nextCursor, metadata) => makeListPage(items, nextCursor, metadata),
   measureResult: (page, metadata) =>
     serializedByteLength(makeProjectListToolSuccess(page, metadata.observations)),
   makeNextCursor: (databaseId, captureId, position) =>
     makeProjectCaptureCursor(databaseId, captureId, scope, position),
+});
+
+const modelCaptureCodec = (
+  query: ModelListQuery,
+): CapturePageCodec<ModelSummary, ListCaptureMetadata, ModelListPage> => ({
+  order: MODEL_CAPTURE_ORDER,
+  cursorKind: "model",
+  decodeMetadata: decodeListCaptureMetadata,
+  decodeItem: decodeModelCaptureItem,
+  buildPage: (items, nextCursor, metadata) => makeListPage(items, nextCursor, metadata),
+  measureResult: (page, metadata) =>
+    serializedByteLength(makeModelListToolSuccess(page, metadata.observations)),
+  makeNextCursor: (databaseId, captureId, position) =>
+    makeModelCaptureCursor(databaseId, captureId, query, position),
 });
 
 const readCapturePage = <Items, Metadata, Page>(
@@ -1891,9 +2155,9 @@ const decodeCaptureItem = (payload: unknown): Effect.Effect<InstanceSummary, Loc
   );
 };
 
-const decodeProjectCaptureMetadata = (
+const decodeListCaptureMetadata = (
   capture: CaptureRow,
-): Effect.Effect<ProjectCaptureMetadata, LocalStoreError> => {
+): Effect.Effect<ListCaptureMetadata, LocalStoreError> => {
   const observationsJson =
     typeof capture.observations_json === "string" ? capture.observations_json : null;
   return Effect.try({
@@ -1906,28 +2170,29 @@ const decodeProjectCaptureMetadata = (
     catch: () =>
       new LocalStoreError({
         kind: "malformed_row",
-        message: "A saved project capture is malformed.",
+        message: "A saved list capture is malformed.",
       }),
   }).pipe(
-    Effect.flatMap((value) => Schema.decodeUnknownEffect(ProjectCaptureMetadataSchema)(value)),
+    Effect.flatMap((value) => Schema.decodeUnknownEffect(ListCaptureMetadataSchema)(value)),
     Effect.mapError(
       () =>
         new LocalStoreError({
           kind: "malformed_row",
-          message: "A saved project capture is malformed.",
+          message: "A saved list capture is malformed.",
         }),
     ),
   );
 };
 
-const decodeProjectCaptureItem = (
+const decodeListCaptureItem = <Item>(
   payload: unknown,
-): Effect.Effect<ProjectSummary, LocalStoreError> => {
+  schema: Schema.ConstraintDecoder<Item>,
+): Effect.Effect<Item, LocalStoreError> => {
   if (typeof payload !== "string") {
     return Effect.fail(
       new LocalStoreError({
         kind: "malformed_row",
-        message: "A saved project capture row is malformed.",
+        message: "A saved list capture row is malformed.",
       }),
     );
   }
@@ -1936,26 +2201,34 @@ const decodeProjectCaptureItem = (
     catch: () =>
       new LocalStoreError({
         kind: "malformed_row",
-        message: "A saved project capture row is not valid JSON.",
+        message: "A saved list capture row is not valid JSON.",
       }),
   }).pipe(
-    Effect.flatMap((value) => Schema.decodeUnknownEffect(ProjectSummarySchema)(value)),
+    Effect.flatMap((value) => Schema.decodeUnknownEffect(schema)(value)),
     Effect.mapError((error) =>
       error instanceof LocalStoreError
         ? error
         : new LocalStoreError({
             kind: "malformed_row",
-            message: "A saved project capture row is malformed.",
+            message: "A saved list capture row is malformed.",
           }),
     ),
   );
 };
 
-const makeProjectListPage = (
-  items: ReadonlyArray<ProjectSummary>,
+const decodeProjectCaptureItem = (
+  payload: unknown,
+): Effect.Effect<ProjectSummary, LocalStoreError> =>
+  decodeListCaptureItem(payload, ProjectSummarySchema);
+
+const decodeModelCaptureItem = (payload: unknown): Effect.Effect<ModelSummary, LocalStoreError> =>
+  decodeListCaptureItem(payload, ModelSummarySchema);
+
+const makeListPage = <Items>(
+  items: ReadonlyArray<Items>,
   nextCursor: string | null,
-  metadata: ProjectCaptureMetadata,
-): ProjectListPage => ({
+  metadata: ListCaptureMetadata,
+) => ({
   items,
   nextCursor,
   coverage: metadata.coverage,
@@ -3229,6 +3502,22 @@ const makeProjectCaptureCursor = (
     position,
   } satisfies ProjectCursorPayload);
 
+const makeModelCaptureCursor = (
+  databaseId: string,
+  captureId: string,
+  query: ModelListQuery,
+  position: number,
+): string =>
+  encodeCursor({
+    version: 1,
+    databaseId,
+    captureId,
+    scope: MODEL_CAPTURE_SCOPE,
+    order: MODEL_CAPTURE_ORDER,
+    query,
+    position,
+  } satisfies ModelCursorPayload);
+
 const makeInstanceListPage = (
   items: ReadonlyArray<InstanceSummary>,
   nextCursor: string | null,
@@ -3245,69 +3534,34 @@ const makeInstanceListPage = (
   failures: metadata.failures,
 });
 
-const encodeCursor = (payload: CursorPayload | ProjectCursorPayload): string =>
+const encodeCursor = (payload: CursorPayload | ProjectCursorPayload | ModelCursorPayload): string =>
   Encoding.encodeBase64Url(JSON.stringify(payload));
 
-const decodeCursor = (value: string): Effect.Effect<CursorPayload, LocalStoreError> => {
+const decodeCursorPayload = <Payload>(
+  value: string,
+  schema: Schema.ConstraintDecoder<Payload>,
+  kind: "registration" | "project" | "model",
+): Effect.Effect<Payload, LocalStoreError> => {
+  const malformed = new LocalStoreError({
+    kind: "cursor_mismatch",
+    message: `The ${kind} cursor is malformed.`,
+  });
   try {
     const decodedText = Encoding.decodeBase64UrlString(value);
-    if (Result.isFailure(decodedText)) {
-      return Effect.fail(
-        new LocalStoreError({
-          kind: "cursor_mismatch",
-          message: "The registration cursor is malformed.",
-        }),
-      );
-    }
+    if (Result.isFailure(decodedText)) return Effect.fail(malformed);
     const decoded = JSON.parse(decodedText.success);
-    const result = Schema.decodeUnknownResult(CursorPayloadSchema)(decoded);
-    return Result.isSuccess(result)
-      ? Effect.succeed(result.success)
-      : Effect.fail(
-          new LocalStoreError({
-            kind: "cursor_mismatch",
-            message: "The registration cursor is malformed.",
-          }),
-        );
+    const result = Schema.decodeUnknownResult(schema)(decoded);
+    return Result.isSuccess(result) ? Effect.succeed(result.success) : Effect.fail(malformed);
   } catch {
-    return Effect.fail(
-      new LocalStoreError({
-        kind: "cursor_mismatch",
-        message: "The registration cursor is malformed.",
-      }),
-    );
+    return Effect.fail(malformed);
   }
 };
 
-const decodeProjectCursor = (
-  value: string,
-): Effect.Effect<ProjectCursorPayload, LocalStoreError> => {
-  try {
-    const decodedText = Encoding.decodeBase64UrlString(value);
-    if (Result.isFailure(decodedText)) {
-      return Effect.fail(
-        new LocalStoreError({
-          kind: "cursor_mismatch",
-          message: "The project cursor is malformed.",
-        }),
-      );
-    }
-    const decoded = JSON.parse(decodedText.success);
-    const result = Schema.decodeUnknownResult(ProjectCursorPayloadSchema)(decoded);
-    return Result.isSuccess(result)
-      ? Effect.succeed(result.success)
-      : Effect.fail(
-          new LocalStoreError({
-            kind: "cursor_mismatch",
-            message: "The project cursor is malformed.",
-          }),
-        );
-  } catch {
-    return Effect.fail(
-      new LocalStoreError({
-        kind: "cursor_mismatch",
-        message: "The project cursor is malformed.",
-      }),
-    );
-  }
-};
+const decodeCursor = (value: string): Effect.Effect<CursorPayload, LocalStoreError> =>
+  decodeCursorPayload(value, CursorPayloadSchema, "registration");
+
+const decodeProjectCursor = (value: string): Effect.Effect<ProjectCursorPayload, LocalStoreError> =>
+  decodeCursorPayload(value, ProjectCursorPayloadSchema, "project");
+
+const decodeModelCursor = (value: string): Effect.Effect<ModelCursorPayload, LocalStoreError> =>
+  decodeCursorPayload(value, ModelCursorPayloadSchema, "model");
