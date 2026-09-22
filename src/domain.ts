@@ -1,5 +1,6 @@
 import * as Schema from "effect/Schema";
 import * as SchemaGetter from "effect/SchemaGetter";
+import * as Encoding from "effect/Encoding";
 
 const nonEmptyString = Schema.NonEmptyString;
 export const DEFAULT_PAGE_LIMIT = 25;
@@ -659,6 +660,100 @@ export type ThreadListQuery = {
   readonly archived: ThreadArchivedMode;
 };
 
+/**
+ * A thread-get capture binds one direct thread reference; its cursor pages
+ * the captured thread's pending requests without mixing snapshots.
+ */
+export type ThreadGetCaptureQuery = {
+  readonly thread: ThreadReference;
+};
+
+const threadGetReferenceRuntimeShape = Schema.StructWithRest(
+  Schema.Struct({
+    instanceId: nonEmptyString,
+    threadId: nonEmptyString,
+  }),
+  [
+    Schema.Record(
+      Schema.String.check(
+        Schema.makeFilter((key) => key !== "instanceId" && key !== "threadId", {
+          message: "unknown thread_get thread argument",
+        }),
+      ),
+      Schema.Never,
+    ),
+  ],
+);
+
+const threadGetReferenceJsonShape = Schema.StructWithRest(
+  Schema.Struct({
+    instanceId: nonEmptyString,
+    threadId: nonEmptyString,
+  }),
+  [Schema.Record(Schema.String, Schema.Never)],
+);
+
+const threadGetFields = Schema.Struct({
+  thread: threadGetReferenceRuntimeShape,
+  cursor: Schema.optionalKey(nonEmptyString),
+  limit: Schema.optionalKey(pageLimit),
+  allowStale: Schema.optionalKey(Schema.Boolean),
+});
+
+const threadGetJsonFields = Schema.Struct({
+  thread: threadGetReferenceJsonShape,
+  cursor: Schema.optionalKey(nonEmptyString),
+  limit: Schema.optionalKey(pageLimit),
+  allowStale: Schema.optionalKey(Schema.Boolean),
+});
+
+const unknownThreadGetField = Schema.String.check(
+  Schema.makeFilter(
+    (key) => key !== "thread" && key !== "cursor" && key !== "limit" && key !== "allowStale",
+    {
+      message: "unknown thread_get argument",
+    },
+  ),
+);
+
+const threadGetRuntimeShape = Schema.StructWithRest(threadGetFields, [
+  Schema.Record(unknownThreadGetField, Schema.Never),
+]);
+
+const threadGetJsonShape = Schema.StructWithRest(threadGetJsonFields, [
+  Schema.Record(Schema.String, Schema.Never),
+]);
+
+/**
+ * The detailed thread read accepts one direct instance-qualified native
+ * thread reference, with page inputs over its pending requests. A UI-created
+ * thread reference works without prior listing or enrollment.
+ */
+export const ThreadGetInputSchema = Schema.declare<{
+  readonly thread: ThreadReference;
+  readonly cursor?: string;
+  readonly limit?: number;
+  readonly allowStale?: boolean;
+}>(
+  (
+    input,
+  ): input is {
+    readonly thread: ThreadReference;
+    readonly cursor?: string;
+    readonly limit?: number;
+    readonly allowStale?: boolean;
+  } => Schema.is(threadGetRuntimeShape)(input),
+  {
+    toCodecJson: () =>
+      Schema.link()(threadGetJsonShape, {
+        decode: SchemaGetter.passthrough({ strict: false }),
+        encode: SchemaGetter.passthrough({ strict: false }),
+      } as never),
+  },
+);
+
+export type ThreadGetInput = typeof ThreadGetInputSchema.Type;
+
 const operationGetFields = Schema.Struct({
   requestId,
   waitMs: Schema.optionalKey(
@@ -1147,6 +1242,187 @@ export const ThreadListToolResultSchema = toolResultFields(ThreadListPageSchema)
 
 export type ThreadListToolResult = typeof ThreadListToolResultSchema.Type;
 
+export const THREAD_SNAPSHOT_TURN_LIMIT = 20;
+export const MAX_ACTIVE_THREAD_SUBSCRIPTIONS_PER_INSTANCE = 32;
+export const MAX_PENDING_REQUEST_QUESTIONS = 32;
+export const MAX_PENDING_REQUEST_OPTIONS = 64;
+
+/**
+ * The windowed thread snapshot always requests the pinned server's supported
+ * turn window while retaining pending-request information; older turns beyond
+ * the window are reported as limited history instead of silent truncation.
+ */
+
+// fallow-ignore-next-line unused-export
+export const RuntimeModeSchema = Schema.Literals([
+  "approval-required",
+  "auto-accept-edits",
+  "auto",
+  "full-access",
+]);
+
+export type RuntimeMode = typeof RuntimeModeSchema.Type;
+
+// fallow-ignore-next-line unused-export
+export const InteractionModeSchema = Schema.Literals(["default", "plan"]);
+
+export type InteractionMode = typeof InteractionModeSchema.Type;
+
+// fallow-ignore-next-line unused-export
+export const ThreadConfigurationSchema = Schema.Struct({
+  model: ModelSelectionSchema,
+  runtimeMode: RuntimeModeSchema,
+  interactionMode: InteractionModeSchema,
+});
+
+export type ThreadConfiguration = typeof ThreadConfigurationSchema.Type;
+
+// fallow-ignore-next-line unused-export
+export const ApprovalDecisionSchema = Schema.Literals([
+  "accept",
+  "acceptForSession",
+  "acceptAlways",
+  "decline",
+  "cancel",
+]);
+
+export type ApprovalDecision = typeof ApprovalDecisionSchema.Type;
+
+const approvalChoiceSchema = Schema.Struct({
+  decision: ApprovalDecisionSchema,
+  label: nonEmptyString,
+});
+
+const inputQuestionSchema = Schema.Struct({
+  id: nonEmptyString,
+  header: Schema.String,
+  question: Schema.String,
+  options: Schema.Array(Schema.Struct({ label: Schema.String, description: Schema.String })),
+  multiSelect: Schema.Boolean,
+});
+
+const actionablePendingRequestFormSchema = Schema.Union([
+  Schema.Struct({
+    kind: Schema.Literal("approval"),
+    detail: Schema.String,
+    choices: Schema.Array(approvalChoiceSchema),
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("input"),
+    questions: Schema.Array(inputQuestionSchema),
+    responseSchema: Schema.Record(Schema.String, Schema.Unknown),
+  }),
+]);
+
+// fallow-ignore-next-line unused-export
+export const PendingRequestFormSchema = Schema.Union([
+  actionablePendingRequestFormSchema,
+  Schema.Struct({
+    kind: Schema.Literal("unavailable"),
+    requestKind: Schema.Literals(["approval", "input", "unknown"]),
+  }),
+]);
+
+export type PendingRequestForm = typeof PendingRequestFormSchema.Type;
+
+const pendingRequestBaseFields = {
+  activityId: nonEmptyString,
+  thread: threadReferenceSchema,
+  turn: Schema.NullOr(turnReferenceSchema),
+  state: Schema.Literals(["pending", "resolved", "unknown"]),
+};
+
+/**
+ * A pending request pairs its native activity identity with a nullable native
+ * request identity. Actionable requests always carry an ID, no unavailable
+ * reason, and a representable form; everything else stays visible but
+ * explicitly unactionable, and an unknown lifecycle is never reported as
+ * resolved.
+ */
+export const PendingRequestSchema = Schema.Union([
+  Schema.Struct({
+    ...pendingRequestBaseFields,
+    actionable: Schema.Literal(true),
+    pendingRequestId: nonEmptyString,
+    unavailableReason: Schema.Null,
+    form: actionablePendingRequestFormSchema,
+  }),
+  Schema.Struct({
+    ...pendingRequestBaseFields,
+    actionable: Schema.Literal(false),
+    pendingRequestId: Schema.NullOr(nonEmptyString),
+    unavailableReason: nonEmptyString,
+    form: PendingRequestFormSchema,
+  }),
+]);
+
+export type PendingRequest = typeof PendingRequestSchema.Type;
+
+// fallow-ignore-next-line unused-export
+export const PendingRequestPageSchema = Schema.Struct({
+  items: Schema.Array(PendingRequestSchema),
+  nextCursor: Schema.NullOr(nonEmptyString),
+  coverage: Schema.Literals(coverageStates),
+  limitations: Schema.Array(Schema.String),
+  failures: projectPageFailuresSchema,
+});
+
+export type PendingRequestPage = typeof PendingRequestPageSchema.Type;
+
+// fallow-ignore-next-line unused-export
+export const ThreadExecutionStateSchema = Schema.Struct({
+  state: Schema.Literals(["active", "inactive", "unknown"]),
+  turn: Schema.NullOr(turnReferenceSchema),
+  nativeState: Schema.NullOr(Schema.String),
+  evidence: Schema.Array(EvidenceSchema),
+});
+
+export type ThreadExecutionState = typeof ThreadExecutionStateSchema.Type;
+
+// fallow-ignore-next-line unused-export
+export const ThreadSessionStateSchema = Schema.Struct({
+  state: Schema.Literals(["starting", "running", "ready", "stopped", "error", "unknown"]),
+  nativeState: Schema.NullOr(Schema.String),
+  evidence: Schema.Array(EvidenceSchema),
+});
+
+export type ThreadSessionState = typeof ThreadSessionStateSchema.Type;
+
+/**
+ * The captured thread-state frame accompanies every pending-request page so
+ * a cursor continuation never mixes snapshots; the pending request items
+ * themselves live in the capture rows.
+ */
+export const CapturedThreadStateSchema = Schema.Struct({
+  summary: ThreadSummarySchema,
+  observationCursor: nonEmptyString,
+  configuration: ThreadConfigurationSchema,
+  execution: ThreadExecutionStateSchema,
+  session: ThreadSessionStateSchema,
+  interruptionPending: Schema.Boolean,
+  limitations: Schema.Array(Schema.String),
+});
+
+export type CapturedThreadState = typeof CapturedThreadStateSchema.Type;
+
+// fallow-ignore-next-line unused-export
+export const ThreadStateSchema = Schema.Struct({
+  summary: ThreadSummarySchema,
+  observationCursor: nonEmptyString,
+  configuration: ThreadConfigurationSchema,
+  execution: ThreadExecutionStateSchema,
+  session: ThreadSessionStateSchema,
+  pendingRequests: PendingRequestPageSchema,
+  interruptionPending: Schema.Boolean,
+  limitations: Schema.Array(Schema.String),
+});
+
+export type ThreadState = typeof ThreadStateSchema.Type;
+
+export const ThreadGetToolResultSchema = toolResultFields(ThreadStateSchema);
+
+export type ThreadGetToolResult = typeof ThreadGetToolResultSchema.Type;
+
 /**
  * A model list binds one saved instance registration and an optional native
  * provider instance filter. It never mixes registrations with native provider
@@ -1260,6 +1536,53 @@ export const makeThreadListToolSuccess = (
       : [],
   ),
 });
+
+export const staleThreadGetReadLimitation = staleProjectReadLimitation;
+
+export const makeThreadGetToolSuccess = (
+  value: ThreadState,
+  observations: ReadonlyArray<Observation>,
+): ThreadGetToolResult => ({
+  result: { kind: "ok" as const, value },
+  observations,
+  warnings: observations.flatMap((observation) =>
+    observation.freshness === "stale"
+      ? [
+          {
+            code: "fresh_read_failed" as const,
+            message: observation.limitations[0] ?? staleThreadGetReadLimitation,
+          },
+        ]
+      : [],
+  ),
+});
+
+/**
+ * The observation cursor records the snapshot boundary a thread state was
+ * published at: the global snapshot sequence plus the thread-scoped watermark
+ * (null when the pinned response carries none). A later `changed` wait can
+ * compare against it without re-reading history.
+ */
+export interface ThreadObservationCursor {
+  readonly version: 1;
+  readonly instanceId: string;
+  readonly threadId: string;
+  readonly snapshotSequence: number;
+  readonly threadSequence: number | null;
+  readonly observedAt: string;
+}
+
+export const encodeThreadObservationCursor = (cursor: ThreadObservationCursor): string =>
+  Encoding.encodeBase64Url(
+    JSON.stringify({
+      v: cursor.version,
+      i: cursor.instanceId,
+      t: cursor.threadId,
+      s: cursor.snapshotSequence,
+      w: cursor.threadSequence,
+      o: cursor.observedAt,
+    }),
+  );
 
 export const serializedByteLength = (value: unknown): number =>
   new TextEncoder().encode(JSON.stringify(value)).byteLength;

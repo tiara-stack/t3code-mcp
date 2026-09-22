@@ -110,6 +110,7 @@ describe("stdio transport", () => {
               "project_list",
               "model_list",
               "thread_list",
+              "thread_get",
               "operation_get",
             ]);
             for (const tool of toolsMessage.result?.tools ?? []) {

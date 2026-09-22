@@ -19,6 +19,7 @@ import {
   decodeProviderModelListing,
   type DiscoveredProvider,
   type ShellStreamItem,
+  type ThreadStreamItem,
 } from "./t3code-adapter";
 import type { ThreadListPage } from "./domain";
 import { ServerToolkit, serverToolkitLayer } from "./tools";
@@ -185,6 +186,15 @@ const fakeConnections = (options?: {
           status: null,
         }),
       ),
+    openThreadStream: () =>
+      Stream.fail(
+        new T3CodeAdapterError({
+          kind: "capacity",
+          message: "The test connection does not support thread observation.",
+          uncertain: false,
+          status: null,
+        }),
+      ),
     readArchivedShell: () =>
       Effect.fail(
         new T3CodeAdapterError({
@@ -244,6 +254,15 @@ const fakeAdapterLayer = (
         new T3CodeAdapterError({
           kind: "capacity",
           message: "The test adapter does not support shell subscriptions.",
+          uncertain: false,
+          status: null,
+        }),
+      ),
+    subscribeThread: () =>
+      Stream.fail(
+        new T3CodeAdapterError({
+          kind: "capacity",
+          message: "The test adapter does not support thread subscriptions.",
           uncertain: false,
           status: null,
         }),
@@ -1469,6 +1488,15 @@ describe("instance_pair_again", () => {
             status: null,
           }),
         ),
+      openThreadStream: () =>
+        Stream.fail(
+          new T3CodeAdapterError({
+            kind: "capacity",
+            message: "The test connection does not support thread observation.",
+            uncertain: false,
+            status: null,
+          }),
+        ),
       readArchivedShell: () =>
         Effect.fail(
           new T3CodeAdapterError({
@@ -1853,6 +1881,15 @@ describe("instance_pair_again", () => {
               new T3CodeAdapterError({
                 kind: "capacity",
                 message: "The test connection does not support shell observation.",
+                uncertain: false,
+                status: null,
+              }),
+            ),
+          openThreadStream: () =>
+            Stream.fail(
+              new T3CodeAdapterError({
+                kind: "capacity",
+                message: "The test connection does not support thread observation.",
                 uncertain: false,
                 status: null,
               }),
@@ -2678,6 +2715,15 @@ const projectFixtures = (
           status: null,
         }),
       ),
+    subscribeThread: () =>
+      Stream.fail(
+        new T3CodeAdapterError({
+          kind: "capacity",
+          message: "The project test adapter does not subscribe to threads.",
+          uncertain: false,
+          status: null,
+        }),
+      ),
     getArchivedShellSnapshot: () =>
       Effect.fail(
         new T3CodeAdapterError({
@@ -3378,6 +3424,15 @@ const modelFixtures = (
           status: null,
         }),
       ),
+    subscribeThread: () =>
+      Stream.fail(
+        new T3CodeAdapterError({
+          kind: "capacity",
+          message: "The model test adapter does not subscribe to threads.",
+          uncertain: false,
+          status: null,
+        }),
+      ),
     getArchivedShellSnapshot: () =>
       Effect.fail(
         new T3CodeAdapterError({
@@ -3947,6 +4002,15 @@ describe("model_list", () => {
                     status: null,
                   }),
                 ),
+              subscribeThread: () =>
+                Stream.fail(
+                  new T3CodeAdapterError({
+                    kind: "capacity",
+                    message: "The model test adapter does not subscribe to threads.",
+                    uncertain: false,
+                    status: null,
+                  }),
+                ),
               getArchivedShellSnapshot: () =>
                 Effect.fail(
                   new T3CodeAdapterError({
@@ -4213,6 +4277,15 @@ interface ThreadFixtureOptions {
       }) => Stream.Stream<ShellStreamItem, LocalStoreError | T3CodeAdapterError>
     >
   >;
+  threadStreams?: Readonly<
+    Record<
+      string,
+      (options?: {
+        readonly afterSequence?: number;
+        readonly turnLimit?: number;
+      }) => Stream.Stream<ThreadStreamItem, LocalStoreError | T3CodeAdapterError>
+    >
+  >;
   archivedShells?: Readonly<
     Record<
       string,
@@ -4229,6 +4302,7 @@ interface ThreadFixtureOptions {
   >;
   readonly seenActive: Array<string>;
   readonly seenArchived: Array<string>;
+  readonly seenThreads: Array<string>;
 }
 
 const threadConnections = (options: ThreadFixtureOptions) =>
@@ -4320,6 +4394,26 @@ const threadConnections = (options: ThreadFixtureOptions) =>
       }
       return scripted(streamOptions);
     },
+    openThreadStream: (
+      instanceId: string,
+      threadId: string,
+      streamOptions?: { readonly afterSequence?: number; readonly turnLimit?: number },
+    ) => {
+      const key = `${instanceId}:${threadId}`;
+      options.seenThreads.push(key);
+      const scripted = options.threadStreams?.[key];
+      if (scripted === undefined) {
+        return Stream.fail(
+          new T3CodeAdapterError({
+            kind: "transport",
+            message: `The thread test connection has no thread fixture for ${key}.`,
+            uncertain: false,
+            status: null,
+          }),
+        );
+      }
+      return scripted(streamOptions);
+    },
     readArchivedShell: (instanceId: string) => {
       options.seenArchived.push(instanceId);
       const scripted = options.archivedShells?.[instanceId];
@@ -4339,7 +4433,7 @@ const threadConnections = (options: ThreadFixtureOptions) =>
   });
 
 const emptyThreadFixtures = () => {
-  const options: ThreadFixtureOptions = { seenActive: [], seenArchived: [] };
+  const options: ThreadFixtureOptions = { seenActive: [], seenArchived: [], seenThreads: [] };
   return {
     options,
     connections: threadConnections(options),
@@ -5037,3 +5131,1135 @@ type ThreadListToolResultShape = {
   readonly observations: ReadonlyArray<unknown>;
   readonly warnings: ReadonlyArray<unknown>;
 };
+
+type ThreadGetToolResultShape = {
+  readonly result: {
+    readonly kind: "ok" | "error";
+    readonly value: {
+      readonly summary: unknown;
+      readonly observationCursor: string;
+      readonly configuration: unknown;
+      readonly execution: unknown;
+      readonly session: unknown;
+      readonly pendingRequests: {
+        readonly items: ReadonlyArray<unknown>;
+        readonly nextCursor: string | null;
+      };
+      readonly interruptionPending: boolean;
+      readonly limitations: ReadonlyArray<string>;
+    };
+    readonly error: { readonly code: string; readonly retry: string };
+  };
+  readonly observations: ReadonlyArray<{
+    readonly instanceId: string;
+    readonly freshness: string;
+    readonly sourceSequence: number | null;
+    readonly coverage: string;
+  }>;
+  readonly warnings: ReadonlyArray<{ readonly code: string }>;
+};
+
+const observedThreadFixture = (
+  threadId: string,
+  overrides: Partial<{
+    readonly projectId: string;
+    readonly title: string;
+    readonly modelSelection: { readonly providerInstanceId: string; readonly model: string };
+    readonly runtimeMode: "approval-required" | "auto-accept-edits" | "auto" | "full-access";
+    readonly interactionMode: "default" | "plan";
+    readonly worktreePath: string | null;
+    readonly latestTurn: {
+      readonly turnId: string;
+      readonly state: "running" | "interrupted" | "completed" | "error";
+    } | null;
+    readonly archivedAt: string | null;
+    readonly settledOverride: "settled" | "active" | null;
+    readonly settledAt: string | null;
+    readonly activities: ReadonlyArray<{
+      readonly activityId: string;
+      readonly kind: string;
+      readonly payload: unknown;
+      readonly turnId: string | null;
+      readonly createdAt: string;
+    }>;
+    readonly session: {
+      readonly status:
+        | "idle"
+        | "starting"
+        | "running"
+        | "ready"
+        | "interrupted"
+        | "stopped"
+        | "error";
+      readonly activeTurnId: string | null;
+      readonly lastError: string | null;
+      readonly updatedAt: string;
+    } | null;
+  }> = {},
+) => ({
+  threadId,
+  projectId: "project-a",
+  title: `Thread ${threadId}`,
+  modelSelection: { providerInstanceId: "provider-a", model: "model-a" },
+  runtimeMode: "full-access" as const,
+  interactionMode: "default" as const,
+  branch: null,
+  worktreePath: null,
+  latestTurn: null,
+  archivedAt: null,
+  settledOverride: null,
+  settledAt: null,
+  activities: [],
+  session: null,
+  ...overrides,
+});
+
+const detailSnapshotStream = (
+  snapshotSequence: number,
+  thread: ReturnType<typeof observedThreadFixture>,
+  page?: {
+    readonly beforeCursor: string | null;
+    readonly hasMore: boolean;
+    readonly threadSequence: number | null;
+  },
+): Stream.Stream<ThreadStreamItem, LocalStoreError | T3CodeAdapterError> =>
+  Stream.make(
+    {
+      kind: "snapshot" as const,
+      snapshot: { snapshotSequence, thread, page: page ?? null },
+    },
+    { kind: "synchronized" as const },
+  );
+
+const approvalActivity = (
+  activityId: string,
+  requestId: string | null,
+  overrides: Partial<{
+    readonly detail: string;
+    readonly options: ReadonlyArray<unknown>;
+    readonly turnId: string | null;
+    readonly createdAt: string;
+  }> = {},
+) => ({
+  activityId,
+  kind: "approval.requested",
+  payload: {
+    ...(requestId === null ? {} : { requestId }),
+    ...(overrides.detail === undefined ? {} : { detail: overrides.detail }),
+    ...(overrides.options === undefined ? {} : { options: overrides.options }),
+  },
+  turnId: overrides.turnId ?? null,
+  createdAt: overrides.createdAt ?? "2026-09-22T00:00:00.000Z",
+});
+
+const inputActivity = (
+  activityId: string,
+  requestId: string | null,
+  questions: ReadonlyArray<unknown>,
+  overrides: Partial<{ readonly turnId: string | null; readonly createdAt: string }> = {},
+) => ({
+  activityId,
+  kind: "user-input.requested",
+  payload: {
+    ...(requestId === null ? {} : { requestId }),
+    questions,
+  },
+  turnId: overrides.turnId ?? null,
+  createdAt: overrides.createdAt ?? "2026-09-22T00:00:00.000Z",
+});
+
+describe("thread_get", () => {
+  it.live("returns compact thread state for a direct reference without prior listing", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(41, [shellProjectFixture("project-a", "/srv/project-a")], []),
+              shellSynchronizedItem,
+            ),
+        };
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              42,
+              observedThreadFixture("thread-a", {
+                worktreePath: "/srv/worktrees/thread-a",
+                latestTurn: { turnId: "turn-9", state: "completed" },
+                session: {
+                  status: "ready",
+                  activeTurnId: null,
+                  lastError: null,
+                  updatedAt: "2026-09-22T00:00:00.000Z",
+                },
+                settledAt: "2026-09-22T01:00:00.000Z",
+                activities: [
+                  approvalActivity("activity-1", "request-1", {
+                    detail: "Allow command?",
+                    options: [
+                      { decision: "accept", label: "Accept" },
+                      { decision: "decline", label: "Decline" },
+                    ],
+                    turnId: "turn-9",
+                    createdAt: "2026-09-22T00:00:01.000Z",
+                  }),
+                  inputActivity(
+                    "activity-2",
+                    "request-2",
+                    [
+                      {
+                        id: "q1",
+                        header: "Target",
+                        question: "Which target?",
+                        options: [{ label: "staging", description: "Staging env" }],
+                        multiSelect: false,
+                      },
+                    ],
+                    { createdAt: "2026-09-22T00:00:02.000Z" },
+                  ),
+                ],
+              }),
+              { beforeCursor: null, hasMore: false, threadSequence: 42 },
+            ),
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_get", {
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        const value = result[0]?.result as unknown as ThreadGetToolResultShape;
+        expect(value.result).toMatchObject({
+          kind: "ok",
+          value: {
+            summary: {
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+              project: { instanceId: "instance-a", projectId: "project-a" },
+              title: "Thread thread-a",
+              archived: false,
+              worktree: {
+                instanceId: "instance-a",
+                repositoryPath: "/srv/project-a",
+                worktreePath: "/srv/worktrees/thread-a",
+              },
+              latestTurn: { instanceId: "instance-a", threadId: "thread-a", turnId: "turn-9" },
+              settlement: "settled",
+            },
+            configuration: {
+              model: { providerInstanceId: "provider-a", model: "model-a" },
+              runtimeMode: "full-access",
+              interactionMode: "default",
+            },
+            execution: {
+              state: "inactive",
+              turn: { instanceId: "instance-a", threadId: "thread-a", turnId: "turn-9" },
+              nativeState: "completed",
+            },
+            session: { state: "ready", nativeState: "ready" },
+            interruptionPending: false,
+            pendingRequests: {
+              nextCursor: null,
+              items: [
+                {
+                  activityId: "activity-1",
+                  thread: { instanceId: "instance-a", threadId: "thread-a" },
+                  turn: { instanceId: "instance-a", threadId: "thread-a", turnId: "turn-9" },
+                  state: "pending",
+                  actionable: true,
+                  pendingRequestId: "request-1",
+                  unavailableReason: null,
+                  form: {
+                    kind: "approval",
+                    detail: "Allow command?",
+                    choices: [
+                      { decision: "accept", label: "Accept" },
+                      { decision: "decline", label: "Decline" },
+                    ],
+                  },
+                },
+                {
+                  activityId: "activity-2",
+                  turn: null,
+                  state: "pending",
+                  actionable: true,
+                  pendingRequestId: "request-2",
+                  form: {
+                    kind: "input",
+                    questions: [
+                      {
+                        id: "q1",
+                        header: "Target",
+                        question: "Which target?",
+                        options: [{ label: "staging", description: "Staging env" }],
+                        multiSelect: false,
+                      },
+                    ],
+                    responseSchema: {
+                      type: "object",
+                      properties: { q1: { type: "string", enum: ["staging"] } },
+                      required: ["q1"],
+                      additionalProperties: false,
+                    },
+                  },
+                },
+              ],
+            },
+          },
+        });
+        const state = (
+          value.result as {
+            kind: "ok";
+            value: { observationCursor: string; limitations: ReadonlyArray<string> };
+          }
+        ).value;
+        expect(typeof state.observationCursor).toBe("string");
+        expect(state.limitations).toEqual([]);
+        expect(value.observations).toMatchObject([
+          { instanceId: "instance-a", freshness: "fresh", sourceSequence: 42 },
+        ]);
+        expect(value.warnings).toEqual([]);
+        expect(result[0]?.encodedResult).toEqual(result[0]?.result);
+      }),
+    ),
+  );
+
+  it.live("keeps execution, session, and settlement distinct for an active turn", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(41, [shellProjectFixture("project-a", "/srv/project-a")], []),
+              shellSynchronizedItem,
+            ),
+        };
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              42,
+              observedThreadFixture("thread-a", {
+                latestTurn: { turnId: "turn-9", state: "running" },
+                session: {
+                  status: "running",
+                  activeTurnId: "turn-9",
+                  lastError: null,
+                  updatedAt: "2026-09-22T00:00:00.000Z",
+                },
+                settledOverride: "active",
+              }),
+            ),
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_get", {
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        const value = result[0]?.result as unknown as ThreadGetToolResultShape;
+        expect(value.result).toMatchObject({
+          kind: "ok",
+          value: {
+            execution: {
+              state: "active",
+              turn: { turnId: "turn-9" },
+              nativeState: "running",
+            },
+            session: { state: "running", nativeState: "running" },
+            interruptionPending: false,
+          },
+        });
+        const summary = (value.result as { value: { summary: { settlement: string } } }).value
+          .summary;
+        expect(summary.settlement).toBe("unsettled");
+      }),
+    ),
+  );
+
+  it.live("reports interruption evidence from the projected turn and session", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(41, [shellProjectFixture("project-a")], []),
+              shellSynchronizedItem,
+            ),
+        };
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              42,
+              observedThreadFixture("thread-a", {
+                latestTurn: { turnId: "turn-9", state: "interrupted" },
+                session: {
+                  status: "interrupted",
+                  activeTurnId: null,
+                  lastError: null,
+                  updatedAt: "2026-09-22T00:00:00.000Z",
+                },
+              }),
+            ),
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_get", {
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        const value = result[0]?.result as unknown as ThreadGetToolResultShape;
+        expect(value.result).toMatchObject({
+          kind: "ok",
+          value: {
+            execution: { state: "inactive", nativeState: "interrupted" },
+            session: { state: "stopped", nativeState: "interrupted" },
+            interruptionPending: true,
+          },
+        });
+      }),
+    ),
+  );
+
+  it.live("keeps colliding thread IDs distinct across instances", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(41, [shellProjectFixture("project-a", "/srv/a")], []),
+              shellSynchronizedItem,
+            ),
+          "instance-b": () =>
+            Stream.make(
+              shellSnapshotItem(41, [shellProjectFixture("project-a", "/srv/b")], []),
+              shellSynchronizedItem,
+            ),
+        };
+        options.threadStreams = {
+          "instance-a:thread-same": () =>
+            detailSnapshotStream(42, observedThreadFixture("thread-same", { title: "A's thread" })),
+          "instance-b:thread-same": () =>
+            detailSnapshotStream(
+              43,
+              observedThreadFixture("thread-same", {
+                title: "B's thread",
+                latestTurn: { turnId: "turn-b", state: "running" },
+                session: {
+                  status: "running",
+                  activeTurnId: "turn-b",
+                  lastError: null,
+                  updatedAt: "2026-09-22T00:00:00.000Z",
+                },
+              }),
+            ),
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            yield* seedProjectRegistration("instance-b", "https://b.test", "secret-b");
+            const first = yield* callTool("thread_get", {
+              thread: { instanceId: "instance-a", threadId: "thread-same" },
+            });
+            const second = yield* callTool("thread_get", {
+              thread: { instanceId: "instance-b", threadId: "thread-same" },
+            });
+            return { first: first[0]?.result, second: second[0]?.result };
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        const first = result.first as unknown as ThreadGetToolResultShape;
+        const second = result.second as unknown as ThreadGetToolResultShape;
+        expect(first.result).toMatchObject({
+          kind: "ok",
+          value: {
+            summary: {
+              thread: { instanceId: "instance-a", threadId: "thread-same" },
+              title: "A's thread",
+            },
+            execution: { state: "inactive", nativeState: null },
+            session: { state: "unknown", nativeState: null },
+          },
+        });
+        expect(second.result).toMatchObject({
+          kind: "ok",
+          value: {
+            summary: {
+              thread: { instanceId: "instance-b", threadId: "thread-same" },
+              title: "B's thread",
+            },
+            execution: { state: "active", turn: { turnId: "turn-b" } },
+            session: { state: "running" },
+          },
+        });
+      }),
+    ),
+  );
+
+  it.live("marks limited history when the window reports more turns", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(41, [shellProjectFixture("project-a")], []),
+              shellSynchronizedItem,
+            ),
+        };
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(42, observedThreadFixture("thread-a"), {
+              beforeCursor: "cursor-page-2",
+              hasMore: true,
+              threadSequence: 40,
+            }),
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_get", {
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        const value = result[0]?.result as unknown as ThreadGetToolResultShape;
+        const state = (value.result as { value: { limitations: ReadonlyArray<string> } }).value;
+        expect(state.limitations).toEqual([
+          "The pinned server retained only the most recent 20 user-anchored turns; earlier history is unavailable through this read.",
+        ]);
+      }),
+    ),
+  );
+
+  it.live("leaves missing or unrepresentable requests visible but unactionable", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(41, [shellProjectFixture("project-a")], []),
+              shellSynchronizedItem,
+            ),
+        };
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              42,
+              observedThreadFixture("thread-a", {
+                activities: [
+                  approvalActivity("activity-1", null, { createdAt: "2026-09-22T00:00:01.000Z" }),
+                  approvalActivity("activity-2", "request-2", {
+                    options: [{ unexpected: true }],
+                    createdAt: "2026-09-22T00:00:02.000Z",
+                  }),
+                  approvalActivity("activity-2b", "request-2b", {
+                    options: [],
+                    createdAt: "2026-09-22T00:00:02.500Z",
+                  }),
+                  inputActivity(
+                    "activity-3",
+                    "request-3",
+                    Array.from({ length: 33 }, (_, index) => ({
+                      id: `q${index}`,
+                      header: "H",
+                      question: "Q",
+                      options: [],
+                      multiSelect: false,
+                    })),
+                    { createdAt: "2026-09-22T00:00:03.000Z" },
+                  ),
+                  {
+                    activityId: "activity-4",
+                    kind: "user-input.requested",
+                    payload: { requestId: "request-4", questions: "not-an-array" },
+                    turnId: null,
+                    createdAt: "2026-09-22T00:00:04.000Z",
+                  },
+                  {
+                    activityId: "activity-5",
+                    kind: "approval.resolved",
+                    payload: { requestId: "request-5" },
+                    turnId: null,
+                    createdAt: "2026-09-22T00:00:05.000Z",
+                  },
+                  approvalActivity("activity-6", "request-5", {
+                    options: [{ decision: "accept", label: "Accept" }],
+                    createdAt: "2026-09-22T00:00:06.000Z",
+                  }),
+                ],
+              }),
+            ),
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_get", {
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        const value = result[0]?.result as unknown as ThreadGetToolResultShape;
+        const items = (
+          value.result as {
+            value: {
+              pendingRequests: {
+                items: ReadonlyArray<{
+                  activityId: string;
+                  state: string;
+                  actionable: boolean;
+                  pendingRequestId: string | null;
+                  form: { kind: string };
+                }>;
+              };
+            };
+          }
+        ).value.pendingRequests.items;
+        expect(items).toEqual([
+          {
+            activityId: "activity-1",
+            thread: { instanceId: "instance-a", threadId: "thread-a" },
+            turn: null,
+            state: "unknown",
+            actionable: false,
+            pendingRequestId: null,
+            unavailableReason: "The native request ID is missing; the request cannot be answered.",
+            form: { kind: "unavailable", requestKind: "approval" },
+          },
+          {
+            activityId: "activity-2",
+            thread: { instanceId: "instance-a", threadId: "thread-a" },
+            turn: null,
+            state: "pending",
+            actionable: false,
+            pendingRequestId: "request-2",
+            unavailableReason: "The offered approval decisions could not be represented.",
+            form: { kind: "unavailable", requestKind: "approval" },
+          },
+          {
+            activityId: "activity-2b",
+            thread: { instanceId: "instance-a", threadId: "thread-a" },
+            turn: null,
+            state: "pending",
+            actionable: false,
+            pendingRequestId: "request-2b",
+            unavailableReason: "The offered approval decisions could not be represented.",
+            form: { kind: "unavailable", requestKind: "approval" },
+          },
+          {
+            activityId: "activity-3",
+            thread: { instanceId: "instance-a", threadId: "thread-a" },
+            turn: null,
+            state: "pending",
+            actionable: false,
+            pendingRequestId: "request-3",
+            unavailableReason: "The input form could not be represented.",
+            form: { kind: "unavailable", requestKind: "input" },
+          },
+          {
+            activityId: "activity-4",
+            thread: { instanceId: "instance-a", threadId: "thread-a" },
+            turn: null,
+            state: "pending",
+            actionable: false,
+            pendingRequestId: "request-4",
+            unavailableReason: "The input form could not be represented.",
+            form: { kind: "unavailable", requestKind: "input" },
+          },
+          {
+            activityId: "activity-6",
+            thread: { instanceId: "instance-a", threadId: "thread-a" },
+            turn: null,
+            state: "resolved",
+            actionable: false,
+            pendingRequestId: "request-5",
+            unavailableReason: "The request is already resolved.",
+            form: {
+              kind: "approval",
+              detail: "approval.requested",
+              choices: [{ decision: "accept", label: "Accept" }],
+            },
+          },
+        ]);
+      }),
+    ),
+  );
+
+  it.live("pages pending requests within one immutable captured state", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(41, [shellProjectFixture("project-a")], []),
+              shellSynchronizedItem,
+            ),
+        };
+        const manyActivities = Array.from({ length: 30 }, (_, index) =>
+          approvalActivity(`activity-${index}`, `request-${index}`, {
+            createdAt: `2026-09-22T00:00:${String(index).padStart(2, "0")}.000Z`,
+          }),
+        );
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              42,
+              observedThreadFixture("thread-a", { activities: manyActivities }),
+            ),
+        };
+        const first = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_get", {
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+              limit: 25,
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        const firstValue = first[0]?.result as unknown as ThreadGetToolResultShape;
+        const firstState = (
+          firstValue.result as {
+            value: {
+              observationCursor: string;
+              pendingRequests: {
+                items: ReadonlyArray<{ pendingRequestId: string }>;
+                nextCursor: string;
+              };
+            };
+          }
+        ).value;
+        expect(firstState.pendingRequests.items).toHaveLength(25);
+        expect(firstState.pendingRequests.items[0]?.pendingRequestId).toBe("request-0");
+        expect(firstState.pendingRequests.nextCursor).not.toBeNull();
+
+        // The continuation serves the same captured state after the layer
+        // (and process scope) is rebuilt around the same database.
+        const second = yield* Effect.scoped(
+          Effect.gen(function* () {
+            return yield* callTool("thread_get", {
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+              cursor: firstState.pendingRequests.nextCursor,
+              limit: 25,
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        const secondValue = second[0]?.result as unknown as ThreadGetToolResultShape;
+        const secondState = (
+          secondValue.result as {
+            value: {
+              observationCursor: string;
+              pendingRequests: {
+                items: ReadonlyArray<{ pendingRequestId: string }>;
+                nextCursor: null;
+              };
+            };
+          }
+        ).value;
+        expect(secondState.observationCursor).toBe(firstState.observationCursor);
+        expect(secondState.pendingRequests.items).toHaveLength(5);
+        expect(secondState.pendingRequests.items[0]?.pendingRequestId).toBe("request-25");
+        expect(secondState.pendingRequests.nextCursor).toBeNull();
+
+        // A cursor from this capture cannot page another thread's pending requests.
+        const { options: otherOptions, connections: otherConnections } = emptyThreadFixtures();
+        otherOptions.activeStreams = options.activeStreams;
+        otherOptions.threadStreams = {
+          "instance-a:thread-b": () => detailSnapshotStream(7, observedThreadFixture("thread-b")),
+        };
+        const mismatched = yield* Effect.scoped(
+          Effect.gen(function* () {
+            return yield* callTool("thread_get", {
+              thread: { instanceId: "instance-a", threadId: "thread-b" },
+              cursor: firstState.pendingRequests.nextCursor,
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, otherConnections))),
+        );
+        expect(mismatched[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "cursor_mismatch", retry: "safe_read" } },
+        });
+      }),
+    ),
+  );
+
+  it.live("serves explicit stale reads from retained captures after a fresh failure", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(41, [shellProjectFixture("project-a")], []),
+              shellSynchronizedItem,
+            ),
+        };
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              42,
+              observedThreadFixture("thread-a", {
+                latestTurn: { turnId: "turn-9", state: "completed" },
+              }),
+            ),
+        };
+        const first = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_get", {
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        const firstValue = first[0]?.result as unknown as ThreadGetToolResultShape;
+        expect(firstValue.observations).toMatchObject([{ freshness: "fresh" }]);
+
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            Stream.fail(
+              new T3CodeAdapterError({
+                kind: "transport",
+                message: "The thread observation stream dropped.",
+                uncertain: true,
+                status: null,
+              }),
+            ),
+        };
+        const stale = yield* Effect.scoped(
+          Effect.gen(function* () {
+            return yield* callTool("thread_get", {
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+              allowStale: true,
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        const staleValue = stale[0]?.result as unknown as ThreadGetToolResultShape;
+        expect(staleValue.result).toMatchObject({
+          kind: "ok",
+          value: {
+            summary: { thread: { instanceId: "instance-a", threadId: "thread-a" } },
+            execution: { nativeState: "completed" },
+          },
+        });
+        expect(staleValue.observations).toMatchObject([
+          { freshness: "stale", coverage: "partial" },
+        ]);
+        expect(staleValue.warnings).toMatchObject([{ code: "fresh_read_failed" }]);
+
+        // A fresh read without the explicit stale policy fails typed.
+        const fresh = yield* Effect.scoped(
+          Effect.gen(function* () {
+            return yield* callTool("thread_get", {
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        expect(fresh[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "unavailable", retry: "safe_read" } },
+        });
+      }),
+    ),
+  );
+
+  it.live("reports resource_not_found for an unknown thread", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.threadStreams = {
+          "instance-a:thread-missing": () =>
+            Stream.fail(
+              new T3CodeAdapterError({
+                kind: "resource_not_found",
+                message: "Thread thread-missing was not found",
+                uncertain: false,
+                status: null,
+              }),
+            ),
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_get", {
+              thread: { instanceId: "instance-a", threadId: "thread-missing" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "error",
+            error: { code: "resource_not_found", retry: "reconcile_first" },
+          },
+        });
+      }),
+    ),
+  );
+
+  it.live("publishes buffered live events that race the thread snapshot", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(41, [shellProjectFixture("project-a")], []),
+              shellSynchronizedItem,
+            ),
+        };
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            Stream.make(
+              {
+                kind: "activity-appended" as const,
+                sequence: 43,
+                activity: approvalActivity("activity-live", "request-live"),
+              },
+              {
+                kind: "snapshot" as const,
+                snapshot: {
+                  snapshotSequence: 42,
+                  thread: observedThreadFixture("thread-a"),
+                  page: null,
+                },
+              },
+              {
+                kind: "session-set" as const,
+                sequence: 44,
+                session: {
+                  status: "running" as const,
+                  activeTurnId: "turn-1",
+                  lastError: null,
+                  updatedAt: "2026-09-22T00:00:01.000Z",
+                },
+              },
+              { kind: "synchronized" as const },
+            ),
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_get", {
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        const value = result[0]?.result as unknown as ThreadGetToolResultShape;
+        expect(value.result).toMatchObject({
+          kind: "ok",
+          value: {
+            session: { state: "running", nativeState: "running" },
+            pendingRequests: {
+              items: [
+                {
+                  activityId: "activity-live",
+                  pendingRequestId: "request-live",
+                  actionable: false,
+                },
+              ],
+            },
+          },
+        });
+        const observations = value.observations;
+        expect(observations).toMatchObject([{ sourceSequence: 44 }]);
+      }),
+    ),
+  );
+
+  it.live("deduplicates colliding pending-request IDs, keeping the latest lifecycle row", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(41, [shellProjectFixture("project-a")], []),
+              shellSynchronizedItem,
+            ),
+        };
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              42,
+              observedThreadFixture("thread-a", {
+                activities: [
+                  approvalActivity("activity-first", "request-same", {
+                    detail: "Stale row",
+                    options: [{ decision: "accept", label: "Accept" }],
+                    createdAt: "2026-09-22T00:00:01.000Z",
+                  }),
+                  approvalActivity("activity-latest", "request-same", {
+                    detail: "Current row",
+                    options: [{ decision: "accept", label: "Accept" }],
+                    createdAt: "2026-09-22T00:00:02.000Z",
+                  }),
+                ],
+              }),
+            ),
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_get", {
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        const value = result[0]?.result as unknown as ThreadGetToolResultShape;
+        const items = (
+          value.result as {
+            value: {
+              pendingRequests: {
+                items: ReadonlyArray<{ activityId: string; form: { detail: string } }>;
+              };
+            };
+          }
+        ).value.pendingRequests.items;
+        // One entry per native request ID; the latest requested row wins.
+        expect(items).toHaveLength(1);
+        expect(items[0]?.activityId).toBe("activity-latest");
+        expect(items[0]?.form.detail).toBe("Current row");
+      }),
+    ),
+  );
+
+  it.live(
+    "reports session-projected turn state as unknown rather than authoritative completion",
+    () =>
+      withDatabasePath((databasePath) =>
+        Effect.gen(function* () {
+          const { options, connections } = emptyThreadFixtures();
+          options.activeStreams = {
+            "instance-a": () =>
+              Stream.make(
+                shellSnapshotItem(41, [shellProjectFixture("project-a")], []),
+                shellSynchronizedItem,
+              ),
+          };
+          options.threadStreams = {
+            "instance-a:thread-a": () =>
+              Stream.make(
+                {
+                  kind: "snapshot" as const,
+                  snapshot: {
+                    snapshotSequence: 42,
+                    thread: observedThreadFixture("thread-a", {
+                      latestTurn: { turnId: "turn-1", state: "running" },
+                      session: {
+                        status: "running" as const,
+                        activeTurnId: "turn-1",
+                        lastError: null,
+                        updatedAt: "2026-09-22T00:00:00.000Z",
+                      },
+                    }),
+                    page: null,
+                  },
+                },
+                {
+                  kind: "session-set" as const,
+                  sequence: 43,
+                  session: {
+                    status: "ready" as const,
+                    activeTurnId: null,
+                    lastError: null,
+                    updatedAt: "2026-09-22T00:00:01.000Z",
+                  },
+                },
+                {
+                  kind: "session-set" as const,
+                  sequence: 44,
+                  session: {
+                    status: "idle" as const,
+                    activeTurnId: null,
+                    lastError: null,
+                    updatedAt: "2026-09-22T00:00:02.000Z",
+                  },
+                },
+                { kind: "synchronized" as const },
+              ),
+          };
+          const result = yield* Effect.scoped(
+            Effect.gen(function* () {
+              yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+              return yield* callTool("thread_get", {
+                thread: { instanceId: "instance-a", threadId: "thread-a" },
+              });
+            }).pipe(Effect.provide(appLayer(databasePath, connections))),
+          );
+          const value = result[0]?.result as unknown as ThreadGetToolResultShape;
+          expect(value.result).toMatchObject({
+            kind: "ok",
+            value: {
+              execution: {
+                state: "unknown",
+                turn: { instanceId: "instance-a", threadId: "thread-a", turnId: "turn-1" },
+                nativeState: "completed",
+              },
+              session: { state: "ready", nativeState: "idle" },
+            },
+          });
+          const execution = (
+            value.result as {
+              value: { execution: { evidence: ReadonlyArray<{ detail: string }> } };
+            }
+          ).value.execution;
+          expect(execution.evidence[0]?.detail).toContain("projected from a session transition");
+        }),
+      ),
+  );
+
+  it.live("rejects unknown thread_get arguments before dispatch", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const exit = yield* Effect.exit(
+          Effect.scoped(
+            Effect.gen(function* () {
+              yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+              return yield* callTool("thread_get", {
+                thread: { instanceId: "instance-a", threadId: "thread-a" },
+                unexpected: true,
+              });
+            }).pipe(Effect.provide(appLayer(databasePath, connections))),
+          ),
+        );
+        expect(Exit.isFailure(exit)).toBe(true);
+        if (Exit.isSuccess(exit)) return;
+        expect(String(exit.cause)).toContain("Invalid parameters for tool 'thread_get'");
+        expect(options.seenThreads).toEqual([]);
+      }),
+    ),
+  );
+
+  it.live("fails oversized one-turn snapshots with an explicit unavailable result", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              42,
+              observedThreadFixture("thread-a", { title: "x".repeat(140 * 1024 * 1024) }),
+            ),
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_get", {
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        expect(result[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "unavailable", retry: "safe_read" } },
+        });
+      }),
+    ),
+  );
+});

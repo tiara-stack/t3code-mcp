@@ -3,12 +3,13 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { cachedConnectionLimitation } from "./domain";
 
 export const MIGRATION_TABLE = "effect_sql_migrations";
-export const SUPPORTED_SCHEMA_VERSION = 5;
+export const SUPPORTED_SCHEMA_VERSION = 6;
 export const MIGRATION_NAME = "create_local_registration_store";
 export const CAPTURE_MIGRATION_NAME = "add_capture_metadata";
 export const LATEST_MIGRATION_NAME = "add_mutation_receipts";
 export const PAIRING_MIGRATION_NAME = "add_pairing_recovery";
 export const OBSERVATION_MIGRATION_NAME = "add_capture_observations";
+export const THREAD_STATE_MIGRATION_NAME = "add_thread_state_captures";
 
 export const migrations = {
   [`0001_${MIGRATION_NAME}`]: Effect.gen(function* () {
@@ -229,5 +230,15 @@ export const migrations = {
     yield* sql`ALTER TABLE captures ADD COLUMN observations_json TEXT`;
     yield* sql`UPDATE local_store_meta SET value = '5' WHERE key = 'schema_version'`;
     yield* sql.unsafe("PRAGMA user_version = 5");
+  }),
+  [`0006_${THREAD_STATE_MIGRATION_NAME}`]: Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+
+    // Thread-get captures persist the captured thread-state frame beside the
+    // pending-request page items so a cursor continuation never mixes
+    // snapshots. Other capture kinds leave the column NULL.
+    yield* sql`ALTER TABLE captures ADD COLUMN state_json TEXT`;
+    yield* sql`UPDATE local_store_meta SET value = '6' WHERE key = 'schema_version'`;
+    yield* sql.unsafe("PRAGMA user_version = 6");
   }),
 } as const;

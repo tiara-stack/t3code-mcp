@@ -19,6 +19,7 @@ import {
   type ShellStreamItem,
   type StagedPairingToken,
   type T3CodeAdapterService,
+  type ThreadStreamItem,
   type VerifiedInstance,
 } from "./t3code-adapter";
 
@@ -86,6 +87,18 @@ export interface InstanceConnectionsService {
     instanceId: string,
     options?: { readonly afterSequence?: number },
   ) => Stream.Stream<ShellStreamItem, LocalStoreError | T3CodeAdapterError>;
+  /**
+   * Open a scoped thread-detail observation stream for one thread on the
+   * current registration revision. The per-instance RPC capacity permit is
+   * held until the returned stream terminates; the caller consumes the
+   * stream to the synchronized boundary and interrupts it to release the
+   * upstream subscription.
+   */
+  readonly openThreadStream: (
+    instanceId: string,
+    threadId: string,
+    options?: { readonly afterSequence?: number; readonly turnLimit?: number },
+  ) => Stream.Stream<ThreadStreamItem, LocalStoreError | T3CodeAdapterError>;
   readonly readArchivedShell: (
     instanceId: string,
   ) => Effect.Effect<ObservedShellSnapshot, LocalStoreError | T3CodeAdapterError>;
@@ -293,10 +306,20 @@ export class InstanceConnections extends Context.Service<
             return { ...listing, observedAt };
           });
 
-        const openShellStream = (
+        /**
+         * Open one scoped observation stream for the current registration
+         * revision. The per-instance RPC capacity permit is held until the
+         * returned stream terminates; the caller consumes the stream to the
+         * synchronized boundary and interrupts it to release the upstream
+         * subscription.
+         */
+        const openObservationStream = <Item>(
           instanceId: string,
-          options?: { readonly afterSequence?: number },
-        ): Stream.Stream<ShellStreamItem, LocalStoreError | T3CodeAdapterError> =>
+          unsupportedMessage: string,
+          open: (
+            connection: InstanceConnection,
+          ) => Stream.Stream<Item, LocalStoreError | T3CodeAdapterError>,
+        ): Stream.Stream<Item, LocalStoreError | T3CodeAdapterError> =>
           Stream.unwrap(
             Effect.gen(function* () {
               const registration = yield* store.getRegistration(instanceId);
@@ -312,8 +335,7 @@ export class InstanceConnections extends Context.Service<
                 return yield* Effect.fail(
                   new T3CodeAdapterError({
                     kind: "pairing_required",
-                    message:
-                      "The saved registration requires pairing before threads can be listed.",
+                    message: unsupportedMessage,
                     uncertain: false,
                     status: null,
                   }),
@@ -340,15 +362,46 @@ export class InstanceConnections extends Context.Service<
                   }),
                 );
               }
-              return adapter.subscribeShell({
+              return open(connection);
+            }),
+          );
+
+        const openShellStream = (
+          instanceId: string,
+          options?: { readonly afterSequence?: number },
+        ): Stream.Stream<ShellStreamItem, LocalStoreError | T3CodeAdapterError> =>
+          openObservationStream(
+            instanceId,
+            "The saved registration requires pairing before threads can be listed.",
+            (connection) =>
+              adapter.subscribeShell({
                 endpoint: connection.endpoint,
                 credential: connection.credential,
                 ...(options?.afterSequence === undefined
                   ? {}
                   : { afterSequence: options.afterSequence }),
                 requestCompletionMarker: true,
-              });
-            }),
+              }),
+          );
+
+        const openThreadStream = (
+          instanceId: string,
+          threadId: string,
+          options?: { readonly afterSequence?: number; readonly turnLimit?: number },
+        ): Stream.Stream<ThreadStreamItem, LocalStoreError | T3CodeAdapterError> =>
+          openObservationStream(
+            instanceId,
+            "The saved registration requires pairing before threads can be inspected.",
+            (connection) =>
+              adapter.subscribeThread({
+                endpoint: connection.endpoint,
+                credential: connection.credential,
+                threadId,
+                ...(options?.afterSequence === undefined
+                  ? {}
+                  : { afterSequence: options.afterSequence }),
+                ...(options?.turnLimit === undefined ? {} : { turnLimit: options.turnLimit }),
+              }),
           );
 
         const readArchivedShell = (
@@ -610,6 +663,7 @@ export class InstanceConnections extends Context.Service<
           discoverProjects,
           discoverModels,
           openShellStream,
+          openThreadStream,
           readArchivedShell,
           invalidate,
         });

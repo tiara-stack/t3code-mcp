@@ -229,6 +229,13 @@ export class Operations extends Context.Service<Operations, OperationsService>()
               retry: "reconcile_first",
               details: {},
             };
+          case "resource_not_found":
+            return {
+              code: "resource_not_found",
+              message: error.message,
+              retry: "reconcile_first",
+              details: {},
+            };
         }
       };
 

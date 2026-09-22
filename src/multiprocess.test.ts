@@ -117,6 +117,7 @@ const startServer = async (databasePath: string): Promise<Server> => {
       "project_list",
       "model_list",
       "thread_list",
+      "thread_get",
       "operation_get",
     ]);
     return server;

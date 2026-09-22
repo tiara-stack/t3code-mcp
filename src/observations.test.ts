@@ -15,10 +15,16 @@ import {
   ObservationError,
   Observations,
   synchronizeShellStream,
+  synchronizeThreadStream,
   type SynchronizedShell,
 } from "./observations";
 import * as Result from "effect/Result";
-import { T3CodeAdapter, T3CodeAdapterError, type ShellStreamItem } from "./t3code-adapter";
+import {
+  T3CodeAdapter,
+  T3CodeAdapterError,
+  type ShellStreamItem,
+  type ThreadStreamItem,
+} from "./t3code-adapter";
 
 const makeDirectory = () => {
   const directory = mkdtempSync(join(tmpdir(), "t3code-mcp-observations-"));
@@ -87,6 +93,7 @@ const runSync = (
   synchronizeShellStream({
     stream: Stream.make(...items),
     initialSequence: undefined,
+    initial: undefined,
     isGenerationStale: () => false,
     bufferBudgetBytes: 1024 * 1024,
     ...options,
@@ -206,6 +213,7 @@ describe("synchronizeShellStream", () => {
             Stream.fromEffect(Deferred.await(gate)).pipe(Stream.map(() => synchronizedItem)),
           ),
           initialSequence: undefined,
+          initial: undefined,
           isGenerationStale: () => stale,
           bufferBudgetBytes: 1024,
         }),
@@ -226,6 +234,7 @@ describe("synchronizeShellStream", () => {
         synchronizeShellStream({
           stream: Stream.fromEffect(Effect.never).pipe(Stream.map(() => synchronizedItem)),
           initialSequence: undefined,
+          initial: undefined,
           isGenerationStale: () => false,
           bufferBudgetBytes: 1024,
         }),
@@ -266,6 +275,7 @@ const observationsLayer = (
           seenAfterSequences.push(options?.afterSequence);
           return scripts.openShellStream(instanceId, options);
         },
+        openThreadStream: () => Stream.die("not used"),
         readArchivedShell: (instanceId) => scripts.readArchivedShell(instanceId),
         invalidate: () => Effect.void,
       }),
@@ -314,6 +324,10 @@ describe("Observations service", () => {
         );
         expect(first.snapshotSequence).toBe(5);
         expect(second.snapshotSequence).toBe(5);
+        // A resume whose stream carries no replay events restates the
+        // retained projection instead of publishing an empty shell.
+        expect(second.threads.map((entry) => entry.threadId)).toEqual(["thread-a"]);
+        expect(second.projects.map((entry) => entry.projectId)).toEqual(["project-a"]);
         expect(seenAfterSequences).toEqual([undefined, 5]);
       }),
     ),
@@ -435,6 +449,7 @@ describe("Observations coalescing", () => {
                   synchronizedItem,
                 );
               },
+              openThreadStream: () => Stream.die("not used"),
               readArchivedShell: () => Effect.die("not used"),
               invalidate: () => Effect.void,
             }),
@@ -457,6 +472,666 @@ describe("Observations coalescing", () => {
         expect(seenAfterSequences).toEqual([undefined]);
       }),
     ),
+  );
+});
+
+const threadDetailFixture = (
+  threadId: string,
+  overrides: Partial<{
+    readonly projectId: string;
+    readonly title: string;
+    readonly modelSelection: { readonly providerInstanceId: string; readonly model: string };
+    readonly runtimeMode: "approval-required" | "auto-accept-edits" | "auto" | "full-access";
+    readonly interactionMode: "default" | "plan";
+    readonly branch: string | null;
+    readonly worktreePath: string | null;
+    readonly latestTurn: {
+      readonly turnId: string;
+      readonly state: "running" | "interrupted" | "completed" | "error";
+    } | null;
+    readonly archivedAt: string | null;
+    readonly settledOverride: "settled" | "active" | null;
+    readonly settledAt: string | null;
+    readonly activities: ReadonlyArray<{
+      readonly activityId: string;
+      readonly kind: string;
+      readonly payload: unknown;
+      readonly turnId: string | null;
+      readonly createdAt: string;
+    }>;
+    readonly session: {
+      readonly status:
+        | "idle"
+        | "starting"
+        | "running"
+        | "ready"
+        | "interrupted"
+        | "stopped"
+        | "error";
+      readonly activeTurnId: string | null;
+      readonly lastError: string | null;
+      readonly updatedAt: string;
+    } | null;
+  }> = {},
+) => ({
+  threadId,
+  projectId: "project-a",
+  title: `Thread ${threadId}`,
+  modelSelection: { providerInstanceId: "provider-a", model: "model-a" },
+  runtimeMode: "full-access" as const,
+  interactionMode: "default" as const,
+  branch: null,
+  worktreePath: null,
+  latestTurn: null,
+  archivedAt: null,
+  settledOverride: null,
+  settledAt: null,
+  activities: [],
+  session: null,
+  ...overrides,
+});
+
+const threadSnapshotItem = (
+  snapshotSequence: number,
+  thread: ReturnType<typeof threadDetailFixture>,
+  page?: {
+    readonly beforeCursor: string | null;
+    readonly hasMore: boolean;
+    readonly threadSequence: number | null;
+  },
+): ThreadStreamItem => ({
+  kind: "snapshot",
+  snapshot: {
+    snapshotSequence,
+    thread,
+    page: page === undefined ? null : page,
+  },
+});
+
+const threadSynchronizedItem: ThreadStreamItem = { kind: "synchronized" };
+
+const threadSessionSetItem = (
+  sequence: number,
+  session: {
+    readonly status:
+      | "idle"
+      | "starting"
+      | "running"
+      | "ready"
+      | "interrupted"
+      | "stopped"
+      | "error";
+    readonly activeTurnId: string | null;
+    readonly lastError: string | null;
+    readonly updatedAt: string;
+  },
+): ThreadStreamItem => ({ kind: "session-set", sequence, session });
+
+const threadActivityAppendedItem = (
+  sequence: number,
+  activity: {
+    readonly activityId: string;
+    readonly kind: string;
+    readonly payload: unknown;
+    readonly turnId: string | null;
+    readonly createdAt: string;
+  },
+): ThreadStreamItem => ({ kind: "activity-appended", sequence, activity });
+
+const runThreadSync = (
+  items: ReadonlyArray<ThreadStreamItem>,
+  options?: Partial<Parameters<typeof synchronizeThreadStream>[0]>,
+) =>
+  synchronizeThreadStream({
+    stream: Stream.make(...items),
+    initialSequence: undefined,
+    initial: undefined,
+    isGenerationStale: () => false,
+    bufferBudgetBytes: 1024 * 1024,
+    ...options,
+  });
+
+describe("synchronizeThreadStream", () => {
+  it.effect("publishes the windowed snapshot once the synchronized boundary arrives", () =>
+    Effect.gen(function* () {
+      const detail = yield* runThreadSync([
+        threadSnapshotItem(7, threadDetailFixture("thread-a"), {
+          beforeCursor: null,
+          hasMore: true,
+          threadSequence: 6,
+        }),
+        threadSynchronizedItem,
+      ]);
+      expect(detail.snapshotSequence).toBe(7);
+      expect(detail.threadSequence).toBe(6);
+      expect(detail.thread.threadId).toBe("thread-a");
+      expect(detail.limitedHistory).toBe(true);
+    }),
+  );
+
+  it.effect("treats a snapshot without page metadata as fully loaded history", () =>
+    Effect.gen(function* () {
+      const detail = yield* runThreadSync([
+        threadSnapshotItem(7, threadDetailFixture("thread-a")),
+        threadSynchronizedItem,
+      ]);
+      expect(detail.limitedHistory).toBe(false);
+    }),
+  );
+
+  it.effect("applies live session and activity events buffered before the snapshot after it", () =>
+    Effect.gen(function* () {
+      const detail = yield* runThreadSync([
+        threadActivityAppendedItem(8, {
+          activityId: "activity-live",
+          kind: "approval.requested",
+          payload: { requestId: "request-live" },
+          turnId: "turn-1",
+          createdAt: "2026-09-22T00:00:01.000Z",
+        }),
+        threadSnapshotItem(7, threadDetailFixture("thread-a")),
+        threadSessionSetItem(9, {
+          status: "running",
+          activeTurnId: "turn-1",
+          lastError: null,
+          updatedAt: "2026-09-22T00:00:02.000Z",
+        }),
+        threadSynchronizedItem,
+      ]);
+      expect(detail.snapshotSequence).toBe(9);
+      expect(detail.thread.session?.status).toBe("running");
+      expect(detail.thread.activities.map((activity) => activity.activityId)).toEqual([
+        "activity-live",
+      ]);
+    }),
+  );
+
+  it.effect("settles a running turn when a buffered session leaves the running status", () =>
+    Effect.gen(function* () {
+      const detail = yield* runThreadSync([
+        threadSnapshotItem(
+          7,
+          threadDetailFixture("thread-a", {
+            latestTurn: { turnId: "turn-1", state: "running" },
+            session: {
+              status: "running",
+              activeTurnId: "turn-1",
+              lastError: null,
+              updatedAt: "2026-09-22T00:00:00.000Z",
+            },
+          }),
+        ),
+        threadSessionSetItem(8, {
+          status: "ready",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: "2026-09-22T00:00:01.000Z",
+        }),
+        threadSynchronizedItem,
+      ]);
+      // Session readiness alone cannot establish authoritative completion:
+      // the projection marks the state as projected, not observed.
+      expect(detail.projectedTurnState).toBe(true);
+      expect(detail.thread.latestTurn?.state).toBe("completed");
+      expect(detail.thread.session?.status).toBe("ready");
+    }),
+  );
+
+  it.effect("marks snapshot turn state as observed, not projected", () =>
+    Effect.gen(function* () {
+      const detail = yield* runThreadSync([
+        threadSnapshotItem(
+          7,
+          threadDetailFixture("thread-a", {
+            latestTurn: { turnId: "turn-1", state: "completed" },
+          }),
+        ),
+        threadSynchronizedItem,
+      ]);
+      expect(detail.projectedTurnState).toBe(false);
+      expect(detail.thread.latestTurn?.state).toBe("completed");
+    }),
+  );
+
+  it.effect("deduplicates replay overlap by sequence without reporting gaps", () =>
+    Effect.gen(function* () {
+      const detail = yield* runThreadSync(
+        [
+          threadSnapshotItem(10, threadDetailFixture("thread-a")),
+          // Overlapping replay copies at or below the watermark are dropped,
+          // including a session update that the snapshot already reflects.
+          threadActivityAppendedItem(9, {
+            activityId: "stale-copy",
+            kind: "approval.requested",
+            payload: { requestId: "request-1" },
+            turnId: null,
+            createdAt: "2026-09-22T00:00:00.000Z",
+          }),
+          threadSessionSetItem(10, {
+            status: "ready",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: "2026-09-22T00:00:00.000Z",
+          }),
+          threadActivityAppendedItem(11, {
+            activityId: "activity-new",
+            kind: "approval.requested",
+            payload: { requestId: "request-2" },
+            turnId: null,
+            createdAt: "2026-09-22T00:00:01.000Z",
+          }),
+          threadSynchronizedItem,
+        ],
+        { initialSequence: 4 },
+      );
+      expect(detail.snapshotSequence).toBe(11);
+      expect(detail.thread.activities.map((activity) => activity.activityId)).toEqual([
+        "activity-new",
+      ]);
+      expect(detail.thread.session).toBeNull();
+    }),
+  );
+
+  it.effect("lets a replacement snapshot restate the staged thread", () =>
+    Effect.gen(function* () {
+      const detail = yield* runThreadSync([
+        threadSnapshotItem(3, threadDetailFixture("thread-old")),
+        threadSnapshotItem(12, threadDetailFixture("thread-a")),
+        threadActivityAppendedItem(13, {
+          activityId: "activity-new",
+          kind: "user-input.requested",
+          payload: { requestId: "request-9", questions: [] },
+          turnId: null,
+          createdAt: "2026-09-22T00:00:01.000Z",
+        }),
+        threadSynchronizedItem,
+      ]);
+      expect(detail.snapshotSequence).toBe(13);
+      expect(detail.thread.threadId).toBe("thread-a");
+    }),
+  );
+
+  it.effect("reports a missing boundary when the thread stream ends early", () =>
+    Effect.gen(function* () {
+      const error = yield* Effect.flip(
+        runThreadSync([threadSnapshotItem(7, threadDetailFixture("thread-a"))]),
+      );
+      expect(error).toBeInstanceOf(ObservationError);
+      expect((error as ObservationError).kind).toBe("boundary_missing");
+    }),
+  );
+
+  it.effect("fails with an overflow when the buffered thread queue exceeds its budget", () =>
+    Effect.gen(function* () {
+      const error = yield* Effect.flip(
+        runThreadSync(
+          [
+            threadActivityAppendedItem(8, {
+              activityId: "oversized",
+              kind: "approval.requested",
+              payload: { requestId: "request-1", detail: "x".repeat(2048) },
+              turnId: null,
+              createdAt: "2026-09-22T00:00:00.000Z",
+            }),
+            threadSnapshotItem(7, threadDetailFixture("thread-a")),
+            threadSynchronizedItem,
+          ],
+          { bufferBudgetBytes: 256 },
+        ),
+      );
+      expect(error).toBeInstanceOf(ObservationError);
+      expect((error as ObservationError).kind).toBe("observation_overflow");
+    }),
+  );
+
+  it.effect("rejects callbacks from a superseded thread generation", () =>
+    Effect.gen(function* () {
+      const gate = yield* Deferred.make<void>();
+      let stale = false;
+      const fiber = yield* Effect.forkDetach(
+        synchronizeThreadStream({
+          stream: Stream.concat(
+            Stream.make(threadSnapshotItem(7, threadDetailFixture("thread-a"))),
+            Stream.fromEffect(Deferred.await(gate)).pipe(Stream.map(() => threadSynchronizedItem)),
+          ),
+          initialSequence: undefined,
+          initial: undefined,
+          isGenerationStale: () => stale,
+          bufferBudgetBytes: 1024,
+        }),
+      );
+      stale = true;
+      yield* Deferred.succeed(gate, undefined);
+      const error = yield* Effect.flip(Fiber.join(fiber));
+      expect(error).toBeInstanceOf(ObservationError);
+      expect((error as ObservationError).kind).toBe("stale_generation");
+    }),
+  );
+
+  it.effect("bounds the thread synchronization attempt with the shared 30-second limit", () =>
+    Effect.gen(function* () {
+      const fiber = yield* Effect.forkDetach(
+        synchronizeThreadStream({
+          stream: Stream.fromEffect(Effect.never).pipe(Stream.map(() => threadSynchronizedItem)),
+          initialSequence: undefined,
+          initial: undefined,
+          isGenerationStale: () => false,
+          bufferBudgetBytes: 1024,
+        }),
+      );
+      yield* TestClock.adjust(Duration.millis(30_000));
+      const error = yield* Effect.flip(Fiber.join(fiber));
+      expect(error).toBeInstanceOf(ObservationError);
+      expect((error as ObservationError).kind).toBe("synchronization_timeout");
+    }),
+  );
+});
+
+interface ThreadScripts {
+  readonly openThreadStream: (
+    instanceId: string,
+    threadId: string,
+    options?: { readonly afterSequence?: number; readonly turnLimit?: number },
+  ) => Stream.Stream<ThreadStreamItem, never>;
+}
+
+const threadObservationsLayer = (
+  databasePath: string,
+  scripts: ThreadScripts,
+  seenThreadReads: Array<{
+    readonly threadId: string;
+    readonly afterSequence: number | undefined;
+    readonly turnLimit: number | undefined;
+  }>,
+) =>
+  Observations.layer.pipe(
+    Layer.provideMerge(
+      InstanceConnections.layerTest({
+        exchangePairingCode: () => Effect.die("not used"),
+        verifyCredential: () => Effect.die("not used"),
+        inspectCredential: () => Effect.die("not used"),
+        pair: () => Effect.die("not used"),
+        acquire: () => Effect.die("not used"),
+        inspect: () => Effect.die("not used"),
+        discoverProjects: () => Effect.die("not used"),
+        discoverModels: () => Effect.die("not used"),
+        openShellStream: () => Stream.die("not used"),
+        openThreadStream: (instanceId, threadId, options) => {
+          seenThreadReads.push({
+            threadId,
+            afterSequence: options?.afterSequence,
+            turnLimit: options?.turnLimit,
+          });
+          return scripts.openThreadStream(instanceId, threadId, options);
+        },
+        readArchivedShell: () => Effect.die("not used"),
+        invalidate: () => Effect.void,
+      }),
+    ),
+    Layer.provideMerge(LocalStore.layer({ databasePath })),
+  );
+
+describe("Observations thread detail", () => {
+  it.effect("requests the 20-turn window and resumes from the published watermark", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const seenThreadReads: Array<{
+          readonly threadId: string;
+          readonly afterSequence: number | undefined;
+          readonly turnLimit: number | undefined;
+        }> = [];
+        const layer = threadObservationsLayer(
+          databasePath,
+          {
+            openThreadStream: () =>
+              Stream.make(
+                threadSnapshotItem(5, threadDetailFixture("thread-a")),
+                threadSynchronizedItem,
+              ),
+          },
+          seenThreadReads,
+        );
+        const { first, second } = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedRegistration;
+            const observations = yield* Observations;
+            const firstDetail = yield* observations.threadDetail("instance-a", "thread-a");
+            const secondDetail = yield* observations.threadDetail("instance-a", "thread-a");
+            return { first: firstDetail, second: secondDetail };
+          }).pipe(Effect.provide(layer)),
+        );
+        expect(first.snapshotSequence).toBe(5);
+        expect(second.snapshotSequence).toBe(5);
+        // A no-op resume restates the retained thread detail rather than
+        // publishing an empty projection.
+        expect(second.thread.threadId).toBe("thread-a");
+        expect(seenThreadReads).toEqual([
+          { threadId: "thread-a", afterSequence: undefined, turnLimit: 20 },
+          { threadId: "thread-a", afterSequence: 5, turnLimit: 20 },
+        ]);
+      }),
+    ),
+  );
+
+  it.effect("joins overlapping thread reads of one registration revision", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        let streamOpens = 0;
+        const seenThreadReads: Array<{
+          readonly threadId: string;
+          readonly afterSequence: number | undefined;
+          readonly turnLimit: number | undefined;
+        }> = [];
+        const layer = threadObservationsLayer(
+          databasePath,
+          {
+            openThreadStream: () => {
+              streamOpens += 1;
+              return Stream.make(
+                threadSnapshotItem(5, threadDetailFixture("thread-a")),
+                threadSynchronizedItem,
+              );
+            },
+          },
+          seenThreadReads,
+        );
+        const [first, second] = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedRegistration;
+            const observations = yield* Observations;
+            return yield* Effect.all(
+              [
+                observations.threadDetail("instance-a", "thread-a"),
+                observations.threadDetail("instance-a", "thread-a"),
+              ],
+              { concurrency: "unbounded" },
+            );
+          }).pipe(Effect.provide(layer)),
+        );
+        expect(first.snapshotSequence).toBe(5);
+        expect(second.snapshotSequence).toBe(5);
+        expect(streamOpens).toBe(1);
+      }),
+    ),
+  );
+
+  it.effect("rejects a thread projection when the registration revision changes during sync", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const gate = yield* Deferred.make<void>();
+        const snapshotEmitted = yield* Deferred.make<void>();
+        const seenThreadReads: Array<{
+          readonly threadId: string;
+          readonly afterSequence: number | undefined;
+          readonly turnLimit: number | undefined;
+        }> = [];
+        const layer = threadObservationsLayer(
+          databasePath,
+          {
+            openThreadStream: () =>
+              Stream.concat(
+                Stream.make(threadSnapshotItem(5, threadDetailFixture("thread-a"))),
+                Stream.fromEffect(
+                  Effect.gen(function* () {
+                    yield* Deferred.succeed(snapshotEmitted, undefined);
+                    yield* Deferred.await(gate);
+                  }),
+                ).pipe(Stream.map(() => threadSynchronizedItem)),
+              ),
+          },
+          seenThreadReads,
+        );
+        yield* Effect.scoped(
+          seedRegistration.pipe(Effect.provide(LocalStore.layer({ databasePath }))),
+        );
+        const fiber = yield* Effect.forkDetach(
+          Effect.scoped(
+            Effect.gen(function* () {
+              const observations = yield* Observations;
+              return yield* observations.threadDetail("instance-a", "thread-a");
+            }).pipe(Effect.provide(layer)),
+          ),
+        );
+        yield* Deferred.await(snapshotEmitted);
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const store = yield* LocalStore;
+            yield* store.updateRegistration({
+              instanceId: "instance-a",
+              expectedRevision: 0,
+              alias: "Instance A renamed",
+              endpoint: "https://a.test",
+              environmentId: "env-a",
+              connection: "connected",
+              lastObservedAt: null,
+            });
+          }).pipe(Effect.provide(LocalStore.layer({ databasePath }))),
+        );
+        yield* Deferred.succeed(gate, undefined);
+        const error = yield* Effect.flip(Fiber.join(fiber));
+        expect(error).toBeInstanceOf(T3CodeAdapterError);
+        expect((error as T3CodeAdapterError).kind).toBe("identity_mismatch");
+      }),
+    ),
+  );
+
+  it.effect("releases the subscription scope when synchronization overflows", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        let overflowing = true;
+        const seenThreadReads: Array<{
+          readonly threadId: string;
+          readonly afterSequence: number | undefined;
+          readonly turnLimit: number | undefined;
+        }> = [];
+        const layer = threadObservationsLayer(
+          databasePath,
+          {
+            openThreadStream: (_instanceId, threadId) =>
+              overflowing
+                ? Stream.make(
+                    threadActivityAppendedItem(2, {
+                      activityId: "oversized",
+                      kind: "approval.requested",
+                      payload: { requestId: "request-1", detail: "x".repeat(40 * 1024 * 1024) },
+                      turnId: null,
+                      createdAt: "2026-09-22T00:00:00.000Z",
+                    }),
+                    threadSnapshotItem(1, threadDetailFixture(threadId)),
+                    threadSynchronizedItem,
+                  )
+                : Stream.make(
+                    threadSnapshotItem(3, threadDetailFixture(threadId)),
+                    threadSynchronizedItem,
+                  ),
+          },
+          seenThreadReads,
+        );
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedRegistration;
+            const observations = yield* Observations;
+            // The buffer overflows while a live event races the snapshot.
+            const error = yield* Effect.flip(observations.threadDetail("instance-a", "thread-a"));
+            if (!(error instanceof ObservationError) || error.kind !== "observation_overflow") {
+              throw new Error(`expected observation_overflow, got ${JSON.stringify(error)}`);
+            }
+            // Overflow released the scope: a follow-up read succeeds.
+            overflowing = false;
+            const detail = yield* observations.threadDetail("instance-a", "thread-a");
+            expect(detail.snapshotSequence).toBe(3);
+          }).pipe(Effect.provide(layer)),
+        );
+      }),
+    ),
+  );
+
+  it.effect(
+    "refuses the 33rd concurrent thread subscription per instance and releases scopes on closure",
+    () =>
+      withDatabasePath((databasePath) =>
+        Effect.gen(function* () {
+          const gate = yield* Deferred.make<void>();
+          const ready = yield* Deferred.make<void>();
+          let streamStarts = 0;
+          const seenThreadReads: Array<{
+            readonly threadId: string;
+            readonly afterSequence: number | undefined;
+            readonly turnLimit: number | undefined;
+          }> = [];
+          const layer = threadObservationsLayer(
+            databasePath,
+            {
+              openThreadStream: (_instanceId, threadId) => {
+                streamStarts += 1;
+                if (streamStarts === 32) Deferred.doneUnsafe(ready, Effect.void);
+                return Stream.concat(
+                  Stream.make(threadSnapshotItem(1, threadDetailFixture(threadId))),
+                  Stream.fromEffect(Deferred.await(gate)).pipe(
+                    Stream.map(() => threadSynchronizedItem),
+                  ),
+                );
+              },
+            },
+            seenThreadReads,
+          );
+          yield* Effect.scoped(
+            Effect.gen(function* () {
+              yield* seedRegistration;
+              const observations = yield* Observations;
+              // Thirty-two concurrent synchronizations hold their scopes;
+              // the thirty-third must fail with the subscription capacity.
+              const pool = yield* Effect.forkDetach(
+                Effect.forEach(
+                  Array.from({ length: 32 }, (_, index) => `thread-${index}`),
+                  (threadId) => observations.threadDetail("instance-a", threadId),
+                  { concurrency: "unbounded" },
+                ),
+              );
+              yield* Deferred.await(ready);
+              const refused = yield* Effect.result(
+                observations.threadDetail("instance-a", "thread-overflow"),
+              );
+              if (Result.isSuccess(refused)) {
+                throw new Error("the 33rd thread subscription should fail while capacity is full");
+              }
+              if (
+                !(refused.failure instanceof ObservationError) ||
+                refused.failure.kind !== "subscription_capacity"
+              ) {
+                throw new Error(
+                  `expected a subscription_capacity failure, got ${JSON.stringify(refused.failure)}`,
+                );
+              }
+              yield* Deferred.succeed(gate, undefined);
+              yield* Fiber.join(pool);
+              // Closure released every scope: a fresh read succeeds at once.
+              const after = yield* observations.threadDetail("instance-a", "thread-after");
+              expect(after.snapshotSequence).toBe(1);
+            }).pipe(Effect.provide(layer)),
+          );
+        }),
+      ),
   );
 });
 
@@ -486,6 +1161,7 @@ describe("InstanceConnections observation capacity", () => {
                 Stream.make(snapshotItem(1, [project("project-a")], [])),
                 Stream.fromEffect(Deferred.await(gate)).pipe(Stream.map(() => synchronizedItem)),
               ),
+            subscribeThread: () => Stream.die("not used"),
             getArchivedShellSnapshot: () => Effect.die("not used"),
           };
           const layer = InstanceConnections.layerWithAdapter(
@@ -571,6 +1247,7 @@ describe("InstanceConnections observation capacity", () => {
           listProviderModels: () => Effect.die("not used"),
           subscribeShell: () =>
             Stream.make(snapshotItem(1, [project("project-a")], []), synchronizedItem),
+          subscribeThread: () => Stream.die("not used"),
           getArchivedShellSnapshot: () => Effect.die("not used"),
         };
         const layer = InstanceConnections.layerWithAdapter(

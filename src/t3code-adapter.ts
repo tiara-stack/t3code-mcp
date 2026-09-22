@@ -123,7 +123,123 @@ const ShellSnapshotWireSchema = Schema.Struct({
   threads: Schema.Array(ThreadShellWireSchema),
 });
 
+const runtimeModeWireSchema = Schema.Literals([
+  "approval-required",
+  "auto-accept-edits",
+  "auto",
+  "full-access",
+]);
+
 const nonNegativeWireInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0));
+
+/**
+ * Thread-detail wire schemas for the pinned orchestration.subscribeThread
+ * stream. Only the fields the thread-state read consumes are declared; the
+ * struct decoders drop the rest, including windowed message bodies.
+ */
+const ThreadSessionWireSchema = Schema.Struct({
+  status: Schema.Literals([
+    "idle",
+    "starting",
+    "running",
+    "ready",
+    "interrupted",
+    "stopped",
+    "error",
+  ]),
+  activeTurnId: Schema.NullOr(trimmedNonEmptyWireString),
+  lastError: Schema.NullOr(trimmedNonEmptyWireString),
+  updatedAt: Schema.String,
+});
+
+const ThreadLatestTurnWireSchema = Schema.Struct({
+  turnId: trimmedNonEmptyWireString,
+  state: Schema.Literals(["running", "interrupted", "completed", "error"]),
+});
+
+const ThreadActivityWireSchema = Schema.Struct({
+  id: trimmedNonEmptyWireString,
+  tone: Schema.Literals(["info", "tool", "approval", "error"]),
+  kind: trimmedNonEmptyWireString,
+  summary: Schema.String,
+  payload: Schema.Unknown,
+  turnId: Schema.NullOr(trimmedNonEmptyWireString),
+  sequence: Schema.optionalKey(nonNegativeWireInt),
+  createdAt: Schema.String,
+});
+
+const ThreadDetailWireSchema = Schema.Struct({
+  id: trimmedNonEmptyWireString,
+  projectId: trimmedNonEmptyWireString,
+  title: trimmedNonEmptyWireString,
+  modelSelection: ModelSelectionWireSchema,
+  runtimeMode: runtimeModeWireSchema,
+  interactionMode: Schema.optionalKey(Schema.Literals(["default", "plan"])),
+  branch: Schema.NullOr(trimmedNonEmptyWireString),
+  worktreePath: Schema.NullOr(trimmedNonEmptyWireString),
+  latestTurn: Schema.NullOr(ThreadLatestTurnWireSchema),
+  archivedAt: Schema.optionalKey(Schema.NullOr(Schema.String)),
+  settledOverride: Schema.optionalKey(Schema.NullOr(Schema.Literals(["settled", "active"]))),
+  settledAt: Schema.optionalKey(Schema.NullOr(Schema.String)),
+  activities: Schema.Array(ThreadActivityWireSchema),
+  session: Schema.NullOr(ThreadSessionWireSchema),
+});
+
+const ThreadDetailPageWireSchema = Schema.Struct({
+  beforeCursor: Schema.NullOr(trimmedNonEmptyWireString),
+  hasMore: Schema.Boolean,
+  snapshotSequence: nonNegativeWireInt,
+  threadSequence: Schema.optionalKey(nonNegativeWireInt),
+});
+
+const ThreadDetailSnapshotWireSchema = Schema.Struct({
+  snapshotSequence: nonNegativeWireInt,
+  thread: ThreadDetailWireSchema,
+  page: Schema.optionalKey(ThreadDetailPageWireSchema),
+});
+
+/**
+ * The pinned server filters this stream to detail events only; decoding the
+ * six delivered types keeps buffering resilient when a message or plan event
+ * races the snapshot. Events the thread state does not consume still advance
+ * the staging watermark.
+ */
+const ThreadDetailEventWireSchema = Schema.Union([
+  Schema.Struct({
+    sequence: nonNegativeWireInt,
+    type: Schema.Literal("thread.session-set"),
+    payload: Schema.Struct({ session: ThreadSessionWireSchema }),
+  }),
+  Schema.Struct({
+    sequence: nonNegativeWireInt,
+    type: Schema.Literal("thread.activity-appended"),
+    payload: Schema.Struct({ activity: ThreadActivityWireSchema }),
+  }),
+  Schema.Struct({ sequence: nonNegativeWireInt, type: Schema.Literal("thread.message-sent") }),
+  Schema.Struct({
+    sequence: nonNegativeWireInt,
+    type: Schema.Literal("thread.proposed-plan-upserted"),
+  }),
+  Schema.Struct({
+    sequence: nonNegativeWireInt,
+    type: Schema.Literal("thread.turn-diff-completed"),
+  }),
+  Schema.Struct({ sequence: nonNegativeWireInt, type: Schema.Literal("thread.reverted") }),
+]);
+
+const ThreadStreamItemWireSchema = Schema.Union([
+  Schema.Struct({
+    kind: Schema.Literal("synchronized"),
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("snapshot"),
+    snapshot: ThreadDetailSnapshotWireSchema,
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("event"),
+    event: ThreadDetailEventWireSchema,
+  }),
+]);
 
 const SubscribeShellInputWireSchema = Schema.Struct({
   afterSequence: Schema.optionalKey(nonNegativeWireInt),
@@ -266,11 +382,24 @@ const GetArchivedShellSnapshotRpc = Rpc.make("orchestration.getArchivedShellSnap
   error: Schema.Union([GetSnapshotErrorWireSchema, EnvironmentAuthorizationErrorWireSchema]),
 });
 
+const SubscribeThreadRpc = Rpc.make("orchestration.subscribeThread", {
+  payload: Schema.Struct({
+    threadId: trimmedNonEmptyWireString,
+    afterSequence: Schema.optionalKey(nonNegativeWireInt),
+    requestCompletionMarker: Schema.optionalKey(Schema.Boolean),
+    turnLimit: Schema.optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))),
+  }),
+  success: ThreadStreamItemWireSchema,
+  error: Schema.Union([GetSnapshotErrorWireSchema, EnvironmentAuthorizationErrorWireSchema]),
+  stream: true,
+});
+
 const AdapterRpcGroup = RpcGroup.make(
   ServerProbeRpc,
   ServerGetConfigRpc,
   SubscribeShellRpc,
   GetArchivedShellSnapshotRpc,
+  SubscribeThreadRpc,
 );
 
 type AdapterRpcClient = RpcClient.RpcClient<
@@ -453,6 +582,37 @@ const mapShellStreamError = (error: unknown): T3CodeAdapterError => {
   return mapped instanceof T3CodeAdapterError ? mapped : mapAuthenticatedChannelError(mapped);
 };
 
+/**
+ * Thread-detail reads name the pinned "Thread <id> was not found" snapshot
+ * failure distinctly so a direct reference to an absent thread maps to
+ * resource_not_found; every other snapshot failure stays an uncertain
+ * transport result because the load itself may have raced upstream activity.
+ */
+const mapThreadStreamError = (error: unknown): T3CodeAdapterError => {
+  if (
+    Predicate.hasProperty(error, "_tag") &&
+    error._tag === "OrchestrationGetSnapshotError" &&
+    Predicate.hasProperty(error, "message") &&
+    typeof error.message === "string"
+  ) {
+    return error.message.includes("was not found")
+      ? new T3CodeAdapterError({
+          kind: "resource_not_found",
+          message: error.message,
+          uncertain: false,
+          status: null,
+        })
+      : new T3CodeAdapterError({
+          kind: "transport",
+          message: `The T3Code thread snapshot was unavailable: ${error.message}`,
+          uncertain: true,
+          status: null,
+        });
+  }
+  const mapped = mapOrchestrationReadError("The T3Code thread observation stream failed.")(error);
+  return mapped instanceof T3CodeAdapterError ? mapped : mapAuthenticatedChannelError(mapped);
+};
+
 export type T3CodeAdapterErrorKind =
   | "invalid_pairing_code"
   | "pairing_code_used"
@@ -464,6 +624,7 @@ export type T3CodeAdapterErrorKind =
   | "identity_conflict"
   | "incompatible_instance"
   | "wire_incompatible"
+  | "resource_not_found"
   | "capacity";
 
 export class T3CodeAdapterError extends Data.TaggedError("T3CodeAdapterError")<{
@@ -521,6 +682,78 @@ export interface ShellThread {
   readonly settledAt: string | null;
 }
 
+export interface ObservedThreadActivity {
+  readonly activityId: string;
+  readonly kind: string;
+  readonly payload: unknown;
+  readonly turnId: string | null;
+  readonly createdAt: string;
+}
+
+export type ObservedSessionStatus =
+  | "idle"
+  | "starting"
+  | "running"
+  | "ready"
+  | "interrupted"
+  | "stopped"
+  | "error";
+
+export interface ObservedThreadSession {
+  readonly status: ObservedSessionStatus;
+  readonly activeTurnId: string | null;
+  readonly lastError: string | null;
+  readonly updatedAt: string;
+}
+
+export interface ObservedThreadLatestTurn {
+  readonly turnId: string;
+  readonly state: "running" | "interrupted" | "completed" | "error";
+}
+
+export interface ObservedThreadDetail {
+  readonly threadId: string;
+  readonly projectId: string;
+  readonly title: string;
+  readonly modelSelection: DiscoveredModelSelection;
+  readonly runtimeMode: "approval-required" | "auto-accept-edits" | "auto" | "full-access";
+  readonly interactionMode: "default" | "plan";
+  readonly branch: string | null;
+  readonly worktreePath: string | null;
+  readonly latestTurn: ObservedThreadLatestTurn | null;
+  readonly archivedAt: string | null;
+  readonly settledOverride: "settled" | "active" | null;
+  readonly settledAt: string | null;
+  readonly activities: ReadonlyArray<ObservedThreadActivity>;
+  readonly session: ObservedThreadSession | null;
+}
+
+export interface ObservedThreadSnapshotPage {
+  readonly beforeCursor: string | null;
+  readonly hasMore: boolean;
+  readonly threadSequence: number | null;
+}
+
+export interface ObservedThreadSnapshot {
+  readonly snapshotSequence: number;
+  readonly thread: ObservedThreadDetail;
+  readonly page: ObservedThreadSnapshotPage | null;
+}
+
+export type ThreadStreamItem =
+  | { readonly kind: "synchronized" }
+  | { readonly kind: "snapshot"; readonly snapshot: ObservedThreadSnapshot }
+  | {
+      readonly kind: "session-set";
+      readonly sequence: number;
+      readonly session: ObservedThreadSession;
+    }
+  | {
+      readonly kind: "activity-appended";
+      readonly sequence: number;
+      readonly activity: ObservedThreadActivity;
+    }
+  | { readonly kind: "detail-event"; readonly sequence: number };
 export interface ShellSnapshot {
   readonly snapshotSequence: number;
   readonly projects: ReadonlyArray<DiscoveredProject>;
@@ -606,6 +839,13 @@ export interface T3CodeAdapterService {
     readonly afterSequence?: number;
     readonly requestCompletionMarker?: boolean;
   }) => Stream.Stream<ShellStreamItem, T3CodeAdapterError>;
+  readonly subscribeThread: (input: {
+    readonly endpoint: string;
+    readonly credential: string;
+    readonly threadId: string;
+    readonly afterSequence?: number;
+    readonly turnLimit?: number;
+  }) => Stream.Stream<ThreadStreamItem, T3CodeAdapterError>;
   readonly getArchivedShellSnapshot: (input: {
     readonly endpoint: string;
     readonly credential: string;
@@ -831,6 +1071,96 @@ const shellStreamItemFromWire = (item: typeof ShellStreamItemWireSchema.Type): S
       };
     case "thread-removed":
       return { kind: "thread-removed", sequence: item.sequence, threadId: item.threadId };
+  }
+};
+
+const observedThreadActivityFromWire = (
+  activity: typeof ThreadActivityWireSchema.Type,
+): ObservedThreadActivity => ({
+  activityId: activity.id,
+  kind: activity.kind,
+  payload: activity.payload,
+  turnId: activity.turnId,
+  createdAt: activity.createdAt,
+});
+
+const observedThreadSessionFromWire = (
+  session: typeof ThreadSessionWireSchema.Type,
+): ObservedThreadSession => ({
+  status: session.status,
+  activeTurnId: session.activeTurnId,
+  lastError: session.lastError,
+  updatedAt: session.updatedAt,
+});
+
+const observedThreadDetailFromWire = (
+  thread: typeof ThreadDetailWireSchema.Type,
+): ObservedThreadDetail => ({
+  threadId: thread.id,
+  projectId: thread.projectId,
+  title: thread.title,
+  modelSelection: {
+    providerInstanceId: thread.modelSelection.instanceId,
+    model: thread.modelSelection.model,
+    ...(thread.modelSelection.options === undefined
+      ? {}
+      : { options: thread.modelSelection.options }),
+  },
+  runtimeMode: thread.runtimeMode,
+  interactionMode: thread.interactionMode ?? "default",
+  branch: thread.branch,
+  worktreePath: thread.worktreePath,
+  latestTurn:
+    thread.latestTurn === null
+      ? null
+      : { turnId: thread.latestTurn.turnId, state: thread.latestTurn.state },
+  archivedAt: thread.archivedAt ?? null,
+  settledOverride: thread.settledOverride ?? null,
+  settledAt: thread.settledAt ?? null,
+  activities: thread.activities.map(observedThreadActivityFromWire),
+  session: thread.session === null ? null : observedThreadSessionFromWire(thread.session),
+});
+
+const observedThreadSnapshotFromWire = (
+  snapshot: typeof ThreadDetailSnapshotWireSchema.Type,
+): ObservedThreadSnapshot => ({
+  snapshotSequence: snapshot.snapshotSequence,
+  thread: observedThreadDetailFromWire(snapshot.thread),
+  page:
+    snapshot.page === undefined
+      ? null
+      : {
+          beforeCursor: snapshot.page.beforeCursor,
+          hasMore: snapshot.page.hasMore,
+          threadSequence: snapshot.page.threadSequence ?? null,
+        },
+});
+
+const threadStreamItemFromWire = (
+  item: typeof ThreadStreamItemWireSchema.Type,
+): ThreadStreamItem => {
+  switch (item.kind) {
+    case "synchronized":
+      return { kind: "synchronized" };
+    case "snapshot":
+      return { kind: "snapshot", snapshot: observedThreadSnapshotFromWire(item.snapshot) };
+    case "event":
+      switch (item.event.type) {
+        case "thread.session-set":
+          return {
+            kind: "session-set",
+            sequence: item.event.sequence,
+            session: observedThreadSessionFromWire(item.event.payload.session),
+          };
+        case "thread.activity-appended":
+          return {
+            kind: "activity-appended",
+            sequence: item.event.sequence,
+            activity: observedThreadActivityFromWire(item.event.payload.activity),
+          };
+        default:
+          return { kind: "detail-event", sequence: item.event.sequence };
+      }
   }
 };
 
@@ -1314,21 +1644,22 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
           ),
         );
 
-      const subscribeShell = (input: {
-        readonly endpoint: string;
-        readonly credential: string;
-        readonly afterSequence?: number;
-        readonly requestCompletionMarker?: boolean;
-      }): Stream.Stream<ShellStreamItem, T3CodeAdapterError> =>
+      /**
+       * Open one authenticated streaming RPC subscription. The shared
+       * adapter capacity permit is held for the whole stream lifetime; the
+       * acquisition registers in the stream scope so termination and
+       * interruption release it, matching the per-instance budget in
+       * connections.
+       */
+      const authenticatedSubscription = <Item>(
+        input: { readonly endpoint: string; readonly credential: string },
+        open: (client: AdapterRpcClient) => Stream.Stream<Item, T3CodeAdapterError>,
+      ): Stream.Stream<Item, T3CodeAdapterError> =>
         Stream.unwrap(
           withRpcChannelBoundaries(
             Effect.map(authenticatedRpcChannel(input.endpoint, input.credential), (protocolLayer) =>
               Stream.unwrap(
                 Effect.gen(function* () {
-                  // Hold one shared adapter capacity permit for the whole
-                  // stream lifetime; the acquisition registers in the
-                  // stream scope so termination and interruption release
-                  // it, matching the per-instance budget in connections.
                   const acquired = yield* Effect.acquireRelease(
                     capacity.takeIfAvailable(1),
                     (permit) => (permit ? capacity.release(1).pipe(Effect.ignore) : Effect.void),
@@ -1344,18 +1675,45 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
                     );
                   }
                   const client = yield* RpcClient.make(AdapterRpcGroup);
-                  return client["orchestration.subscribeShell"]({
-                    ...(input.afterSequence === undefined
-                      ? {}
-                      : { afterSequence: input.afterSequence }),
-                    requestCompletionMarker: input.requestCompletionMarker ?? false,
-                  }).pipe(
-                    Stream.map(shellStreamItemFromWire),
-                    Stream.mapError((error: unknown) => mapShellStreamError(error)),
-                  );
+                  return open(client);
                 }),
               ).pipe(Stream.provide(protocolLayer, { local: true })),
             ),
+          ),
+        );
+
+      const subscribeShell = (input: {
+        readonly endpoint: string;
+        readonly credential: string;
+        readonly afterSequence?: number;
+        readonly requestCompletionMarker?: boolean;
+      }): Stream.Stream<ShellStreamItem, T3CodeAdapterError> =>
+        authenticatedSubscription(input, (client) =>
+          client["orchestration.subscribeShell"]({
+            ...(input.afterSequence === undefined ? {} : { afterSequence: input.afterSequence }),
+            requestCompletionMarker: input.requestCompletionMarker ?? false,
+          }).pipe(
+            Stream.map(shellStreamItemFromWire),
+            Stream.mapError((error: unknown) => mapShellStreamError(error)),
+          ),
+        );
+
+      const subscribeThread = (input: {
+        readonly endpoint: string;
+        readonly credential: string;
+        readonly threadId: string;
+        readonly afterSequence?: number;
+        readonly turnLimit?: number;
+      }): Stream.Stream<ThreadStreamItem, T3CodeAdapterError> =>
+        authenticatedSubscription(input, (client) =>
+          client["orchestration.subscribeThread"]({
+            threadId: input.threadId,
+            ...(input.afterSequence === undefined ? {} : { afterSequence: input.afterSequence }),
+            requestCompletionMarker: true,
+            ...(input.turnLimit === undefined ? {} : { turnLimit: input.turnLimit }),
+          }).pipe(
+            Stream.map(threadStreamItemFromWire),
+            Stream.mapError((error: unknown) => mapThreadStreamError(error)),
           ),
         );
 
@@ -1445,6 +1803,7 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
         listProjects,
         listProviderModels,
         subscribeShell,
+        subscribeThread,
         getArchivedShellSnapshot,
       });
     }),

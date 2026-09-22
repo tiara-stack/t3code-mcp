@@ -20,15 +20,30 @@ import {
   InstancePairAgainInputSchema,
   InstancePairInputSchema,
   InstanceUpdateInputSchema,
+  MAX_ACTIVE_THREAD_SUBSCRIPTIONS_PER_INSTANCE,
   MAX_OPERATION_CAPACITY,
+  MAX_PENDING_REQUEST_OPTIONS,
+  MAX_PENDING_REQUEST_QUESTIONS,
   MAX_TOTAL_RPC_CAPACITY,
+  THREAD_SNAPSHOT_TURN_LIMIT,
+  type ApprovalDecision,
+  type CapturedThreadState,
+  type Evidence,
   type OperationRecord,
+  type PendingRequest,
+  type PendingRequestForm,
+  type ThreadConfiguration,
+  type ThreadGetCaptureQuery,
+  type ThreadState,
+  encodeThreadObservationCursor,
   makeToolSuccess,
   makeModelListToolSuccess,
   makeProjectListToolSuccess,
+  makeThreadGetToolSuccess,
   makeThreadListToolSuccess,
   staleModelReadLimitation,
   staleProjectReadLimitation,
+  staleThreadGetReadLimitation,
   staleThreadReadLimitation,
   unknownModelCapabilities,
   MAX_SERIALIZED_RESULT_BYTES,
@@ -39,6 +54,8 @@ import {
   OperationToolResultSchema,
   ProjectListInputSchema,
   ProjectListToolResultSchema,
+  ThreadGetInputSchema,
+  ThreadGetToolResultSchema,
   ThreadListInputSchema,
   ThreadListToolResultSchema,
   ToolResultSchema,
@@ -63,6 +80,7 @@ import {
   type RetainedProjectCapture,
   type RetainedThreadCapture,
   type ThreadCaptureMetadata,
+  type ThreadGetCaptureMetadata,
 } from "./local-store";
 import { OperationServiceError, Operations } from "./operations";
 import {
@@ -76,8 +94,14 @@ import {
   Observations,
   type ObservationsService,
   type SynchronizedShell,
+  type SynchronizedThreadDetail,
 } from "./observations";
-import { T3CodeAdapterError, type DiscoveredModelSelection } from "./t3code-adapter";
+import {
+  T3CodeAdapterError,
+  type DiscoveredModelSelection,
+  type ObservedThreadActivity,
+  type ObservedThreadDetail,
+} from "./t3code-adapter";
 
 // fallow-ignore-next-line unused-export
 export const InstanceListTool = Tool.make("instance_list", {
@@ -137,6 +161,20 @@ export const ThreadListTool = Tool.make("thread_list", {
     "List existing and archived threads on one saved T3Code instance or one explicit project scope, with stable pagination.",
   parameters: ThreadListInputSchema,
   success: ThreadListToolResultSchema,
+})
+  .addDependency(LocalStore)
+  .addDependency(Observations)
+  .annotate(Tool.Readonly, true)
+  .annotate(Tool.Destructive, false)
+  .annotate(Tool.Idempotent, true)
+  .annotate(Tool.OpenWorld, true);
+
+// fallow-ignore-next-line unused-export
+export const ThreadGetTool = Tool.make("thread_get", {
+  description:
+    "Inspect one thread's compact configuration, execution, provider session, settlement, and pending requests through a synchronized native thread snapshot.",
+  parameters: ThreadGetInputSchema,
+  success: ThreadGetToolResultSchema,
 })
   .addDependency(LocalStore)
   .addDependency(Observations)
@@ -235,6 +273,7 @@ export const ServerToolkit = Toolkit.make(
   ProjectListTool,
   ModelListTool,
   ThreadListTool,
+  ThreadGetTool,
   OperationGetTool,
 );
 
@@ -269,6 +308,11 @@ const toToolFailure = (
         return makeToolFailure(error.message, "unavailable", "safe_read", {
           action: "retry_observation",
         });
+      case "subscription_capacity":
+        return makeToolFailure(error.message, "unavailable", "safe_read", {
+          action: "retry_observation",
+          capacity: MAX_ACTIVE_THREAD_SUBSCRIPTIONS_PER_INSTANCE,
+        });
     }
   }
   if (error instanceof T3CodeAdapterError) {
@@ -293,6 +337,8 @@ const toToolFailure = (
       case "invalid_pairing_code":
       case "pairing_code_used":
         return makeToolFailure(error.message, "pairing_failed", "change_request");
+      case "resource_not_found":
+        return makeToolFailure(error.message, "resource_not_found", "reconcile_first");
     }
   }
   if (error instanceof OperationServiceError) {
@@ -767,13 +813,17 @@ const compareThreadSummaries = (left: ThreadSummary, right: ThreadSummary): numb
           ? 1
           : 0;
 
-const threadSettlement = (
-  thread: SynchronizedShell["threads"][number],
+const settlementFromNative = (
+  settledOverride: "settled" | "active" | null,
+  settledAt: string | null,
 ): ThreadSummary["settlement"] =>
-  thread.settledOverride === "settled" ||
-  (thread.settledOverride === null && thread.settledAt !== null)
+  settledOverride === "settled" || (settledOverride === null && settledAt !== null)
     ? "settled"
     : "unsettled";
+
+const threadSettlement = (
+  thread: SynchronizedShell["threads"][number],
+): ThreadSummary["settlement"] => settlementFromNative(thread.settledOverride, thread.settledAt);
 
 const toThreadSummaries = (
   shell: SynchronizedShell,
@@ -832,7 +882,7 @@ const resultFailure = (result: ThreadInventoryResult | null) =>
   result !== null && Result.isFailure(result) ? result.failure : null;
 
 const staleThreadObservations = (options: {
-  readonly retained: RetainedThreadCapture;
+  readonly retained: Pick<RetainedThreadCapture, "observations">;
   readonly instanceId: string;
   readonly fallbackObservedAt: string;
   readonly causeMessage: string;
@@ -1043,6 +1093,736 @@ const discoverThreadPage = (options: {
     return makeThreadListToolSuccess(captured.page, captured.observations);
   });
 
+const sessionStateByNativeStatus: Record<string, ThreadState["session"]["state"]> = {
+  starting: "starting",
+  running: "running",
+  // The pinned projection's idle sessions are live sessions awaiting work;
+  // the native string stays available alongside the normalized state.
+  ready: "ready",
+  idle: "ready",
+  // An interrupted session is no longer running; interruption-driven
+  // shutdown is preserved on nativeState rather than conflated with an
+  // explicit stop request.
+  stopped: "stopped",
+  interrupted: "stopped",
+  error: "error",
+};
+
+const threadSessionState = (status: string | null): ThreadState["session"]["state"] =>
+  status === null ? "unknown" : (sessionStateByNativeStatus[status] ?? "unknown");
+
+const threadSnapshotEvidence = (detail: SynchronizedThreadDetail, note: string): Evidence[] => [
+  {
+    kind: "snapshot",
+    observedAt: detail.observedAt,
+    sourceSequence: detail.snapshotSequence,
+    nativeEventId: null,
+    detail: note,
+  },
+];
+
+const approvalDecisions: ReadonlyArray<ApprovalDecision> = [
+  "accept",
+  "acceptForSession",
+  "acceptAlways",
+  "decline",
+  "cancel",
+];
+
+interface DecodedApprovalOption {
+  readonly decision: ApprovalDecision;
+  readonly label: string;
+}
+
+const decodeApprovalOption = (element: unknown): DecodedApprovalOption | null => {
+  if (typeof element !== "object" || element === null) return null;
+  const candidate = element as Record<string, unknown>;
+  if (
+    typeof candidate.decision !== "string" ||
+    !approvalDecisions.includes(candidate.decision as ApprovalDecision) ||
+    typeof candidate.label !== "string" ||
+    candidate.label.length === 0
+  ) {
+    return null;
+  }
+  return { decision: candidate.decision as ApprovalDecision, label: candidate.label };
+};
+
+const decodeApprovalOptions = (
+  payload: Record<string, unknown>,
+): ReadonlyArray<DecodedApprovalOption> | null => {
+  if (!Array.isArray(payload.options)) return null;
+  // A request with no offered decisions cannot be answered; an oversized
+  // list exceeds the bounded-form limit. Both stay unactionable.
+  if (payload.options.length === 0 || payload.options.length > MAX_PENDING_REQUEST_OPTIONS) {
+    return null;
+  }
+  const options: Array<DecodedApprovalOption> = [];
+  for (const element of payload.options) {
+    const option = decodeApprovalOption(element);
+    if (option === null) return null;
+    options.push(option);
+  }
+  return options;
+};
+
+interface DecodedInputQuestion {
+  readonly id: string;
+  readonly header: string;
+  readonly question: string;
+  readonly options: ReadonlyArray<{ readonly label: string; readonly description: string }>;
+  readonly multiSelect: boolean;
+}
+
+const decodeInputQuestionOption = (
+  rawOption: unknown,
+): { readonly label: string; readonly description: string } | null => {
+  if (typeof rawOption !== "object" || rawOption === null) return null;
+  const option = rawOption as Record<string, unknown>;
+  if (typeof option.label !== "string" || typeof option.description !== "string") return null;
+  return { label: option.label, description: option.description };
+};
+
+const decodeQuestionIdentity = (
+  candidate: Record<string, unknown>,
+): { readonly id: string; readonly header: string; readonly question: string } | null => {
+  if (
+    typeof candidate.id !== "string" ||
+    candidate.id.length === 0 ||
+    typeof candidate.header !== "string" ||
+    typeof candidate.question !== "string"
+  ) {
+    return null;
+  }
+  return { id: candidate.id, header: candidate.header, question: candidate.question };
+};
+
+const decodeInputQuestion = (element: unknown): DecodedInputQuestion | null => {
+  if (typeof element !== "object" || element === null) return null;
+  const candidate = element as Record<string, unknown>;
+  const identity = decodeQuestionIdentity(candidate);
+  if (identity === null) return null;
+  const rawOptions = Array.isArray(candidate.options) ? candidate.options : [];
+  if (rawOptions.length > MAX_PENDING_REQUEST_OPTIONS) return null;
+  const options: Array<{ label: string; description: string }> = [];
+  for (const rawOption of rawOptions) {
+    const option = decodeInputQuestionOption(rawOption);
+    if (option === null) return null;
+    options.push(option);
+  }
+  return {
+    ...identity,
+    options,
+    multiSelect: candidate.multiSelect === true,
+  };
+};
+
+const decodeInputQuestions = (
+  payload: Record<string, unknown>,
+): ReadonlyArray<DecodedInputQuestion> | null => {
+  if (!Array.isArray(payload.questions)) return null;
+  if (payload.questions.length > MAX_PENDING_REQUEST_QUESTIONS) return null;
+  const questions: Array<DecodedInputQuestion> = [];
+  for (const element of payload.questions) {
+    const question = decodeInputQuestion(element);
+    if (question === null) return null;
+    questions.push(question);
+  }
+  return questions;
+};
+
+/**
+ * Build the bounded JSON Schema describing the answers an actionable input
+ * request accepts. Multi-select questions accept arrays of offered labels;
+ * single-select questions accept one offered label; questions without
+ * options accept free text.
+ */
+const inputResponseSchema = (
+  questions: ReadonlyArray<DecodedInputQuestion>,
+): Record<string, unknown> => ({
+  type: "object",
+  properties: Object.fromEntries(
+    questions.map((question) => {
+      const labels = question.options.map((option) => option.label);
+      const value =
+        labels.length === 0
+          ? { type: "string" }
+          : question.multiSelect
+            ? { type: "array", items: { enum: labels }, minItems: 1, uniqueItems: true }
+            : { type: "string", enum: labels };
+      return [question.id, value];
+    }),
+  ),
+  required: questions.map((question) => question.id),
+  additionalProperties: false,
+});
+
+const activityPayloadRecord = (activity: ObservedThreadActivity): Record<string, unknown> =>
+  typeof activity.payload === "object" && activity.payload !== null
+    ? (activity.payload as Record<string, unknown>)
+    : {};
+
+const MISSING_REQUEST_ID_REASON =
+  "The native request ID is missing; the request cannot be answered.";
+const RESOLVED_REQUEST_REASON = "The request is already resolved.";
+const UNREPRESENTABLE_APPROVAL_REASON = "The offered approval decisions could not be represented.";
+const UNREPRESENTABLE_INPUT_REASON = "The input form could not be represented.";
+
+interface PendingRequestContext {
+  readonly thread: ThreadState["summary"]["thread"];
+  readonly resolvedRequestIds: ReadonlySet<string>;
+}
+
+const collectResolvedRequestIds = (
+  activities: ReadonlyArray<ObservedThreadActivity>,
+): ReadonlySet<string> => {
+  const resolvedRequestIds = new Set<string>();
+  for (const activity of activities) {
+    if (activity.kind !== "approval.resolved" && activity.kind !== "user-input.resolved") {
+      continue;
+    }
+    const requestId = activityPayloadRecord(activity).requestId;
+    if (typeof requestId === "string" && requestId.length > 0) resolvedRequestIds.add(requestId);
+  }
+  return resolvedRequestIds;
+};
+
+const pendingRequestBase = (context: PendingRequestContext, activity: ObservedThreadActivity) => ({
+  activityId: activity.activityId,
+  thread: context.thread,
+  turn:
+    activity.turnId === null
+      ? null
+      : {
+          instanceId: context.thread.instanceId,
+          threadId: context.thread.threadId,
+          turnId: activity.turnId,
+        },
+});
+
+type ActionableForm = Extract<PendingRequestForm, { readonly kind: "approval" | "input" }>;
+
+interface RepresentableForm {
+  readonly actionable: true;
+  readonly form: ActionableForm;
+}
+
+interface UnrepresentableForm {
+  readonly actionable: false;
+  readonly form: PendingRequestForm;
+  readonly unavailableReason: string;
+}
+
+const pendingRequestWithLifecycle = (options: {
+  readonly context: PendingRequestContext;
+  readonly base: ReturnType<typeof pendingRequestBase>;
+  readonly requestId: string;
+  readonly representable: RepresentableForm | UnrepresentableForm;
+}): PendingRequest => {
+  const { context, base, requestId, representable } = options;
+  if (!representable.actionable) {
+    return {
+      ...base,
+      state: context.resolvedRequestIds.has(requestId) ? "resolved" : "pending",
+      actionable: false,
+      pendingRequestId: requestId,
+      unavailableReason: representable.unavailableReason,
+      form: representable.form,
+    };
+  }
+  return context.resolvedRequestIds.has(requestId)
+    ? {
+        ...base,
+        state: "resolved" as const,
+        actionable: false,
+        pendingRequestId: requestId,
+        unavailableReason: RESOLVED_REQUEST_REASON,
+        form: representable.form,
+      }
+    : {
+        ...base,
+        state: "pending" as const,
+        actionable: true,
+        pendingRequestId: requestId,
+        unavailableReason: null,
+        form: representable.form,
+      };
+};
+
+const approvalPendingRequest = (
+  context: PendingRequestContext,
+  activity: ObservedThreadActivity,
+  requestId: string,
+): PendingRequest => {
+  const payload = activityPayloadRecord(activity);
+  const options = decodeApprovalOptions(payload);
+  const representable: RepresentableForm | UnrepresentableForm =
+    options === null
+      ? {
+          actionable: false,
+          form: { kind: "unavailable", requestKind: "approval" },
+          unavailableReason: UNREPRESENTABLE_APPROVAL_REASON,
+        }
+      : {
+          actionable: true,
+          form: {
+            kind: "approval" as const,
+            detail: typeof payload.detail === "string" ? payload.detail : activity.kind,
+            choices: options.map((option) => ({
+              decision: option.decision,
+              label: option.label,
+            })),
+          },
+        };
+  return pendingRequestWithLifecycle({
+    context,
+    base: pendingRequestBase(context, activity),
+    requestId,
+    representable,
+  });
+};
+
+const inputPendingRequest = (
+  context: PendingRequestContext,
+  activity: ObservedThreadActivity,
+  requestId: string,
+): PendingRequest => {
+  const questions = decodeInputQuestions(activityPayloadRecord(activity));
+  const representable: RepresentableForm | UnrepresentableForm =
+    questions === null
+      ? {
+          actionable: false,
+          form: { kind: "unavailable", requestKind: "input" },
+          unavailableReason: UNREPRESENTABLE_INPUT_REASON,
+        }
+      : {
+          actionable: true,
+          form: {
+            kind: "input" as const,
+            questions: questions.map((question) => ({
+              id: question.id,
+              header: question.header,
+              question: question.question,
+              options: question.options.map((option) => ({
+                label: option.label,
+                description: option.description,
+              })),
+              multiSelect: question.multiSelect,
+            })),
+            responseSchema: inputResponseSchema(questions),
+          },
+        };
+  return pendingRequestWithLifecycle({
+    context,
+    base: pendingRequestBase(context, activity),
+    requestId,
+    representable,
+  });
+};
+
+const compareActivities = (left: ObservedThreadActivity, right: ObservedThreadActivity): number =>
+  left.createdAt.localeCompare(right.createdAt) || left.activityId.localeCompare(right.activityId);
+
+const isRequestActivity = (activity: ObservedThreadActivity): boolean =>
+  activity.kind === "approval.requested" || activity.kind === "user-input.requested";
+
+const requestedPendingRequest = (
+  context: PendingRequestContext,
+  activity: ObservedThreadActivity,
+  requestId: string | null,
+): PendingRequest =>
+  requestId === null
+    ? uncorrelatedPendingRequest(context, activity)
+    : activity.kind === "approval.requested"
+      ? approvalPendingRequest(context, activity, requestId)
+      : inputPendingRequest(context, activity, requestId);
+
+/**
+ * Derive the observed pending-request page from a thread's retained
+ * activities. Approval and user-input requests keep their native identity
+ * when available, their offered form when representable within the bounds,
+ * their lifecycle, and their nullable turn correlation; requests without a
+ * native ID stay visible at thread scope but unactionable, and a lifecycle
+ * that cannot be established is never reported as resolved.
+ */
+const pendingRequestsFromActivities = (
+  thread: ThreadState["summary"]["thread"],
+  activities: ReadonlyArray<ObservedThreadActivity>,
+): ReadonlyArray<PendingRequest> => {
+  const requested = activities.filter(isRequestActivity).slice().sort(compareActivities);
+  const context: PendingRequestContext = {
+    thread,
+    resolvedRequestIds: collectResolvedRequestIds(activities),
+  };
+  // The pinned snapshot keeps the latest requested row per native request
+  // ID; deduplicate from the newest row backwards so the same rule holds
+  // when live events or replay deliver more than one requested row.
+  const seenRequestIds = new Set<string>();
+  const requests: Array<PendingRequest> = [];
+  for (const activity of requested.slice().reverse()) {
+    const payload = activityPayloadRecord(activity);
+    const requestId = typeof payload.requestId === "string" ? payload.requestId : null;
+    if (requestId !== null && seenRequestIds.has(requestId)) continue;
+    if (requestId !== null) seenRequestIds.add(requestId);
+    requests.push(requestedPendingRequest(context, activity, requestId));
+  }
+  requests.reverse();
+  return requests;
+};
+
+/**
+ * A request observed without its native identity stays visible at thread
+ * scope but can never be answered, and its lifecycle stays unknown rather
+ * than resolved.
+ */
+const uncorrelatedPendingRequest = (
+  context: PendingRequestContext,
+  activity: ObservedThreadActivity,
+): PendingRequest => ({
+  ...pendingRequestBase(context, activity),
+  state: "unknown",
+  actionable: false,
+  pendingRequestId: null,
+  unavailableReason: MISSING_REQUEST_ID_REASON,
+  form: {
+    kind: "unavailable",
+    requestKind: activity.kind === "approval.requested" ? "approval" : "input",
+  },
+});
+
+const threadConfigurationFromDetail = (detail: ObservedThreadDetail): ThreadConfiguration => ({
+  model: {
+    providerInstanceId: detail.modelSelection.providerInstanceId,
+    model: detail.modelSelection.model,
+    ...(detail.modelSelection.options === undefined
+      ? {}
+      : { options: detail.modelSelection.options.map((option) => ({ ...option })) }),
+  },
+  runtimeMode: detail.runtimeMode,
+  interactionMode: detail.interactionMode,
+});
+
+interface ThreadProjectLookup {
+  readonly repositoryPath: string | null;
+  readonly limitations: ReadonlyArray<string>;
+}
+
+/**
+ * Look up the thread's project in the shell that lists it: the active shell
+ * for active threads, the archived shell for archived ones. The shell read
+ * is auxiliary to the thread detail, so a failure or a missing project only
+ * limits the result (an unknown worktree repository path); it never
+ * manufactures worktree state.
+ */
+const lookupThreadProject = (options: {
+  readonly observations: ObservationsService;
+  readonly instanceId: string;
+  readonly detail: SynchronizedThreadDetail;
+}): Effect.Effect<ThreadProjectLookup, never> =>
+  Effect.gen(function* () {
+    const { observations, instanceId, detail } = options;
+    const shellResult = yield* Effect.result(
+      detail.thread.archivedAt === null
+        ? observations.activeShell(instanceId)
+        : observations.archivedShell(instanceId),
+    );
+    if (Result.isFailure(shellResult)) {
+      return {
+        repositoryPath: null,
+        limitations: [
+          `The project repository path could not be established (${shellResult.failure.message}).`,
+        ],
+      };
+    }
+    const project = shellResult.success.projects.find(
+      (entry) => entry.projectId === detail.thread.projectId,
+    );
+    if (project === undefined) {
+      return {
+        repositoryPath: null,
+        limitations: ["The project repository path could not be established from the shell."],
+      };
+    }
+    return { repositoryPath: project.repositoryPath, limitations: [] };
+  });
+
+const limitedHistoryLimitation = `The pinned server retained only the most recent ${THREAD_SNAPSHOT_TURN_LIMIT} user-anchored turns; earlier history is unavailable through this read.`;
+
+const threadExecutionState = (
+  instanceId: string,
+  detail: SynchronizedThreadDetail,
+): ThreadState["execution"] => {
+  const { thread } = detail;
+  if (thread.latestTurn === null) {
+    return {
+      state: "inactive",
+      turn: null,
+      nativeState: null,
+      evidence: threadSnapshotEvidence(
+        detail,
+        "The thread detail snapshot published no latest turn.",
+      ),
+    };
+  }
+  const turn = { instanceId, threadId: thread.threadId, turnId: thread.latestTurn.turnId };
+  if (detail.projectedTurnState) {
+    // Session readiness or interruption alone cannot establish authoritative
+    // turn completion; the projected state stays visible as the native
+    // diagnostic string while the normalized state stays unknown.
+    return {
+      state: "unknown",
+      turn,
+      nativeState: thread.latestTurn.state,
+      evidence: threadSnapshotEvidence(
+        detail,
+        `The latest turn state ${thread.latestTurn.state} was projected from a session transition racing the snapshot, not observed as authoritative turn evidence.`,
+      ),
+    };
+  }
+  return {
+    state: thread.latestTurn.state === "running" ? "active" : "inactive",
+    turn,
+    nativeState: thread.latestTurn.state,
+    evidence: threadSnapshotEvidence(
+      detail,
+      `The thread detail snapshot published the latest turn as ${thread.latestTurn.state}.`,
+    ),
+  };
+};
+
+const threadSessionStateOf = (detail: SynchronizedThreadDetail): ThreadState["session"] => {
+  const { thread } = detail;
+  if (thread.session === null) return { state: "unknown", nativeState: null, evidence: [] };
+  return {
+    state: threadSessionState(thread.session.status),
+    nativeState: thread.session.status,
+    evidence: threadSnapshotEvidence(
+      detail,
+      `The thread detail snapshot published the provider session as ${thread.session.status}.`,
+    ),
+  };
+};
+
+const threadSummaryFromDetail = (options: {
+  readonly instanceId: string;
+  readonly detail: SynchronizedThreadDetail;
+  readonly project: ThreadProjectLookup;
+}): ThreadSummary => {
+  const { instanceId, detail, project } = options;
+  const { thread } = detail;
+  return {
+    thread: { instanceId, threadId: thread.threadId },
+    project: { instanceId, projectId: thread.projectId },
+    title: thread.title,
+    archived: thread.archivedAt !== null,
+    worktree:
+      thread.worktreePath !== null && project.repositoryPath !== null
+        ? {
+            instanceId,
+            repositoryPath: project.repositoryPath,
+            worktreePath: thread.worktreePath,
+          }
+        : null,
+    latestTurn:
+      thread.latestTurn === null
+        ? null
+        : { instanceId, threadId: thread.threadId, turnId: thread.latestTurn.turnId },
+    settlement: settlementFromNative(thread.settledOverride, thread.settledAt),
+  };
+};
+
+/**
+ * Assemble the contract thread state from one published thread detail and
+ * its auxiliary project lookup. Execution, provider-session, and settlement
+ * state stay distinct: no projected turn state, session readiness, or
+ * settlement is reinterpreted as work completion.
+ */
+const buildThreadState = (options: {
+  readonly instanceId: string;
+  readonly detail: SynchronizedThreadDetail;
+  readonly project: ThreadProjectLookup;
+}): { readonly state: ThreadState; readonly frame: CapturedThreadState } => {
+  const { instanceId, detail, project } = options;
+  const { thread } = detail;
+  const limitations = [
+    ...(detail.limitedHistory ? [limitedHistoryLimitation] : []),
+    ...project.limitations,
+  ];
+  const state: ThreadState = {
+    summary: threadSummaryFromDetail(options),
+    observationCursor: encodeThreadObservationCursor({
+      version: 1,
+      instanceId,
+      threadId: thread.threadId,
+      snapshotSequence: detail.snapshotSequence,
+      threadSequence: detail.threadSequence,
+      observedAt: detail.observedAt,
+    }),
+    configuration: threadConfigurationFromDetail(thread),
+    execution: threadExecutionState(instanceId, detail),
+    session: threadSessionStateOf(detail),
+    pendingRequests: {
+      items: [],
+      nextCursor: null,
+      coverage: "complete_for_query",
+      limitations: [],
+      failures: [],
+    },
+    interruptionPending:
+      thread.latestTurn?.state === "interrupted" || thread.session?.status === "interrupted",
+    limitations,
+  };
+  const frame: CapturedThreadState = {
+    summary: state.summary,
+    observationCursor: state.observationCursor,
+    configuration: state.configuration,
+    execution: state.execution,
+    session: state.session,
+    interruptionPending: state.interruptionPending,
+    limitations: state.limitations,
+  };
+  return { state, frame };
+};
+
+const assembleThreadState = (
+  frame: CapturedThreadState,
+  page: ThreadState["pendingRequests"],
+): ThreadState => ({
+  ...frame,
+  pendingRequests: page,
+});
+
+const serveThreadStatePage = (options: {
+  readonly store: LocalStoreService;
+  readonly query: ThreadGetCaptureQuery;
+  readonly frame: CapturedThreadState;
+  readonly items: ReadonlyArray<PendingRequest>;
+  readonly coverage: ThreadState["pendingRequests"]["coverage"];
+  readonly limitations: ReadonlyArray<string>;
+  readonly observations: ReadonlyArray<Observation>;
+  readonly limit: number | undefined;
+}): Effect.Effect<ReturnType<typeof makeThreadGetToolSuccess>, LocalStoreError> =>
+  Effect.gen(function* () {
+    const { store, query, frame, items, coverage, limitations, observations, limit } = options;
+    const metadata: ThreadGetCaptureMetadata = {
+      failures: [],
+      coverage,
+      limitations,
+      observations,
+      state: frame,
+    };
+    const captured = yield* store.captureThreadStatePage({
+      query,
+      items,
+      metadata,
+      ...(limit === undefined ? {} : { limit }),
+    });
+    return makeThreadGetToolSuccess(
+      assembleThreadState(frame, captured.page),
+      captured.observations,
+    );
+  });
+
+const serveRetainedThreadState = (options: {
+  readonly store: LocalStoreService;
+  readonly query: ThreadGetCaptureQuery;
+  readonly limit: number | undefined;
+  readonly error: LocalStoreError | T3CodeAdapterError | ObservationError;
+}): Effect.Effect<
+  ReturnType<typeof makeThreadGetToolSuccess>,
+  LocalStoreError | T3CodeAdapterError | ObservationError
+> =>
+  Effect.gen(function* () {
+    const { store, query, limit, error } = options;
+    const retained = yield* store.findRetainedThreadStateCapture(query);
+    if (retained === null) return yield* Effect.fail(error);
+    const fallbackObservedAt = new Date(yield* Clock.currentTimeMillis).toISOString();
+    const staleLimitation = `${staleThreadGetReadLimitation} (${error.message})`;
+    const observations = staleThreadObservations({
+      retained: { observations: retained.observations },
+      instanceId: query.thread.instanceId,
+      fallbackObservedAt,
+      causeMessage: error.message,
+    });
+    return yield* serveThreadStatePage({
+      store,
+      query,
+      frame: retained.state,
+      items: retained.items,
+      coverage: "partial",
+      limitations: [staleLimitation],
+      observations,
+      limit,
+    });
+  });
+
+const freshThreadStateObservation = (options: {
+  readonly instanceId: string;
+  readonly detail: SynchronizedThreadDetail;
+  readonly coverage: ThreadState["pendingRequests"]["coverage"];
+  readonly limitations: ReadonlyArray<string>;
+}): Observation => ({
+  instanceId: options.instanceId,
+  observedAt: options.detail.observedAt,
+  freshness: "fresh",
+  sourceSequence: options.detail.snapshotSequence,
+  coverage: options.coverage,
+  limitations: options.limitations,
+});
+
+/**
+ * A fresh thread-state read synchronizes one thread detail, derives its
+ * pending requests, and publishes one immutable capture for paging. Fresh
+ * reads fail when current evidence cannot be established; explicit stale
+ * reads serve the retained capture with freshness and failure information.
+ */
+const discoverThreadState = (options: {
+  readonly store: LocalStoreService;
+  readonly observations: ObservationsService;
+  readonly query: ThreadGetCaptureQuery;
+  readonly limit: number | undefined;
+  readonly allowStale: boolean;
+}): Effect.Effect<
+  ReturnType<typeof makeThreadGetToolSuccess>,
+  LocalStoreError | T3CodeAdapterError | ObservationError
+> =>
+  Effect.gen(function* () {
+    const { store, observations, query, limit, allowStale } = options;
+    const { instanceId, threadId } = query.thread;
+    const detailResult = yield* Effect.result(observations.threadDetail(instanceId, threadId));
+    if (Result.isFailure(detailResult)) {
+      if (!allowStale) return yield* Effect.fail(detailResult.failure);
+      return yield* serveRetainedThreadState({
+        store,
+        query,
+        limit,
+        error: detailResult.failure,
+      });
+    }
+    const detail = detailResult.success;
+    const project = yield* lookupThreadProject({ observations, instanceId, detail });
+    const { state, frame } = buildThreadState({ instanceId, detail, project });
+    const items = pendingRequestsFromActivities(query.thread, detail.thread.activities);
+    const coverage = project.limitations.length > 0 ? "partial" : "complete_for_query";
+    return yield* serveThreadStatePage({
+      store,
+      query,
+      frame,
+      items,
+      coverage,
+      limitations: state.limitations,
+      observations: [
+        freshThreadStateObservation({
+          instanceId,
+          detail,
+          coverage,
+          limitations: state.limitations,
+        }),
+      ],
+      limit,
+    });
+  });
+
 const serverToolHandlers = ServerToolkit.of({
   instance_list: ({ cursor, limit }) =>
     Effect.gen(function* () {
@@ -1181,6 +1961,38 @@ const serverToolHandlers = ServerToolkit.of({
         return makeThreadListToolSuccess(captured.page, captured.observations);
       }
       return yield* discoverThreadPage({
+        store,
+        observations,
+        query,
+        limit,
+        allowStale: allowStale ?? false,
+      });
+    }).pipe(
+      Effect.catch((error: LocalStoreError | T3CodeAdapterError | ObservationError) =>
+        Effect.succeed({
+          result: { kind: "error" as const, error: toToolFailure(error) },
+          observations: [],
+          warnings: [],
+        }),
+      ),
+    ),
+  thread_get: ({ thread, cursor, limit, allowStale }) =>
+    Effect.gen(function* () {
+      const store = yield* LocalStore;
+      const observations = yield* Observations;
+      const query: ThreadGetCaptureQuery = { thread };
+      if (cursor !== undefined) {
+        const captured = yield* store.readThreadStatePage({
+          query,
+          cursor,
+          ...(limit === undefined ? {} : { limit }),
+        });
+        return makeThreadGetToolSuccess(
+          assembleThreadState(captured.state, captured.page),
+          captured.observations,
+        );
+      }
+      return yield* discoverThreadState({
         store,
         observations,
         query,
