@@ -20,6 +20,23 @@ export const MAX_INSTANCE_OBSERVATION_QUEUE_BYTES = 32 * 1024 * 1024;
 export const MAX_RETAINED_OBSERVATION_BYTES = 128 * 1024 * 1024;
 export const SYNCHRONIZATION_BOUND_MILLIS = 30_000;
 
+/**
+ * Thread output budgets measure UTF-8 content bytes, not model tokens. The
+ * default chunk serves 16 KiB of text; callers may request 1 to 64 KiB per
+ * response underneath the shared 128 KiB serialized-result ceiling.
+ */
+export const THREAD_OUTPUT_DEFAULT_MAX_BYTES = 16 * 1024;
+// fallow-ignore-next-line unused-export
+export const THREAD_OUTPUT_MIN_MAX_BYTES = 1024;
+// fallow-ignore-next-line unused-export
+export const THREAD_OUTPUT_MAX_MAX_BYTES = 64 * 1024;
+/**
+ * Retained texts are split into fixed parts at UTF-8 character boundaries.
+ * The part limit equals the smallest allowed chunk budget so every allowed
+ * request can always serve at least one whole part.
+ */
+export const THREAD_OUTPUT_PART_LIMIT_BYTES = THREAD_OUTPUT_MIN_MAX_BYTES;
+
 // fallow-ignore-next-line complexity
 const endpoint = Schema.String.check(
   Schema.makeFilter(
@@ -754,6 +771,81 @@ export const ThreadGetInputSchema = Schema.declare<{
 
 export type ThreadGetInput = typeof ThreadGetInputSchema.Type;
 
+const outputByteBudget = Schema.Int.check(
+  Schema.isBetween({ minimum: THREAD_OUTPUT_MIN_MAX_BYTES, maximum: THREAD_OUTPUT_MAX_MAX_BYTES }),
+);
+
+const threadOutputFields = Schema.Struct({
+  thread: threadGetReferenceRuntimeShape,
+  cursor: Schema.optionalKey(nonEmptyString),
+  maxBytes: Schema.optionalKey(outputByteBudget),
+  allowStale: Schema.optionalKey(Schema.Boolean),
+});
+
+const threadOutputJsonFields = Schema.Struct({
+  thread: threadGetReferenceJsonShape,
+  cursor: Schema.optionalKey(nonEmptyString),
+  maxBytes: Schema.optionalKey(outputByteBudget),
+  allowStale: Schema.optionalKey(Schema.Boolean),
+});
+
+const unknownThreadOutputField = Schema.String.check(
+  Schema.makeFilter(
+    (key) => key !== "thread" && key !== "cursor" && key !== "maxBytes" && key !== "allowStale",
+    {
+      message: "unknown thread_output argument",
+    },
+  ),
+);
+
+const threadOutputRuntimeShape = Schema.StructWithRest(threadOutputFields, [
+  Schema.Record(unknownThreadOutputField, Schema.Never),
+]);
+
+const threadOutputJsonShape = Schema.StructWithRest(threadOutputJsonFields, [
+  Schema.Record(Schema.String, Schema.Never),
+]);
+
+/**
+ * The bounded thread-output read accepts one direct instance-qualified native
+ * thread reference, an optional continuation cursor, and a UTF-8 content
+ * budget between 1 and 64 KiB. Like every tool input it rejects unknown
+ * arguments before dispatch.
+ */
+export const ThreadOutputInputSchema = Schema.declare<{
+  readonly thread: ThreadReference;
+  readonly cursor?: string;
+  readonly maxBytes?: number;
+  readonly allowStale?: boolean;
+}>(
+  (
+    input,
+  ): input is {
+    readonly thread: ThreadReference;
+    readonly cursor?: string;
+    readonly maxBytes?: number;
+    readonly allowStale?: boolean;
+  } => Schema.is(threadOutputRuntimeShape)(input),
+  {
+    toCodecJson: () =>
+      Schema.link()(threadOutputJsonShape, {
+        decode: SchemaGetter.passthrough({ strict: false }),
+        encode: SchemaGetter.passthrough({ strict: false }),
+      } as never),
+  },
+);
+
+export type ThreadOutputInput = typeof ThreadOutputInputSchema.Type;
+
+/**
+ * A thread-output capture binds one direct thread reference; its cursor pages
+ * one immutable latest-first view of retained conversation and activity
+ * parts.
+ */
+export type ThreadOutputCaptureQuery = {
+  readonly thread: ThreadReference;
+};
+
 const operationGetFields = Schema.Struct({
   requestId,
   waitMs: Schema.optionalKey(
@@ -1423,6 +1515,61 @@ export const ThreadGetToolResultSchema = toolResultFields(ThreadStateSchema);
 
 export type ThreadGetToolResult = typeof ThreadGetToolResultSchema.Type;
 
+const outputItemKinds = ["message", "activity", "diff"] as const;
+
+const sourceCompletenessStates = ["retained_projection", "complete", "partial", "unknown"] as const;
+
+/**
+ * One thread-output item is one text part of one retained message or
+ * activity. Native identity (id and kind), the nullable native turn
+ * correlation, and the ascending part position let clients reconstruct the
+ * conversation order even though the latest retained items are served first.
+ */
+export const OutputChunkItemSchema = Schema.Struct({
+  id: nonEmptyString,
+  kind: Schema.Literals(outputItemKinds),
+  turn: Schema.NullOr(turnReferenceSchema),
+  part: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  lastPart: Schema.Boolean,
+  text: Schema.String,
+});
+
+export type OutputChunkItem = typeof OutputChunkItemSchema.Type;
+
+/**
+ * A thread-output chunk serves T3Code's retained, projected conversation and
+ * activities: never a complete raw execution log. Paging may exhaust the
+ * captured view while upstream history stays truncated; the two dimensions
+ * stay explicit.
+ */
+// fallow-ignore-next-line unused-export
+export const OutputChunkSchema = Schema.Struct({
+  captureId: nonEmptyString,
+  nextCursor: Schema.NullOr(nonEmptyString),
+  sourceCompleteness: Schema.Literals(sourceCompletenessStates),
+  upstreamTruncated: Schema.NullOr(Schema.Boolean),
+  items: Schema.Array(OutputChunkItemSchema),
+  limitations: Schema.Array(Schema.String),
+});
+
+export type OutputChunk = typeof OutputChunkSchema.Type;
+
+export const ThreadOutputToolResultSchema = toolResultFields(OutputChunkSchema);
+
+export type ThreadOutputToolResult = typeof ThreadOutputToolResultSchema.Type;
+
+/**
+ * The captured thread-output frame persists the chunk-level provenance beside
+ * the part items so every continuation page is accompanied by the one
+ * immutable view it was cut from.
+ */
+export const ThreadOutputCaptureFrameSchema = Schema.Struct({
+  sourceCompleteness: Schema.Literals(sourceCompletenessStates),
+  upstreamTruncated: Schema.NullOr(Schema.Boolean),
+});
+
+export type ThreadOutputCaptureFrame = typeof ThreadOutputCaptureFrameSchema.Type;
+
 /**
  * A model list binds one saved instance registration and an optional native
  * provider instance filter. It never mixes registrations with native provider
@@ -1538,6 +1685,26 @@ export const makeThreadListToolSuccess = (
 });
 
 export const staleThreadGetReadLimitation = staleProjectReadLimitation;
+
+export const staleThreadOutputReadLimitation = staleProjectReadLimitation;
+
+export const makeThreadOutputToolSuccess = (
+  value: OutputChunk,
+  observations: ReadonlyArray<Observation>,
+): ThreadOutputToolResult => ({
+  result: { kind: "ok" as const, value },
+  observations,
+  warnings: observations.flatMap((observation) =>
+    observation.freshness === "stale"
+      ? [
+          {
+            code: "fresh_read_failed" as const,
+            message: observation.limitations[0] ?? staleThreadOutputReadLimitation,
+          },
+        ]
+      : [],
+  ),
+});
 
 export const makeThreadGetToolSuccess = (
   value: ThreadState,

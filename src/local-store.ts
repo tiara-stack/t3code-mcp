@@ -23,13 +23,16 @@ import {
   MAX_PAGE_LIMIT,
   MAX_SERIALIZED_RESULT_BYTES,
   OPERATION_DETAIL_RETENTION_MILLIS,
+  THREAD_OUTPUT_DEFAULT_MAX_BYTES,
   CapturedThreadStateSchema,
   EvidenceSchema,
   ModelSummarySchema,
   ObservationSchema,
   OperationRecordSchema,
+  OutputChunkItemSchema,
   PendingRequestSchema,
   ProjectSummarySchema,
+  ThreadOutputCaptureFrameSchema,
   ThreadSummarySchema,
   type CapturedThreadState,
   type Evidence,
@@ -40,6 +43,8 @@ import {
   type OperationRecord,
   type OperationState,
   type OperationStepState,
+  type OutputChunk,
+  type OutputChunkItem,
   type PendingRequest,
   type PendingRequestPage,
   type ProjectListPage,
@@ -48,12 +53,15 @@ import {
   type ThreadGetCaptureQuery,
   type ThreadListPage,
   type ThreadListQuery,
+  type ThreadOutputCaptureFrame,
+  type ThreadOutputCaptureQuery,
   type ThreadSummary,
   makeToolSuccess,
   makeModelListToolSuccess,
   makeProjectListToolSuccess,
   makeThreadGetToolSuccess,
   makeThreadListToolSuccess,
+  makeThreadOutputToolSuccess,
   serializedByteLength,
   ToolFailureSchema,
 } from "./domain";
@@ -82,6 +90,8 @@ const THREAD_CAPTURE_SCOPE = "thread_list";
 const THREAD_CAPTURE_ORDER = "instance_id_thread_id_asc";
 const THREAD_GET_CAPTURE_SCOPE = "thread_get";
 const THREAD_GET_CAPTURE_ORDER = "activity_id_asc";
+const THREAD_OUTPUT_CAPTURE_SCOPE = "thread_output";
+const THREAD_OUTPUT_CAPTURE_ORDER = "created_at_desc";
 const OPERATION_DETAIL_CLEANUP_BATCH_SIZE = 64;
 
 const projectScopeKey = (scope: ProjectListScope): string =>
@@ -132,6 +142,18 @@ const threadGetScopeKey = (query: ThreadGetCaptureQuery): string =>
 const threadGetQueriesEqual = (
   left: ThreadGetCaptureQuery,
   right: ThreadGetCaptureQuery,
+): boolean =>
+  left.thread.instanceId === right.thread.instanceId &&
+  left.thread.threadId === right.thread.threadId;
+
+// Thread-output captures bind the same direct thread reference as thread-get
+// captures, under their own scope so the two view kinds never mix.
+const threadOutputScopeKey = (query: ThreadOutputCaptureQuery): string =>
+  JSON.stringify([THREAD_OUTPUT_CAPTURE_SCOPE, query.thread.instanceId, query.thread.threadId]);
+
+const threadOutputQueriesEqual = (
+  left: ThreadOutputCaptureQuery,
+  right: ThreadOutputCaptureQuery,
 ): boolean =>
   left.thread.instanceId === right.thread.instanceId &&
   left.thread.threadId === right.thread.threadId;
@@ -344,6 +366,31 @@ const ThreadGetCursorPayloadSchema = Schema.Struct({
   position: Schema.Natural,
 });
 
+type ThreadOutputCursorPayload = {
+  readonly version: 1;
+  readonly databaseId: string;
+  readonly captureId: string;
+  readonly scope: typeof THREAD_OUTPUT_CAPTURE_SCOPE;
+  readonly order: typeof THREAD_OUTPUT_CAPTURE_ORDER;
+  readonly query: ThreadOutputCaptureQuery;
+  readonly position: number;
+};
+
+const ThreadOutputCursorPayloadSchema = Schema.Struct({
+  version: Schema.Literal(1),
+  databaseId: Schema.NonEmptyString,
+  captureId: Schema.NonEmptyString,
+  scope: Schema.Literal(THREAD_OUTPUT_CAPTURE_SCOPE),
+  order: Schema.Literal(THREAD_OUTPUT_CAPTURE_ORDER),
+  query: Schema.Struct({
+    thread: Schema.Struct({
+      instanceId: Schema.NonEmptyString,
+      threadId: Schema.NonEmptyString,
+    }),
+  }),
+  position: Schema.Natural,
+});
+
 const CaptureMetadataSchema = Schema.Struct({
   failures: Schema.Array(
     Schema.Struct({
@@ -424,6 +471,22 @@ export interface RetainedThreadGetCapture {
   readonly items: ReadonlyArray<PendingRequest>;
   readonly observations: ReadonlyArray<Observation>;
   readonly state: CapturedThreadState;
+}
+
+export type ThreadOutputCaptureMetadata = ListCaptureMetadata;
+export interface ThreadOutputCapturePage {
+  readonly chunk: OutputChunk;
+  readonly observations: ReadonlyArray<Observation>;
+}
+/**
+ * A retained thread-output capture keeps the captured provenance frame beside
+ * the latest-first part items so an explicit stale read can serve the same
+ * view the retained page was cut from.
+ */
+export interface RetainedThreadOutputCapture {
+  readonly items: ReadonlyArray<OutputChunkItem>;
+  readonly observations: ReadonlyArray<Observation>;
+  readonly frame: ThreadOutputCaptureFrame;
 }
 
 type RegistrationRowDecode = {
@@ -653,6 +716,21 @@ export interface LocalStoreService {
   readonly findRetainedThreadStateCapture: (
     query: ThreadGetCaptureQuery,
   ) => Effect.Effect<RetainedThreadGetCapture | null, LocalStoreError>;
+  readonly captureThreadOutputPage: (input: {
+    readonly query: ThreadOutputCaptureQuery;
+    readonly items: ReadonlyArray<OutputChunkItem>;
+    readonly metadata: ThreadOutputCaptureMetadata;
+    readonly frame: ThreadOutputCaptureFrame;
+    readonly maxBytes?: number;
+  }) => Effect.Effect<ThreadOutputCapturePage, LocalStoreError>;
+  readonly readThreadOutputPage: (options: {
+    readonly query: ThreadOutputCaptureQuery;
+    readonly cursor: string;
+    readonly maxBytes?: number;
+  }) => Effect.Effect<ThreadOutputCapturePage, LocalStoreError>;
+  readonly findRetainedThreadOutputCapture: (
+    query: ThreadOutputCaptureQuery,
+  ) => Effect.Effect<RetainedThreadOutputCapture | null, LocalStoreError>;
   readonly putRegistration: (
     registration: PutRegistrationInput,
   ) => Effect.Effect<void, LocalStoreError>;
@@ -916,6 +994,31 @@ export class LocalStore extends Context.Service<LocalStore, LocalStoreService>()
         const findRetainedThreadStateCapture = (query: ThreadGetCaptureQuery) =>
           findRetainedThreadStateCaptureInDatabase(sql, query, verifySchemaForOperation);
 
+        const captureThreadOutputPage = (input: {
+          readonly query: ThreadOutputCaptureQuery;
+          readonly items: ReadonlyArray<OutputChunkItem>;
+          readonly metadata: ThreadOutputCaptureMetadata;
+          readonly frame: ThreadOutputCaptureFrame;
+          readonly maxBytes?: number;
+        }) =>
+          captureThreadOutputPageInDatabase(
+            sql,
+            crypto,
+            config,
+            databaseId,
+            input,
+            verifySchemaForOperation,
+          );
+
+        const readThreadOutputPage = (options: {
+          readonly query: ThreadOutputCaptureQuery;
+          readonly cursor: string;
+          readonly maxBytes?: number;
+        }) => readThreadOutputPageFromDatabase(sql, databaseId, options, verifySchemaForOperation);
+
+        const findRetainedThreadOutputCapture = (query: ThreadOutputCaptureQuery) =>
+          findRetainedThreadOutputCaptureInDatabase(sql, query, verifySchemaForOperation);
+
         const putRegistration = (registration: PutRegistrationInput) =>
           putRegistrationInDatabase(
             sql,
@@ -1014,6 +1117,9 @@ export class LocalStore extends Context.Service<LocalStore, LocalStoreService>()
           captureThreadStatePage,
           readThreadStatePage,
           findRetainedThreadStateCapture,
+          captureThreadOutputPage,
+          readThreadOutputPage,
+          findRetainedThreadOutputCapture,
           putRegistration,
           stagePairing,
           publishPairing,
@@ -1654,6 +1760,18 @@ const listAllRegistrationsFromDatabase = (
 const projectPageLimit = (limit: number | undefined): number =>
   Math.min(MAX_PAGE_LIMIT, Math.max(1, limit ?? DEFAULT_PAGE_LIMIT));
 
+/** Mint one capture identity, mapping randomness failures to storage errors. */
+const newCaptureId = (crypto: Crypto.Crypto, captureKind: string) =>
+  crypto.randomUUIDv4.pipe(
+    Effect.mapError(
+      () =>
+        new LocalStoreError({
+          kind: "storage",
+          message: `Could not create a ${captureKind} capture.`,
+        }),
+    ),
+  );
+
 const captureListPageInDatabase = <Items, Metadata extends ListCaptureMetadata, Page>(
   sql: SqlClient.SqlClient,
   crypto: Crypto.Crypto,
@@ -1679,15 +1797,7 @@ const captureListPageInDatabase = <Items, Metadata extends ListCaptureMetadata, 
     yield* verify();
     return yield* sql.withTransaction(
       Effect.gen(function* () {
-        const captureId = yield* crypto.randomUUIDv4.pipe(
-          Effect.mapError(
-            () =>
-              new LocalStoreError({
-                kind: "storage",
-                message: `Could not create a ${input.captureKind} capture.`,
-              }),
-          ),
-        );
+        const captureId = yield* newCaptureId(crypto, input.captureKind);
         const now = yield* Clock.currentTimeMillis;
         yield* publishCapture(
           sql,
@@ -2203,6 +2313,290 @@ const findRetainedThreadStateCaptureInDatabase = (
     }).pipe(Effect.mapError(toStoreError)),
   );
 
+/**
+ * Assemble one bounded output chunk from a capture at a cursor position.
+ * Parts accumulate in captured order until the requested UTF-8 content
+ * budget or the shared serialized-result ceiling would be exceeded; the
+ * continuation cursor names the next unconsumed position. Every page serves
+ * at least one whole part because parts never exceed the smallest allowed
+ * content budget.
+ */
+const readThreadOutputChunkAtPosition = (
+  sql: SqlClient.SqlClient,
+  databaseId: string,
+  query: ThreadOutputCaptureQuery,
+  captureId: string,
+  now: number,
+  position: number,
+  maxBytes: number,
+): Effect.Effect<ThreadOutputCapturePage, LocalStoreError | SqlError.SqlError> =>
+  // fallow-ignore-next-line complexity
+  Effect.gen(function* () {
+    const capture = yield* loadCaptureForCursor(sql, captureId, now, "thread output");
+    if (
+      capture.database_id !== databaseId ||
+      capture.scope !== threadOutputScopeKey(query) ||
+      capture.order_key !== THREAD_OUTPUT_CAPTURE_ORDER ||
+      !Number.isSafeInteger(position) ||
+      position < 0
+    ) {
+      return yield* Effect.fail(
+        new LocalStoreError({
+          kind: "cursor_mismatch",
+          message: "The thread output cursor does not match its capture.",
+        }),
+      );
+    }
+    const metadata = yield* decodeThreadOutputCaptureMetadata(capture);
+    const frame = yield* decodeThreadOutputCaptureFrame(capture);
+    const itemCount = Number(capture.item_count);
+    // Candidates are capped well below the content budget: the shared
+    // envelope allows only on the order of a thousand parts per page, so
+    // reading more rows would decode work the budgets can never serve.
+    // Position still advances by at least one accepted part per page.
+    const candidateLimit = Math.min(maxBytes, 1024);
+    const rows = yield* sql<CaptureItemRow>`
+      SELECT position, payload, item_bytes
+      FROM capture_items
+      WHERE capture_id = ${captureId} AND position >= ${position}
+      ORDER BY position ASC
+      LIMIT ${candidateLimit}
+    `;
+    const candidates = yield* Effect.forEach(rows, (row) =>
+      decodeThreadOutputCaptureItem(row.payload),
+    );
+    const capturedId = String(capture.capture_id);
+    const encodeText = new TextEncoder();
+    // The result skeleton is measured once with an empty item list; each
+    // added part contributes its serialized JSON length plus one array
+    // separator, and the page carries exactly one continuation cursor (or
+    // none at the end of the view). The prospective envelope after accepting
+    // a part is compared against the ceiling, so the accounting is exact at
+    // every step.
+    const baseBytes = serializedByteLength(
+      makeThreadOutputToolSuccess(
+        {
+          captureId: capturedId,
+          nextCursor: null,
+          sourceCompleteness: frame.sourceCompleteness,
+          upstreamTruncated: frame.upstreamTruncated,
+          items: [],
+          limitations: metadata.limitations,
+        },
+        metadata.observations,
+      ),
+    );
+    if (baseBytes > MAX_SERIALIZED_RESULT_BYTES) {
+      return yield* Effect.fail(
+        new LocalStoreError({
+          kind: "malformed_row",
+          message: "The thread output failure metadata exceeds the result size limit.",
+        }),
+      );
+    }
+    const items: Array<OutputChunkItem> = [];
+    let contentBytes = 0;
+    let partsBytes = 0;
+    for (const part of candidates) {
+      // The empty-item skeleton already carries the array brackets, so only
+      // the second and later parts pay a one-byte separator.
+      const separatorBytes = items.length === 0 ? 0 : 1;
+      const partJsonBytes = serializedByteLength(part) + separatorBytes;
+      const nextPosition = position + items.length + 1;
+      // A pending continuation swaps the null cursor for its string form;
+      // a page that ends the view keeps the null cursor.
+      const cursorCost =
+        nextPosition < itemCount
+          ? serializedByteLength(
+              makeThreadOutputCaptureCursor(databaseId, capturedId, query, nextPosition),
+            ) - 4
+          : 0;
+      const nextContentBytes = contentBytes + encodeText.encode(part.text).byteLength;
+      const nextEnvelopeBytes = baseBytes + partsBytes + partJsonBytes + cursorCost;
+      if (nextContentBytes > maxBytes || nextEnvelopeBytes > MAX_SERIALIZED_RESULT_BYTES) break;
+      items.push(part);
+      contentBytes = nextContentBytes;
+      partsBytes += partJsonBytes;
+    }
+    if (candidates.length > 0 && items.length === 0) {
+      return yield* Effect.fail(
+        new LocalStoreError({
+          kind: "result_too_large",
+          message: "A thread output part exceeds the result size limit.",
+        }),
+      );
+    }
+    const nextPosition = position + items.length;
+    const nextCursor =
+      nextPosition < itemCount
+        ? makeThreadOutputCaptureCursor(databaseId, capturedId, query, nextPosition)
+        : null;
+    return {
+      chunk: {
+        captureId: capturedId,
+        nextCursor,
+        sourceCompleteness: frame.sourceCompleteness,
+        upstreamTruncated: frame.upstreamTruncated,
+        items,
+        limitations: metadata.limitations,
+      },
+      observations: metadata.observations,
+    };
+  });
+
+/**
+ * Publish one immutable latest-first thread-output capture and read its
+ * first bounded chunk in the same transaction. The capture's state column
+ * keeps the provenance frame beside the part items so every continuation
+ * page is accompanied by the one immutable view it was cut from.
+ */
+const captureThreadOutputPageInDatabase = (
+  sql: SqlClient.SqlClient,
+  crypto: Crypto.Crypto,
+  config: Required<LocalStoreConfigValue>,
+  databaseId: string,
+  input: {
+    readonly query: ThreadOutputCaptureQuery;
+    readonly items: ReadonlyArray<OutputChunkItem>;
+    readonly metadata: ThreadOutputCaptureMetadata;
+    readonly frame: ThreadOutputCaptureFrame;
+    readonly maxBytes?: number;
+  },
+  verify: SchemaVerifier,
+): Effect.Effect<ThreadOutputCapturePage, LocalStoreError> => {
+  const maxBytes = input.maxBytes ?? THREAD_OUTPUT_DEFAULT_MAX_BYTES;
+  const effect = Effect.gen(function* () {
+    yield* verify();
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        const captureId = yield* newCaptureId(crypto, "thread output");
+        const now = yield* Clock.currentTimeMillis;
+        yield* publishCapture(
+          sql,
+          config,
+          databaseId,
+          threadOutputScopeKey(input.query),
+          THREAD_OUTPUT_CAPTURE_ORDER,
+          captureId,
+          now,
+          input.items,
+          input.metadata,
+          JSON.stringify(input.metadata.observations),
+          JSON.stringify(input.frame),
+        );
+        return yield* readThreadOutputChunkAtPosition(
+          sql,
+          databaseId,
+          input.query,
+          captureId,
+          now,
+          0,
+          maxBytes,
+        );
+      }),
+    );
+  });
+  return retryStorage(effect.pipe(Effect.mapError(toStoreError)));
+};
+
+/**
+ * Continue one captured thread-output view at a decoded cursor position in a
+ * short transaction; expiry cleanup runs first so eviction cannot produce a
+ * half-chunk.
+ */
+const readThreadOutputPageFromDatabase = (
+  sql: SqlClient.SqlClient,
+  databaseId: string,
+  options: {
+    readonly query: ThreadOutputCaptureQuery;
+    readonly cursor: string;
+    readonly maxBytes?: number;
+  },
+  verify: SchemaVerifier,
+): Effect.Effect<ThreadOutputCapturePage, LocalStoreError> => {
+  const maxBytes = options.maxBytes ?? THREAD_OUTPUT_DEFAULT_MAX_BYTES;
+  const effect = Effect.gen(function* () {
+    yield* verify();
+    const payload = yield* decodeThreadOutputCursor(options.cursor);
+    if (
+      payload.databaseId !== databaseId ||
+      payload.scope !== THREAD_OUTPUT_CAPTURE_SCOPE ||
+      payload.order !== THREAD_OUTPUT_CAPTURE_ORDER ||
+      !threadOutputQueriesEqual(payload.query, options.query)
+    ) {
+      return yield* Effect.fail(
+        new LocalStoreError({
+          kind: "cursor_mismatch",
+          message: "The thread output cursor does not match this thread.",
+        }),
+      );
+    }
+    const now = yield* Clock.currentTimeMillis;
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        yield* sql`DELETE FROM captures WHERE expires_at <= ${now}`;
+        return yield* readThreadOutputChunkAtPosition(
+          sql,
+          databaseId,
+          options.query,
+          payload.captureId,
+          now,
+          payload.position,
+          maxBytes,
+        );
+      }),
+    );
+  });
+  return retryStorage(effect.pipe(Effect.mapError(toStoreError)));
+};
+
+const findRetainedThreadOutputCaptureInDatabase = (
+  sql: SqlClient.SqlClient,
+  query: ThreadOutputCaptureQuery,
+  verify: SchemaVerifier,
+): Effect.Effect<RetainedThreadOutputCapture | null, LocalStoreError> =>
+  retryStorage(
+    Effect.gen(function* () {
+      yield* verify();
+      const now = yield* Clock.currentTimeMillis;
+      // The capture and its items read in one transaction: a concurrent
+      // expiry or capacity eviction cannot delete the capture between the
+      // two queries and leave a retained frame with an empty item list.
+      return yield* sql.withTransaction(
+        Effect.gen(function* () {
+          const captures = yield* sql<CaptureRow>`
+            SELECT capture_id, database_id, scope, order_key, expires_at, item_count,
+              failures_json, coverage, limitations_json, observations_json, state_json
+            FROM captures
+            WHERE scope = ${threadOutputScopeKey(query)}
+              AND order_key = ${THREAD_OUTPUT_CAPTURE_ORDER}
+              AND expires_at > ${now}
+            ORDER BY created_at DESC, capture_id DESC
+            LIMIT 1
+          `;
+          const capture = captures[0];
+          if (capture === undefined) return null;
+          const metadata = yield* decodeThreadOutputCaptureMetadata(capture);
+          const frame = yield* decodeThreadOutputCaptureFrame(capture);
+          const rows = yield* sql<CaptureItemRow>`
+            SELECT position, payload, item_bytes
+            FROM capture_items
+            WHERE capture_id = ${capture.capture_id}
+            ORDER BY position ASC
+          `;
+          const items = yield* Effect.forEach(rows, (row) =>
+            decodeThreadOutputCaptureItem(row.payload),
+          );
+          return {
+            items,
+            observations: metadata.observations,
+            frame,
+          } satisfies RetainedThreadOutputCapture;
+        }),
+      );
+    }).pipe(Effect.mapError(toStoreError)),
+  );
+
 const publishAndReadFirstPage = (
   sql: SqlClient.SqlClient,
   crypto: Crypto.Crypto,
@@ -2227,15 +2621,7 @@ const publishAndReadFirstPage = (
         serializedByteLength(makeToolSuccess(page, "1970-01-01T00:00:00.000Z")) <= maxBytes
       )
         return page;
-      const captureId = yield* crypto.randomUUIDv4.pipe(
-        Effect.mapError(
-          () =>
-            new LocalStoreError({
-              kind: "storage",
-              message: "Could not create a registration capture.",
-            }),
-        ),
-      );
+      const captureId = yield* newCaptureId(crypto, "registration");
       const now = yield* Clock.currentTimeMillis;
       yield* publishCapture(
         sql,
@@ -2478,6 +2864,34 @@ const threadStateCaptureCodec = (
     makeThreadGetCaptureCursor(databaseId, captureId, query, position),
 });
 
+/**
+ * Load one capture row for a cursor read, failing expired or missing
+ * captures with the shared cursor-expiry result.
+ */
+const loadCaptureForCursor = (
+  sql: SqlClient.SqlClient,
+  captureId: string,
+  now: number,
+  cursorKind: string,
+): Effect.Effect<CaptureRow, LocalStoreError | SqlError.SqlError> =>
+  Effect.gen(function* () {
+    const captures = yield* sql<CaptureRow>`
+      SELECT capture_id, database_id, scope, order_key, expires_at, item_count,
+        failures_json, coverage, limitations_json, observations_json, state_json
+      FROM captures WHERE capture_id = ${captureId}
+    `;
+    const capture = captures[0];
+    if (capture === undefined || Number(capture.expires_at) <= now) {
+      return yield* Effect.fail(
+        new LocalStoreError({
+          kind: "cursor_expired",
+          message: `The ${cursorKind} cursor has expired.`,
+        }),
+      );
+    }
+    return capture;
+  });
+
 const readCapturePage = <Items, Metadata, Page>(
   sql: SqlClient.SqlClient,
   databaseId: string,
@@ -2494,20 +2908,7 @@ const readCapturePage = <Items, Metadata, Page>(
 > =>
   // fallow-ignore-next-line complexity
   Effect.gen(function* () {
-    const captures = yield* sql<CaptureRow>`
-      SELECT capture_id, database_id, scope, order_key, expires_at, item_count,
-        failures_json, coverage, limitations_json, observations_json, state_json
-      FROM captures WHERE capture_id = ${captureId}
-    `;
-    const capture = captures[0];
-    if (capture === undefined || Number(capture.expires_at) <= now) {
-      return yield* Effect.fail(
-        new LocalStoreError({
-          kind: "cursor_expired",
-          message: `The ${codec.cursorKind} cursor has expired.`,
-        }),
-      );
-    }
+    const capture = yield* loadCaptureForCursor(sql, captureId, now, codec.cursorKind);
     const metadata = yield* codec.decodeMetadata(capture);
     if (
       capture.database_id !== databaseId ||
@@ -2779,6 +3180,48 @@ const decodeThreadGetCaptureItem = (
   payload: unknown,
 ): Effect.Effect<PendingRequest, LocalStoreError> =>
   decodeListCaptureItem(payload, PendingRequestSchema);
+
+const decodeThreadOutputCaptureMetadata = (
+  capture: CaptureRow,
+): Effect.Effect<ThreadOutputCaptureMetadata, LocalStoreError> =>
+  decodeListCaptureMetadata(capture);
+
+const decodeThreadOutputCaptureFrame = (
+  capture: CaptureRow,
+): Effect.Effect<ThreadOutputCaptureFrame, LocalStoreError> => {
+  const stateJson = typeof capture.state_json === "string" ? capture.state_json : null;
+  if (stateJson === null) {
+    return Effect.fail(
+      new LocalStoreError({
+        kind: "malformed_row",
+        message: "A saved thread output capture is missing its captured frame.",
+      }),
+    );
+  }
+  return Effect.try({
+    try: () => JSON.parse(stateJson) as unknown,
+    catch: () =>
+      new LocalStoreError({
+        kind: "malformed_row",
+        message: "A saved thread output capture is not valid JSON.",
+      }),
+  }).pipe(
+    Effect.flatMap((value) => Schema.decodeUnknownEffect(ThreadOutputCaptureFrameSchema)(value)),
+    Effect.mapError((error) =>
+      error instanceof LocalStoreError
+        ? error
+        : new LocalStoreError({
+            kind: "malformed_row",
+            message: "A saved thread output capture is malformed.",
+          }),
+    ),
+  );
+};
+
+const decodeThreadOutputCaptureItem = (
+  payload: unknown,
+): Effect.Effect<OutputChunkItem, LocalStoreError> =>
+  decodeListCaptureItem(payload, OutputChunkItemSchema);
 
 const makeListPage = <Items>(
   items: ReadonlyArray<Items>,
@@ -4106,6 +4549,22 @@ const makeThreadGetCaptureCursor = (
     position,
   } satisfies ThreadGetCursorPayload);
 
+const makeThreadOutputCaptureCursor = (
+  databaseId: string,
+  captureId: string,
+  query: ThreadOutputCaptureQuery,
+  position: number,
+): string =>
+  encodeCursor({
+    version: 1,
+    databaseId,
+    captureId,
+    scope: THREAD_OUTPUT_CAPTURE_SCOPE,
+    order: THREAD_OUTPUT_CAPTURE_ORDER,
+    query,
+    position,
+  } satisfies ThreadOutputCursorPayload);
+
 const makeInstanceListPage = (
   items: ReadonlyArray<InstanceSummary>,
   nextCursor: string | null,
@@ -4128,13 +4587,14 @@ const encodeCursor = (
     | ProjectCursorPayload
     | ModelCursorPayload
     | ThreadCursorPayload
-    | ThreadGetCursorPayload,
+    | ThreadGetCursorPayload
+    | ThreadOutputCursorPayload,
 ): string => Encoding.encodeBase64Url(JSON.stringify(payload));
 
 const decodeCursorPayload = <Payload>(
   value: string,
   schema: Schema.ConstraintDecoder<Payload>,
-  kind: "registration" | "project" | "model" | "thread" | "thread state",
+  kind: "registration" | "project" | "model" | "thread" | "thread state" | "thread output",
 ): Effect.Effect<Payload, LocalStoreError> => {
   const malformed = new LocalStoreError({
     kind: "cursor_mismatch",
@@ -4167,3 +4627,8 @@ const decodeThreadGetCursor = (
   value: string,
 ): Effect.Effect<ThreadGetCursorPayload, LocalStoreError> =>
   decodeCursorPayload(value, ThreadGetCursorPayloadSchema, "thread state");
+
+const decodeThreadOutputCursor = (
+  value: string,
+): Effect.Effect<ThreadOutputCursorPayload, LocalStoreError> =>
+  decodeCursorPayload(value, ThreadOutputCursorPayloadSchema, "thread output");

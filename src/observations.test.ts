@@ -495,7 +495,14 @@ const threadDetailFixture = (
     readonly activities: ReadonlyArray<{
       readonly activityId: string;
       readonly kind: string;
+      readonly summary: string;
       readonly payload: unknown;
+      readonly turnId: string | null;
+      readonly createdAt: string;
+    }>;
+    readonly messages: ReadonlyArray<{
+      readonly messageId: string;
+      readonly text: string;
       readonly turnId: string | null;
       readonly createdAt: string;
     }>;
@@ -527,6 +534,7 @@ const threadDetailFixture = (
   settledOverride: null,
   settledAt: null,
   activities: [],
+  messages: [],
   session: null,
   ...overrides,
 });
@@ -572,11 +580,22 @@ const threadActivityAppendedItem = (
   activity: {
     readonly activityId: string;
     readonly kind: string;
+    readonly summary: string;
     readonly payload: unknown;
     readonly turnId: string | null;
     readonly createdAt: string;
   },
 ): ThreadStreamItem => ({ kind: "activity-appended", sequence, activity });
+
+const threadMessageSentItem = (
+  sequence: number,
+  message: {
+    readonly messageId: string;
+    readonly text: string;
+    readonly turnId: string | null;
+    readonly createdAt: string;
+  },
+): ThreadStreamItem => ({ kind: "message-sent", sequence, message });
 
 const runThreadSync = (
   items: ReadonlyArray<ThreadStreamItem>,
@@ -625,6 +644,7 @@ describe("synchronizeThreadStream", () => {
         threadActivityAppendedItem(8, {
           activityId: "activity-live",
           kind: "approval.requested",
+          summary: "Fixture summary",
           payload: { requestId: "request-live" },
           turnId: "turn-1",
           createdAt: "2026-09-22T00:00:01.000Z",
@@ -642,6 +662,51 @@ describe("synchronizeThreadStream", () => {
       expect(detail.thread.session?.status).toBe("running");
       expect(detail.thread.activities.map((activity) => activity.activityId)).toEqual([
         "activity-live",
+      ]);
+    }),
+  );
+
+  it.effect("appends, replaces, and drains message events in the staged messages", () =>
+    Effect.gen(function* () {
+      // A message event racing the snapshot buffers and drains after it;
+      // a re-sent message identity replaces its retained row instead of
+      // duplicating it.
+      const detail = yield* runThreadSync([
+        threadMessageSentItem(7, {
+          messageId: "message-live",
+          text: "buffered text",
+          turnId: "turn-1",
+          createdAt: "2026-09-22T00:00:01.000Z",
+        }),
+        threadSnapshotItem(6, threadDetailFixture("thread-a")),
+        threadMessageSentItem(8, {
+          messageId: "message-live",
+          text: "replaced text",
+          turnId: "turn-1",
+          createdAt: "2026-09-22T00:00:02.000Z",
+        }),
+        threadMessageSentItem(9, {
+          messageId: "message-new",
+          text: "later text",
+          turnId: null,
+          createdAt: "2026-09-22T00:00:03.000Z",
+        }),
+        threadSynchronizedItem,
+      ]);
+      expect(detail.snapshotSequence).toBe(9);
+      expect(detail.thread.messages).toEqual([
+        {
+          messageId: "message-live",
+          text: "replaced text",
+          turnId: "turn-1",
+          createdAt: "2026-09-22T00:00:02.000Z",
+        },
+        {
+          messageId: "message-new",
+          text: "later text",
+          turnId: null,
+          createdAt: "2026-09-22T00:00:03.000Z",
+        },
       ]);
     }),
   );
@@ -703,6 +768,7 @@ describe("synchronizeThreadStream", () => {
           threadActivityAppendedItem(9, {
             activityId: "stale-copy",
             kind: "approval.requested",
+            summary: "Fixture summary",
             payload: { requestId: "request-1" },
             turnId: null,
             createdAt: "2026-09-22T00:00:00.000Z",
@@ -716,6 +782,7 @@ describe("synchronizeThreadStream", () => {
           threadActivityAppendedItem(11, {
             activityId: "activity-new",
             kind: "approval.requested",
+            summary: "Fixture summary",
             payload: { requestId: "request-2" },
             turnId: null,
             createdAt: "2026-09-22T00:00:01.000Z",
@@ -740,6 +807,7 @@ describe("synchronizeThreadStream", () => {
         threadActivityAppendedItem(13, {
           activityId: "activity-new",
           kind: "user-input.requested",
+          summary: "Fixture summary",
           payload: { requestId: "request-9", questions: [] },
           turnId: null,
           createdAt: "2026-09-22T00:00:01.000Z",
@@ -769,6 +837,7 @@ describe("synchronizeThreadStream", () => {
             threadActivityAppendedItem(8, {
               activityId: "oversized",
               kind: "approval.requested",
+              summary: "Fixture summary",
               payload: { requestId: "request-1", detail: "x".repeat(2048) },
               turnId: null,
               createdAt: "2026-09-22T00:00:00.000Z",
@@ -1033,6 +1102,7 @@ describe("Observations thread detail", () => {
                     threadActivityAppendedItem(2, {
                       activityId: "oversized",
                       kind: "approval.requested",
+                      summary: "Fixture summary",
                       payload: { requestId: "request-1", detail: "x".repeat(40 * 1024 * 1024) },
                       turnId: null,
                       createdAt: "2026-09-22T00:00:00.000Z",

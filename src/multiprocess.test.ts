@@ -118,6 +118,7 @@ const startServer = async (databasePath: string): Promise<Server> => {
       "model_list",
       "thread_list",
       "thread_get",
+      "thread_output",
       "operation_get",
     ]);
     return server;
@@ -564,6 +565,152 @@ describe("shared SQLite mutation admission", () => {
           );
           expect(receipt.result?.structuredContent).toMatchObject({
             result: { kind: "ok", value: { operation: { requestId: "update-race-victim" } } },
+          });
+        }),
+      ),
+    60000,
+  );
+});
+
+describe("shared SQLite thread-output captures", () => {
+  // fallow-ignore-next-line complexity
+  it.live(
+    "continues a captured output view across processes and restarts, then reports expiry",
+    () =>
+      withServers("t3code-mcp-output-continue-", ({ databasePath, servers }) =>
+        Effect.gen(function* () {
+          yield* seed(databasePath, [{ instanceId: "output-instance" }]);
+          const query = {
+            thread: { instanceId: "output-instance", threadId: "thread-a" },
+          };
+          // Publish one immutable capture through the shared store exactly
+          // as a fresh read in another process would.
+          const firstPage = yield* Effect.scoped(
+            Effect.gen(function* () {
+              const store = yield* LocalStore;
+              return yield* store.captureThreadOutputPage({
+                query,
+                items: Array.from({ length: 4 }, (_unused, index) => ({
+                  id: `message-${index}`,
+                  kind: "message" as const,
+                  turn: null,
+                  part: 0,
+                  lastPart: true,
+                  text: `text ${index} ${"x".repeat(800)}`,
+                })),
+                metadata: {
+                  failures: [],
+                  coverage: "complete_for_query" as const,
+                  limitations: [],
+                  observations: [
+                    {
+                      instanceId: "output-instance",
+                      observedAt: "2026-09-22T00:00:00.000Z",
+                      freshness: "fresh" as const,
+                      sourceSequence: 1,
+                      coverage: "complete_for_query" as const,
+                      limitations: [],
+                    },
+                  ],
+                },
+                frame: {
+                  sourceCompleteness: "retained_projection" as const,
+                  upstreamTruncated: false,
+                },
+                maxBytes: 1024,
+              });
+            }).pipe(Effect.provide(LocalStore.layer({ databasePath }))),
+          );
+          expect(firstPage.chunk.items).toHaveLength(1);
+          expect(firstPage.chunk.nextCursor).toEqual(expect.any(String));
+          const captureId = firstPage.chunk.captureId;
+
+          const first = yield* Effect.promise(() => startServer(databasePath));
+          servers.add(first);
+          const second = yield* Effect.promise(() =>
+            call(first, 3, "thread_output", {
+              thread: query.thread,
+              cursor: firstPage.chunk.nextCursor,
+              maxBytes: 1024,
+            }),
+          );
+          const secondContent = second.result?.structuredContent;
+          expect(secondContent).toMatchObject({
+            result: {
+              kind: "ok",
+              value: {
+                captureId,
+                items: [{ id: "message-1", part: 0, lastPart: true }],
+                nextCursor: expect.any(String),
+              },
+            },
+          });
+          const secondCursor = (
+            secondContent as {
+              result: { value: { nextCursor: string } };
+            }
+          ).result.value.nextCursor;
+
+          const mismatched = yield* Effect.promise(() =>
+            call(first, 4, "thread_output", {
+              thread: { instanceId: "output-instance", threadId: "thread-b" },
+              cursor: secondCursor,
+            }),
+          );
+          expect(mismatched.result?.structuredContent).toMatchObject({
+            result: { kind: "error", error: { code: "cursor_mismatch" } },
+          });
+
+          // A restart continues the same immutable capture from the shared
+          // database; the cursor binds the persisted database identity.
+          yield* Effect.promise(() => stopServer(first));
+          servers.delete(first);
+          const restarted = yield* Effect.promise(() => startServer(databasePath));
+          servers.add(restarted);
+          const third = yield* Effect.promise(() =>
+            call(restarted, 3, "thread_output", {
+              thread: query.thread,
+              cursor: secondCursor,
+              maxBytes: 1024,
+            }),
+          );
+          const thirdContent = third.result?.structuredContent;
+          expect(thirdContent).toMatchObject({
+            result: {
+              kind: "ok",
+              value: { captureId, items: [{ id: "message-2" }] },
+            },
+          });
+          const thirdCursor = (
+            thirdContent as {
+              result: { value: { nextCursor: string } };
+            }
+          ).result.value.nextCursor;
+
+          // Age the capture past its retention: the next continuation is an
+          // explicit expiry, never a silent restart.
+          yield* Effect.sync(() => {
+            const database = new DatabaseSync(databasePath);
+            try {
+              database.exec("PRAGMA busy_timeout = 5000");
+              const result = database
+                .prepare("UPDATE captures SET expires_at = 1 WHERE capture_id = ?")
+                .run(captureId);
+              if (Number(result.changes) !== 1) {
+                throw new Error(`Could not age capture ${captureId}`);
+              }
+            } finally {
+              database.close();
+            }
+          });
+          const expired = yield* Effect.promise(() =>
+            call(restarted, 4, "thread_output", {
+              thread: query.thread,
+              cursor: thirdCursor,
+            }),
+          );
+          expect(expired.result?.structuredContent).toMatchObject({
+            result: { kind: "error", error: { code: "cursor_expired" } },
           });
         }),
       ),

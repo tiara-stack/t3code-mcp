@@ -238,6 +238,17 @@ const applyThreadEvent = (staging: ThreadDetailStaging, item: OrderedStagingItem
       staging.thread = { ...staging.thread, activities };
       break;
     }
+    case "message-sent": {
+      // A message event replaces any retained row with the same native
+      // identity (streaming updates re-send the message) and appends the
+      // new message otherwise, mirroring the activity append.
+      const messages = staging.thread.messages.filter(
+        (message) => message.messageId !== threadItem.message.messageId,
+      );
+      messages.push(threadItem.message);
+      staging.thread = { ...staging.thread, messages };
+      break;
+    }
     case "detail-event":
     case "synchronized":
     case "snapshot":

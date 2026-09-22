@@ -25,15 +25,19 @@ import {
   MAX_PENDING_REQUEST_OPTIONS,
   MAX_PENDING_REQUEST_QUESTIONS,
   MAX_TOTAL_RPC_CAPACITY,
+  THREAD_OUTPUT_PART_LIMIT_BYTES,
   THREAD_SNAPSHOT_TURN_LIMIT,
   type ApprovalDecision,
   type CapturedThreadState,
   type Evidence,
   type OperationRecord,
+  type OutputChunkItem,
   type PendingRequest,
   type PendingRequestForm,
   type ThreadConfiguration,
   type ThreadGetCaptureQuery,
+  type ThreadOutputCaptureFrame,
+  type ThreadOutputCaptureQuery,
   type ThreadState,
   encodeThreadObservationCursor,
   makeToolSuccess,
@@ -41,9 +45,11 @@ import {
   makeProjectListToolSuccess,
   makeThreadGetToolSuccess,
   makeThreadListToolSuccess,
+  makeThreadOutputToolSuccess,
   staleModelReadLimitation,
   staleProjectReadLimitation,
   staleThreadGetReadLimitation,
+  staleThreadOutputReadLimitation,
   staleThreadReadLimitation,
   unknownModelCapabilities,
   MAX_SERIALIZED_RESULT_BYTES,
@@ -58,6 +64,8 @@ import {
   ThreadGetToolResultSchema,
   ThreadListInputSchema,
   ThreadListToolResultSchema,
+  ThreadOutputInputSchema,
+  ThreadOutputToolResultSchema,
   ToolResultSchema,
   type ModelListPage,
   type ModelListQuery,
@@ -81,6 +89,7 @@ import {
   type RetainedThreadCapture,
   type ThreadCaptureMetadata,
   type ThreadGetCaptureMetadata,
+  type ThreadOutputCaptureMetadata,
 } from "./local-store";
 import { OperationServiceError, Operations } from "./operations";
 import {
@@ -183,6 +192,20 @@ export const ThreadGetTool = Tool.make("thread_get", {
   .annotate(Tool.Idempotent, true)
   .annotate(Tool.OpenWorld, true);
 
+// fallow-ignore-next-line unused-export
+export const ThreadOutputTool = Tool.make("thread_output", {
+  description:
+    "Read one thread's retained conversation and activity output as bounded latest-first UTF-8 chunks with native identities, turn correlation, and explicit truncation.",
+  parameters: ThreadOutputInputSchema,
+  success: ThreadOutputToolResultSchema,
+})
+  .addDependency(LocalStore)
+  .addDependency(Observations)
+  .annotate(Tool.Readonly, true)
+  .annotate(Tool.Destructive, false)
+  .annotate(Tool.Idempotent, true)
+  .annotate(Tool.OpenWorld, true);
+
 /**
  * The registration mutations share one admission/supervision dependency set
  * and differ only in their destructive and open-world hints.
@@ -274,6 +297,7 @@ export const ServerToolkit = Toolkit.make(
   ModelListTool,
   ThreadListTool,
   ThreadGetTool,
+  ThreadOutputTool,
   OperationGetTool,
 );
 
@@ -1771,6 +1795,36 @@ const freshThreadStateObservation = (options: {
 });
 
 /**
+ * Synchronize one thread detail for a fresh read; when the observation fails
+ * the read either fails with the typed error or, on an explicit stale read,
+ * hands the error to the caller's retained-serve path and returns its
+ * result. A targeted read never fails over to another registration.
+ */
+const threadDetailOrRetained = <A, E>(options: {
+  readonly observations: ObservationsService;
+  readonly thread: ThreadState["summary"]["thread"];
+  readonly allowStale: boolean;
+  readonly serveRetained: (
+    error: LocalStoreError | T3CodeAdapterError | ObservationError,
+  ) => Effect.Effect<A, E>;
+}): Effect.Effect<
+  | { readonly kind: "fresh"; readonly detail: SynchronizedThreadDetail }
+  | { readonly kind: "stale"; readonly value: A },
+  LocalStoreError | T3CodeAdapterError | ObservationError | E
+> =>
+  Effect.gen(function* () {
+    const { observations, thread, allowStale, serveRetained } = options;
+    const detailResult = yield* Effect.result(
+      observations.threadDetail(thread.instanceId, thread.threadId),
+    );
+    if (Result.isSuccess(detailResult)) {
+      return { kind: "fresh" as const, detail: detailResult.success };
+    }
+    if (!allowStale) return yield* Effect.fail(detailResult.failure);
+    return { kind: "stale" as const, value: yield* serveRetained(detailResult.failure) };
+  });
+
+/**
  * A fresh thread-state read synchronizes one thread detail, derives its
  * pending requests, and publishes one immutable capture for paging. Fresh
  * reads fail when current evidence cannot be established; explicit stale
@@ -1788,18 +1842,15 @@ const discoverThreadState = (options: {
 > =>
   Effect.gen(function* () {
     const { store, observations, query, limit, allowStale } = options;
-    const { instanceId, threadId } = query.thread;
-    const detailResult = yield* Effect.result(observations.threadDetail(instanceId, threadId));
-    if (Result.isFailure(detailResult)) {
-      if (!allowStale) return yield* Effect.fail(detailResult.failure);
-      return yield* serveRetainedThreadState({
-        store,
-        query,
-        limit,
-        error: detailResult.failure,
-      });
-    }
-    const detail = detailResult.success;
+    const { instanceId } = query.thread;
+    const outcome = yield* threadDetailOrRetained({
+      observations,
+      thread: query.thread,
+      allowStale,
+      serveRetained: (error) => serveRetainedThreadState({ store, query, limit, error }),
+    });
+    if (outcome.kind === "stale") return outcome.value;
+    const detail = outcome.detail;
     const project = yield* lookupThreadProject({ observations, instanceId, detail });
     const { state, frame } = buildThreadState({ instanceId, detail, project });
     const items = pendingRequestsFromActivities(query.thread, detail.thread.activities);
@@ -1820,6 +1871,245 @@ const discoverThreadState = (options: {
         }),
       ],
       limit,
+    });
+  });
+
+/**
+ * The retained projection is the only source: upstream may have summarized
+ * or dropped full tool output, so a chunk never claims to be a complete raw
+ * execution log.
+ */
+const threadOutputProjectionLimitation =
+  "Thread output is T3Code's retained projection; upstream may have summarized or dropped full tool output, so it is not a complete raw execution log.";
+
+interface ThreadOutputStreamEntry {
+  readonly id: string;
+  readonly kind: "message" | "activity";
+  readonly turn: ThreadState["summary"]["latestTurn"];
+  readonly createdAt: string;
+  readonly text: string;
+}
+
+/**
+ * Merge the retained messages and activities into one deterministic
+ * latest-first stream. Creation time orders the stream; equal timestamps
+ * fall back to kind and then native identity so every capture of the same
+ * view cuts identical pages.
+ */
+const threadOutputStreamEntries = (
+  instanceId: string,
+  threadId: string,
+  detail: SynchronizedThreadDetail,
+): Array<ThreadOutputStreamEntry> => {
+  const turn = (turnId: string | null): ThreadOutputStreamEntry["turn"] =>
+    turnId === null ? null : { instanceId, threadId, turnId };
+  const entries: Array<ThreadOutputStreamEntry> = [
+    ...detail.thread.messages.map((message): ThreadOutputStreamEntry => ({
+      id: message.messageId,
+      kind: "message",
+      turn: turn(message.turnId),
+      createdAt: message.createdAt,
+      text: message.text,
+    })),
+    ...detail.thread.activities.map((activity): ThreadOutputStreamEntry => ({
+      id: activity.activityId,
+      kind: "activity",
+      turn: turn(activity.turnId),
+      createdAt: activity.createdAt,
+      text: activity.summary,
+    })),
+  ];
+  return entries.sort(compareOutputEntries);
+};
+
+/**
+ * Order the merged stream latest-first: creation time, then kind, then
+ * native identity keep every capture of one view deterministic.
+ */
+const compareOutputEntries = (
+  left: ThreadOutputStreamEntry,
+  right: ThreadOutputStreamEntry,
+): number => {
+  if (left.createdAt !== right.createdAt) return left.createdAt < right.createdAt ? 1 : -1;
+  if (left.kind !== right.kind) return left.kind < right.kind ? -1 : 1;
+  return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
+};
+
+/**
+ * Split one retained text at UTF-8 lead-byte boundaries so no code point is
+ * ever divided. One code point larger than the part limit stays whole; with
+ * the agreed 1 KiB part limit that cannot happen for valid UTF-8.
+ */
+const nextUtf8PartCut = (bytes: Uint8Array, start: number, limit: number): number => {
+  let cut = Math.min(start + limit, bytes.byteLength);
+  if (cut >= bytes.byteLength) return cut;
+  // Continuation bytes share the top bits 10; back the cut up to the lead
+  // byte so the boundary never lands inside a code point.
+  while (cut > start && (bytes[cut]! & 0xc0) === 0x80) cut -= 1;
+  if (cut === start) {
+    cut = start + 1;
+    while (cut < bytes.byteLength && (bytes[cut]! & 0xc0) === 0x80) cut += 1;
+  }
+  return cut;
+};
+
+const splitOutputTextParts = (text: string, partLimitBytes: number): ReadonlyArray<string> => {
+  const bytes = new TextEncoder().encode(text);
+  if (bytes.byteLength <= partLimitBytes) return [text];
+  const decoder = new TextDecoder();
+  const parts: Array<string> = [];
+  let start = 0;
+  while (start < bytes.byteLength) {
+    const cut = nextUtf8PartCut(bytes, start, partLimitBytes);
+    parts.push(decoder.decode(bytes.subarray(start, cut)));
+    start = cut;
+  }
+  return parts;
+};
+
+/**
+ * Flatten the latest-first stream into captured parts: each item's text
+ * parts stay in ascending order before the stream continues to earlier
+ * items, and every part keeps the native identity and turn correlation a
+ * client needs to reconstruct conversation order.
+ */
+const threadOutputParts = (
+  instanceId: string,
+  threadId: string,
+  detail: SynchronizedThreadDetail,
+): ReadonlyArray<OutputChunkItem> => {
+  const parts: Array<OutputChunkItem> = [];
+  for (const entry of threadOutputStreamEntries(instanceId, threadId, detail)) {
+    const texts = splitOutputTextParts(entry.text, THREAD_OUTPUT_PART_LIMIT_BYTES);
+    texts.forEach((text, index) =>
+      parts.push({
+        id: entry.id,
+        kind: entry.kind,
+        turn: entry.turn,
+        part: index,
+        lastPart: index === texts.length - 1,
+        text,
+      }),
+    );
+  }
+  return parts;
+};
+
+const serveThreadOutputPage = (options: {
+  readonly store: LocalStoreService;
+  readonly query: ThreadOutputCaptureQuery;
+  readonly frame: ThreadOutputCaptureFrame;
+  readonly items: ReadonlyArray<OutputChunkItem>;
+  readonly coverage: "complete_for_query" | "partial";
+  readonly limitations: ReadonlyArray<string>;
+  readonly observations: ReadonlyArray<Observation>;
+  readonly maxBytes: number | undefined;
+}): Effect.Effect<ReturnType<typeof makeThreadOutputToolSuccess>, LocalStoreError> =>
+  Effect.gen(function* () {
+    const { store, query, frame, items, coverage, limitations, observations, maxBytes } = options;
+    const metadata: ThreadOutputCaptureMetadata = {
+      failures: [],
+      coverage,
+      limitations,
+      observations,
+    };
+    const captured = yield* store.captureThreadOutputPage({
+      query,
+      items,
+      metadata,
+      frame,
+      ...(maxBytes === undefined ? {} : { maxBytes }),
+    });
+    return makeThreadOutputToolSuccess(captured.chunk, captured.observations);
+  });
+
+const serveRetainedThreadOutput = (options: {
+  readonly store: LocalStoreService;
+  readonly query: ThreadOutputCaptureQuery;
+  readonly maxBytes: number | undefined;
+  readonly error: LocalStoreError | T3CodeAdapterError | ObservationError;
+}): Effect.Effect<
+  ReturnType<typeof makeThreadOutputToolSuccess>,
+  LocalStoreError | T3CodeAdapterError | ObservationError
+> =>
+  Effect.gen(function* () {
+    const { store, query, maxBytes, error } = options;
+    const retained = yield* store.findRetainedThreadOutputCapture(query);
+    if (retained === null) return yield* Effect.fail(error);
+    const fallbackObservedAt = new Date(yield* Clock.currentTimeMillis).toISOString();
+    const staleLimitation = `${staleThreadOutputReadLimitation} (${error.message})`;
+    const observations = staleThreadObservations({
+      retained,
+      instanceId: query.thread.instanceId,
+      fallbackObservedAt,
+      causeMessage: error.message,
+    });
+    return yield* serveThreadOutputPage({
+      store,
+      query,
+      frame: retained.frame,
+      items: retained.items,
+      coverage: "partial",
+      limitations: [staleLimitation],
+      observations,
+      maxBytes,
+    });
+  });
+
+/**
+ * A fresh thread-output read synchronizes one thread detail, derives the
+ * latest-first retained conversation and activity parts, and publishes one
+ * immutable capture for bounded paging. Fresh reads fail when current
+ * evidence cannot be established; explicit stale reads serve the retained
+ * capture with freshness and failure information.
+ */
+const discoverThreadOutput = (options: {
+  readonly store: LocalStoreService;
+  readonly observations: ObservationsService;
+  readonly query: ThreadOutputCaptureQuery;
+  readonly maxBytes: number | undefined;
+  readonly allowStale: boolean;
+}): Effect.Effect<
+  ReturnType<typeof makeThreadOutputToolSuccess>,
+  LocalStoreError | T3CodeAdapterError | ObservationError
+> =>
+  Effect.gen(function* () {
+    const { store, observations, query, maxBytes, allowStale } = options;
+    const { instanceId } = query.thread;
+    const outcome = yield* threadDetailOrRetained({
+      observations,
+      thread: query.thread,
+      allowStale,
+      serveRetained: (error) => serveRetainedThreadOutput({ store, query, maxBytes, error }),
+    });
+    if (outcome.kind === "stale") return outcome.value;
+    const detail = outcome.detail;
+    const items = threadOutputParts(instanceId, query.thread.threadId, detail);
+    const limitations = [
+      threadOutputProjectionLimitation,
+      ...(detail.limitedHistory ? [limitedHistoryLimitation] : []),
+    ];
+    const coverage = detail.limitedHistory ? ("partial" as const) : ("complete_for_query" as const);
+    const frame: ThreadOutputCaptureFrame = {
+      sourceCompleteness: "retained_projection",
+      upstreamTruncated: detail.limitedHistory,
+    };
+    return yield* serveThreadOutputPage({
+      store,
+      query,
+      frame,
+      items,
+      coverage,
+      limitations,
+      observations: [
+        freshThreadStateObservation({
+          instanceId,
+          detail,
+          coverage,
+          limitations,
+        }),
+      ],
+      maxBytes,
     });
   });
 
@@ -1997,6 +2287,35 @@ const serverToolHandlers = ServerToolkit.of({
         observations,
         query,
         limit,
+        allowStale: allowStale ?? false,
+      });
+    }).pipe(
+      Effect.catch((error: LocalStoreError | T3CodeAdapterError | ObservationError) =>
+        Effect.succeed({
+          result: { kind: "error" as const, error: toToolFailure(error) },
+          observations: [],
+          warnings: [],
+        }),
+      ),
+    ),
+  thread_output: ({ thread, cursor, maxBytes, allowStale }) =>
+    Effect.gen(function* () {
+      const store = yield* LocalStore;
+      const observations = yield* Observations;
+      const query: ThreadOutputCaptureQuery = { thread };
+      if (cursor !== undefined) {
+        const captured = yield* store.readThreadOutputPage({
+          query,
+          cursor,
+          ...(maxBytes === undefined ? {} : { maxBytes }),
+        });
+        return makeThreadOutputToolSuccess(captured.chunk, captured.observations);
+      }
+      return yield* discoverThreadOutput({
+        store,
+        observations,
+        query,
+        maxBytes,
         allowStale: allowStale ?? false,
       });
     }).pipe(

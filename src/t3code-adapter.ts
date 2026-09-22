@@ -134,8 +134,8 @@ const nonNegativeWireInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0));
 
 /**
  * Thread-detail wire schemas for the pinned orchestration.subscribeThread
- * stream. Only the fields the thread-state read consumes are declared; the
- * struct decoders drop the rest, including windowed message bodies.
+ * stream. Only the fields the thread reads consume are declared; the struct
+ * decoders drop the rest, including attachments and streaming state.
  */
 const ThreadSessionWireSchema = Schema.Struct({
   status: Schema.Literals([
@@ -168,6 +168,18 @@ const ThreadActivityWireSchema = Schema.Struct({
   createdAt: Schema.String,
 });
 
+/**
+ * Conversation messages kept by the pinned thread detail snapshot. Only the
+ * fields the bounded output read consumes are declared; attachments,
+ * streaming state, and role stay upstream.
+ */
+const ThreadMessageWireSchema = Schema.Struct({
+  id: trimmedNonEmptyWireString,
+  text: Schema.String,
+  turnId: Schema.NullOr(trimmedNonEmptyWireString),
+  createdAt: Schema.String,
+});
+
 const ThreadDetailWireSchema = Schema.Struct({
   id: trimmedNonEmptyWireString,
   projectId: trimmedNonEmptyWireString,
@@ -181,6 +193,7 @@ const ThreadDetailWireSchema = Schema.Struct({
   archivedAt: Schema.optionalKey(Schema.NullOr(Schema.String)),
   settledOverride: Schema.optionalKey(Schema.NullOr(Schema.Literals(["settled", "active"]))),
   settledAt: Schema.optionalKey(Schema.NullOr(Schema.String)),
+  messages: Schema.Array(ThreadMessageWireSchema),
   activities: Schema.Array(ThreadActivityWireSchema),
   session: Schema.NullOr(ThreadSessionWireSchema),
 });
@@ -200,9 +213,9 @@ const ThreadDetailSnapshotWireSchema = Schema.Struct({
 
 /**
  * The pinned server filters this stream to detail events only; decoding the
- * six delivered types keeps buffering resilient when a message or plan event
- * races the snapshot. Events the thread state does not consume still advance
- * the staging watermark.
+ * delivered types keeps buffering resilient when an event races the
+ * snapshot. Session, activity, and message payloads update the staged
+ * projection; the remaining events only advance the staging watermark.
  */
 const ThreadDetailEventWireSchema = Schema.Union([
   Schema.Struct({
@@ -215,7 +228,11 @@ const ThreadDetailEventWireSchema = Schema.Union([
     type: Schema.Literal("thread.activity-appended"),
     payload: Schema.Struct({ activity: ThreadActivityWireSchema }),
   }),
-  Schema.Struct({ sequence: nonNegativeWireInt, type: Schema.Literal("thread.message-sent") }),
+  Schema.Struct({
+    sequence: nonNegativeWireInt,
+    type: Schema.Literal("thread.message-sent"),
+    payload: Schema.Struct({ message: ThreadMessageWireSchema }),
+  }),
   Schema.Struct({
     sequence: nonNegativeWireInt,
     type: Schema.Literal("thread.proposed-plan-upserted"),
@@ -685,7 +702,20 @@ export interface ShellThread {
 export interface ObservedThreadActivity {
   readonly activityId: string;
   readonly kind: string;
+  readonly summary: string;
   readonly payload: unknown;
+  readonly turnId: string | null;
+  readonly createdAt: string;
+}
+
+/**
+ * One retained conversation message from the pinned thread detail snapshot.
+ * The role and streaming state stay upstream; the bounded output read
+ * consumes identity, text, native turn correlation, and ordering time.
+ */
+export interface ObservedThreadMessage {
+  readonly messageId: string;
+  readonly text: string;
   readonly turnId: string | null;
   readonly createdAt: string;
 }
@@ -725,6 +755,7 @@ export interface ObservedThreadDetail {
   readonly settledOverride: "settled" | "active" | null;
   readonly settledAt: string | null;
   readonly activities: ReadonlyArray<ObservedThreadActivity>;
+  readonly messages: ReadonlyArray<ObservedThreadMessage>;
   readonly session: ObservedThreadSession | null;
 }
 
@@ -752,6 +783,11 @@ export type ThreadStreamItem =
       readonly kind: "activity-appended";
       readonly sequence: number;
       readonly activity: ObservedThreadActivity;
+    }
+  | {
+      readonly kind: "message-sent";
+      readonly sequence: number;
+      readonly message: ObservedThreadMessage;
     }
   | { readonly kind: "detail-event"; readonly sequence: number };
 export interface ShellSnapshot {
@@ -1079,9 +1115,19 @@ const observedThreadActivityFromWire = (
 ): ObservedThreadActivity => ({
   activityId: activity.id,
   kind: activity.kind,
+  summary: activity.summary,
   payload: activity.payload,
   turnId: activity.turnId,
   createdAt: activity.createdAt,
+});
+
+const observedThreadMessageFromWire = (
+  message: typeof ThreadMessageWireSchema.Type,
+): ObservedThreadMessage => ({
+  messageId: message.id,
+  text: message.text,
+  turnId: message.turnId,
+  createdAt: message.createdAt,
 });
 
 const observedThreadSessionFromWire = (
@@ -1118,6 +1164,7 @@ const observedThreadDetailFromWire = (
   settledOverride: thread.settledOverride ?? null,
   settledAt: thread.settledAt ?? null,
   activities: thread.activities.map(observedThreadActivityFromWire),
+  messages: thread.messages.map(observedThreadMessageFromWire),
   session: thread.session === null ? null : observedThreadSessionFromWire(thread.session),
 });
 
@@ -1157,6 +1204,12 @@ const threadStreamItemFromWire = (
             kind: "activity-appended",
             sequence: item.event.sequence,
             activity: observedThreadActivityFromWire(item.event.payload.activity),
+          };
+        case "thread.message-sent":
+          return {
+            kind: "message-sent",
+            sequence: item.event.sequence,
+            message: observedThreadMessageFromWire(item.event.payload.message),
           };
         default:
           return { kind: "detail-event", sequence: item.event.sequence };

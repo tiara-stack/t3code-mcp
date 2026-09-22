@@ -5178,7 +5178,14 @@ const observedThreadFixture = (
     readonly activities: ReadonlyArray<{
       readonly activityId: string;
       readonly kind: string;
+      readonly summary: string;
       readonly payload: unknown;
+      readonly turnId: string | null;
+      readonly createdAt: string;
+    }>;
+    readonly messages: ReadonlyArray<{
+      readonly messageId: string;
+      readonly text: string;
       readonly turnId: string | null;
       readonly createdAt: string;
     }>;
@@ -5210,6 +5217,7 @@ const observedThreadFixture = (
   settledOverride: null,
   settledAt: null,
   activities: [],
+  messages: [],
   session: null,
   ...overrides,
 });
@@ -5237,12 +5245,14 @@ const approvalActivity = (
   overrides: Partial<{
     readonly detail: string;
     readonly options: ReadonlyArray<unknown>;
+    readonly summary: string;
     readonly turnId: string | null;
     readonly createdAt: string;
   }> = {},
 ) => ({
   activityId,
   kind: "approval.requested",
+  summary: overrides.summary ?? "Approval requested",
   payload: {
     ...(requestId === null ? {} : { requestId }),
     ...(overrides.detail === undefined ? {} : { detail: overrides.detail }),
@@ -5256,10 +5266,15 @@ const inputActivity = (
   activityId: string,
   requestId: string | null,
   questions: ReadonlyArray<unknown>,
-  overrides: Partial<{ readonly turnId: string | null; readonly createdAt: string }> = {},
+  overrides: Partial<{
+    readonly summary: string;
+    readonly turnId: string | null;
+    readonly createdAt: string;
+  }> = {},
 ) => ({
   activityId,
   kind: "user-input.requested",
+  summary: overrides.summary ?? "Input requested",
   payload: {
     ...(requestId === null ? {} : { requestId }),
     questions,
@@ -5681,6 +5696,7 @@ describe("thread_get", () => {
                   {
                     activityId: "activity-4",
                     kind: "user-input.requested",
+                    summary: "Fixture summary",
                     payload: { requestId: "request-4", questions: "not-an-array" },
                     turnId: null,
                     createdAt: "2026-09-22T00:00:04.000Z",
@@ -5688,6 +5704,7 @@ describe("thread_get", () => {
                   {
                     activityId: "activity-5",
                     kind: "approval.resolved",
+                    summary: "Fixture summary",
                     payload: { requestId: "request-5" },
                     turnId: null,
                     createdAt: "2026-09-22T00:00:05.000Z",
@@ -6259,6 +6276,545 @@ describe("thread_get", () => {
         expect(result[0]?.result).toMatchObject({
           result: { kind: "error", error: { code: "unavailable", retry: "safe_read" } },
         });
+      }),
+    ),
+  );
+});
+
+const messageFixture = (
+  messageId: string,
+  text: string,
+  overrides: Partial<{ readonly turnId: string | null; readonly createdAt: string }> = {},
+) => ({
+  messageId,
+  text,
+  turnId: overrides.turnId ?? null,
+  createdAt: overrides.createdAt ?? "2026-09-22T00:00:00.000Z",
+});
+
+const toolActivity = (
+  activityId: string,
+  summary: string,
+  overrides: Partial<{ readonly turnId: string | null; readonly createdAt: string }> = {},
+) => ({
+  activityId,
+  kind: "tool.completed",
+  summary,
+  payload: { item: { command: "pnpm check" } },
+  turnId: overrides.turnId ?? null,
+  createdAt: overrides.createdAt ?? "2026-09-22T00:00:00.000Z",
+});
+
+type ThreadOutputToolResultShape = {
+  readonly result: {
+    readonly kind: "ok" | "error";
+    readonly value: {
+      readonly captureId: string;
+      readonly nextCursor: string | null;
+      readonly sourceCompleteness: string;
+      readonly upstreamTruncated: boolean | null;
+      readonly items: ReadonlyArray<{
+        readonly id: string;
+        readonly kind: string;
+        readonly turn: unknown;
+        readonly part: number;
+        readonly lastPart: boolean;
+        readonly text: string;
+      }>;
+      readonly limitations: ReadonlyArray<string>;
+    };
+    readonly error: { readonly code: string; readonly retry: string };
+  };
+  readonly observations: ReadonlyArray<{
+    readonly instanceId: string;
+    readonly freshness: string;
+    readonly sourceSequence: number | null;
+    readonly coverage: string;
+  }>;
+  readonly warnings: ReadonlyArray<{ readonly code: string }>;
+};
+
+describe("thread_output", () => {
+  it.live("serves the latest retained messages and activities first with native identities", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              42,
+              observedThreadFixture("thread-a", {
+                messages: [
+                  messageFixture("message-1", "first message", {
+                    createdAt: "2026-09-22T00:00:01.000Z",
+                    turnId: "turn-1",
+                  }),
+                  messageFixture("message-2", "second message", {
+                    createdAt: "2026-09-22T00:00:03.000Z",
+                    turnId: "turn-2",
+                  }),
+                ],
+                activities: [
+                  toolActivity("activity-1", "ran tests", {
+                    createdAt: "2026-09-22T00:00:02.000Z",
+                    turnId: "turn-2",
+                  }),
+                  toolActivity("activity-2", "wrote files", {
+                    createdAt: "2026-09-22T00:00:04.000Z",
+                  }),
+                ],
+              }),
+            ),
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_output", {
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        const value = result[0]?.result as unknown as ThreadOutputToolResultShape;
+        const turnTwo = { instanceId: "instance-a", threadId: "thread-a", turnId: "turn-2" };
+        expect(value.result).toMatchObject({
+          kind: "ok",
+          value: {
+            nextCursor: null,
+            sourceCompleteness: "retained_projection",
+            upstreamTruncated: false,
+            items: [
+              {
+                id: "activity-2",
+                kind: "activity",
+                turn: null,
+                part: 0,
+                lastPart: true,
+                text: "wrote files",
+              },
+              { id: "message-2", kind: "message", turn: turnTwo, part: 0, lastPart: true },
+              { id: "activity-1", kind: "activity", turn: turnTwo, part: 0, lastPart: true },
+              {
+                id: "message-1",
+                kind: "message",
+                turn: { instanceId: "instance-a", threadId: "thread-a", turnId: "turn-1" },
+                part: 0,
+                lastPart: true,
+              },
+            ],
+            limitations: [expect.stringContaining("retained projection")],
+          },
+        });
+        expect(typeof value.result.value.captureId).toBe("string");
+        expect(value.observations).toMatchObject([
+          { instanceId: "instance-a", freshness: "fresh", sourceSequence: 42 },
+        ]);
+        expect(value.warnings).toEqual([]);
+      }),
+    ),
+  );
+
+  it.live("marks upstream turn-window truncation explicitly", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              42,
+              observedThreadFixture("thread-a", {
+                messages: [messageFixture("message-1", "visible")],
+              }),
+              { beforeCursor: "native-window-cursor", hasMore: true, threadSequence: 7 },
+            ),
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_output", {
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        const value = result[0]?.result as unknown as ThreadOutputToolResultShape;
+        expect(value.result).toMatchObject({
+          kind: "ok",
+          value: {
+            upstreamTruncated: true,
+            sourceCompleteness: "retained_projection",
+            limitations: [
+              expect.stringContaining("retained projection"),
+              expect.stringContaining("20 user-anchored turns"),
+            ],
+          },
+        });
+        expect(value.observations).toMatchObject([{ coverage: "partial" }]);
+      }),
+    ),
+  );
+
+  it.live("splits large multibyte messages at character boundaries across pages", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const multibyte = "🎉".repeat(3000);
+        const { options, connections } = emptyThreadFixtures();
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              42,
+              observedThreadFixture("thread-a", {
+                messages: [messageFixture("message-1", multibyte)],
+              }),
+            ),
+        };
+        const layer = appLayer(databasePath, connections);
+        const first = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_output", {
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+              maxBytes: 1024,
+            });
+          }).pipe(Effect.provide(layer)),
+        );
+        const firstValue = first[0]?.result as unknown as ThreadOutputToolResultShape;
+        expect(firstValue.result).toMatchObject({
+          kind: "ok",
+          value: { items: [{ part: 0, lastPart: false }], nextCursor: expect.any(String) },
+        });
+        // Walk every continuation page and reassemble the message text.
+        const captureId = firstValue.result.value.captureId;
+        const texts: Array<string> = firstValue.result.value.items.map((item) => item.text);
+        const parts: Array<number> = firstValue.result.value.items.map((item) => item.part);
+        let cursor = firstValue.result.value.nextCursor;
+        let pages = 1;
+        while (cursor !== null) {
+          const next = yield* Effect.scoped(
+            Effect.gen(function* () {
+              return yield* callTool("thread_output", {
+                thread: { instanceId: "instance-a", threadId: "thread-a" },
+                cursor,
+                maxBytes: 1024,
+              });
+            }).pipe(Effect.provide(layer)),
+          );
+          const nextValue = next[0]?.result as unknown as ThreadOutputToolResultShape;
+          expect(nextValue.result.kind).toBe("ok");
+          expect(nextValue.result.value.captureId).toBe(captureId);
+          texts.push(...nextValue.result.value.items.map((item) => item.text));
+          parts.push(...nextValue.result.value.items.map((item) => item.part));
+          cursor = nextValue.result.value.nextCursor;
+          pages += 1;
+        }
+        // 12000 UTF-8 bytes split into 1 KiB parts: twelve pages, ascending
+        // part indices, exact reassembly, and no split code points.
+        expect(pages).toBe(12);
+        expect(parts).toEqual(Array.from({ length: 12 }, (_unused, index) => index));
+        expect(texts.join("")).toBe(multibyte);
+        for (const text of texts) {
+          expect(new TextEncoder().encode(text).byteLength).toBeLessThanOrEqual(1024);
+        }
+      }),
+    ),
+  );
+
+  it.live("bounds the serialized result even when many small activities exhaust it first", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const manyActivities = Array.from({ length: 1200 }, (_unused, index) =>
+          toolActivity(`activity-${index}`, `line ${index}`, {
+            createdAt: new Date(Date.UTC(2026, 8, 22, 0, 0, index)).toISOString(),
+          }),
+        );
+        const { options, connections } = emptyThreadFixtures();
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              42,
+              observedThreadFixture("thread-a", { activities: manyActivities }),
+            ),
+        };
+        const layer = appLayer(databasePath, connections);
+        const collect = Effect.gen(function* () {
+          const items: Array<{ id: string }> = [];
+          let cursor: string | null = null;
+          let firstPageCount = 0;
+          let pageCount = 0;
+          do {
+            const page = yield* callTool("thread_output", {
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+              ...(cursor === null ? {} : { cursor }),
+            });
+            const value = page[0]?.result as unknown as ThreadOutputToolResultShape;
+            expect(value.result.kind).toBe("ok");
+            // The shared serialized-result ceiling bounds every chunk.
+            expect(
+              new TextEncoder().encode(JSON.stringify(value.result.value)).byteLength,
+            ).toBeLessThanOrEqual(128 * 1024);
+            if (pageCount === 0) firstPageCount = value.result.value.items.length;
+            items.push(...value.result.value.items);
+            cursor = value.result.value.nextCursor;
+            pageCount += 1;
+          } while (cursor !== null);
+          return { items, firstPageCount, pageCount };
+        });
+        const collected = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* collect;
+          }).pipe(Effect.provide(layer)),
+        );
+        expect(collected.firstPageCount).toBeGreaterThanOrEqual(1000);
+        expect(collected.items).toHaveLength(1200);
+        expect(new Set(collected.items.map((item) => item.id)).size).toBe(1200);
+      }),
+    ),
+  );
+
+  it.live("serves empty threads as an empty complete chunk", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.threadStreams = {
+          "instance-a:thread-a": () => detailSnapshotStream(42, observedThreadFixture("thread-a")),
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_output", {
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        const value = result[0]?.result as unknown as ThreadOutputToolResultShape;
+        expect(value.result).toMatchObject({
+          kind: "ok",
+          value: { items: [], nextCursor: null, upstreamTruncated: false },
+        });
+      }),
+    ),
+  );
+
+  it.live(
+    "serves a retained capture marked stale when a fresh read fails and allowStale is set",
+    () =>
+      withDatabasePath((databasePath) =>
+        Effect.gen(function* () {
+          const { options, connections } = emptyThreadFixtures();
+          options.threadStreams = {
+            "instance-a:thread-a": () =>
+              detailSnapshotStream(
+                42,
+                observedThreadFixture("thread-a", {
+                  messages: [messageFixture("message-1", "retained text")],
+                }),
+              ),
+          };
+          const layer = appLayer(databasePath, connections);
+          const first = yield* Effect.scoped(
+            Effect.gen(function* () {
+              yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+              return yield* callTool("thread_output", {
+                thread: { instanceId: "instance-a", threadId: "thread-a" },
+              });
+            }).pipe(Effect.provide(layer)),
+          );
+          const firstValue = first[0]?.result as unknown as ThreadOutputToolResultShape;
+          expect(firstValue.observations).toMatchObject([{ freshness: "fresh" }]);
+
+          options.threadStreams = {
+            "instance-a:thread-a": () =>
+              Stream.fail(
+                new T3CodeAdapterError({
+                  kind: "transport",
+                  message: "The pinned test instance became unreachable.",
+                  uncertain: true,
+                  status: null,
+                }),
+              ),
+          };
+          const second = yield* Effect.scoped(
+            Effect.gen(function* () {
+              return yield* callTool("thread_output", {
+                thread: { instanceId: "instance-a", threadId: "thread-a" },
+                allowStale: true,
+              });
+            }).pipe(Effect.provide(layer)),
+          );
+          const secondValue = second[0]?.result as unknown as ThreadOutputToolResultShape;
+          expect(secondValue.result).toMatchObject({
+            kind: "ok",
+            value: {
+              items: [{ id: "message-1", text: "retained text" }],
+              sourceCompleteness: "retained_projection",
+            },
+          });
+          expect(secondValue.observations).toMatchObject([
+            { instanceId: "instance-a", freshness: "stale", coverage: "partial" },
+          ]);
+          expect(secondValue.warnings).toMatchObject([{ code: "fresh_read_failed" }]);
+        }),
+      ),
+  );
+
+  it.live("fails a stale read without a retained capture using the original error", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            Stream.fail(
+              new T3CodeAdapterError({
+                kind: "transport",
+                message: "The pinned test instance became unreachable.",
+                uncertain: true,
+                status: null,
+              }),
+            ),
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_output", {
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+              allowStale: true,
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        expect(result[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "unavailable", retry: "safe_read" } },
+        });
+      }),
+    ),
+  );
+
+  it.live("rejects a continuation cursor bound to another thread", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              42,
+              observedThreadFixture("thread-a", {
+                messages: [messageFixture("message-1", "🎉".repeat(3000))],
+              }),
+            ),
+        };
+        const layer = appLayer(databasePath, connections);
+        const first = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_output", {
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+              maxBytes: 1024,
+            });
+          }).pipe(Effect.provide(layer)),
+        );
+        const firstValue = first[0]?.result as unknown as ThreadOutputToolResultShape;
+        expect(firstValue.result.value.nextCursor).toEqual(expect.any(String));
+        const second = yield* Effect.scoped(
+          Effect.gen(function* () {
+            return yield* callTool("thread_output", {
+              thread: { instanceId: "instance-a", threadId: "thread-b" },
+              cursor: firstValue.result.value.nextCursor as string,
+            });
+          }).pipe(Effect.provide(layer)),
+        );
+        expect(second[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "cursor_mismatch", retry: "safe_read" } },
+        });
+      }),
+    ),
+  );
+
+  it.effect("expires an output cursor when the capture retention lapses", () => {
+    const startedAt = 4_000_000;
+    return withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(startedAt);
+        const { options, connections } = emptyThreadFixtures();
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              42,
+              observedThreadFixture("thread-a", {
+                messages: [messageFixture("message-1", "🎉".repeat(3000))],
+              }),
+            ),
+        };
+        const layer = appLayer(databasePath, connections);
+        const first = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_output", {
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+              maxBytes: 1024,
+            });
+          }).pipe(Effect.provide(layer)),
+        );
+        const firstValue = first[0]?.result as unknown as ThreadOutputToolResultShape;
+        expect(firstValue.result.value.nextCursor).toEqual(expect.any(String));
+        yield* TestClock.adjust(Duration.millis(10 * 60 * 1000 + 1));
+        const second = yield* Effect.scoped(
+          Effect.gen(function* () {
+            return yield* callTool("thread_output", {
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+              cursor: firstValue.result.value.nextCursor as string,
+              maxBytes: 1024,
+            });
+          }).pipe(Effect.provide(layer)),
+        );
+        expect(second[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "cursor_expired", retry: "safe_read" } },
+        });
+      }),
+    );
+  });
+
+  it.effect("rejects unknown thread_output arguments before dispatch", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const exit = yield* Effect.exit(
+          Effect.scoped(
+            Effect.gen(function* () {
+              yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+              return yield* callTool("thread_output", {
+                thread: { instanceId: "instance-a", threadId: "thread-a" },
+                unexpected: true,
+              });
+            }).pipe(Effect.provide(appLayer(databasePath, connections))),
+          ),
+        );
+        expect(Exit.isFailure(exit)).toBe(true);
+        if (Exit.isSuccess(exit)) return;
+        expect(String(exit.cause)).toContain("Invalid parameters for tool 'thread_output'");
+        expect(options.seenThreads).toEqual([]);
+      }),
+    ),
+  );
+
+  it.effect("rejects out-of-range thread_output byte budgets before dispatch", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        for (const maxBytes of [512, 65_537]) {
+          const exit = yield* Effect.exit(
+            Effect.scoped(
+              Effect.gen(function* () {
+                yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+                return yield* callTool("thread_output", {
+                  thread: { instanceId: "instance-a", threadId: "thread-a" },
+                  maxBytes,
+                });
+              }).pipe(Effect.provide(appLayer(databasePath, connections))),
+            ),
+          );
+          expect(Exit.isFailure(exit)).toBe(true);
+          if (Exit.isSuccess(exit)) return;
+          expect(String(exit.cause)).toContain("Invalid parameters for tool 'thread_output'");
+        }
+        expect(options.seenThreads).toEqual([]);
       }),
     ),
   );
