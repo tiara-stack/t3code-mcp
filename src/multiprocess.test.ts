@@ -119,6 +119,7 @@ const startServer = async (databasePath: string): Promise<Server> => {
       "thread_list",
       "thread_get",
       "thread_output",
+      "thread_wait",
       "operation_get",
     ]);
     return server;

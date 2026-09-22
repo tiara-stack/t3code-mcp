@@ -56,6 +56,13 @@ export interface SynchronizedThreadDetail {
    * evidence; consumers must not present it as authoritative completion.
    */
   readonly projectedTurnState: boolean;
+  /**
+   * True when the published projection was (re)established from an initial or
+   * replacement snapshot instead of continuous replay from the retained
+   * watermark; a `changed` wait treats it as a history gap and never asserts
+   * the condition occurred.
+   */
+  readonly snapshotReset: boolean;
   readonly observedAt: string;
 }
 
@@ -86,6 +93,11 @@ interface ThreadDetailStaging {
   buffered: Array<ThreadStreamItem>;
   /** Whether the current latest-turn state came from session-transition projection. */
   turnProjected: boolean;
+  /**
+   * Whether an initial or replacement snapshot restated the projection during
+   * this synchronization, breaking continuity with the resume position.
+   */
+  snapshotReset: boolean;
 }
 
 const makeShellStaging = (
@@ -180,6 +192,9 @@ const makeThreadDetailStaging = (
   boundary: false,
   buffered: [],
   turnProjected: initial?.projectedTurnState ?? false,
+  // Restating a retained projection keeps its continuity; only a snapshot
+  // arriving during this synchronization breaks it.
+  snapshotReset: false,
 });
 
 /**
@@ -270,6 +285,9 @@ const applyThreadSnapshot = (
   staging.page = snapshot.page;
   staging.watermark = snapshot.snapshotSequence;
   staging.turnProjected = false;
+  // A snapshot restates the projection without replaying the intervening
+  // events; consumers waiting from an older cursor must resynchronize.
+  staging.snapshotReset = true;
 };
 
 type StagingStep = "continue" | "published" | ObservationError;
@@ -448,6 +466,7 @@ const threadDetailSynchronizationEngine: StreamSynchronizationEngine<
         thread: staging.thread,
         limitedHistory: staging.page?.hasMore ?? false,
         projectedTurnState: staging.turnProjected,
+        snapshotReset: staging.snapshotReset,
         observedAt,
       } satisfies SynchronizedThreadDetail;
     }),
@@ -695,18 +714,64 @@ export class Observations extends Context.Service<Observations, ObservationsServ
       const store = yield* LocalStore;
       const generations = new Map<string, number>();
       const retained = new RetainedObservationBudget(MAX_RETAINED_OBSERVATION_BYTES);
-      interface InflightSync {
+      interface InflightSync<A, E> {
         revision: number;
-        fiber: Fiber.Fiber<SynchronizedShell, ObservationServiceError>;
+        fiber: Fiber.Fiber<A, E>;
+        /** Active readers holding a join on the in-flight fiber. */
+        readers: number;
       }
-      const inflight = new Map<string, InflightSync>();
+      const inflight = new Map<string, InflightSync<SynchronizedShell, ObservationServiceError>>();
       const threadGenerations = new Map<string, number>();
-      interface InflightThreadSync {
-        revision: number;
-        fiber: Fiber.Fiber<SynchronizedThreadDetail, ObservationServiceError>;
-      }
-      const threadInflight = new Map<string, InflightThreadSync>();
+      const threadInflight = new Map<
+        string,
+        InflightSync<SynchronizedThreadDetail, ObservationServiceError>
+      >();
       const activeThreadSubscriptions = new Map<string, number>();
+
+      /**
+       * One reader of a shared in-flight synchronization leaves: decrement the
+       * reader count and, when the last reader is gone, drop the entry and
+       * interrupt the shared fiber so its scoped resources release promptly.
+       * Interrupting an already-completed fiber is a no-op.
+       */
+      const leaveInflightReader = <A, E>(
+        entries: Map<string, InflightSync<A, E>>,
+        key: string,
+        entry: InflightSync<A, E>,
+      ): Effect.Effect<void> =>
+        Effect.suspend(() => {
+          entry.readers -= 1;
+          if (entry.readers > 0) return Effect.void;
+          if (entries.get(key) !== entry) return Effect.void;
+          entries.delete(key);
+          return Fiber.interrupt(entry.fiber);
+        });
+
+      /**
+       * Join one in-flight synchronization as an active reader. The entry is
+       * revalidated and the reader count increments atomically with the join,
+       * so neither an interruption between the lookup and the join nor a
+       * concurrent last-reader removal can strand the count or join a dead
+       * fiber. A stale entry reports none so the caller starts a fresh
+       * synchronization instead.
+       */
+      const tryJoinInflightReader = <A, E>(
+        entries: Map<string, InflightSync<A, E>>,
+        key: string,
+        entry: InflightSync<A, E>,
+      ): Effect.Effect<Option.Option<A>, E> =>
+        Effect.acquireUseRelease(
+          Effect.sync(() => {
+            if (entries.get(key) !== entry) return false;
+            entry.readers += 1;
+            return true;
+          }),
+          (joined) =>
+            joined
+              ? Effect.map(Fiber.join(entry.fiber), Option.some<A>)
+              : Effect.succeed(Option.none<A>()),
+          (joined) => (joined ? leaveInflightReader(entries, key, entry) : Effect.void),
+        );
 
       const runShellSynchronization = (
         instanceId: string,
@@ -784,13 +849,15 @@ export class Observations extends Context.Service<Observations, ObservationsServ
           // revision change.
           const existing = inflight.get(instanceId);
           if (existing !== undefined && existing.revision === before.revision) {
-            return yield* Fiber.join(existing.fiber);
+            const joined = yield* tryJoinInflightReader(inflight, instanceId, existing);
+            if (Option.isSome(joined)) return joined.value;
           }
           const generation = (generations.get(instanceId) ?? 0) + 1;
           generations.set(instanceId, generation);
-          const entry: InflightSync = {
+          const entry: InflightSync<SynchronizedShell, ObservationServiceError> = {
             revision: before.revision,
             fiber: undefined as never,
+            readers: 0,
           };
           const run = runShellSynchronization(instanceId, before.revision, generation).pipe(
             Effect.ensuring(
@@ -801,6 +868,13 @@ export class Observations extends Context.Service<Observations, ObservationsServ
           );
           entry.fiber = yield* Effect.forkDetach(run);
           inflight.set(instanceId, entry);
+          // The creator joins as a reader like everyone else: cancelling the
+          // last reader interrupts the in-flight synchronization, while other
+          // joined readers keep the shared sync alive.
+          const joined = yield* tryJoinInflightReader(inflight, instanceId, entry);
+          if (Option.isSome(joined)) return joined.value;
+          // The synchronization already completed and published before the
+          // creator joined; its result is final.
           return yield* Fiber.join(entry.fiber);
         });
 
@@ -923,13 +997,15 @@ export class Observations extends Context.Service<Observations, ObservationsServ
           // the in-flight synchronization.
           const existing = threadInflight.get(key);
           if (existing !== undefined && existing.revision === before.revision) {
-            return yield* Fiber.join(existing.fiber);
+            const joined = yield* tryJoinInflightReader(threadInflight, key, existing);
+            if (Option.isSome(joined)) return joined.value;
           }
           const generation = (threadGenerations.get(key) ?? 0) + 1;
           threadGenerations.set(key, generation);
-          const entry: InflightThreadSync = {
+          const entry: InflightSync<SynchronizedThreadDetail, ObservationServiceError> = {
             revision: before.revision,
             fiber: undefined as never,
+            readers: 0,
           };
           const run = runThreadSynchronization(
             instanceId,
@@ -945,6 +1021,14 @@ export class Observations extends Context.Service<Observations, ObservationsServ
           );
           entry.fiber = yield* Effect.forkDetach(run);
           threadInflight.set(key, entry);
+          // The creator joins as a reader like everyone else: cancelling the
+          // last reader interrupts the in-flight synchronization, releasing
+          // its subscription scope, while other joined readers keep the
+          // shared sync alive.
+          const joined = yield* tryJoinInflightReader(threadInflight, key, entry);
+          if (Option.isSome(joined)) return joined.value;
+          // The synchronization already completed and published before the
+          // creator joined; its result is final.
           return yield* Fiber.join(entry.fiber);
         });
 

@@ -1,5 +1,6 @@
 import { NodeCrypto } from "@effect/platform-node";
 import * as Context from "effect/Context";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Clock from "effect/Clock";
 import * as Result from "effect/Result";
@@ -20,6 +21,7 @@ import {
   InstancePairAgainInputSchema,
   InstancePairInputSchema,
   InstanceUpdateInputSchema,
+  DEFAULT_THREAD_WAIT_MILLIS,
   MAX_ACTIVE_THREAD_SUBSCRIPTIONS_PER_INSTANCE,
   MAX_OPERATION_CAPACITY,
   MAX_PENDING_REQUEST_OPTIONS,
@@ -34,11 +36,15 @@ import {
   type OutputChunkItem,
   type PendingRequest,
   type PendingRequestForm,
+  type ThreadCondition,
   type ThreadConfiguration,
   type ThreadGetCaptureQuery,
+  type ThreadObservationCursor,
   type ThreadOutputCaptureFrame,
   type ThreadOutputCaptureQuery,
   type ThreadState,
+  type ThreadWaitResult,
+  decodeThreadObservationCursor,
   encodeThreadObservationCursor,
   makeToolSuccess,
   makeModelListToolSuccess,
@@ -66,6 +72,9 @@ import {
   ThreadListToolResultSchema,
   ThreadOutputInputSchema,
   ThreadOutputToolResultSchema,
+  ThreadWaitInputSchema,
+  ThreadWaitToolResultSchema,
+  type ThreadWaitToolResult,
   ToolResultSchema,
   type ModelListPage,
   type ModelListQuery,
@@ -206,6 +215,20 @@ export const ThreadOutputTool = Tool.make("thread_output", {
   .annotate(Tool.Idempotent, true)
   .annotate(Tool.OpenWorld, true);
 
+// fallow-ignore-next-line unused-export
+export const ThreadWaitTool = Tool.make("thread_wait", {
+  description:
+    "Wait for one observable thread condition (changed, inactive, settled, unsettled, session_stopped, needs_response) across all clients' activity, reporting condition_met, timed_out, unavailable, and history_gap separately from the observed thread state.",
+  parameters: ThreadWaitInputSchema,
+  success: ThreadWaitToolResultSchema,
+})
+  .addDependency(LocalStore)
+  .addDependency(Observations)
+  .annotate(Tool.Readonly, true)
+  .annotate(Tool.Destructive, false)
+  .annotate(Tool.Idempotent, true)
+  .annotate(Tool.OpenWorld, true);
+
 /**
  * The registration mutations share one admission/supervision dependency set
  * and differ only in their destructive and open-world hints.
@@ -298,6 +321,7 @@ export const ServerToolkit = Toolkit.make(
   ThreadListTool,
   ThreadGetTool,
   ThreadOutputTool,
+  ThreadWaitTool,
   OperationGetTool,
 );
 
@@ -2113,6 +2137,285 @@ const discoverThreadOutput = (options: {
     });
   });
 
+/**
+ * Between observations one wait polls at an interval that doubles from 100 ms
+ * up to one second; every poll is a full bounded synchronization resuming
+ * from the retained watermark, so the interval trades detection latency
+ * against subscription churn.
+ */
+const THREAD_WAIT_POLL_INTERVAL_MILLIS = 100;
+const THREAD_WAIT_MAX_POLL_INTERVAL_MILLIS = 1_000;
+
+const HISTORY_GAP_LIMITATION =
+  "The observation cursor could not be continuously established; resynchronize with a fresh thread_get before waiting again.";
+
+type ThreadWaitEvaluation = { readonly outcome: "met" | "not_met" | "history_gap" };
+
+const hasUnresolvedRequests = (state: ThreadState): boolean =>
+  state.pendingRequests.items.some(
+    (request) => request.state === "pending" || request.state === "unknown",
+  );
+
+interface ThreadConditionEvaluatorOptions {
+  readonly cursor: ThreadObservationCursor | null;
+  readonly detail: SynchronizedThreadDetail;
+  readonly state: ThreadState;
+}
+
+type ThreadConditionEvaluator = (options: ThreadConditionEvaluatorOptions) => ThreadWaitEvaluation;
+
+/**
+ * A `changed` condition is only ever asserted from a continuous replay
+ * boundary; a snapshot reset or a watermark behind the cursor reports a
+ * history gap instead of claiming the condition occurred.
+ */
+const changedCondition: ThreadConditionEvaluator = ({ cursor, detail }) => {
+  if (cursor === null) return { outcome: "not_met" };
+  if (detail.snapshotReset || detail.snapshotSequence < cursor.snapshotSequence) {
+    return { outcome: "history_gap" };
+  }
+  return { outcome: detail.snapshotSequence > cursor.snapshotSequence ? "met" : "not_met" };
+};
+
+const threadConditionEvaluators: Record<ThreadCondition, ThreadConditionEvaluator> = {
+  changed: changedCondition,
+  inactive: ({ state }) => ({
+    outcome:
+      state.execution.state === "inactive" && !hasUnresolvedRequests(state) ? "met" : "not_met",
+  }),
+  settled: ({ state }) => ({
+    outcome: state.summary.settlement === "settled" ? "met" : "not_met",
+  }),
+  unsettled: ({ state }) => ({
+    outcome: state.summary.settlement === "unsettled" ? "met" : "not_met",
+  }),
+  session_stopped: ({ state }) => ({
+    outcome: state.session.state === "stopped" ? "met" : "not_met",
+  }),
+  needs_response: ({ state }) => ({
+    outcome: state.pendingRequests.items.some((request) => request.state === "pending")
+      ? "met"
+      : "not_met",
+  }),
+};
+
+const evaluateThreadCondition = (options: {
+  readonly condition: ThreadCondition;
+  readonly cursor: ThreadObservationCursor | null;
+  readonly detail: SynchronizedThreadDetail;
+  readonly state: ThreadState;
+}): ThreadWaitEvaluation => threadConditionEvaluators[options.condition](options);
+
+interface ThreadWaitSuccessOptions {
+  readonly observations: ObservationsService;
+  readonly thread: ThreadState["summary"]["thread"];
+  readonly condition: ThreadCondition;
+  readonly cursor: ThreadObservationCursor | null;
+  readonly waitMs: number;
+}
+
+const threadWaitObservationResult = (options: {
+  readonly condition: ThreadCondition;
+  readonly observation: ThreadWaitResult["observation"];
+  readonly state: ThreadState | null;
+  readonly observations: ReadonlyArray<Observation>;
+  readonly warnings: ReadonlyArray<{ readonly code: string; readonly message: string }>;
+}): ThreadWaitToolResult => ({
+  result: {
+    kind: "ok" as const,
+    value: {
+      condition: options.condition,
+      observation: options.observation,
+      state: options.state,
+    },
+  },
+  observations: options.observations,
+  warnings: options.warnings,
+});
+
+interface ThreadWaitPoll {
+  /** A terminal result ends the wait; null asks the loop to keep waiting. */
+  readonly terminal: ThreadWaitToolResult | null;
+  readonly state: ThreadState;
+  readonly observation: Observation;
+}
+
+/**
+ * Run one bounded observation of the waited thread and evaluate the condition
+ * against the published state. Typed observation failures propagate so the
+ * wait loop can distinguish a failed first evaluation from losing the
+ * observation mid-wait. The auxiliary project lookup is supplied by the wait
+ * loop, which caches it across polls.
+ */
+const pollThreadWait = (options: {
+  readonly thread: ThreadState["summary"]["thread"];
+  readonly condition: ThreadCondition;
+  readonly cursor: ThreadObservationCursor | null;
+  readonly project: ThreadProjectLookup;
+  readonly detail: SynchronizedThreadDetail;
+}): ThreadWaitPoll => {
+  const { thread, condition, cursor, project, detail } = options;
+  const { instanceId } = thread;
+  const { state, frame } = buildThreadState({ instanceId, detail, project });
+  const items = pendingRequestsFromActivities(thread, detail.thread.activities);
+  const coverage =
+    project.limitations.length > 0 ? ("partial" as const) : ("complete_for_query" as const);
+  // A wait is not a paging read: the state carries every observed pending
+  // request with no continuation cursor.
+  const fullState = assembleThreadState(frame, {
+    items,
+    nextCursor: null,
+    coverage,
+    limitations: state.limitations,
+    failures: [],
+  });
+  const evaluation = evaluateThreadCondition({ condition, cursor, detail, state: fullState });
+  const observation = freshThreadStateObservation({
+    instanceId,
+    detail,
+    coverage,
+    limitations:
+      evaluation.outcome === "history_gap"
+        ? [...state.limitations, HISTORY_GAP_LIMITATION]
+        : state.limitations,
+  });
+  const terminal =
+    evaluation.outcome === "met"
+      ? threadWaitObservationResult({
+          condition,
+          observation: "condition_met",
+          state: fullState,
+          observations: [observation],
+          warnings: [],
+        })
+      : evaluation.outcome === "history_gap"
+        ? threadWaitObservationResult({
+            condition,
+            observation: "history_gap",
+            state: fullState,
+            observations: [observation],
+            warnings: [],
+          })
+        : null;
+  return { terminal, state: fullState, observation };
+};
+
+/**
+ * Losing an observation mid-wait does not imply the work ended: transient
+ * observation failures retry within the remaining budget, while identity,
+ * authorization, compatibility, and registration failures end the wait as an
+ * unavailable observation.
+ */
+const retriableWaitObservationError = (
+  error: LocalStoreError | T3CodeAdapterError | ObservationError,
+): boolean => {
+  // Storage contention is transient by design: the local store retries
+  // rolled-back work with jittered backoff, so the wait retries it too.
+  if (error instanceof LocalStoreError) return error.kind === "contention";
+  if (error instanceof ObservationError) return true;
+  if (error instanceof T3CodeAdapterError) {
+    switch (error.kind) {
+      case "transport":
+      case "timeout":
+      case "capacity":
+      case "resource_not_found":
+        return true;
+      default:
+        return false;
+    }
+  }
+  return false;
+};
+
+/**
+ * Observe one thread until its condition is met, the deadline passes, the
+ * observation becomes unavailable, or a cursor gap demands resynchronization.
+ * Every synchronization is scoped: cancelling the wait interrupts only this
+ * observation, releases its subscription scope, and dispatches no
+ * interruption, settlement, session shutdown, or work-completion decision.
+ */
+const runThreadWait = (
+  options: ThreadWaitSuccessOptions,
+): Effect.Effect<ThreadWaitToolResult, LocalStoreError | T3CodeAdapterError | ObservationError> =>
+  Effect.gen(function* () {
+    const { observations, thread, condition, cursor, waitMs } = options;
+    const { instanceId, threadId } = thread;
+    // The project lookup answers one shell read per observation; cache it
+    // across polls and re-resolve only when the fields it depends on change.
+    let cachedProject: {
+      readonly archived: boolean;
+      readonly projectId: string;
+      readonly lookup: ThreadProjectLookup;
+    } | null = null;
+    const projectLookupFor = (detail: SynchronizedThreadDetail) =>
+      Effect.gen(function* () {
+        const archived = detail.thread.archivedAt !== null;
+        const projectId = detail.thread.projectId;
+        if (
+          cachedProject !== null &&
+          cachedProject.archived === archived &&
+          cachedProject.projectId === projectId
+        ) {
+          return cachedProject.lookup;
+        }
+        const lookup = yield* lookupThreadProject({ observations, instanceId, detail });
+        // A degraded lookup (the repository path could not be established)
+        // stays uncached so a later poll can recover full coverage.
+        if (lookup.limitations.length === 0) {
+          cachedProject = { archived, projectId, lookup };
+        }
+        return lookup;
+      });
+    const startedAt = yield* Clock.currentTimeMillis;
+    const deadline = startedAt + waitMs;
+    let firstEvaluation = true;
+    let pollInterval = THREAD_WAIT_POLL_INTERVAL_MILLIS;
+    while (true) {
+      const detailResult = yield* Effect.result(observations.threadDetail(instanceId, threadId));
+      if (Result.isFailure(detailResult)) {
+        // A wait that never observed its target fails with the typed error;
+        // losing the observation later ends the wait as unavailable instead
+        // of implying the work ended.
+        if (firstEvaluation) return yield* Effect.fail(detailResult.failure);
+        const failedAt = yield* Clock.currentTimeMillis;
+        if (!retriableWaitObservationError(detailResult.failure) || failedAt >= deadline) {
+          return threadWaitObservationResult({
+            condition,
+            observation: "unavailable",
+            state: null,
+            observations: [],
+            warnings: [{ code: "observation_unavailable", message: detailResult.failure.message }],
+          });
+        }
+        yield* Effect.sleep(Duration.millis(Math.min(pollInterval, deadline - failedAt)));
+        pollInterval = Math.min(THREAD_WAIT_MAX_POLL_INTERVAL_MILLIS, pollInterval * 2);
+        continue;
+      }
+      firstEvaluation = false;
+      const project = yield* projectLookupFor(detailResult.success);
+      const poll = pollThreadWait({
+        thread,
+        condition,
+        cursor,
+        project,
+        detail: detailResult.success,
+      });
+      if (poll.terminal !== null) return poll.terminal;
+      const now = yield* Clock.currentTimeMillis;
+      if (now >= deadline) {
+        return threadWaitObservationResult({
+          condition,
+          observation: "timed_out",
+          state: poll.state,
+          observations: [poll.observation],
+          warnings: [],
+        });
+      }
+      yield* Effect.sleep(Duration.millis(Math.min(pollInterval, deadline - now)));
+      pollInterval = Math.min(THREAD_WAIT_MAX_POLL_INTERVAL_MILLIS, pollInterval * 2);
+    }
+  });
+
 const serverToolHandlers = ServerToolkit.of({
   instance_list: ({ cursor, limit }) =>
     Effect.gen(function* () {
@@ -2317,6 +2620,78 @@ const serverToolHandlers = ServerToolkit.of({
         query,
         maxBytes,
         allowStale: allowStale ?? false,
+      });
+    }).pipe(
+      Effect.catch((error: LocalStoreError | T3CodeAdapterError | ObservationError) =>
+        Effect.succeed({
+          result: { kind: "error" as const, error: toToolFailure(error) },
+          observations: [],
+          warnings: [],
+        }),
+      ),
+    ),
+  thread_wait: ({ thread, condition, afterCursor, waitMs }) =>
+    Effect.gen(function* () {
+      const observations = yield* Observations;
+      if (condition !== "changed" && afterCursor !== undefined) {
+        return {
+          result: {
+            kind: "error" as const,
+            error: makeToolFailure(
+              "The afterCursor argument only applies to the changed condition.",
+              "invalid_argument",
+              "change_request",
+            ),
+          },
+          observations: [],
+          warnings: [],
+        };
+      }
+      let cursor: ThreadObservationCursor | null = null;
+      if (condition === "changed") {
+        // The input schema already rejects a changed wait without a cursor;
+        // the decode still guards the handler boundary.
+        if (afterCursor === undefined) {
+          return {
+            result: {
+              kind: "error" as const,
+              error: makeToolFailure(
+                "A changed wait requires the afterCursor from a prior observation.",
+                "invalid_argument",
+                "change_request",
+              ),
+            },
+            observations: [],
+            warnings: [],
+          };
+        }
+        const decoded = decodeThreadObservationCursor(afterCursor);
+        if (
+          decoded === null ||
+          decoded.instanceId !== thread.instanceId ||
+          decoded.threadId !== thread.threadId
+        ) {
+          return {
+            result: {
+              kind: "error" as const,
+              error: makeToolFailure(
+                "The afterCursor is not a valid observation cursor for this thread.",
+                "invalid_argument",
+                "change_request",
+              ),
+            },
+            observations: [],
+            warnings: [],
+          };
+        }
+        cursor = decoded;
+      }
+      return yield* runThreadWait({
+        observations,
+        thread,
+        condition,
+        cursor,
+        waitMs: waitMs ?? DEFAULT_THREAD_WAIT_MILLIS,
       });
     }).pipe(
       Effect.catch((error: LocalStoreError | T3CodeAdapterError | ObservationError) =>

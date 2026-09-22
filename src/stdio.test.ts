@@ -1,10 +1,13 @@
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
 import { createRequire } from "node:module";
+import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { LocalStore } from "./local-store";
 
 const tsxCliPath = createRequire(import.meta.url).resolve("tsx/cli");
 
@@ -112,6 +115,7 @@ describe("stdio transport", () => {
               "thread_list",
               "thread_get",
               "thread_output",
+              "thread_wait",
               "operation_get",
             ]);
             for (const tool of toolsMessage.result?.tools ?? []) {
@@ -185,5 +189,128 @@ describe("stdio transport", () => {
           }),
       ),
     30000,
+  );
+
+  // fallow-ignore-next-line complexity
+  it.live(
+    "cancelling a waiting thread_wait call stops only the observation",
+    () =>
+      Effect.acquireUseRelease(
+        Effect.gen(function* () {
+          const directory = mkdtempSync(join(tmpdir(), "t3code-mcp-stdio-cancel-"));
+          // A hanging endpoint keeps the wait in flight: the connection is
+          // verified through a request that never receives a response.
+          const hangSockets = new Set<Socket>();
+          const hangServer = createServer((socket) => {
+            hangSockets.add(socket);
+            socket.on("close", () => hangSockets.delete(socket));
+            socket.on("error", () => undefined);
+          });
+          hangServer.unref();
+          yield* Effect.promise(() => once(hangServer.listen(0), "listening"));
+          const address = hangServer.address();
+          if (typeof address === "string" || address === null) {
+            return yield* Effect.die("The hanging test server has no address.");
+          }
+          const databasePath = join(directory, "state.sqlite");
+          yield* Effect.scoped(
+            Effect.gen(function* () {
+              const store = yield* LocalStore;
+              yield* store.putRegistration({
+                instanceId: "hang-instance",
+                alias: "Hanging instance",
+                endpoint: `http://127.0.0.1:${address.port}`,
+                environmentId: null,
+                connection: "connected",
+                lastObservedAt: null,
+                credential: "secret-hang",
+              });
+            }).pipe(Effect.provide(LocalStore.layer({ databasePath }))),
+          );
+          const child = spawn(process.execPath, [tsxCliPath, "src/main.ts"], {
+            cwd: process.cwd(),
+            env: { ...process.env, T3CODE_MCP_DATABASE_PATH: databasePath },
+            stdio: ["pipe", "pipe", "inherit"],
+          });
+          return { directory, hangSockets, hangServer, child, nextMessage: waitForMessage(child) };
+        }),
+        ({ child, nextMessage }) =>
+          // fallow-ignore-next-line complexity
+          Effect.promise(async () => {
+            send(child, {
+              jsonrpc: "2.0",
+              id: 1,
+              method: "initialize",
+              params: {
+                protocolVersion: "2025-06-18",
+                capabilities: {},
+                clientInfo: { name: "stdio-test", version: "1.0.0" },
+              },
+            });
+            expect((await nextMessage()).result?.tools).toBeUndefined();
+            send(child, { jsonrpc: "2.0", method: "notifications/initialized", params: {} });
+
+            send(child, {
+              jsonrpc: "2.0",
+              id: 7,
+              method: "tools/call",
+              params: {
+                name: "thread_wait",
+                arguments: {
+                  thread: { instanceId: "hang-instance", threadId: "thread-a" },
+                  condition: "inactive",
+                  waitMs: 30_000,
+                },
+              },
+            });
+            // The wait hangs against the hanging endpoint. A cheap round trip
+            // proves the server accepted it and stays responsive while it is in
+            // flight, without any response for the waiting request.
+            const seen: Array<number | undefined> = [];
+            const awaitResponse = async (id: number) => {
+              let message = await nextMessage();
+              while (message.id !== id) {
+                seen.push(message.id);
+                message = await nextMessage();
+              }
+              return message;
+            };
+            send(child, { jsonrpc: "2.0", id: 8, method: "tools/list", params: {} });
+            const listed = await awaitResponse(8);
+            expect(seen).not.toContain(7);
+            expect(listed.result?.tools?.map((tool) => tool.name)).toContain("thread_wait");
+
+            // Cancelling the MCP request interrupts only the observation; the
+            // cancelled request never receives a response and the server stays
+            // responsive without dispatching any thread mutation.
+            send(child, {
+              jsonrpc: "2.0",
+              method: "notifications/cancelled",
+              params: { requestId: 7, reason: "test cancellation" },
+            });
+            send(child, { jsonrpc: "2.0", id: 9, method: "tools/list", params: {} });
+            await awaitResponse(9);
+            expect(seen).not.toContain(7);
+          }),
+        ({ directory, hangSockets, hangServer, child }) =>
+          Effect.promise(async () => {
+            // Destroy the hanging sockets first so the server process observes
+            // the closed connection and the graceful termination can finish.
+            for (const socket of hangSockets) socket.destroy();
+            hangServer.close();
+            const exit =
+              child.exitCode !== null || child.signalCode !== null
+                ? Promise.resolve()
+                : new Promise<void>((resolve) => child.once("exit", () => resolve()));
+            if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+            await Promise.race([exit, new Promise((resolve) => setTimeout(resolve, 3000))]);
+            if (child.exitCode === null && child.signalCode === null) {
+              child.kill("SIGKILL");
+              await Promise.race([exit, new Promise((resolve) => setTimeout(resolve, 1000))]);
+            }
+            rmSync(directory, { recursive: true, force: true });
+          }),
+      ),
+    15_000,
   );
 });

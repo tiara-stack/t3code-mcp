@@ -1,6 +1,7 @@
 import * as Schema from "effect/Schema";
 import * as SchemaGetter from "effect/SchemaGetter";
 import * as Encoding from "effect/Encoding";
+import * as Result from "effect/Result";
 
 const nonEmptyString = Schema.NonEmptyString;
 export const DEFAULT_PAGE_LIMIT = 25;
@@ -8,6 +9,13 @@ export const MAX_PAGE_LIMIT = 100;
 export const MAX_SERIALIZED_RESULT_BYTES = 128 * 1024;
 const MAX_REQUEST_ID_LENGTH = 128;
 export const MAX_OPERATION_WAIT_MILLIS = 30_000;
+/**
+ * Dedicated thread waits default to a ten-second budget and accept 0 to
+ * 30 seconds; none of these budgets set an execution deadline.
+ */
+export const DEFAULT_THREAD_WAIT_MILLIS = 10_000;
+// fallow-ignore-next-line unused-export
+export const MAX_THREAD_WAIT_MILLIS = 30_000;
 export const MAX_OPERATION_CAPACITY = 128;
 export const MAX_INSTANCE_RPC_CAPACITY = 8;
 export const MAX_TOTAL_RPC_CAPACITY = 32;
@@ -838,6 +846,93 @@ export const ThreadOutputInputSchema = Schema.declare<{
 export type ThreadOutputInput = typeof ThreadOutputInputSchema.Type;
 
 /**
+ * The published thread-wait conditions observe all clients' activity on one
+ * thread; `inactive` requires no active execution and no pending
+ * approval/input requests.
+ */
+// fallow-ignore-next-line unused-export
+export const threadConditions = [
+  "changed",
+  "inactive",
+  "settled",
+  "unsettled",
+  "session_stopped",
+  "needs_response",
+] as const;
+
+export type ThreadCondition = (typeof threadConditions)[number];
+
+const threadWaitWaitMs = Schema.Int.check(
+  Schema.isBetween({ minimum: 0, maximum: MAX_THREAD_WAIT_MILLIS }),
+);
+
+const threadWaitFields = Schema.Struct({
+  thread: threadGetReferenceRuntimeShape,
+  condition: Schema.Literals(threadConditions),
+  afterCursor: Schema.optionalKey(nonEmptyString),
+  waitMs: Schema.optionalKey(threadWaitWaitMs),
+});
+
+const threadWaitJsonFields = Schema.Struct({
+  thread: threadGetReferenceJsonShape,
+  condition: Schema.Literals(threadConditions),
+  afterCursor: Schema.optionalKey(nonEmptyString),
+  waitMs: Schema.optionalKey(threadWaitWaitMs),
+});
+
+const unknownThreadWaitField = Schema.String.check(
+  Schema.makeFilter(
+    (key) => key !== "thread" && key !== "condition" && key !== "afterCursor" && key !== "waitMs",
+    {
+      message: "unknown thread_wait argument",
+    },
+  ),
+);
+
+const threadWaitRuntimeShape = Schema.StructWithRest(threadWaitFields, [
+  Schema.Record(unknownThreadWaitField, Schema.Never),
+]);
+
+const threadWaitJsonShape = Schema.StructWithRest(threadWaitJsonFields, [
+  Schema.Record(Schema.String, Schema.Never),
+]);
+
+/**
+ * The thread wait accepts one direct instance-qualified native thread
+ * reference and one explicit condition. A `changed` wait requires the prior
+ * observation cursor so a history gap can be reported instead of asserting
+ * the condition occurred; every other condition evaluates the current state
+ * before waiting. The wait budget accepts 0 (check now) to 30 seconds and
+ * defaults to ten seconds.
+ */
+export const ThreadWaitInputSchema = Schema.declare<{
+  readonly thread: ThreadReference;
+  readonly condition: ThreadCondition;
+  readonly afterCursor?: string;
+  readonly waitMs?: number;
+}>(
+  (
+    input,
+  ): input is {
+    readonly thread: ThreadReference;
+    readonly condition: ThreadCondition;
+    readonly afterCursor?: string;
+    readonly waitMs?: number;
+  } =>
+    Schema.is(threadWaitRuntimeShape)(input) &&
+    (input.condition !== "changed" || typeof input.afterCursor === "string"),
+  {
+    toCodecJson: () =>
+      Schema.link()(threadWaitJsonShape, {
+        decode: SchemaGetter.passthrough({ strict: false }),
+        encode: SchemaGetter.passthrough({ strict: false }),
+      } as never),
+  },
+);
+
+export type ThreadWaitInput = typeof ThreadWaitInputSchema.Type;
+
+/**
  * A thread-output capture binds one direct thread reference; its cursor pages
  * one immutable latest-first view of retained conversation and activity
  * parts.
@@ -1515,6 +1610,25 @@ export const ThreadGetToolResultSchema = toolResultFields(ThreadStateSchema);
 
 export type ThreadGetToolResult = typeof ThreadGetToolResultSchema.Type;
 
+/**
+ * A thread wait reports its observation separately from the thread state:
+ * timeout, unavailable observation, and history gaps never imply anything
+ * about execution outcome, and the state stays null when no current state
+ * could be observed.
+ */
+// fallow-ignore-next-line unused-export
+export const ThreadWaitResultSchema = Schema.Struct({
+  condition: Schema.Literals(threadConditions),
+  observation: Schema.Literals(["condition_met", "timed_out", "unavailable", "history_gap"]),
+  state: Schema.NullOr(ThreadStateSchema),
+});
+
+export type ThreadWaitResult = typeof ThreadWaitResultSchema.Type;
+
+export const ThreadWaitToolResultSchema = toolResultFields(ThreadWaitResultSchema);
+
+export type ThreadWaitToolResult = typeof ThreadWaitToolResultSchema.Type;
+
 const outputItemKinds = ["message", "activity", "diff"] as const;
 
 const sourceCompletenessStates = ["retained_projection", "complete", "partial", "unknown"] as const;
@@ -1750,6 +1864,44 @@ export const encodeThreadObservationCursor = (cursor: ThreadObservationCursor): 
       o: cursor.observedAt,
     }),
   );
+
+const cursorJsonShape = Schema.Struct({
+  v: Schema.Literal(1),
+  i: nonEmptyString,
+  t: nonEmptyString,
+  s: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  w: Schema.NullOr(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+  o: nonEmptyString,
+});
+
+/**
+ * Strictly decode an observation cursor produced by
+ * `encodeThreadObservationCursor`. Anything else — malformed base64 or JSON,
+ * an unsupported version, wrong field shapes — decodes to null so callers can
+ * reject it as an invalid argument instead of waiting on an unreadable
+ * position.
+ */
+export const decodeThreadObservationCursor = (encoded: string): ThreadObservationCursor | null => {
+  const decoded = Encoding.decodeBase64UrlString(encoded);
+  if (Result.isFailure(decoded)) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(decoded.success);
+  } catch {
+    return null;
+  }
+  const result = Schema.decodeUnknownResult(cursorJsonShape)(parsed);
+  if (Result.isFailure(result)) return null;
+  const { v, i, t, s, w, o } = result.success;
+  return {
+    version: v,
+    instanceId: i,
+    threadId: t,
+    snapshotSequence: s,
+    threadSequence: w,
+    observedAt: o,
+  };
+};
 
 export const serializedByteLength = (value: unknown): number =>
   new TextEncoder().encode(JSON.stringify(value)).byteLength;
