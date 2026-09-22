@@ -5,6 +5,7 @@ import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Semaphore from "effect/Semaphore";
+import * as Stream from "effect/Stream";
 import type { InstanceDetails } from "./domain";
 import { MAX_INSTANCE_RPC_CAPACITY, REVISION_POLL_INTERVAL_MILLIS } from "./domain";
 import { LocalStore, LocalStoreError } from "./local-store";
@@ -14,6 +15,8 @@ import {
   type DiscoveredProject,
   type DiscoveredProvider,
   type PairingExchangeInput,
+  type ShellSnapshot,
+  type ShellStreamItem,
   type StagedPairingToken,
   type T3CodeAdapterService,
   type VerifiedInstance,
@@ -30,6 +33,10 @@ export interface DiscoveredProjects {
 export interface DiscoveredModels {
   readonly providers: ReadonlyArray<DiscoveredProvider>;
   readonly limitations: ReadonlyArray<string>;
+  readonly observedAt: string;
+}
+
+export interface ObservedShellSnapshot extends ShellSnapshot {
   readonly observedAt: string;
 }
 
@@ -69,6 +76,19 @@ export interface InstanceConnectionsService {
   readonly discoverModels: (
     instanceId: string,
   ) => Effect.Effect<DiscoveredModels, LocalStoreError | T3CodeAdapterError>;
+  /**
+   * Open a scoped shell observation stream for the current registration
+   * revision. The per-instance RPC capacity permit is held until the returned
+   * stream terminates; the caller consumes the stream to the synchronized
+   * boundary and interrupts it to release the upstream subscription.
+   */
+  readonly openShellStream: (
+    instanceId: string,
+    options?: { readonly afterSequence?: number },
+  ) => Stream.Stream<ShellStreamItem, LocalStoreError | T3CodeAdapterError>;
+  readonly readArchivedShell: (
+    instanceId: string,
+  ) => Effect.Effect<ObservedShellSnapshot, LocalStoreError | T3CodeAdapterError>;
   readonly invalidate: (instanceId: string) => Effect.Effect<void>;
 }
 
@@ -271,6 +291,100 @@ export class InstanceConnections extends Context.Service<
             );
             const observedAt = new Date(yield* Clock.currentTimeMillis).toISOString();
             return { ...listing, observedAt };
+          });
+
+        const openShellStream = (
+          instanceId: string,
+          options?: { readonly afterSequence?: number },
+        ): Stream.Stream<ShellStreamItem, LocalStoreError | T3CodeAdapterError> =>
+          Stream.unwrap(
+            Effect.gen(function* () {
+              const registration = yield* store.getRegistration(instanceId);
+              if (registration === null) {
+                return yield* Effect.fail(
+                  new LocalStoreError({
+                    kind: "registration_not_found",
+                    message: "The saved registration was not found.",
+                  }),
+                );
+              }
+              if (registration.credential === null) {
+                return yield* Effect.fail(
+                  new T3CodeAdapterError({
+                    kind: "pairing_required",
+                    message:
+                      "The saved registration requires pairing before threads can be listed.",
+                    uncertain: false,
+                    status: null,
+                  }),
+                );
+              }
+              const connection = yield* acquire(instanceId);
+              const semaphore = capacityFor(instanceId);
+              // The non-blocking take and the release finalizer register
+              // atomically so an interruption between them cannot leak a
+              // permit; the permit is held until the returned stream
+              // terminates so concurrent observations cannot exceed the
+              // per-instance RPC budget.
+              const acquired = yield* Effect.acquireRelease(
+                semaphore.takeIfAvailable(1),
+                (permit) => (permit ? semaphore.release(1).pipe(Effect.ignore) : Effect.void),
+              );
+              if (!acquired) {
+                return yield* Effect.fail(
+                  new T3CodeAdapterError({
+                    kind: "capacity",
+                    message: "The instance RPC capacity is full.",
+                    uncertain: false,
+                    status: null,
+                  }),
+                );
+              }
+              return adapter.subscribeShell({
+                endpoint: connection.endpoint,
+                credential: connection.credential,
+                ...(options?.afterSequence === undefined
+                  ? {}
+                  : { afterSequence: options.afterSequence }),
+                requestCompletionMarker: true,
+              });
+            }),
+          );
+
+        const readArchivedShell = (
+          instanceId: string,
+        ): Effect.Effect<ObservedShellSnapshot, LocalStoreError | T3CodeAdapterError> =>
+          Effect.gen(function* () {
+            const registration = yield* store.getRegistration(instanceId);
+            if (registration === null) {
+              return yield* Effect.fail(
+                new LocalStoreError({
+                  kind: "registration_not_found",
+                  message: "The saved registration was not found.",
+                }),
+              );
+            }
+            if (registration.credential === null) {
+              return yield* Effect.fail(
+                new T3CodeAdapterError({
+                  kind: "pairing_required",
+                  message:
+                    "The saved registration requires pairing before archived threads can be listed.",
+                  uncertain: false,
+                  status: null,
+                }),
+              );
+            }
+            const connection = yield* acquire(instanceId);
+            const snapshot = yield* withInstanceCapacity(
+              instanceId,
+              adapter.getArchivedShellSnapshot({
+                endpoint: connection.endpoint,
+                credential: connection.credential,
+              }),
+            );
+            const observedAt = new Date(yield* Clock.currentTimeMillis).toISOString();
+            return { ...snapshot, observedAt };
           });
 
         const inspectFresh = (
@@ -495,6 +609,8 @@ export class InstanceConnections extends Context.Service<
           inspect,
           discoverProjects,
           discoverModels,
+          openShellStream,
+          readArchivedShell,
           invalidate,
         });
       }),

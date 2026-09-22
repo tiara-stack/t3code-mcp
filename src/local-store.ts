@@ -28,6 +28,7 @@ import {
   ObservationSchema,
   OperationRecordSchema,
   ProjectSummarySchema,
+  ThreadSummarySchema,
   type Evidence,
   type ModelListPage,
   type ModelListQuery,
@@ -39,9 +40,13 @@ import {
   type ProjectListPage,
   type ProjectListScope,
   type ProjectSummary,
+  type ThreadListPage,
+  type ThreadListQuery,
+  type ThreadSummary,
   makeToolSuccess,
   makeModelListToolSuccess,
   makeProjectListToolSuccess,
+  makeThreadListToolSuccess,
   serializedByteLength,
   ToolFailureSchema,
 } from "./domain";
@@ -65,6 +70,8 @@ const PROJECT_CAPTURE_SCOPE = "project_list";
 const PROJECT_CAPTURE_ORDER = "instance_id_project_id_asc";
 const MODEL_CAPTURE_SCOPE = "model_list";
 const MODEL_CAPTURE_ORDER = "provider_instance_id_model_asc";
+const THREAD_CAPTURE_SCOPE = "thread_list";
+const THREAD_CAPTURE_ORDER = "instance_id_thread_id_asc";
 const OPERATION_DETAIL_CLEANUP_BATCH_SIZE = 64;
 
 const projectScopeKey = (scope: ProjectListScope): string =>
@@ -86,6 +93,26 @@ const modelScopeKey = (query: ModelListQuery): string =>
 
 const modelQueriesEqual = (left: ModelListQuery, right: ModelListQuery): boolean =>
   left.instanceId === right.instanceId && left.providerInstanceId === right.providerInstanceId;
+
+// The scope key uses JSON encoding like the model scope key so instance and
+// project IDs containing the separator cannot collide with other scopes.
+const threadScopeKeyForQuery = (query: ThreadListQuery): string =>
+  JSON.stringify([
+    THREAD_CAPTURE_SCOPE,
+    query.scope.kind,
+    ...(query.scope.kind === "instance"
+      ? [query.scope.instanceId]
+      : [query.scope.project.instanceId, query.scope.project.projectId]),
+    query.archived,
+  ]);
+
+const threadQueriesEqual = (left: ThreadListQuery, right: ThreadListQuery): boolean =>
+  left.archived === right.archived &&
+  (left.scope.kind === "instance"
+    ? right.scope.kind === "instance" && right.scope.instanceId === left.scope.instanceId
+    : right.scope.kind === "project" &&
+      right.scope.project.instanceId === left.scope.project.instanceId &&
+      right.scope.project.projectId === left.scope.project.projectId);
 
 export const REQUEST_RECORD_UNAVAILABLE_MESSAGE =
   "The mutation receipt details are unavailable; the request ID remains permanently reserved.";
@@ -234,6 +261,41 @@ const ModelCursorPayloadSchema = Schema.Struct({
   position: Schema.Natural,
 });
 
+type ThreadCursorPayload = {
+  readonly version: 1;
+  readonly databaseId: string;
+  readonly captureId: string;
+  readonly scope: typeof THREAD_CAPTURE_SCOPE;
+  readonly order: typeof THREAD_CAPTURE_ORDER;
+  readonly query: ThreadListQuery;
+  readonly position: number;
+};
+
+const ThreadCursorPayloadSchema = Schema.Struct({
+  version: Schema.Literal(1),
+  databaseId: Schema.NonEmptyString,
+  captureId: Schema.NonEmptyString,
+  scope: Schema.Literal(THREAD_CAPTURE_SCOPE),
+  order: Schema.Literal(THREAD_CAPTURE_ORDER),
+  query: Schema.Struct({
+    scope: Schema.Union([
+      Schema.Struct({
+        kind: Schema.Literal("instance"),
+        instanceId: Schema.NonEmptyString,
+      }),
+      Schema.Struct({
+        kind: Schema.Literal("project"),
+        project: Schema.Struct({
+          instanceId: Schema.NonEmptyString,
+          projectId: Schema.NonEmptyString,
+        }),
+      }),
+    ]),
+    archived: Schema.Literals(["exclude", "include", "only"]),
+  }),
+  position: Schema.Natural,
+});
+
 const CaptureMetadataSchema = Schema.Struct({
   failures: Schema.Array(
     Schema.Struct({
@@ -291,6 +353,9 @@ export type RetainedProjectCapture = RetainedCapture<ProjectSummary>;
 export type ModelCaptureMetadata = ListCaptureMetadata;
 export type ModelCapturePage = ListCapturePage<ModelListPage>;
 export type RetainedModelCapture = RetainedCapture<ModelSummary>;
+export type ThreadCaptureMetadata = ListCaptureMetadata;
+export type ThreadCapturePage = ListCapturePage<ThreadListPage>;
+export type RetainedThreadCapture = RetainedCapture<ThreadSummary>;
 
 type RegistrationRowDecode = {
   readonly item: InstanceSummary | null;
@@ -487,6 +552,22 @@ export interface LocalStoreService {
   readonly findRetainedModelCapture: (
     query: ModelListQuery,
   ) => Effect.Effect<RetainedModelCapture | null, LocalStoreError>;
+  readonly captureThreadPage: (input: {
+    readonly query: ThreadListQuery;
+    readonly items: ReadonlyArray<ThreadSummary>;
+    readonly metadata: ThreadCaptureMetadata;
+    readonly limit?: number;
+    readonly maxBytes?: number;
+  }) => Effect.Effect<ThreadCapturePage, LocalStoreError>;
+  readonly readThreadPage: (options: {
+    readonly query: ThreadListQuery;
+    readonly cursor: string;
+    readonly limit?: number;
+    readonly maxBytes?: number;
+  }) => Effect.Effect<ThreadCapturePage, LocalStoreError>;
+  readonly findRetainedThreadCapture: (
+    query: ThreadListQuery,
+  ) => Effect.Effect<RetainedThreadCapture | null, LocalStoreError>;
   readonly putRegistration: (
     registration: PutRegistrationInput,
   ) => Effect.Effect<void, LocalStoreError>;
@@ -699,6 +780,32 @@ export class LocalStore extends Context.Service<LocalStore, LocalStoreService>()
         const findRetainedModelCapture = (query: ModelListQuery) =>
           findRetainedModelCaptureInDatabase(sql, query, verifySchemaForOperation);
 
+        const captureThreadPage = (input: {
+          readonly query: ThreadListQuery;
+          readonly items: ReadonlyArray<ThreadSummary>;
+          readonly metadata: ThreadCaptureMetadata;
+          readonly limit?: number;
+          readonly maxBytes?: number;
+        }) =>
+          captureThreadPageInDatabase(
+            sql,
+            crypto,
+            config,
+            databaseId,
+            input,
+            verifySchemaForOperation,
+          );
+
+        const readThreadPage = (options: {
+          readonly query: ThreadListQuery;
+          readonly cursor: string;
+          readonly limit?: number;
+          readonly maxBytes?: number;
+        }) => readThreadPageFromDatabase(sql, databaseId, options, verifySchemaForOperation);
+
+        const findRetainedThreadCapture = (query: ThreadListQuery) =>
+          findRetainedThreadCaptureInDatabase(sql, query, verifySchemaForOperation);
+
         const putRegistration = (registration: PutRegistrationInput) =>
           putRegistrationInDatabase(
             sql,
@@ -791,6 +898,9 @@ export class LocalStore extends Context.Service<LocalStore, LocalStoreService>()
           captureModelPage,
           readModelPage,
           findRetainedModelCapture,
+          captureThreadPage,
+          readThreadPage,
+          findRetainedThreadCapture,
           putRegistration,
           stagePairing,
           publishPairing,
@@ -1555,6 +1665,38 @@ const captureModelPageInDatabase = (
     verify,
   );
 
+const captureThreadPageInDatabase = (
+  sql: SqlClient.SqlClient,
+  crypto: Crypto.Crypto,
+  config: Required<LocalStoreConfigValue>,
+  databaseId: string,
+  input: {
+    readonly query: ThreadListQuery;
+    readonly items: ReadonlyArray<ThreadSummary>;
+    readonly metadata: ThreadCaptureMetadata;
+    readonly limit?: number;
+    readonly maxBytes?: number;
+  },
+  verify: SchemaVerifier,
+): Effect.Effect<ThreadCapturePage, LocalStoreError> =>
+  captureListPageInDatabase(
+    sql,
+    crypto,
+    config,
+    databaseId,
+    {
+      scopeKey: threadScopeKeyForQuery(input.query),
+      order: THREAD_CAPTURE_ORDER,
+      captureKind: "thread",
+      items: input.items,
+      metadata: input.metadata,
+      ...(input.limit === undefined ? {} : { limit: input.limit }),
+      ...(input.maxBytes === undefined ? {} : { maxBytes: input.maxBytes }),
+    },
+    threadCaptureCodec(input.query),
+    verify,
+  );
+
 const readListPageFromDatabase = <
   Payload extends { readonly captureId: string; readonly position: number },
   Items,
@@ -1671,6 +1813,37 @@ const readModelPageFromDatabase = (
     verify,
   );
 
+const readThreadPageFromDatabase = (
+  sql: SqlClient.SqlClient,
+  databaseId: string,
+  options: {
+    readonly query: ThreadListQuery;
+    readonly cursor: string;
+    readonly limit?: number;
+    readonly maxBytes?: number;
+  },
+  verify: SchemaVerifier,
+): Effect.Effect<ThreadCapturePage, LocalStoreError> =>
+  readListPageFromDatabase(
+    sql,
+    databaseId,
+    {
+      scopeKey: threadScopeKeyForQuery(options.query),
+      cursor: options.cursor,
+      ...(options.limit === undefined ? {} : { limit: options.limit }),
+      ...(options.maxBytes === undefined ? {} : { maxBytes: options.maxBytes }),
+    },
+    decodeThreadCursor,
+    (payload) =>
+      payload.databaseId === databaseId &&
+      payload.scope === THREAD_CAPTURE_SCOPE &&
+      payload.order === THREAD_CAPTURE_ORDER &&
+      threadQueriesEqual(payload.query, options.query),
+    "The thread cursor does not match this list.",
+    threadCaptureCodec(options.query),
+    verify,
+  );
+
 const findRetainedCaptureInDatabase = <Items>(
   sql: SqlClient.SqlClient,
   scopeKey: string,
@@ -1729,6 +1902,19 @@ const findRetainedModelCaptureInDatabase = (
     modelScopeKey(query),
     MODEL_CAPTURE_ORDER,
     decodeModelCaptureItem,
+    verify,
+  );
+
+const findRetainedThreadCaptureInDatabase = (
+  sql: SqlClient.SqlClient,
+  query: ThreadListQuery,
+  verify: SchemaVerifier,
+): Effect.Effect<RetainedThreadCapture | null, LocalStoreError> =>
+  findRetainedCaptureInDatabase(
+    sql,
+    threadScopeKeyForQuery(query),
+    THREAD_CAPTURE_ORDER,
+    decodeThreadCaptureItem,
     verify,
   );
 
@@ -1963,6 +2149,20 @@ const modelCaptureCodec = (
     serializedByteLength(makeModelListToolSuccess(page, metadata.observations)),
   makeNextCursor: (databaseId, captureId, position) =>
     makeModelCaptureCursor(databaseId, captureId, query, position),
+});
+
+const threadCaptureCodec = (
+  query: ThreadListQuery,
+): CapturePageCodec<ThreadSummary, ListCaptureMetadata, ThreadListPage> => ({
+  order: THREAD_CAPTURE_ORDER,
+  cursorKind: "thread",
+  decodeMetadata: decodeListCaptureMetadata,
+  decodeItem: decodeThreadCaptureItem,
+  buildPage: (items, nextCursor, metadata) => makeListPage(items, nextCursor, metadata),
+  measureResult: (page, metadata) =>
+    serializedByteLength(makeThreadListToolSuccess(page, metadata.observations)),
+  makeNextCursor: (databaseId, captureId, position) =>
+    makeThreadCaptureCursor(databaseId, captureId, query, position),
 });
 
 const readCapturePage = <Items, Metadata, Page>(
@@ -2223,6 +2423,9 @@ const decodeProjectCaptureItem = (
 
 const decodeModelCaptureItem = (payload: unknown): Effect.Effect<ModelSummary, LocalStoreError> =>
   decodeListCaptureItem(payload, ModelSummarySchema);
+
+const decodeThreadCaptureItem = (payload: unknown): Effect.Effect<ThreadSummary, LocalStoreError> =>
+  decodeListCaptureItem(payload, ThreadSummarySchema);
 
 const makeListPage = <Items>(
   items: ReadonlyArray<Items>,
@@ -3518,6 +3721,22 @@ const makeModelCaptureCursor = (
     position,
   } satisfies ModelCursorPayload);
 
+const makeThreadCaptureCursor = (
+  databaseId: string,
+  captureId: string,
+  query: ThreadListQuery,
+  position: number,
+): string =>
+  encodeCursor({
+    version: 1,
+    databaseId,
+    captureId,
+    scope: THREAD_CAPTURE_SCOPE,
+    order: THREAD_CAPTURE_ORDER,
+    query,
+    position,
+  } satisfies ThreadCursorPayload);
+
 const makeInstanceListPage = (
   items: ReadonlyArray<InstanceSummary>,
   nextCursor: string | null,
@@ -3534,13 +3753,14 @@ const makeInstanceListPage = (
   failures: metadata.failures,
 });
 
-const encodeCursor = (payload: CursorPayload | ProjectCursorPayload | ModelCursorPayload): string =>
-  Encoding.encodeBase64Url(JSON.stringify(payload));
+const encodeCursor = (
+  payload: CursorPayload | ProjectCursorPayload | ModelCursorPayload | ThreadCursorPayload,
+): string => Encoding.encodeBase64Url(JSON.stringify(payload));
 
 const decodeCursorPayload = <Payload>(
   value: string,
   schema: Schema.ConstraintDecoder<Payload>,
-  kind: "registration" | "project" | "model",
+  kind: "registration" | "project" | "model" | "thread",
 ): Effect.Effect<Payload, LocalStoreError> => {
   const malformed = new LocalStoreError({
     kind: "cursor_mismatch",
@@ -3565,3 +3785,6 @@ const decodeProjectCursor = (value: string): Effect.Effect<ProjectCursorPayload,
 
 const decodeModelCursor = (value: string): Effect.Effect<ModelCursorPayload, LocalStoreError> =>
   decodeCursorPayload(value, ModelCursorPayloadSchema, "model");
+
+const decodeThreadCursor = (value: string): Effect.Effect<ThreadCursorPayload, LocalStoreError> =>
+  decodeCursorPayload(value, ThreadCursorPayloadSchema, "thread");

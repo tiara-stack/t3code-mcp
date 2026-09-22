@@ -96,9 +96,31 @@ const ProjectShellWireSchema = Schema.Struct({
   defaultModelSelection: Schema.NullOr(ModelSelectionWireSchema),
 });
 
-const ProjectSnapshotWireSchema = Schema.Struct({
+const LatestTurnShellWireSchema = Schema.Struct({
+  turnId: trimmedNonEmptyWireString,
+});
+
+/**
+ * Only the fields the thread inventory consumes are declared. The pinned
+ * thread shell carries more per-thread state; that state belongs to the
+ * thread-detail slice and is ignored here.
+ */
+const ThreadShellWireSchema = Schema.Struct({
+  id: trimmedNonEmptyWireString,
+  projectId: trimmedNonEmptyWireString,
+  title: trimmedNonEmptyWireString,
+  branch: Schema.optionalKey(Schema.NullOr(trimmedNonEmptyWireString)),
+  worktreePath: Schema.optionalKey(Schema.NullOr(trimmedNonEmptyWireString)),
+  latestTurn: Schema.optionalKey(Schema.NullOr(LatestTurnShellWireSchema)),
+  archivedAt: Schema.optionalKey(Schema.NullOr(Schema.String)),
+  settledOverride: Schema.optionalKey(Schema.NullOr(Schema.Literals(["settled", "active"]))),
+  settledAt: Schema.optionalKey(Schema.NullOr(Schema.String)),
+});
+
+const ShellSnapshotWireSchema = Schema.Struct({
   snapshotSequence: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   projects: Schema.Array(ProjectShellWireSchema),
+  threads: Schema.Array(ThreadShellWireSchema),
 });
 
 const nonNegativeWireInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0));
@@ -114,7 +136,7 @@ const ShellStreamItemWireSchema = Schema.Union([
   }),
   Schema.Struct({
     kind: Schema.Literal("snapshot"),
-    snapshot: ProjectSnapshotWireSchema,
+    snapshot: ShellSnapshotWireSchema,
   }),
   Schema.Struct({
     kind: Schema.Literal("project-upserted"),
@@ -129,7 +151,7 @@ const ShellStreamItemWireSchema = Schema.Union([
   Schema.Struct({
     kind: Schema.Literal("thread-upserted"),
     sequence: nonNegativeWireInt,
-    thread: Schema.Unknown,
+    thread: ThreadShellWireSchema,
   }),
   Schema.Struct({
     kind: Schema.Literal("thread-removed"),
@@ -238,7 +260,18 @@ const SubscribeShellRpc = Rpc.make("orchestration.subscribeShell", {
   stream: true,
 });
 
-const AdapterRpcGroup = RpcGroup.make(ServerProbeRpc, ServerGetConfigRpc, SubscribeShellRpc);
+const GetArchivedShellSnapshotRpc = Rpc.make("orchestration.getArchivedShellSnapshot", {
+  payload: Schema.Struct({}),
+  success: ShellSnapshotWireSchema,
+  error: Schema.Union([GetSnapshotErrorWireSchema, EnvironmentAuthorizationErrorWireSchema]),
+});
+
+const AdapterRpcGroup = RpcGroup.make(
+  ServerProbeRpc,
+  ServerGetConfigRpc,
+  SubscribeShellRpc,
+  GetArchivedShellSnapshotRpc,
+);
 
 type AdapterRpcClient = RpcClient.RpcClient<
   RpcGroup.Rpcs<typeof AdapterRpcGroup>,
@@ -366,6 +399,60 @@ const boundedWebSocket = (websocket: Socket.WebSocketLike): Socket.WebSocketLike
   };
 };
 
+const mapOrchestrationReadError = (message: string) => (error: unknown) => {
+  if (error instanceof T3CodeAdapterError) return error;
+  if (error instanceof RpcClientError.RpcClientError) return error;
+  if (
+    Predicate.hasProperty(error, "_tag") &&
+    error._tag === "EnvironmentAuthorizationError" &&
+    Predicate.hasProperty(error, "requiredScope")
+  ) {
+    return new T3CodeAdapterError({
+      kind: "authorization",
+      message: `The T3Code credential lacks the required ${String(error.requiredScope)} scope.`,
+      uncertain: false,
+      status: null,
+    });
+  }
+  return new T3CodeAdapterError({
+    kind: "transport",
+    message,
+    uncertain: false,
+    status: null,
+  });
+};
+
+const mapAuthenticatedChannelError = (error: unknown): T3CodeAdapterError => {
+  if (error instanceof T3CodeAdapterError) return error;
+  if (error instanceof RpcClientError.RpcClientError) {
+    const tag = Predicate.hasProperty(error.reason, "_tag") ? String(error.reason._tag) : "";
+    return tag.startsWith("Socket")
+      ? new T3CodeAdapterError({
+          kind: "transport",
+          message: "The authenticated T3Code RPC channel dropped.",
+          uncertain: true,
+          status: null,
+        })
+      : new T3CodeAdapterError({
+          kind: "wire_incompatible",
+          message: "The T3Code authenticated WebSocket RPC contract was rejected.",
+          uncertain: false,
+          status: null,
+        });
+  }
+  return new T3CodeAdapterError({
+    kind: "wire_incompatible",
+    message: "The T3Code authenticated WebSocket RPC contract was rejected.",
+    uncertain: false,
+    status: null,
+  });
+};
+
+const mapShellStreamError = (error: unknown): T3CodeAdapterError => {
+  const mapped = mapOrchestrationReadError("The T3Code shell observation stream failed.")(error);
+  return mapped instanceof T3CodeAdapterError ? mapped : mapAuthenticatedChannelError(mapped);
+};
+
 export type T3CodeAdapterErrorKind =
   | "invalid_pairing_code"
   | "pairing_code_used"
@@ -422,6 +509,35 @@ export interface DiscoveredProject {
   readonly repositoryPath: string;
   readonly defaultModel: DiscoveredModelSelection | null;
 }
+
+export interface ShellThread {
+  readonly threadId: string;
+  readonly projectId: string;
+  readonly title: string;
+  readonly archivedAt: string | null;
+  readonly worktreePath: string | null;
+  readonly latestTurnId: string | null;
+  readonly settledOverride: "settled" | "active" | null;
+  readonly settledAt: string | null;
+}
+
+export interface ShellSnapshot {
+  readonly snapshotSequence: number;
+  readonly projects: ReadonlyArray<DiscoveredProject>;
+  readonly threads: ReadonlyArray<ShellThread>;
+}
+
+export type ShellStreamItem =
+  | { readonly kind: "synchronized" }
+  | { readonly kind: "snapshot"; readonly snapshot: ShellSnapshot }
+  | {
+      readonly kind: "project-upserted";
+      readonly sequence: number;
+      readonly project: DiscoveredProject;
+    }
+  | { readonly kind: "project-removed"; readonly sequence: number; readonly projectId: string }
+  | { readonly kind: "thread-upserted"; readonly sequence: number; readonly thread: ShellThread }
+  | { readonly kind: "thread-removed"; readonly sequence: number; readonly threadId: string };
 
 export interface ProjectListing {
   readonly snapshotSequence: number;
@@ -484,6 +600,16 @@ export interface T3CodeAdapterService {
     readonly endpoint: string;
     readonly credential: string;
   }) => Effect.Effect<ProviderModelListing, T3CodeAdapterError>;
+  readonly subscribeShell: (input: {
+    readonly endpoint: string;
+    readonly credential: string;
+    readonly afterSequence?: number;
+    readonly requestCompletionMarker?: boolean;
+  }) => Stream.Stream<ShellStreamItem, T3CodeAdapterError>;
+  readonly getArchivedShellSnapshot: (input: {
+    readonly endpoint: string;
+    readonly credential: string;
+  }) => Effect.Effect<ShellSnapshot, T3CodeAdapterError>;
 }
 
 const decodeSelectOptionValues = (
@@ -646,6 +772,66 @@ export const decodeProviderModelListing = (config: unknown): ProviderModelListin
     };
   }
   return decodeProviderModels(decoded.success);
+};
+
+const discoveredProjectFromWire = (
+  project: typeof ProjectShellWireSchema.Type,
+): DiscoveredProject => ({
+  projectId: project.id,
+  title: project.title,
+  repositoryPath: project.workspaceRoot,
+  defaultModel:
+    project.defaultModelSelection === null
+      ? null
+      : {
+          providerInstanceId: project.defaultModelSelection.instanceId,
+          model: project.defaultModelSelection.model,
+          ...(project.defaultModelSelection.options === undefined
+            ? {}
+            : { options: project.defaultModelSelection.options }),
+        },
+});
+
+const shellThreadFromWire = (thread: typeof ThreadShellWireSchema.Type): ShellThread => ({
+  threadId: thread.id,
+  projectId: thread.projectId,
+  title: thread.title,
+  archivedAt: thread.archivedAt ?? null,
+  worktreePath: thread.worktreePath ?? null,
+  latestTurnId: thread.latestTurn?.turnId ?? null,
+  settledOverride: thread.settledOverride ?? null,
+  settledAt: thread.settledAt ?? null,
+});
+
+const shellSnapshotFromWire = (snapshot: typeof ShellSnapshotWireSchema.Type): ShellSnapshot => ({
+  snapshotSequence: snapshot.snapshotSequence,
+  projects: snapshot.projects.map(discoveredProjectFromWire),
+  threads: snapshot.threads.map(shellThreadFromWire),
+});
+
+const shellStreamItemFromWire = (item: typeof ShellStreamItemWireSchema.Type): ShellStreamItem => {
+  switch (item.kind) {
+    case "synchronized":
+      return { kind: "synchronized" };
+    case "snapshot":
+      return { kind: "snapshot", snapshot: shellSnapshotFromWire(item.snapshot) };
+    case "project-upserted":
+      return {
+        kind: "project-upserted",
+        sequence: item.sequence,
+        project: discoveredProjectFromWire(item.project),
+      };
+    case "project-removed":
+      return { kind: "project-removed", sequence: item.sequence, projectId: item.projectId };
+    case "thread-upserted":
+      return {
+        kind: "thread-upserted",
+        sequence: item.sequence,
+        thread: shellThreadFromWire(item.thread),
+      };
+    case "thread-removed":
+      return { kind: "thread-removed", sequence: item.sequence, threadId: item.threadId };
+  }
 };
 
 export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterService>()(
@@ -874,11 +1060,14 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
           }),
         );
 
-      const withAuthenticatedRpc = <A>(
-        endpoint: string,
-        credential: string,
-        use: (client: AdapterRpcClient) => Effect.Effect<A, unknown>,
-      ): Effect.Effect<A, T3CodeAdapterError> =>
+      /**
+       * Mint a WebSocket ticket and build the bounded socket plus protocol
+       * layers for one authenticated JSON RPC channel. The scoped layers must
+       * be provided around the RPC exchange and every stream pull: providing
+       * them only around `RpcClient.make` finalizes the socket scope before
+       * the first request or pull and the channel hangs.
+       */
+      const authenticatedRpcChannel = (endpoint: string, credential: string) =>
         Effect.gen(function* () {
           const ticket = yield* json(
             HttpClientRequest.post(endpointUrl(endpoint, "/api/auth/websocket-ticket")).pipe(
@@ -900,17 +1089,16 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
             openTimeout: Duration.millis(MUTATION_RPC_DEADLINE_MILLIS),
           }).pipe(Layer.provide(boundedWebSocketConstructor));
 
-          return yield* Effect.scoped(
-            Effect.gen(function* () {
-              const client = yield* RpcClient.make(AdapterRpcGroup);
-              return yield* use(client);
-            }).pipe(
-              Effect.provide(RpcClient.layerProtocolSocket({ retryTransientErrors: false })),
-              Effect.provide(RpcSerialization.layerJson),
-              Effect.provide(socketLayer),
-            ),
+          return RpcClient.layerProtocolSocket({ retryTransientErrors: false }).pipe(
+            Layer.provide(RpcSerialization.layerJson),
+            Layer.provide(socketLayer),
           );
-        }).pipe(
+        });
+
+      const withRpcChannelBoundaries = <A, R>(
+        effect: Effect.Effect<A, unknown, R>,
+      ): Effect.Effect<A, T3CodeAdapterError, R> =>
+        effect.pipe(
           Effect.timeoutOrElse({
             duration: Duration.millis(MUTATION_RPC_DEADLINE_MILLIS),
             orElse: () =>
@@ -923,33 +1111,23 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
                 }),
               ),
           }),
-          Effect.mapError((error): T3CodeAdapterError => {
-            if (error instanceof T3CodeAdapterError) return error;
-            if (error instanceof RpcClientError.RpcClientError) {
-              const tag = Predicate.hasProperty(error.reason, "_tag")
-                ? String(error.reason._tag)
-                : "";
-              return tag.startsWith("Socket")
-                ? new T3CodeAdapterError({
-                    kind: "transport",
-                    message: "The authenticated T3Code RPC channel dropped.",
-                    uncertain: true,
-                    status: null,
-                  })
-                : new T3CodeAdapterError({
-                    kind: "wire_incompatible",
-                    message: "The T3Code authenticated WebSocket RPC contract was rejected.",
-                    uncertain: false,
-                    status: null,
-                  });
-            }
-            return new T3CodeAdapterError({
-              kind: "wire_incompatible",
-              message: "The T3Code authenticated WebSocket RPC contract was rejected.",
-              uncertain: false,
-              status: null,
-            });
-          }),
+          Effect.mapError((error: unknown) => mapAuthenticatedChannelError(error)),
+        );
+
+      const withAuthenticatedRpc = <A>(
+        endpoint: string,
+        credential: string,
+        use: (client: AdapterRpcClient) => Effect.Effect<A, unknown>,
+      ): Effect.Effect<A, T3CodeAdapterError> =>
+        withRpcChannelBoundaries(
+          Effect.scoped(
+            Effect.flatMap(authenticatedRpcChannel(endpoint, credential), (protocolLayer) =>
+              Effect.gen(function* () {
+                const client = yield* RpcClient.make(AdapterRpcGroup);
+                return yield* use(client);
+              }).pipe(Effect.provide(protocolLayer)),
+            ),
+          ),
         );
 
       const verifyEnvironmentSession = (input: {
@@ -1075,21 +1253,7 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
             }
             return {
               snapshotSequence: snapshot.snapshotSequence,
-              projects: snapshot.projects.map((project) => ({
-                projectId: project.id,
-                title: project.title,
-                repositoryPath: project.workspaceRoot,
-                defaultModel:
-                  project.defaultModelSelection === null
-                    ? null
-                    : {
-                        providerInstanceId: project.defaultModelSelection.instanceId,
-                        model: project.defaultModelSelection.model,
-                        ...(project.defaultModelSelection.options === undefined
-                          ? {}
-                          : { options: project.defaultModelSelection.options }),
-                      },
-              })),
+              projects: snapshot.projects.map(discoveredProjectFromWire),
             } satisfies ProjectListing;
           }).pipe(
             Effect.mapError((error): T3CodeAdapterError | RpcClientError.RpcClientError => {
@@ -1133,6 +1297,66 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
 
             return yield* snapshotProjects(input);
           }),
+        );
+
+      const getArchivedShellSnapshot = (input: {
+        readonly endpoint: string;
+        readonly credential: string;
+      }): Effect.Effect<ShellSnapshot, T3CodeAdapterError> =>
+        withCapacity(
+          withAuthenticatedRpc(input.endpoint, input.credential, (client) =>
+            client["orchestration.getArchivedShellSnapshot"]({}).pipe(
+              Effect.map(shellSnapshotFromWire),
+              Effect.mapError(
+                mapOrchestrationReadError("The T3Code archived shell snapshot was unavailable."),
+              ),
+            ),
+          ),
+        );
+
+      const subscribeShell = (input: {
+        readonly endpoint: string;
+        readonly credential: string;
+        readonly afterSequence?: number;
+        readonly requestCompletionMarker?: boolean;
+      }): Stream.Stream<ShellStreamItem, T3CodeAdapterError> =>
+        Stream.unwrap(
+          withRpcChannelBoundaries(
+            Effect.map(authenticatedRpcChannel(input.endpoint, input.credential), (protocolLayer) =>
+              Stream.unwrap(
+                Effect.gen(function* () {
+                  // Hold one shared adapter capacity permit for the whole
+                  // stream lifetime; the acquisition registers in the
+                  // stream scope so termination and interruption release
+                  // it, matching the per-instance budget in connections.
+                  const acquired = yield* Effect.acquireRelease(
+                    capacity.takeIfAvailable(1),
+                    (permit) => (permit ? capacity.release(1).pipe(Effect.ignore) : Effect.void),
+                  );
+                  if (!acquired) {
+                    return yield* Effect.fail(
+                      new T3CodeAdapterError({
+                        kind: "capacity",
+                        message: "The shared T3Code adapter RPC capacity is full.",
+                        uncertain: false,
+                        status: null,
+                      }),
+                    );
+                  }
+                  const client = yield* RpcClient.make(AdapterRpcGroup);
+                  return client["orchestration.subscribeShell"]({
+                    ...(input.afterSequence === undefined
+                      ? {}
+                      : { afterSequence: input.afterSequence }),
+                    requestCompletionMarker: input.requestCompletionMarker ?? false,
+                  }).pipe(
+                    Stream.map(shellStreamItemFromWire),
+                    Stream.mapError((error: unknown) => mapShellStreamError(error)),
+                  );
+                }),
+              ).pipe(Stream.provide(protocolLayer, { local: true })),
+            ),
+          ),
         );
 
       const loadProviderModels = (input: {
@@ -1220,6 +1444,8 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
         inspectCredential,
         listProjects,
         listProviderModels,
+        subscribeShell,
+        getArchivedShellSnapshot,
       });
     }),
   ).pipe(Layer.provide(NodeHttpClient.layerUndici), Layer.provide(NodeCrypto.layer));

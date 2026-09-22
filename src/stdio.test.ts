@@ -109,6 +109,7 @@ describe("stdio transport", () => {
               "instance_remove",
               "project_list",
               "model_list",
+              "thread_list",
               "operation_get",
             ]);
             for (const tool of toolsMessage.result?.tools ?? []) {

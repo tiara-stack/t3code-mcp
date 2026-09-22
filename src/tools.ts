@@ -2,6 +2,7 @@ import { NodeCrypto } from "@effect/platform-node";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Clock from "effect/Clock";
+import * as Result from "effect/Result";
 import * as Layer from "effect/Layer";
 import * as McpSchema from "effect/unstable/ai/McpSchema";
 import * as McpServer from "effect/unstable/ai/McpServer";
@@ -25,8 +26,10 @@ import {
   makeToolSuccess,
   makeModelListToolSuccess,
   makeProjectListToolSuccess,
+  makeThreadListToolSuccess,
   staleModelReadLimitation,
   staleProjectReadLimitation,
+  staleThreadReadLimitation,
   unknownModelCapabilities,
   MAX_SERIALIZED_RESULT_BYTES,
   ModelListInputSchema,
@@ -36,6 +39,8 @@ import {
   OperationToolResultSchema,
   ProjectListInputSchema,
   ProjectListToolResultSchema,
+  ThreadListInputSchema,
+  ThreadListToolResultSchema,
   ToolResultSchema,
   type ModelListPage,
   type ModelListQuery,
@@ -43,6 +48,9 @@ import {
   type Observation,
   type ProjectListPage,
   type ProjectListScope,
+  type ThreadListPage,
+  type ThreadListQuery,
+  type ThreadSummary,
 } from "./domain";
 import type { ToolFailure } from "./domain";
 import {
@@ -53,6 +61,8 @@ import {
   type ProjectCaptureMetadata,
   type RetainedModelCapture,
   type RetainedProjectCapture,
+  type RetainedThreadCapture,
+  type ThreadCaptureMetadata,
 } from "./local-store";
 import { OperationServiceError, Operations } from "./operations";
 import {
@@ -61,6 +71,12 @@ import {
   type DiscoveredProjects,
   type InstanceConnectionsService,
 } from "./instance-connections";
+import {
+  ObservationError,
+  Observations,
+  type ObservationsService,
+  type SynchronizedShell,
+} from "./observations";
 import { T3CodeAdapterError, type DiscoveredModelSelection } from "./t3code-adapter";
 
 // fallow-ignore-next-line unused-export
@@ -110,6 +126,20 @@ export const ModelListTool = Tool.make("model_list", {
 })
   .addDependency(LocalStore)
   .addDependency(InstanceConnections)
+  .annotate(Tool.Readonly, true)
+  .annotate(Tool.Destructive, false)
+  .annotate(Tool.Idempotent, true)
+  .annotate(Tool.OpenWorld, true);
+
+// fallow-ignore-next-line unused-export
+export const ThreadListTool = Tool.make("thread_list", {
+  description:
+    "List existing and archived threads on one saved T3Code instance or one explicit project scope, with stable pagination.",
+  parameters: ThreadListInputSchema,
+  success: ThreadListToolResultSchema,
+})
+  .addDependency(LocalStore)
+  .addDependency(Observations)
   .annotate(Tool.Readonly, true)
   .annotate(Tool.Destructive, false)
   .annotate(Tool.Idempotent, true)
@@ -204,6 +234,7 @@ export const ServerToolkit = Toolkit.make(
   InstanceRemoveTool,
   ProjectListTool,
   ModelListTool,
+  ThreadListTool,
   OperationGetTool,
 );
 
@@ -215,7 +246,31 @@ const makeToolFailure = (
 ) => ({ code, message, retry, details });
 
 // fallow-ignore-next-line complexity
-const toToolFailure = (error: LocalStoreError | OperationServiceError | T3CodeAdapterError) => {
+const toToolFailure = (
+  error: LocalStoreError | OperationServiceError | T3CodeAdapterError | ObservationError,
+) => {
+  if (error instanceof ObservationError) {
+    switch (error.kind) {
+      case "observation_overflow":
+        return makeToolFailure(error.message, "unavailable", "safe_read", {
+          action: "retry_observation",
+        });
+      case "synchronization_timeout":
+        return makeToolFailure(error.message, "unavailable", "safe_read", {
+          action: "retry_observation",
+        });
+      case "boundary_missing":
+        return makeToolFailure(error.message, "unavailable", "safe_read", {
+          action: "retry_observation",
+        });
+      case "stale_generation":
+        return makeToolFailure(error.message, "stale_state", "reconcile_first");
+      case "retention_budget":
+        return makeToolFailure(error.message, "unavailable", "safe_read", {
+          action: "retry_observation",
+        });
+    }
+  }
   if (error instanceof T3CodeAdapterError) {
     switch (error.kind) {
       case "pairing_required":
@@ -698,6 +753,296 @@ const discoverModelPage = (options: {
     return makeModelListToolSuccess(captured.page, captured.observations);
   });
 
+const threadInstanceId = (query: ThreadListQuery): string =>
+  query.scope.kind === "instance" ? query.scope.instanceId : query.scope.project.instanceId;
+
+const compareThreadSummaries = (left: ThreadSummary, right: ThreadSummary): number =>
+  left.thread.instanceId < right.thread.instanceId
+    ? -1
+    : left.thread.instanceId > right.thread.instanceId
+      ? 1
+      : left.thread.threadId < right.thread.threadId
+        ? -1
+        : left.thread.threadId > right.thread.threadId
+          ? 1
+          : 0;
+
+const threadSettlement = (
+  thread: SynchronizedShell["threads"][number],
+): ThreadSummary["settlement"] =>
+  thread.settledOverride === "settled" ||
+  (thread.settledOverride === null && thread.settledAt !== null)
+    ? "settled"
+    : "unsettled";
+
+const toThreadSummaries = (
+  shell: SynchronizedShell,
+  query: ThreadListQuery,
+): ReadonlyArray<ThreadSummary> => {
+  const instanceId = threadInstanceId(query);
+  return (
+    shell.threads
+      .filter(
+        (thread) =>
+          query.scope.kind === "instance" || thread.projectId === query.scope.project.projectId,
+      )
+      // The active projection normally holds only active threads; exclude
+      // mode must not surface a thread whose archive state already advanced.
+      .filter((thread) => query.archived !== "exclude" || thread.archivedAt === null)
+      .map((thread) => {
+        const project = shell.projects.find((entry) => entry.projectId === thread.projectId);
+        return {
+          thread: { instanceId, threadId: thread.threadId },
+          project: { instanceId, projectId: thread.projectId },
+          title: thread.title,
+          archived: thread.archivedAt !== null,
+          worktree:
+            thread.worktreePath !== null && project !== undefined
+              ? {
+                  instanceId,
+                  repositoryPath: project.repositoryPath,
+                  worktreePath: thread.worktreePath,
+                }
+              : null,
+          latestTurn:
+            thread.latestTurnId !== null
+              ? { instanceId, threadId: thread.threadId, turnId: thread.latestTurnId }
+              : null,
+          settlement: threadSettlement(thread),
+        } satisfies ThreadSummary;
+      })
+  );
+};
+
+interface GatheredThreadInventory {
+  readonly items: Array<ThreadSummary>;
+  readonly failures: Array<ThreadListPage["failures"][number]>;
+  readonly observations: Array<Observation>;
+  readonly coverage: ThreadListPage["coverage"];
+  readonly limitations: Array<string>;
+}
+
+// fallow-ignore-next-line complexity
+type ThreadInventoryResult = Result.Result<
+  SynchronizedShell,
+  LocalStoreError | T3CodeAdapterError | ObservationError
+>;
+
+const resultFailure = (result: ThreadInventoryResult | null) =>
+  result !== null && Result.isFailure(result) ? result.failure : null;
+
+const staleThreadObservations = (options: {
+  readonly retained: RetainedThreadCapture;
+  readonly instanceId: string;
+  readonly fallbackObservedAt: string;
+  readonly causeMessage: string;
+}): Array<Observation> => {
+  const { retained, instanceId, fallbackObservedAt, causeMessage } = options;
+  const staleLimitation = `${staleThreadReadLimitation} (${causeMessage})`;
+  return retained.observations.length > 0
+    ? retained.observations.map((observation) => ({
+        ...observation,
+        freshness: "stale" as const,
+        coverage: "partial" as const,
+        limitations: [staleLimitation],
+      }))
+    : [
+        {
+          instanceId,
+          observedAt: fallbackObservedAt,
+          freshness: "stale" as const,
+          sourceSequence: null,
+          coverage: "partial" as const,
+          limitations: [staleLimitation],
+        },
+      ];
+};
+
+/**
+ * A targeted read never fails over to another registration; its typed
+ * failure is the result unless an explicit stale read found retained data.
+ */
+const serveRetainedThreadPage = (options: {
+  readonly store: LocalStoreService;
+  readonly query: ThreadListQuery;
+  readonly instanceId: string;
+  readonly limit: number | undefined;
+  readonly error: LocalStoreError | T3CodeAdapterError | ObservationError;
+}): Effect.Effect<
+  ReturnType<typeof makeThreadListToolSuccess>,
+  LocalStoreError | T3CodeAdapterError | ObservationError
+> =>
+  Effect.gen(function* () {
+    const { store, query, instanceId, limit, error } = options;
+    const retained = yield* store.findRetainedThreadCapture(query);
+    if (retained === null) return yield* Effect.fail(error);
+    const fallbackObservedAt = new Date(yield* Clock.currentTimeMillis).toISOString();
+    const staleObservations = staleThreadObservations({
+      retained,
+      instanceId,
+      fallbackObservedAt,
+      causeMessage: error.message,
+    });
+    const metadata: ThreadCaptureMetadata = {
+      failures: [],
+      coverage: "partial",
+      limitations: staleObservations.flatMap((observation) => observation.limitations),
+      observations: staleObservations,
+    };
+    const captured = yield* store.captureThreadPage({
+      query,
+      items: retained.items,
+      metadata,
+      ...(limit === undefined ? {} : { limit }),
+    });
+    return makeThreadListToolSuccess(captured.page, captured.observations);
+  });
+
+const recordShellSummaries = (options: {
+  readonly shell: SynchronizedShell;
+  readonly query: ThreadListQuery;
+  readonly itemsByThread: Map<string, ThreadSummary>;
+  readonly observationsMeta: Array<Observation>;
+}): void => {
+  const { shell, query, itemsByThread, observationsMeta } = options;
+  for (const summary of toThreadSummaries(shell, query)) {
+    itemsByThread.set(summary.thread.threadId, summary);
+  }
+  observationsMeta.push(freshShellObservation(shell, threadInstanceId(query)));
+};
+
+const freshShellObservation = (shell: SynchronizedShell, instanceId: string): Observation => ({
+  instanceId,
+  observedAt: shell.observedAt,
+  freshness: "fresh",
+  sourceSequence: shell.snapshotSequence,
+  coverage: "complete_for_query",
+  limitations: [],
+});
+
+/**
+ * Active and archived inventories are separate native reads and can race
+ * with changes between them; the later archived read wins collisions so
+ * the merged page never lists one thread twice.
+ */
+const mergeThreadInventories = (options: {
+  readonly query: ThreadListQuery;
+  readonly activeResult: ThreadInventoryResult | null;
+  readonly archivedResult: ThreadInventoryResult | null;
+}): GatheredThreadInventory => {
+  const { query, activeResult, archivedResult } = options;
+  const instanceId = threadInstanceId(query);
+  const itemsByThread = new Map<string, ThreadSummary>();
+  const observationsMeta: Array<Observation> = [];
+  const failures: Array<ThreadListPage["failures"][number]> = [];
+  const limitations: Array<string> = [];
+  let partial = false;
+
+  if (activeResult !== null && Result.isSuccess(activeResult)) {
+    recordShellSummaries({
+      shell: activeResult.success,
+      query,
+      itemsByThread,
+      observationsMeta,
+    });
+  }
+  if (archivedResult !== null && Result.isSuccess(archivedResult)) {
+    recordShellSummaries({
+      shell: archivedResult.success,
+      query,
+      itemsByThread,
+      observationsMeta,
+    });
+  }
+  const activeError = resultFailure(activeResult);
+  if (activeError !== null) {
+    partial = true;
+    failures.push({ instanceId, error: toToolFailure(activeError) });
+    limitations.push("The active thread inventory could not be read.");
+  }
+  const archivedError = resultFailure(archivedResult);
+  if (archivedError !== null) {
+    partial = true;
+    failures.push({ instanceId, error: toToolFailure(archivedError) });
+    limitations.push("The archived thread inventory could not be read.");
+  }
+
+  return {
+    items: [...itemsByThread.values()].sort(compareThreadSummaries),
+    failures,
+    observations: observationsMeta,
+    coverage: partial ? "partial" : "complete_for_query",
+    limitations,
+  };
+};
+
+const fatalThreadReadError = (
+  query: ThreadListQuery,
+  activeError: LocalStoreError | T3CodeAdapterError | ObservationError | null,
+  archivedError: LocalStoreError | T3CodeAdapterError | ObservationError | null,
+): LocalStoreError | T3CodeAdapterError | ObservationError | null => {
+  const failsEntireQuery =
+    query.archived === "exclude"
+      ? activeError !== null
+      : query.archived === "only"
+        ? archivedError !== null
+        : activeError !== null && archivedError !== null;
+  if (!failsEntireQuery) return null;
+  return (
+    activeError ??
+    archivedError ??
+    new ObservationError({
+      kind: "boundary_missing",
+      message: "The thread inventory could not be read.",
+    })
+  );
+};
+
+const discoverThreadPage = (options: {
+  readonly store: LocalStoreService;
+  readonly observations: ObservationsService;
+  readonly query: ThreadListQuery;
+  readonly limit: number | undefined;
+  readonly allowStale: boolean;
+}): Effect.Effect<
+  ReturnType<typeof makeThreadListToolSuccess>,
+  LocalStoreError | T3CodeAdapterError | ObservationError
+> =>
+  Effect.gen(function* () {
+    const { store, observations, query, limit, allowStale } = options;
+    const instanceId = threadInstanceId(query);
+    const activeResult =
+      query.archived !== "only" ? yield* Effect.result(observations.activeShell(instanceId)) : null;
+    const archivedResult =
+      query.archived !== "exclude"
+        ? yield* Effect.result(observations.archivedShell(instanceId))
+        : null;
+
+    const activeError = resultFailure(activeResult);
+    const archivedError = resultFailure(archivedResult);
+    const fatalError = fatalThreadReadError(query, activeError, archivedError);
+    if (fatalError !== null) {
+      if (!allowStale) return yield* Effect.fail(fatalError);
+      return yield* serveRetainedThreadPage({ store, query, instanceId, limit, error: fatalError });
+    }
+
+    const gathered = mergeThreadInventories({ query, activeResult, archivedResult });
+
+    const metadata: ThreadCaptureMetadata = {
+      failures: gathered.failures,
+      coverage: gathered.coverage,
+      limitations: gathered.limitations,
+      observations: gathered.observations,
+    };
+    const captured = yield* store.captureThreadPage({
+      query,
+      items: gathered.items,
+      metadata,
+      ...(limit === undefined ? {} : { limit }),
+    });
+    return makeThreadListToolSuccess(captured.page, captured.observations);
+  });
+
 const serverToolHandlers = ServerToolkit.of({
   instance_list: ({ cursor, limit }) =>
     Effect.gen(function* () {
@@ -822,6 +1167,35 @@ const serverToolHandlers = ServerToolkit.of({
         }),
       ),
     ),
+  thread_list: ({ scope, archived, cursor, limit, allowStale }) =>
+    Effect.gen(function* () {
+      const store = yield* LocalStore;
+      const observations = yield* Observations;
+      const query: ThreadListQuery = { scope, archived: archived ?? "exclude" };
+      if (cursor !== undefined) {
+        const captured = yield* store.readThreadPage({
+          query,
+          cursor,
+          ...(limit === undefined ? {} : { limit }),
+        });
+        return makeThreadListToolSuccess(captured.page, captured.observations);
+      }
+      return yield* discoverThreadPage({
+        store,
+        observations,
+        query,
+        limit,
+        allowStale: allowStale ?? false,
+      });
+    }).pipe(
+      Effect.catch((error: LocalStoreError | T3CodeAdapterError | ObservationError) =>
+        Effect.succeed({
+          result: { kind: "error" as const, error: toToolFailure(error) },
+          observations: [],
+          warnings: [],
+        }),
+      ),
+    ),
   instance_update: (input) =>
     Effect.gen(function* () {
       const operations = yield* Operations;
@@ -872,6 +1246,7 @@ const serverToolHandlers = ServerToolkit.of({
 
 export const serverToolkitLayer = ServerToolkit.toLayer(serverToolHandlers).pipe(
   Layer.provideMerge(Operations.layer.pipe(Layer.provide(NodeCrypto.layer))),
+  Layer.provideMerge(Observations.layer),
 );
 
 const toStructuredContent = (value: unknown): Schema.JsonObject | undefined =>

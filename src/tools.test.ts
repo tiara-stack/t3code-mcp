@@ -11,14 +11,16 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { LocalStore } from "./local-store";
+import { LocalStore, LocalStoreError } from "./local-store";
 import { InstanceConnections } from "./instance-connections";
 import {
   T3CodeAdapter,
   T3CodeAdapterError,
   decodeProviderModelListing,
   type DiscoveredProvider,
+  type ShellStreamItem,
 } from "./t3code-adapter";
+import type { ThreadListPage } from "./domain";
 import { ServerToolkit, serverToolkitLayer } from "./tools";
 
 const THIRTY_DAYS_MILLIS = 30 * 24 * 60 * 60 * 1000;
@@ -174,6 +176,24 @@ const fakeConnections = (options?: {
           status: null,
         }),
       ),
+    openShellStream: () =>
+      Stream.fail(
+        new T3CodeAdapterError({
+          kind: "capacity",
+          message: "The test connection does not support shell observation.",
+          uncertain: false,
+          status: null,
+        }),
+      ),
+    readArchivedShell: () =>
+      Effect.fail(
+        new T3CodeAdapterError({
+          kind: "capacity",
+          message: "The test connection does not support archived shell reads.",
+          uncertain: false,
+          status: null,
+        }),
+      ),
     invalidate: () => Effect.void,
   });
 };
@@ -215,6 +235,24 @@ const fakeAdapterLayer = (
         new T3CodeAdapterError({
           kind: "capacity",
           message: "The test adapter does not support model listing.",
+          uncertain: false,
+          status: null,
+        }),
+      ),
+    subscribeShell: () =>
+      Stream.fail(
+        new T3CodeAdapterError({
+          kind: "capacity",
+          message: "The test adapter does not support shell subscriptions.",
+          uncertain: false,
+          status: null,
+        }),
+      ),
+    getArchivedShellSnapshot: () =>
+      Effect.fail(
+        new T3CodeAdapterError({
+          kind: "capacity",
+          message: "The test adapter does not support archived shell reads.",
           uncertain: false,
           status: null,
         }),
@@ -1422,6 +1460,24 @@ describe("instance_pair_again", () => {
             status: null,
           }),
         ),
+      openShellStream: () =>
+        Stream.fail(
+          new T3CodeAdapterError({
+            kind: "capacity",
+            message: "The test connection does not support shell observation.",
+            uncertain: false,
+            status: null,
+          }),
+        ),
+      readArchivedShell: () =>
+        Effect.fail(
+          new T3CodeAdapterError({
+            kind: "capacity",
+            message: "The test connection does not support archived shell reads.",
+            uncertain: false,
+            status: null,
+          }),
+        ),
       invalidate: () => Effect.void,
     });
   };
@@ -1788,6 +1844,24 @@ describe("instance_pair_again", () => {
               new T3CodeAdapterError({
                 kind: "capacity",
                 message: "The test connection does not support model discovery.",
+                uncertain: false,
+                status: null,
+              }),
+            ),
+          openShellStream: () =>
+            Stream.fail(
+              new T3CodeAdapterError({
+                kind: "capacity",
+                message: "The test connection does not support shell observation.",
+                uncertain: false,
+                status: null,
+              }),
+            ),
+          readArchivedShell: () =>
+            Effect.fail(
+              new T3CodeAdapterError({
+                kind: "capacity",
+                message: "The test connection does not support archived shell reads.",
                 uncertain: false,
                 status: null,
               }),
@@ -2595,6 +2669,24 @@ const projectFixtures = (
           status: null,
         }),
       ),
+    subscribeShell: () =>
+      Stream.fail(
+        new T3CodeAdapterError({
+          kind: "capacity",
+          message: "The project test adapter does not subscribe to shells.",
+          uncertain: false,
+          status: null,
+        }),
+      ),
+    getArchivedShellSnapshot: () =>
+      Effect.fail(
+        new T3CodeAdapterError({
+          kind: "capacity",
+          message: "The project test adapter does not read archived shells.",
+          uncertain: false,
+          status: null,
+        }),
+      ),
   });
 
 const seedProjectRegistration = (instanceId: string, endpoint: string, credential?: string) =>
@@ -3277,6 +3369,24 @@ const modelFixtures = (
       }
       return Effect.succeed({ providers, limitations: [] });
     },
+    subscribeShell: () =>
+      Stream.fail(
+        new T3CodeAdapterError({
+          kind: "capacity",
+          message: "The model test adapter does not subscribe to shells.",
+          uncertain: false,
+          status: null,
+        }),
+      ),
+    getArchivedShellSnapshot: () =>
+      Effect.fail(
+        new T3CodeAdapterError({
+          kind: "capacity",
+          message: "The model test adapter does not read archived shells.",
+          uncertain: false,
+          status: null,
+        }),
+      ),
   });
 
 const fixtureProviders = (): ReadonlyArray<DiscoveredProvider> => [
@@ -3828,6 +3938,24 @@ describe("model_list", () => {
                   }),
                 ),
               listProviderModels: () => Effect.succeed({ providers: [], limitations }),
+              subscribeShell: () =>
+                Stream.fail(
+                  new T3CodeAdapterError({
+                    kind: "capacity",
+                    message: "The model test adapter does not subscribe to shells.",
+                    uncertain: false,
+                    status: null,
+                  }),
+                ),
+              getArchivedShellSnapshot: () =>
+                Effect.fail(
+                  new T3CodeAdapterError({
+                    kind: "capacity",
+                    message: "The model test adapter does not read archived shells.",
+                    uncertain: false,
+                    status: null,
+                  }),
+                ),
             }),
           ),
         );
@@ -4035,3 +4163,877 @@ describe("model listing wire decode", () => {
     }),
   );
 });
+
+const shellProjectFixture = (projectId: string, repositoryPath = `/srv/${projectId}`) => ({
+  projectId,
+  title: `Project ${projectId}`,
+  repositoryPath,
+  defaultModel: null,
+});
+
+const shellThreadFixture = (
+  threadId: string,
+  overrides: Partial<{
+    readonly projectId: string;
+    readonly title: string;
+    readonly archivedAt: string | null;
+    readonly worktreePath: string | null;
+    readonly latestTurnId: string | null;
+    readonly settledOverride: "settled" | "active" | null;
+    readonly settledAt: string | null;
+  }> = {},
+) => ({
+  threadId,
+  projectId: overrides.projectId ?? "project-a",
+  title: overrides.title ?? `Thread ${threadId}`,
+  archivedAt: overrides.archivedAt ?? null,
+  worktreePath: overrides.worktreePath ?? null,
+  latestTurnId: overrides.latestTurnId ?? null,
+  settledOverride: overrides.settledOverride ?? null,
+  settledAt: overrides.settledAt ?? null,
+});
+
+const shellSnapshotItem = (
+  snapshotSequence: number,
+  projects: ReadonlyArray<ReturnType<typeof shellProjectFixture>>,
+  threads: ReadonlyArray<ReturnType<typeof shellThreadFixture>>,
+): ShellStreamItem => ({
+  kind: "snapshot",
+  snapshot: { snapshotSequence, projects, threads },
+});
+
+const shellSynchronizedItem: ShellStreamItem = { kind: "synchronized" };
+
+interface ThreadFixtureOptions {
+  activeStreams?: Readonly<
+    Record<
+      string,
+      (options?: {
+        readonly afterSequence?: number;
+      }) => Stream.Stream<ShellStreamItem, LocalStoreError | T3CodeAdapterError>
+    >
+  >;
+  archivedShells?: Readonly<
+    Record<
+      string,
+      () => Effect.Effect<
+        {
+          readonly snapshotSequence: number;
+          readonly projects: ReadonlyArray<ReturnType<typeof shellProjectFixture>>;
+          readonly threads: ReadonlyArray<ReturnType<typeof shellThreadFixture>>;
+          readonly observedAt: string;
+        },
+        LocalStoreError | T3CodeAdapterError
+      >
+    >
+  >;
+  readonly seenActive: Array<string>;
+  readonly seenArchived: Array<string>;
+}
+
+const threadConnections = (options: ThreadFixtureOptions) =>
+  InstanceConnections.layerTest({
+    exchangePairingCode: () =>
+      Effect.fail(
+        new T3CodeAdapterError({
+          kind: "capacity",
+          message: "The thread test connection does not pair.",
+          uncertain: false,
+          status: null,
+        }),
+      ),
+    verifyCredential: () =>
+      Effect.fail(
+        new T3CodeAdapterError({
+          kind: "capacity",
+          message: "The thread test connection does not verify credentials.",
+          uncertain: false,
+          status: null,
+        }),
+      ),
+    inspectCredential: () =>
+      Effect.fail(
+        new T3CodeAdapterError({
+          kind: "capacity",
+          message: "The thread test connection does not inspect credentials.",
+          uncertain: false,
+          status: null,
+        }),
+      ),
+    pair: () =>
+      Effect.fail(
+        new T3CodeAdapterError({
+          kind: "capacity",
+          message: "The thread test connection does not pair.",
+          uncertain: false,
+          status: null,
+        }),
+      ),
+    acquire: () =>
+      Effect.fail(
+        new T3CodeAdapterError({
+          kind: "capacity",
+          message: "The thread test connection does not acquire.",
+          uncertain: false,
+          status: null,
+        }),
+      ),
+    inspect: () =>
+      Effect.fail(
+        new T3CodeAdapterError({
+          kind: "capacity",
+          message: "The thread test connection does not inspect.",
+          uncertain: false,
+          status: null,
+        }),
+      ),
+    discoverProjects: () =>
+      Effect.fail(
+        new T3CodeAdapterError({
+          kind: "capacity",
+          message: "The thread test connection does not discover projects.",
+          uncertain: false,
+          status: null,
+        }),
+      ),
+    discoverModels: () =>
+      Effect.fail(
+        new T3CodeAdapterError({
+          kind: "capacity",
+          message: "The thread test connection does not discover models.",
+          uncertain: false,
+          status: null,
+        }),
+      ),
+    openShellStream: (instanceId: string, streamOptions?: { readonly afterSequence?: number }) => {
+      options.seenActive.push(instanceId);
+      const scripted = options.activeStreams?.[instanceId];
+      if (scripted === undefined) {
+        return Stream.fail(
+          new T3CodeAdapterError({
+            kind: "transport",
+            message: `The thread test connection has no active shell fixture for ${instanceId}.`,
+            uncertain: false,
+            status: null,
+          }),
+        );
+      }
+      return scripted(streamOptions);
+    },
+    readArchivedShell: (instanceId: string) => {
+      options.seenArchived.push(instanceId);
+      const scripted = options.archivedShells?.[instanceId];
+      if (scripted === undefined) {
+        return Effect.fail(
+          new T3CodeAdapterError({
+            kind: "transport",
+            message: `The thread test connection has no archived shell fixture for ${instanceId}.`,
+            uncertain: false,
+            status: null,
+          }),
+        );
+      }
+      return scripted();
+    },
+    invalidate: () => Effect.void,
+  });
+
+const emptyThreadFixtures = () => {
+  const options: ThreadFixtureOptions = { seenActive: [], seenArchived: [] };
+  return {
+    options,
+    connections: threadConnections(options),
+  };
+};
+
+describe("thread_list", () => {
+  it.live("lists active threads with published references on a targeted instance", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(
+                17,
+                [shellProjectFixture("project-a"), shellProjectFixture("project-b")],
+                [
+                  shellThreadFixture("thread-a", {
+                    latestTurnId: "turn-9",
+                    settledAt: "2026-09-21T10:00:00.000Z",
+                  }),
+                  shellThreadFixture("thread-b", {
+                    projectId: "project-b",
+                    worktreePath: "/srv/worktrees/thread-b",
+                    settledOverride: "active",
+                    settledAt: "2026-09-21T09:00:00.000Z",
+                  }),
+                ],
+              ),
+              shellSynchronizedItem,
+            ),
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_list", {
+              scope: { kind: "instance", instanceId: "instance-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        const value = result[0]?.result as unknown as ThreadListToolResultShape;
+        expect(value.result).toMatchObject({
+          kind: "ok",
+          value: {
+            items: [
+              {
+                thread: { instanceId: "instance-a", threadId: "thread-a" },
+                project: { instanceId: "instance-a", projectId: "project-a" },
+                title: "Thread thread-a",
+                archived: false,
+                worktree: null,
+                latestTurn: { instanceId: "instance-a", threadId: "thread-a", turnId: "turn-9" },
+                settlement: "settled",
+              },
+              {
+                thread: { instanceId: "instance-a", threadId: "thread-b" },
+                project: { instanceId: "instance-a", projectId: "project-b" },
+                title: "Thread thread-b",
+                archived: false,
+                worktree: {
+                  instanceId: "instance-a",
+                  repositoryPath: "/srv/project-b",
+                  worktreePath: "/srv/worktrees/thread-b",
+                },
+                latestTurn: null,
+                settlement: "unsettled",
+              },
+            ],
+            nextCursor: null,
+            coverage: "complete_for_query",
+            failures: [],
+          },
+        });
+        expect(value.observations).toMatchObject([
+          { instanceId: "instance-a", freshness: "fresh", sourceSequence: 17 },
+        ]);
+        expect(value.warnings).toEqual([]);
+        expect(result[0]?.encodedResult).toEqual(result[0]?.result);
+        expect(options.seenArchived).toEqual([]);
+      }),
+    ),
+  );
+
+  it.live(
+    "merges archived threads with include and reads archived only without the active stream",
+    () =>
+      withDatabasePath((databasePath) =>
+        Effect.gen(function* () {
+          const { options, connections } = emptyThreadFixtures();
+          options.activeStreams = {
+            "instance-a": () =>
+              Stream.make(
+                shellSnapshotItem(
+                  20,
+                  [shellProjectFixture("project-a")],
+                  [shellThreadFixture("active-thread")],
+                ),
+                shellSynchronizedItem,
+              ),
+          };
+          options.archivedShells = {
+            "instance-a": () =>
+              Effect.succeed({
+                snapshotSequence: 4,
+                projects: [shellProjectFixture("project-a")],
+                threads: [
+                  shellThreadFixture("archived-thread", {
+                    archivedAt: "2026-09-20T00:00:00.000Z",
+                  }),
+                ],
+                observedAt: "2026-09-22T00:00:00.000Z",
+              }),
+          };
+          const layer = appLayer(databasePath, connections);
+
+          const included = yield* Effect.scoped(
+            Effect.gen(function* () {
+              yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+              return yield* callTool("thread_list", {
+                scope: { kind: "instance", instanceId: "instance-a" },
+                archived: "include",
+              });
+            }).pipe(Effect.provide(layer)),
+          );
+          const includedValue = included[0]?.result as unknown as ThreadListToolResultShape;
+          expect(includedValue.result).toMatchObject({
+            kind: "ok",
+            value: {
+              items: [
+                {
+                  thread: { threadId: "active-thread" },
+                  archived: false,
+                  settlement: "unsettled",
+                },
+                {
+                  thread: { threadId: "archived-thread" },
+                  archived: true,
+                  settlement: "unsettled",
+                },
+              ],
+              coverage: "complete_for_query",
+            },
+          });
+          expect(options.seenActive).toEqual(["instance-a"]);
+          expect(options.seenArchived).toEqual(["instance-a"]);
+
+          const only = yield* Effect.scoped(
+            Effect.gen(function* () {
+              return yield* callTool("thread_list", {
+                scope: { kind: "instance", instanceId: "instance-a" },
+                archived: "only",
+              });
+            }).pipe(Effect.provide(layer)),
+          );
+          const onlyValue = only[0]?.result as unknown as ThreadListToolResultShape;
+          expect(onlyValue.result).toMatchObject({
+            kind: "ok",
+            value: {
+              items: [{ thread: { threadId: "archived-thread" }, archived: true }],
+              coverage: "complete_for_query",
+            },
+          });
+          // The archived-only read never opens the active shell stream.
+          expect(options.seenActive).toEqual(["instance-a"]);
+          expect(options.seenArchived).toEqual(["instance-a", "instance-a"]);
+
+          const excluded = yield* Effect.scoped(
+            Effect.gen(function* () {
+              return yield* callTool("thread_list", {
+                scope: { kind: "instance", instanceId: "instance-a" },
+              });
+            }).pipe(Effect.provide(layer)),
+          );
+          const excludedValue = excluded[0]?.result as unknown as ThreadListToolResultShape;
+          expect(excludedValue.result).toMatchObject({
+            kind: "ok",
+            value: {
+              items: [{ thread: { threadId: "active-thread" } }],
+              coverage: "complete_for_query",
+            },
+          });
+          expect(options.seenArchived).toEqual(["instance-a", "instance-a"]);
+        }),
+      ),
+  );
+
+  it.live("filters threads for an explicit project scope", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(
+                3,
+                [shellProjectFixture("project-a"), shellProjectFixture("project-b")],
+                [
+                  shellThreadFixture("thread-a", { projectId: "project-a" }),
+                  shellThreadFixture("thread-b", { projectId: "project-b" }),
+                ],
+              ),
+              shellSynchronizedItem,
+            ),
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_list", {
+              scope: {
+                kind: "project",
+                project: { instanceId: "instance-a", projectId: "project-b" },
+              },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        const value = result[0]?.result as unknown as ThreadListToolResultShape;
+        expect(value.result).toMatchObject({
+          kind: "ok",
+          value: {
+            items: [
+              {
+                thread: { instanceId: "instance-a", threadId: "thread-b" },
+                project: { instanceId: "instance-a", projectId: "project-b" },
+              },
+            ],
+            coverage: "complete_for_query",
+          },
+        });
+      }),
+    ),
+  );
+
+  it.live("keeps colliding thread IDs distinct across instances", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(
+                1,
+                [shellProjectFixture("project-a")],
+                [
+                  shellThreadFixture("thread-same", { title: "A's thread" }),
+                  shellThreadFixture("thread-a2", { title: "A's second thread" }),
+                ],
+              ),
+              shellSynchronizedItem,
+            ),
+          "instance-b": () =>
+            Stream.make(
+              shellSnapshotItem(
+                2,
+                [shellProjectFixture("project-a")],
+                [shellThreadFixture("thread-same", { title: "B's thread" })],
+              ),
+              shellSynchronizedItem,
+            ),
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            yield* seedProjectRegistration("instance-b", "https://b.test", "secret-b");
+            const first = yield* callTool("thread_list", {
+              scope: { kind: "instance", instanceId: "instance-a" },
+              limit: 1,
+            });
+            const firstValue = first[0]?.result as unknown as ThreadListToolResultShape;
+            const cursor = firstValue.result.value.nextCursor;
+            expect(cursor).not.toBeNull();
+            // A colliding ID on another instance must not satisfy the cursor.
+            const mismatched = yield* callTool("thread_list", {
+              scope: { kind: "instance", instanceId: "instance-b" },
+              cursor,
+            });
+            return { first, mismatched };
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        const value = result.first[0]?.result as unknown as ThreadListToolResultShape;
+        expect(value.result).toMatchObject({
+          kind: "ok",
+          value: {
+            items: [
+              {
+                thread: { instanceId: "instance-a", threadId: "thread-a2" },
+                title: "A's second thread",
+              },
+            ],
+          },
+        });
+        expect(result.mismatched[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "cursor_mismatch", retry: "safe_read" } },
+        });
+      }),
+    ),
+  );
+
+  it.live("paginates a captured thread view with stable cursors", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(
+                1,
+                [shellProjectFixture("project-a")],
+                [
+                  shellThreadFixture("thread-a"),
+                  shellThreadFixture("thread-b"),
+                  shellThreadFixture("thread-c"),
+                ],
+              ),
+              shellSynchronizedItem,
+            ),
+        };
+        const layer = appLayer(databasePath, connections);
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const first = yield* callTool("thread_list", {
+              scope: { kind: "instance", instanceId: "instance-a" },
+              limit: 2,
+            });
+            const firstValue = first[0]?.result as unknown as ThreadListToolResultShape;
+            const cursor =
+              firstValue.result.kind === "ok" ? firstValue.result.value.nextCursor : null;
+            const second = yield* callTool("thread_list", {
+              scope: { kind: "instance", instanceId: "instance-a" },
+              cursor,
+            });
+            return { firstValue, second };
+          }).pipe(Effect.provide(layer)),
+        );
+        expect(result.firstValue.result).toMatchObject({
+          kind: "ok",
+          value: {
+            items: [{ thread: { threadId: "thread-a" } }, { thread: { threadId: "thread-b" } }],
+            nextCursor: expect.any(String),
+          },
+        });
+        const secondValue = result.second[0]?.result as unknown as ThreadListToolResultShape;
+        expect(secondValue.result).toMatchObject({
+          kind: "ok",
+          value: {
+            items: [{ thread: { threadId: "thread-c" } }],
+            nextCursor: null,
+          },
+        });
+        // Both pages came from one captured view.
+        expect(options.seenActive).toEqual(["instance-a"]);
+      }),
+    ),
+  );
+
+  it.live("rejects unknown arguments and cursor mismatches across archived modes", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(
+                1,
+                [shellProjectFixture("project-a")],
+                [shellThreadFixture("thread-a"), shellThreadFixture("thread-b")],
+              ),
+              shellSynchronizedItem,
+            ),
+        };
+        const exit = yield* Effect.exit(
+          Effect.scoped(
+            Effect.gen(function* () {
+              yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+              return yield* callTool("thread_list", {
+                scope: { kind: "instance", instanceId: "instance-a" },
+                unexpected: true,
+              });
+            }).pipe(Effect.provide(appLayer(databasePath, connections))),
+          ),
+        );
+        expect(Exit.isFailure(exit)).toBe(true);
+        if (Exit.isSuccess(exit)) return;
+        expect(String(exit.cause)).toContain("Invalid parameters for tool 'thread_list'");
+
+        const mismatch = yield* Effect.scoped(
+          Effect.gen(function* () {
+            const first = yield* callTool("thread_list", {
+              scope: { kind: "instance", instanceId: "instance-a" },
+              limit: 1,
+            });
+            const firstValue = first[0]?.result as unknown as ThreadListToolResultShape;
+            const cursor = firstValue.result.value.nextCursor;
+            expect(cursor).not.toBeNull();
+            return yield* callTool("thread_list", {
+              scope: { kind: "instance", instanceId: "instance-a" },
+              archived: "only",
+              cursor,
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        expect(mismatch[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "cursor_mismatch", retry: "safe_read" } },
+        });
+      }),
+    ),
+  );
+
+  it.live("never surfaces an archived thread through the default exclude read", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(
+                3,
+                [shellProjectFixture("project-a")],
+                [
+                  shellThreadFixture("thread-active"),
+                  shellThreadFixture("thread-archived", {
+                    archivedAt: "2026-09-20T00:00:00.000Z",
+                  }),
+                ],
+              ),
+              shellSynchronizedItem,
+            ),
+        };
+        options.archivedShells = {
+          "instance-a": () =>
+            Effect.succeed({
+              snapshotSequence: 2,
+              projects: [shellProjectFixture("project-a")],
+              threads: [
+                shellThreadFixture("thread-archived", {
+                  archivedAt: "2026-09-20T00:00:00.000Z",
+                }),
+              ],
+              observedAt: "2026-09-22T00:00:00.000Z",
+            }),
+        };
+        const layer = appLayer(databasePath, connections);
+        const excluded = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_list", {
+              scope: { kind: "instance", instanceId: "instance-a" },
+            });
+          }).pipe(Effect.provide(layer)),
+        );
+        const excludedValue = excluded[0]?.result as unknown as ThreadListToolResultShape;
+        expect(excludedValue.result).toMatchObject({
+          kind: "ok",
+          value: {
+            items: [{ thread: { threadId: "thread-active" }, archived: false }],
+            coverage: "complete_for_query",
+          },
+        });
+        // The include read still sees the archived thread exactly once.
+        const included = yield* Effect.scoped(
+          Effect.gen(function* () {
+            return yield* callTool("thread_list", {
+              scope: { kind: "instance", instanceId: "instance-a" },
+              archived: "include",
+            });
+          }).pipe(Effect.provide(layer)),
+        );
+        const includedValue = included[0]?.result as unknown as ThreadListToolResultShape;
+        expect(includedValue.result).toMatchObject({
+          kind: "ok",
+          value: {
+            items: [
+              { thread: { threadId: "thread-active" }, archived: false },
+              { thread: { threadId: "thread-archived" }, archived: true },
+            ],
+            coverage: "complete_for_query",
+          },
+        });
+      }),
+    ),
+  );
+
+  it.live("reports a typed failure for a missing registration", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { connections } = emptyThreadFixtures();
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            return yield* callTool("thread_list", {
+              scope: { kind: "instance", instanceId: "missing-instance" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        const value = result[0]?.result as unknown as ThreadListToolResultShape;
+        expect(value.result).toMatchObject({
+          kind: "error",
+          error: { code: "registration_not_found" },
+        });
+      }),
+    ),
+  );
+
+  it.live("reports pairing_required when the registration has no credential", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-unpaired", "https://unpaired.test");
+            return yield* callTool("thread_list", {
+              scope: { kind: "instance", instanceId: "instance-unpaired" },
+            });
+          }).pipe(
+            Effect.provide(
+              appLayer(
+                databasePath,
+                InstanceConnections.layerWithAdapter(fakeAdapterLayer({ current: null })),
+              ),
+            ),
+          ),
+        );
+        const value = result[0]?.result as unknown as ThreadListToolResultShape;
+        expect(value.result).toMatchObject({
+          kind: "error",
+          error: { code: "pairing_required" },
+        });
+      }),
+    ),
+  );
+
+  it.live("reports unavailable when the shell observation cannot synchronize", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.activeStreams = {
+          // The stream ends before the synchronized boundary.
+          "instance-a": () =>
+            Stream.make(shellSnapshotItem(1, [shellProjectFixture("project-a")], [])),
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_list", {
+              scope: { kind: "instance", instanceId: "instance-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        const value = result[0]?.result as unknown as ThreadListToolResultShape;
+        expect(value.result).toMatchObject({
+          kind: "error",
+          error: { code: "unavailable", retry: "safe_read" },
+        });
+      }),
+    ),
+  );
+
+  it.live("serves partial coverage when the archived read fails on an include", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(
+                1,
+                [shellProjectFixture("project-a")],
+                [shellThreadFixture("active-thread")],
+              ),
+              shellSynchronizedItem,
+            ),
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_list", {
+              scope: { kind: "instance", instanceId: "instance-a" },
+              archived: "include",
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        const value = result[0]?.result as unknown as ThreadListToolResultShape;
+        expect(value.result).toMatchObject({
+          kind: "ok",
+          value: {
+            items: [{ thread: { threadId: "active-thread" } }],
+            coverage: "partial",
+            failures: [{ instanceId: "instance-a", error: { code: "unavailable" } }],
+            limitations: ["The archived thread inventory could not be read."],
+          },
+        });
+      }),
+    ),
+  );
+
+  it.live(
+    "serves a retained capture marked stale when a fresh read fails and allowStale is set",
+    () =>
+      withDatabasePath((databasePath) =>
+        Effect.gen(function* () {
+          const { options, connections } = emptyThreadFixtures();
+          options.activeStreams = {
+            "instance-a": () =>
+              Stream.make(
+                shellSnapshotItem(
+                  1,
+                  [shellProjectFixture("project-a")],
+                  [shellThreadFixture("thread-a")],
+                ),
+                shellSynchronizedItem,
+              ),
+          };
+          const layer = appLayer(databasePath, connections);
+          const first = yield* Effect.scoped(
+            Effect.gen(function* () {
+              yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+              return yield* callTool("thread_list", {
+                scope: { kind: "instance", instanceId: "instance-a" },
+              });
+            }).pipe(Effect.provide(layer)),
+          );
+          const firstValue = first[0]?.result as unknown as ThreadListToolResultShape | undefined;
+          expect(firstValue?.observations).toMatchObject([{ freshness: "fresh" }]);
+
+          options.activeStreams = {
+            "instance-a": () =>
+              Stream.fail(
+                new T3CodeAdapterError({
+                  kind: "transport",
+                  message: "The pinned test instance became unreachable.",
+                  uncertain: true,
+                  status: null,
+                }),
+              ),
+          };
+          const second = yield* Effect.scoped(
+            Effect.gen(function* () {
+              return yield* callTool("thread_list", {
+                scope: { kind: "instance", instanceId: "instance-a" },
+                allowStale: true,
+              });
+            }).pipe(Effect.provide(layer)),
+          );
+          const secondValue = second[0]?.result as unknown as ThreadListToolResultShape;
+          expect(secondValue.result).toMatchObject({
+            kind: "ok",
+            value: {
+              items: [{ thread: { threadId: "thread-a" } }],
+              coverage: "partial",
+            },
+          });
+          expect(secondValue.observations).toMatchObject([
+            { instanceId: "instance-a", freshness: "stale" },
+          ]);
+          expect(secondValue.warnings).toMatchObject([{ code: "fresh_read_failed" }]);
+        }),
+      ),
+  );
+
+  it.live("lists an empty inventory as complete for the query", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(9, [shellProjectFixture("project-a")], []),
+              shellSynchronizedItem,
+            ),
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_list", {
+              scope: { kind: "instance", instanceId: "instance-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        const value = result[0]?.result as unknown as ThreadListToolResultShape;
+        expect(value.result).toMatchObject({
+          kind: "ok",
+          value: { items: [], nextCursor: null, coverage: "complete_for_query", failures: [] },
+        });
+      }),
+    ),
+  );
+});
+
+type ThreadListToolResultShape = {
+  readonly result: {
+    readonly kind: "ok" | "error";
+    readonly value: ThreadListPage;
+    readonly error: { readonly code: string };
+  };
+  readonly observations: ReadonlyArray<unknown>;
+  readonly warnings: ReadonlyArray<unknown>;
+};

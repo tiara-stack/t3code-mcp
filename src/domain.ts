@@ -15,6 +15,9 @@ export const LIVE_EFFECT_OBSERVATION_MILLIS = 60_000;
 export const STAGED_PAIRING_RETENTION_MILLIS = 24 * 60 * 60 * 1000;
 export const OPERATION_DETAIL_RETENTION_MILLIS = 30 * 24 * 60 * 60 * 1000;
 export const REVISION_POLL_INTERVAL_MILLIS = 1_000;
+export const MAX_INSTANCE_OBSERVATION_QUEUE_BYTES = 32 * 1024 * 1024;
+export const MAX_RETAINED_OBSERVATION_BYTES = 128 * 1024 * 1024;
+export const SYNCHRONIZATION_BOUND_MILLIS = 30_000;
 
 // fallow-ignore-next-line complexity
 const endpoint = Schema.String.check(
@@ -317,30 +320,39 @@ export const InstanceGetInputSchema = Schema.declare<{
 
 export type InstanceGetInput = typeof InstanceGetInputSchema.Type;
 
-const projectScopeInstanceRuntimeShape = Schema.StructWithRest(
-  Schema.Struct({
-    kind: Schema.Literal("instance"),
-    instanceId: nonEmptyString,
-  }),
-  [
-    Schema.Record(
-      Schema.String.check(
-        Schema.makeFilter((key) => key !== "kind" && key !== "instanceId", {
-          message: "unknown project_list scope argument",
-        }),
-      ),
-      Schema.Never,
+/**
+ * The `{ kind: "instance", instanceId }` scope member shared by the list
+ * tools, with the rejecting rest record keyed by the owning tool name.
+ */
+const scopedInstanceRefShapes = (toolName: string) => {
+  const unknownScopeKey = Schema.String.check(
+    Schema.makeFilter((key) => key !== "kind" && key !== "instanceId", {
+      message: `unknown ${toolName} scope argument`,
+    }),
+  );
+  return {
+    runtime: Schema.StructWithRest(
+      Schema.Struct({
+        kind: Schema.Literal("instance"),
+        instanceId: nonEmptyString,
+      }),
+      [Schema.Record(unknownScopeKey, Schema.Never)],
     ),
-  ],
-);
+    json: Schema.StructWithRest(
+      Schema.Struct({
+        kind: Schema.Literal("instance"),
+        instanceId: nonEmptyString,
+      }),
+      [Schema.Record(Schema.String, Schema.Never)],
+    ),
+  };
+};
 
-const projectScopeInstanceJsonShape = Schema.StructWithRest(
-  Schema.Struct({
-    kind: Schema.Literal("instance"),
-    instanceId: nonEmptyString,
-  }),
-  [Schema.Record(Schema.String, Schema.Never)],
-);
+const projectScopeInstanceShapes = scopedInstanceRefShapes("project_list");
+
+const projectScopeInstanceRuntimeShape = projectScopeInstanceShapes.runtime;
+
+const projectScopeInstanceJsonShape = projectScopeInstanceShapes.json;
 
 const projectScopeAllRuntimeShape = Schema.StructWithRest(
   Schema.Struct({
@@ -491,6 +503,161 @@ export const ModelListInputSchema = Schema.declare<{
 );
 
 export type ModelListInput = typeof ModelListInputSchema.Type;
+
+const threadArchivedModeSchema = Schema.Literals(["exclude", "include", "only"]);
+
+const threadScopeInstanceShapes = scopedInstanceRefShapes("thread_list");
+
+const threadScopeInstanceRuntimeShape = threadScopeInstanceShapes.runtime;
+
+const threadScopeInstanceJsonShape = threadScopeInstanceShapes.json;
+
+const threadScopeProjectRefRuntimeShape = Schema.StructWithRest(
+  Schema.Struct({
+    instanceId: nonEmptyString,
+    projectId: nonEmptyString,
+  }),
+  [
+    Schema.Record(
+      Schema.String.check(
+        Schema.makeFilter((key) => key !== "instanceId" && key !== "projectId", {
+          message: "unknown thread_list scope project argument",
+        }),
+      ),
+      Schema.Never,
+    ),
+  ],
+);
+
+const threadScopeProjectRefJsonShape = Schema.StructWithRest(
+  Schema.Struct({
+    instanceId: nonEmptyString,
+    projectId: nonEmptyString,
+  }),
+  [Schema.Record(Schema.String, Schema.Never)],
+);
+
+const threadScopeProjectRuntimeShape = Schema.StructWithRest(
+  Schema.Struct({
+    kind: Schema.Literal("project"),
+    project: threadScopeProjectRefRuntimeShape,
+  }),
+  [
+    Schema.Record(
+      Schema.String.check(
+        Schema.makeFilter((key) => key !== "kind" && key !== "project", {
+          message: "unknown thread_list scope argument",
+        }),
+      ),
+      Schema.Never,
+    ),
+  ],
+);
+
+const threadScopeProjectJsonShape = Schema.StructWithRest(
+  Schema.Struct({
+    kind: Schema.Literal("project"),
+    project: threadScopeProjectRefJsonShape,
+  }),
+  [Schema.Record(Schema.String, Schema.Never)],
+);
+
+const threadListScopeRuntimeShape = Schema.Union([
+  threadScopeInstanceRuntimeShape,
+  threadScopeProjectRuntimeShape,
+]);
+
+const threadListScopeJsonShape = Schema.Union([
+  threadScopeInstanceJsonShape,
+  threadScopeProjectJsonShape,
+]);
+
+const threadListFields = Schema.Struct({
+  scope: threadListScopeRuntimeShape,
+  archived: Schema.optionalKey(threadArchivedModeSchema),
+  cursor: Schema.optionalKey(nonEmptyString),
+  limit: Schema.optionalKey(pageLimit),
+  allowStale: Schema.optionalKey(Schema.Boolean),
+});
+
+const threadListJsonFields = Schema.Struct({
+  scope: threadListScopeJsonShape,
+  archived: Schema.optionalKey(threadArchivedModeSchema),
+  cursor: Schema.optionalKey(nonEmptyString),
+  limit: Schema.optionalKey(pageLimit),
+  allowStale: Schema.optionalKey(Schema.Boolean),
+});
+
+const unknownThreadListField = Schema.String.check(
+  Schema.makeFilter(
+    (key) =>
+      key !== "scope" &&
+      key !== "archived" &&
+      key !== "cursor" &&
+      key !== "limit" &&
+      key !== "allowStale",
+    {
+      message: "unknown thread_list argument",
+    },
+  ),
+);
+
+const threadListRuntimeShape = Schema.StructWithRest(threadListFields, [
+  Schema.Record(unknownThreadListField, Schema.Never),
+]);
+
+const threadListJsonShape = Schema.StructWithRest(threadListJsonFields, [
+  Schema.Record(Schema.String, Schema.Never),
+]);
+
+/**
+ * The thread list accepts only the contract fields for one saved instance
+ * registration or one explicit project scope. The archived filter defaults
+ * to "exclude" at the tool boundary; this schema only validates explicit
+ * values like every other optional field.
+ */
+export const ThreadListInputSchema = Schema.declare<{
+  readonly scope: ThreadListScope;
+  readonly archived?: ThreadArchivedMode;
+  readonly cursor?: string;
+  readonly limit?: number;
+  readonly allowStale?: boolean;
+}>(
+  (
+    input,
+  ): input is {
+    readonly scope: ThreadListScope;
+    readonly archived?: ThreadArchivedMode;
+    readonly cursor?: string;
+    readonly limit?: number;
+    readonly allowStale?: boolean;
+  } => Schema.is(threadListRuntimeShape)(input),
+  {
+    toCodecJson: () =>
+      Schema.link()(threadListJsonShape, {
+        decode: SchemaGetter.passthrough({ strict: false }),
+        encode: SchemaGetter.passthrough({ strict: false }),
+      } as never),
+  },
+);
+
+export type ThreadListInput = typeof ThreadListInputSchema.Type;
+
+export type ThreadArchivedMode = "exclude" | "include" | "only";
+
+export type ThreadListScope =
+  | { readonly kind: "instance"; readonly instanceId: string }
+  | { readonly kind: "project"; readonly project: ProjectReference };
+
+/**
+ * A thread list binds one saved instance registration (or one explicit
+ * project scope on it) and the archived filter of the captured view. The
+ * archived mode defaults to "exclude" before it reaches the store.
+ */
+export type ThreadListQuery = {
+  readonly scope: ThreadListScope;
+  readonly archived: ThreadArchivedMode;
+};
 
 const operationGetFields = Schema.Struct({
   requestId,
@@ -938,6 +1105,48 @@ export const ModelListToolResultSchema = toolResultFields(ModelListPageSchema);
 
 export type ModelListToolResult = typeof ModelListToolResultSchema.Type;
 
+// fallow-ignore-next-line unused-export
+export const ThreadReferenceSchema = threadReferenceSchema;
+
+export type ThreadReference = typeof ThreadReferenceSchema.Type;
+
+// fallow-ignore-next-line unused-export
+export const WorktreeReferenceSchema = worktreeReferenceSchema;
+
+export type WorktreeReference = typeof WorktreeReferenceSchema.Type;
+
+// fallow-ignore-next-line unused-export
+export const TurnReferenceSchema = turnReferenceSchema;
+
+export type TurnReference = typeof TurnReferenceSchema.Type;
+
+export const ThreadSummarySchema = Schema.Struct({
+  thread: threadReferenceSchema,
+  project: projectReferenceSchema,
+  title: nonEmptyString,
+  archived: Schema.Boolean,
+  worktree: Schema.NullOr(worktreeReferenceSchema),
+  latestTurn: Schema.NullOr(turnReferenceSchema),
+  settlement: Schema.Literals(["settled", "unsettled", "unknown"]),
+});
+
+export type ThreadSummary = typeof ThreadSummarySchema.Type;
+
+// fallow-ignore-next-line unused-export
+export const ThreadListPageSchema = Schema.Struct({
+  items: Schema.Array(ThreadSummarySchema),
+  nextCursor: Schema.NullOr(nonEmptyString),
+  coverage: Schema.Literals(coverageStates),
+  limitations: Schema.Array(Schema.String),
+  failures: projectPageFailuresSchema,
+});
+
+export type ThreadListPage = typeof ThreadListPageSchema.Type;
+
+export const ThreadListToolResultSchema = toolResultFields(ThreadListPageSchema);
+
+export type ThreadListToolResult = typeof ThreadListToolResultSchema.Type;
+
 /**
  * A model list binds one saved instance registration and an optional native
  * provider instance filter. It never mixes registrations with native provider
@@ -978,6 +1187,8 @@ export const staleProjectReadLimitation =
   "Served from a retained capture after a fresh read failed.";
 
 export const staleModelReadLimitation = staleProjectReadLimitation;
+
+export const staleThreadReadLimitation = staleProjectReadLimitation;
 
 /**
  * The conditional guarantees reported for a provider/model. The pinned
@@ -1026,6 +1237,24 @@ export const makeModelListToolSuccess = (
           {
             code: "fresh_read_failed" as const,
             message: observation.limitations[0] ?? staleModelReadLimitation,
+          },
+        ]
+      : [],
+  ),
+});
+
+export const makeThreadListToolSuccess = (
+  value: ThreadListPage,
+  observations: ReadonlyArray<Observation>,
+): ThreadListToolResult => ({
+  result: { kind: "ok" as const, value },
+  observations,
+  warnings: observations.flatMap((observation) =>
+    observation.freshness === "stale"
+      ? [
+          {
+            code: "fresh_read_failed" as const,
+            message: observation.limitations[0] ?? staleThreadReadLimitation,
           },
         ]
       : [],
