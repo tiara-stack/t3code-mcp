@@ -314,6 +314,40 @@ const GetSnapshotErrorWireSchema = Schema.Struct({
   message: Schema.String,
 });
 
+const GitCommandErrorWireSchema = Schema.Struct({
+  _tag: Schema.Literal("GitCommandError"),
+  operation: Schema.String,
+  detail: Schema.String,
+});
+
+const GitManagerErrorWireSchema = Schema.Struct({
+  _tag: Schema.Literal("GitManagerError"),
+  operation: Schema.String,
+  detail: Schema.String,
+});
+
+/**
+ * VCS ref wire shapes for the pinned vcs.listRefs RPC. Only the fields the
+ * worktree discovery consumes are declared; each ref may carry the worktree
+ * path checked out to it, which is the pinned baseline's only inventory-level
+ * VCS worktree evidence. The path decodes as any string — a checkout path is
+ * evidence exactly as reported, not revalidated against host filesystem
+ * conventions — and unconsumed fields stay optional so a server variant that
+ * omits them cannot fail the whole read.
+ */
+const VcsRefWireSchema = Schema.Struct({
+  name: trimmedNonEmptyWireString,
+  worktreePath: Schema.NullOr(Schema.String),
+});
+
+const VcsListRefsResultWireSchema = Schema.Struct({
+  refs: Schema.Array(VcsRefWireSchema),
+  isRepo: Schema.Boolean,
+  hasPrimaryRemote: Schema.optionalKey(Schema.Boolean),
+  nextCursor: Schema.NullOr(nonNegativeWireInt),
+  totalCount: nonNegativeWireInt,
+});
+
 /**
  * Provider/model entries tolerate elements the pinned server already filters
  * with ForwardCompatibleArray semantics: each provider, model, option choice,
@@ -411,12 +445,27 @@ const SubscribeThreadRpc = Rpc.make("orchestration.subscribeThread", {
   stream: true,
 });
 
+const VcsListRefsRpc = Rpc.make("vcs.listRefs", {
+  payload: Schema.Struct({
+    cwd: trimmedNonEmptyWireString,
+    cursor: Schema.optionalKey(nonNegativeWireInt),
+    limit: Schema.optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))),
+  }),
+  success: VcsListRefsResultWireSchema,
+  error: Schema.Union([
+    GitCommandErrorWireSchema,
+    GitManagerErrorWireSchema,
+    EnvironmentAuthorizationErrorWireSchema,
+  ]),
+});
+
 const AdapterRpcGroup = RpcGroup.make(
   ServerProbeRpc,
   ServerGetConfigRpc,
   SubscribeShellRpc,
   GetArchivedShellSnapshotRpc,
   SubscribeThreadRpc,
+  VcsListRefsRpc,
 );
 
 type AdapterRpcClient = RpcClient.RpcClient<
@@ -427,6 +476,22 @@ type AdapterRpcClient = RpcClient.RpcClient<
 const PINNED_T3CODE_VERSION = "0.0.38";
 const REQUIRED_T3CODE_SCOPES = ["orchestration:read", "orchestration:operate"] as const;
 const MAX_INCOMING_WEBSOCKET_MESSAGE_BYTES = 16 * 1024 * 1024;
+/**
+ * The pinned server accepts at most 200 refs per vcs.listRefs page; the
+ * adapter follows the upstream cursor at that page size until it is exhausted.
+ * The page bound stops a pathological upstream from turning discovery into an
+ * unbounded read loop and is reported as a limitation, never silent
+ * truncation.
+ */
+const VCS_LIST_REFS_PAGE_LIMIT = 200;
+const MAX_VCS_LIST_REFS_PAGES = 50;
+/**
+ * One page of the upstream cursor gets at most ten seconds, and the whole
+ * listing stops one second before the shared RPC deadline so a slow upstream
+ * can never let the outer timeout discard refs that already decoded.
+ */
+const VCS_LIST_REFS_PAGE_TIMEOUT_MILLIS = 10_000;
+const VCS_LIST_REFS_DEADLINE_MARGIN_MILLIS = 1_000;
 
 const capabilityKeys: Record<InstanceCapabilityName, ReadonlyArray<string>> = {
   steer_current: ["steer_current", "steerCurrent"],
@@ -597,6 +662,29 @@ const mapAuthenticatedChannelError = (error: unknown): T3CodeAdapterError => {
 const mapShellStreamError = (error: unknown): T3CodeAdapterError => {
   const mapped = mapOrchestrationReadError("The T3Code shell observation stream failed.")(error);
   return mapped instanceof T3CodeAdapterError ? mapped : mapAuthenticatedChannelError(mapped);
+};
+
+/**
+ * Map a failed vcs.listRefs read to a typed adapter error. Upstream git
+ * failures stay explicit so the caller can mark the VCS evidence stream
+ * partial instead of inventing an empty inventory; everything else reuses
+ * the shared orchestration read mapping.
+ */
+const mapVcsRefsError = (error: unknown): T3CodeAdapterError | RpcClientError.RpcClientError => {
+  if (
+    Predicate.hasProperty(error, "_tag") &&
+    (error._tag === "GitCommandError" || error._tag === "GitManagerError") &&
+    Predicate.hasProperty(error, "detail") &&
+    typeof error.detail === "string"
+  ) {
+    return new T3CodeAdapterError({
+      kind: "transport",
+      message: `The T3Code VCS ref listing failed: ${error.detail}`,
+      uncertain: false,
+      status: null,
+    });
+  }
+  return mapOrchestrationReadError("The T3Code VCS ref listing was unavailable.")(error);
 };
 
 /**
@@ -849,6 +937,31 @@ export interface ProviderModelListing {
   readonly limitations: ReadonlyArray<string>;
 }
 
+/**
+ * One VCS ref reported to have a worktree checked out to it. The pinned
+ * vcs.listRefs response attaches the checkout path to individual refs; refs
+ * without a worktree path are inventory noise for worktree discovery and are
+ * filtered by the adapter.
+ */
+export interface DiscoveredVcsWorktreeRef {
+  readonly refName: string;
+  readonly worktreePath: string;
+}
+
+/**
+ * The VCS ref listing for one repository read. `isRepo` reports the target
+ * instance's own VCS classification of the path; limitations describe read
+ * bounds, never silently truncated refs. `truncated` reports that the
+ * upstream cursor still had unread pages past the supported read bound, so
+ * callers mark coverage partial instead of complete.
+ */
+export interface VcsRefListing {
+  readonly isRepo: boolean;
+  readonly refs: ReadonlyArray<DiscoveredVcsWorktreeRef>;
+  readonly limitations: ReadonlyArray<string>;
+  readonly truncated: boolean;
+}
+
 export interface T3CodeAdapterService {
   readonly exchangePairingCode: (
     input: PairingExchangeInput,
@@ -886,6 +999,17 @@ export interface T3CodeAdapterService {
     readonly endpoint: string;
     readonly credential: string;
   }) => Effect.Effect<ShellSnapshot, T3CodeAdapterError>;
+  /**
+   * List the VCS refs for one repository path on the target instance and keep
+   * every ref that reports a worktree checkout. The pinned upstream paginates
+   * refs; the adapter follows the cursor to its end within a bounded number
+   * of pages and reports the bound instead of silently truncating.
+   */
+  readonly listVcsRefs: (input: {
+    readonly endpoint: string;
+    readonly credential: string;
+    readonly cwd: string;
+  }) => Effect.Effect<VcsRefListing, T3CodeAdapterError>;
 }
 
 const decodeSelectOptionValues = (
@@ -1216,6 +1340,143 @@ const threadStreamItemFromWire = (
       }
   }
 };
+
+/** The typed timeout for one vcs.listRefs page or an exhausted listing budget. */
+const vcsPageTimeoutError = (): T3CodeAdapterError =>
+  new T3CodeAdapterError({
+    kind: "timeout",
+    message: "The T3Code VCS ref page request timed out.",
+    uncertain: true,
+    status: null,
+  });
+
+const vcsRefPageFailureMessage = (
+  failure: T3CodeAdapterError | RpcClientError.RpcClientError,
+): string => (failure instanceof T3CodeAdapterError ? failure.message : "The RPC channel dropped.");
+
+/**
+ * Milliseconds left in the shared RPC deadline for one more page fetch, kept
+ * one second short so the outer timeout never fires mid-listing.
+ */
+const remainingVcsRefPageBudgetMillis = (startedAtMillis: number) =>
+  Effect.map(
+    Clock.currentTimeMillis,
+    (now) =>
+      MUTATION_RPC_DEADLINE_MILLIS - (now - startedAtMillis) - VCS_LIST_REFS_DEADLINE_MARGIN_MILLIS,
+  );
+
+type VcsRefPageResult = Result.Result<
+  typeof VcsListRefsResultWireSchema.Type,
+  T3CodeAdapterError | RpcClientError.RpcClientError
+>;
+
+const fetchVcsRefPage = (options: {
+  readonly listPage: (
+    cursor: number | undefined,
+  ) => Effect.Effect<
+    typeof VcsListRefsResultWireSchema.Type,
+    T3CodeAdapterError | RpcClientError.RpcClientError
+  >;
+  readonly cursor: number | undefined;
+  readonly remainingMillis: number;
+}): Effect.Effect<VcsRefPageResult, never> =>
+  Effect.result(
+    options.listPage(options.cursor).pipe(
+      Effect.timeoutOrElse({
+        duration: Duration.millis(
+          Math.min(VCS_LIST_REFS_PAGE_TIMEOUT_MILLIS, options.remainingMillis),
+        ),
+        orElse: () => Effect.fail(vcsPageTimeoutError()),
+      }),
+    ),
+  );
+
+/** Keep only refs that report a non-empty worktree checkout path. */
+const accumulateVcsWorktreeRefs = (
+  pageRefs: ReadonlyArray<typeof VcsRefWireSchema.Type>,
+  refs: Array<DiscoveredVcsWorktreeRef>,
+): void => {
+  for (const ref of pageRefs) {
+    // Refs without a worktree path carry no checkout evidence; an empty path
+    // decodes but names no checkout and is filtered as malformed noise.
+    if (ref.worktreePath !== null && ref.worktreePath.length > 0) {
+      refs.push({ refName: ref.name, worktreePath: ref.worktreePath });
+    }
+  }
+};
+
+const unreadRefsLimitation = (reason: string): string =>
+  `${reason}; worktrees attached to unread refs are not discoverable.`;
+
+/**
+ * Follow the pinned vcs.listRefs cursor to its end within the page and time
+ * bounds, keeping every ref that reports a worktree checkout. A failure on
+ * the first page fails the listing; a failure or timeout on a later page
+ * keeps the refs collected so far and marks the listing truncated so callers
+ * report partial coverage instead of discarding decoded evidence.
+ */
+const collectVcsRefPages = (options: {
+  readonly startedAtMillis: number;
+  readonly listPage: (
+    cursor: number | undefined,
+  ) => Effect.Effect<
+    typeof VcsListRefsResultWireSchema.Type,
+    T3CodeAdapterError | RpcClientError.RpcClientError
+  >;
+}): Effect.Effect<VcsRefListing, T3CodeAdapterError | RpcClientError.RpcClientError> =>
+  Effect.gen(function* () {
+    const refs: Array<DiscoveredVcsWorktreeRef> = [];
+    const limitations: Array<string> = [];
+    let cursor: number | undefined;
+    let pages = 0;
+    let isRepo = true;
+    let truncated = false;
+    while (true) {
+      const remaining = yield* remainingVcsRefPageBudgetMillis(options.startedAtMillis);
+      if (remaining <= 0) {
+        // Without a single read page there is no evidence to return; report
+        // the exhausted budget as the same unavailable timeout a hung first
+        // page produces.
+        if (pages === 0) return yield* Effect.fail(vcsPageTimeoutError());
+        truncated = true;
+        limitations.push(
+          unreadRefsLimitation("The VCS ref inventory exceeded the supported time bound"),
+        );
+        break;
+      }
+      const pageResult = yield* fetchVcsRefPage({
+        listPage: options.listPage,
+        cursor,
+        remainingMillis: remaining,
+      });
+      if (Result.isFailure(pageResult)) {
+        if (pages === 0) return yield* Effect.fail(pageResult.failure);
+        truncated = true;
+        limitations.push(
+          unreadRefsLimitation(
+            `The VCS ref listing was interrupted after ${pages} page(s) (${vcsRefPageFailureMessage(pageResult.failure)})`,
+          ),
+        );
+        break;
+      }
+      const page = pageResult.success;
+      pages += 1;
+      isRepo = page.isRepo;
+      accumulateVcsWorktreeRefs(page.refs, refs);
+      if (page.nextCursor === null) break;
+      if (pages >= MAX_VCS_LIST_REFS_PAGES) {
+        truncated = true;
+        limitations.push(
+          unreadRefsLimitation(
+            `The VCS ref inventory exceeded the supported read bound of ${MAX_VCS_LIST_REFS_PAGES} pages`,
+          ),
+        );
+        break;
+      }
+      cursor = page.nextCursor;
+    }
+    return { isRepo, refs, limitations, truncated } satisfies VcsRefListing;
+  });
 
 export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterService>()(
   "t3code-mcp/T3CodeAdapter",
@@ -1822,6 +2083,44 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
           }),
         );
 
+      const listVcsRefs = (input: {
+        readonly endpoint: string;
+        readonly credential: string;
+        readonly cwd: string;
+      }): Effect.Effect<VcsRefListing, T3CodeAdapterError> =>
+        withCapacity(
+          Effect.gen(function* () {
+            const { authorization } = yield* verifyEnvironmentSession(input);
+            if (authorization.read !== "allowed") {
+              return yield* Effect.fail(
+                new T3CodeAdapterError({
+                  kind: "authorization",
+                  message: "The saved T3Code credential lacks the orchestration read scope.",
+                  uncertain: false,
+                  status: null,
+                }),
+              );
+            }
+
+            // Every page of the upstream cursor runs through the one
+            // authenticated channel so the listing shares a single deadline
+            // instead of reopening a connection per page. The budget starts
+            // before the channel setup so ticket and socket time count.
+            const startedAtMillis = yield* Clock.currentTimeMillis;
+            return yield* withAuthenticatedRpc(input.endpoint, input.credential, (client) =>
+              collectVcsRefPages({
+                startedAtMillis,
+                listPage: (cursor) =>
+                  client["vcs.listRefs"]({
+                    cwd: input.cwd,
+                    ...(cursor === undefined ? {} : { cursor }),
+                    limit: VCS_LIST_REFS_PAGE_LIMIT,
+                  }).pipe(Effect.mapError(mapVcsRefsError)),
+              }),
+            );
+          }),
+        );
+
       const verifyCredential = (input: {
         readonly endpoint: string;
         readonly credential: string;
@@ -1858,6 +2157,7 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
         subscribeShell,
         subscribeThread,
         getArchivedShellSnapshot,
+        listVcsRefs,
       });
     }),
   ).pipe(Layer.provide(NodeHttpClient.layerUndici), Layer.provide(NodeCrypto.layer));

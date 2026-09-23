@@ -52,11 +52,13 @@ import {
   makeThreadGetToolSuccess,
   makeThreadListToolSuccess,
   makeThreadOutputToolSuccess,
+  makeWorktreeListToolSuccess,
   staleModelReadLimitation,
   staleProjectReadLimitation,
   staleThreadGetReadLimitation,
   staleThreadOutputReadLimitation,
   staleThreadReadLimitation,
+  staleWorktreeReadLimitation,
   unknownModelCapabilities,
   MAX_SERIALIZED_RESULT_BYTES,
   ModelListInputSchema,
@@ -81,6 +83,8 @@ import {
   type TurnWaitToolResult,
   type TurnReference,
   ToolResultSchema,
+  WorktreeListInputSchema,
+  WorktreeListToolResultSchema,
   type ModelListPage,
   type ModelListQuery,
   type ModelSummary,
@@ -90,27 +94,34 @@ import {
   type ThreadListPage,
   type ThreadListQuery,
   type ThreadSummary,
+  type WorktreeListPage,
+  type WorktreeListQuery,
+  type WorktreeSummary,
 } from "./domain";
 import type { ToolFailure } from "./domain";
 import {
   LocalStore,
   LocalStoreError,
   type LocalStoreService,
+  type ListCaptureMetadata,
   type ModelCaptureMetadata,
   type ProjectCaptureMetadata,
   type RetainedModelCapture,
   type RetainedProjectCapture,
+  type RetainedCapture,
   type RetainedThreadCapture,
   type ThreadCaptureMetadata,
   type ThreadGetCaptureMetadata,
   type ThreadOutputCaptureMetadata,
   type TurnEvidenceRecord,
+  type WorktreeCaptureMetadata,
 } from "./local-store";
 import { OperationServiceError, Operations } from "./operations";
 import {
   InstanceConnections,
   type DiscoveredModels,
   type DiscoveredProjects,
+  type DiscoveredVcsRefs,
   type InstanceConnectionsService,
 } from "./instance-connections";
 import {
@@ -173,6 +184,21 @@ export const ModelListTool = Tool.make("model_list", {
   success: ModelListToolResultSchema,
 })
   .addDependency(LocalStore)
+  .addDependency(InstanceConnections)
+  .annotate(Tool.Readonly, true)
+  .annotate(Tool.Destructive, false)
+  .annotate(Tool.Idempotent, true)
+  .annotate(Tool.OpenWorld, true);
+
+// fallow-ignore-next-line unused-export
+export const WorktreeListTool = Tool.make("worktree_list", {
+  description:
+    "List the worktrees known for one repository on a saved T3Code instance through thread associations and VCS refs, with explicit inventory limits and stable pagination.",
+  parameters: WorktreeListInputSchema,
+  success: WorktreeListToolResultSchema,
+})
+  .addDependency(LocalStore)
+  .addDependency(Observations)
   .addDependency(InstanceConnections)
   .annotate(Tool.Readonly, true)
   .annotate(Tool.Destructive, false)
@@ -338,6 +364,7 @@ export const ServerToolkit = Toolkit.make(
   InstanceRemoveTool,
   ProjectListTool,
   ModelListTool,
+  WorktreeListTool,
   ThreadListTool,
   ThreadGetTool,
   ThreadOutputTool,
@@ -950,20 +977,26 @@ type ThreadInventoryResult = Result.Result<
 const resultFailure = (result: ThreadInventoryResult | null) =>
   result !== null && Result.isFailure(result) ? result.failure : null;
 
-const staleThreadObservations = (options: {
-  readonly retained: Pick<RetainedThreadCapture, "observations">;
+/**
+ * Mark the observations retained from a failed fresh read as stale. The
+ * cause is recorded in the stale limitation so the caller can tell a cache
+ * serve from fresh evidence.
+ */
+const staleReadObservations = (options: {
+  readonly retainedObservations: ReadonlyArray<Observation>;
+  readonly staleLimitation: string;
   readonly instanceId: string;
   readonly fallbackObservedAt: string;
   readonly causeMessage: string;
 }): Array<Observation> => {
-  const { retained, instanceId, fallbackObservedAt, causeMessage } = options;
-  const staleLimitation = `${staleThreadReadLimitation} (${causeMessage})`;
-  return retained.observations.length > 0
-    ? retained.observations.map((observation) => ({
+  const { staleLimitation, instanceId, fallbackObservedAt, causeMessage } = options;
+  const markedLimitation = `${staleLimitation} (${causeMessage})`;
+  return options.retainedObservations.length > 0
+    ? options.retainedObservations.map((observation) => ({
         ...observation,
         freshness: "stale" as const,
         coverage: "partial" as const,
-        limitations: [staleLimitation],
+        limitations: [markedLimitation],
       }))
     : [
         {
@@ -972,7 +1005,7 @@ const staleThreadObservations = (options: {
           freshness: "stale" as const,
           sourceSequence: null,
           coverage: "partial" as const,
-          limitations: [staleLimitation],
+          limitations: [markedLimitation],
         },
       ];
 };
@@ -980,7 +1013,90 @@ const staleThreadObservations = (options: {
 /**
  * A targeted read never fails over to another registration; its typed
  * failure is the result unless an explicit stale read found retained data.
+ * The retained items are republished under one partial-coverage capture so
+ * the stale page keeps normal cursor semantics.
  */
+const serveRetainedListPage = <Items, Query, Page, Success>(options: {
+  readonly query: Query;
+  readonly instanceId: string;
+  readonly limit: number | undefined;
+  readonly error: LocalStoreError | T3CodeAdapterError | ObservationError;
+  readonly staleLimitation: string;
+  /**
+   * Standing limitations the list always carries (such as the worktree
+   * inventory bounds) so a retained page keeps the same explicit limits as a
+   * fresh page.
+   */
+  readonly standingLimitations?: ReadonlyArray<string>;
+  readonly findRetained: (
+    query: Query,
+  ) => Effect.Effect<RetainedCapture<Items> | null, LocalStoreError>;
+  readonly capture: (input: {
+    readonly query: Query;
+    readonly items: ReadonlyArray<Items>;
+    readonly metadata: ListCaptureMetadata;
+    readonly limit?: number;
+  }) => Effect.Effect<
+    { readonly page: Page; readonly observations: ReadonlyArray<Observation> },
+    LocalStoreError
+  >;
+  readonly makeSuccess: (page: Page, observations: ReadonlyArray<Observation>) => Success;
+}): Effect.Effect<Success, LocalStoreError | T3CodeAdapterError | ObservationError> =>
+  Effect.gen(function* () {
+    const { query, instanceId, limit, error, staleLimitation, findRetained, capture, makeSuccess } =
+      options;
+    const retained = yield* findRetained(query);
+    if (retained === null) return yield* Effect.fail(error);
+    const fallbackObservedAt = new Date(yield* Clock.currentTimeMillis).toISOString();
+    const observations = staleReadObservations({
+      retainedObservations: retained.observations,
+      staleLimitation,
+      instanceId,
+      fallbackObservedAt,
+      causeMessage: error.message,
+    });
+    const metadata: ListCaptureMetadata = {
+      failures: [],
+      coverage: "partial",
+      // Every retained observation carries the same stale limitation; the
+      // page lists each distinct limitation once while the per-observation
+      // warnings stay unchanged.
+      limitations: [
+        ...new Set([
+          ...(options.standingLimitations ?? []),
+          ...observations.flatMap((observation) => observation.limitations),
+        ]),
+      ],
+      observations,
+    };
+    const captured = yield* capture({
+      query,
+      items: retained.items,
+      metadata,
+      ...(limit === undefined ? {} : { limit }),
+    });
+    return makeSuccess(captured.page, captured.observations);
+  });
+
+interface MutableWorktreeEvidence {
+  branch: string | null;
+  evidence: Set<WorktreeSummary["evidence"][number]>;
+}
+
+const staleThreadObservations = (options: {
+  readonly retained: Pick<RetainedThreadCapture, "observations">;
+  readonly instanceId: string;
+  readonly fallbackObservedAt: string;
+  readonly causeMessage: string;
+}): Array<Observation> =>
+  staleReadObservations({
+    retainedObservations: options.retained.observations,
+    staleLimitation: staleThreadReadLimitation,
+    instanceId: options.instanceId,
+    fallbackObservedAt: options.fallbackObservedAt,
+    causeMessage: options.causeMessage,
+  });
+
 const serveRetainedThreadPage = (options: {
   readonly store: LocalStoreService;
   readonly query: ThreadListQuery;
@@ -991,30 +1107,20 @@ const serveRetainedThreadPage = (options: {
   ReturnType<typeof makeThreadListToolSuccess>,
   LocalStoreError | T3CodeAdapterError | ObservationError
 > =>
-  Effect.gen(function* () {
-    const { store, query, instanceId, limit, error } = options;
-    const retained = yield* store.findRetainedThreadCapture(query);
-    if (retained === null) return yield* Effect.fail(error);
-    const fallbackObservedAt = new Date(yield* Clock.currentTimeMillis).toISOString();
-    const staleObservations = staleThreadObservations({
-      retained,
-      instanceId,
-      fallbackObservedAt,
-      causeMessage: error.message,
-    });
-    const metadata: ThreadCaptureMetadata = {
-      failures: [],
-      coverage: "partial",
-      limitations: staleObservations.flatMap((observation) => observation.limitations),
-      observations: staleObservations,
-    };
-    const captured = yield* store.captureThreadPage({
-      query,
-      items: retained.items,
-      metadata,
-      ...(limit === undefined ? {} : { limit }),
-    });
-    return makeThreadListToolSuccess(captured.page, captured.observations);
+  serveRetainedListPage<
+    ThreadSummary,
+    ThreadListQuery,
+    ThreadListPage,
+    ReturnType<typeof makeThreadListToolSuccess>
+  >({
+    query: options.query,
+    instanceId: options.instanceId,
+    limit: options.limit,
+    error: options.error,
+    staleLimitation: staleThreadReadLimitation,
+    findRetained: (query) => options.store.findRetainedThreadCapture(query),
+    capture: (input) => options.store.captureThreadPage(input),
+    makeSuccess: makeThreadListToolSuccess,
   });
 
 const recordShellSummaries = (options: {
@@ -1160,6 +1266,363 @@ const discoverThreadPage = (options: {
       ...(limit === undefined ? {} : { limit }),
     });
     return makeThreadListToolSuccess(captured.page, captured.observations);
+  });
+
+/**
+ * The standing inventory limits every worktree listing carries. The pinned
+ * baseline establishes worktrees only through thread associations and VCS
+ * refs, so a page that exhausts its captured view still never claims an
+ * exhaustive upstream worktree inventory.
+ */
+const worktreeInventoryLimitations: ReadonlyArray<string> = [
+  "The inventory is limited to worktrees known through thread associations and VCS refs; the pinned T3Code baseline provides no exhaustive upstream worktree inventory.",
+  "VCS evidence lists only worktrees attached to a reported ref; checkouts on a detached HEAD or otherwise not attached to a listed ref are not discoverable.",
+];
+
+const worktreeEvidenceOrder: ReadonlyArray<WorktreeSummary["evidence"][number]> = [
+  "thread_association",
+  "vcs_ref",
+  "verified_checkout",
+];
+
+interface GatheredWorktreeInventory {
+  readonly items: Array<WorktreeSummary>;
+  readonly failures: Array<WorktreeListPage["failures"][number]>;
+  readonly observations: Array<Observation>;
+  readonly coverage: WorktreeListPage["coverage"];
+  readonly limitations: Array<string>;
+}
+
+type WorktreeShellResult = Result.Result<
+  SynchronizedShell,
+  LocalStoreError | T3CodeAdapterError | ObservationError
+>;
+
+type WorktreeVcsResult = Result.Result<DiscoveredVcsRefs, LocalStoreError | T3CodeAdapterError>;
+
+const shellResultFailure = (result: WorktreeShellResult | null) =>
+  result !== null && Result.isFailure(result) ? result.failure : null;
+
+const vcsResultFailure = (result: WorktreeVcsResult | null) =>
+  result !== null && Result.isFailure(result) ? result.failure : null;
+
+const serveRetainedWorktreePage = (options: {
+  readonly store: LocalStoreService;
+  readonly query: WorktreeListQuery;
+  readonly limit: number | undefined;
+  readonly error: LocalStoreError | T3CodeAdapterError | ObservationError;
+}): Effect.Effect<
+  ReturnType<typeof makeWorktreeListToolSuccess>,
+  LocalStoreError | T3CodeAdapterError | ObservationError
+> =>
+  serveRetainedListPage<
+    WorktreeSummary,
+    WorktreeListQuery,
+    WorktreeListPage,
+    ReturnType<typeof makeWorktreeListToolSuccess>
+  >({
+    query: options.query,
+    instanceId: options.query.instanceId,
+    limit: options.limit,
+    error: options.error,
+    staleLimitation: staleWorktreeReadLimitation,
+    standingLimitations: worktreeInventoryLimitations,
+    findRetained: (query) => options.store.findRetainedWorktreeCapture(query),
+    capture: (input) => options.store.captureWorktreePage(input),
+    makeSuccess: makeWorktreeListToolSuccess,
+  });
+
+/**
+ * Record one shell's thread worktree associations for the queried
+ * repository. A thread whose project is missing from the same synchronized
+ * inventory cannot be attributed to any repository; it is counted as a
+ * limitation instead of becoming evidence for the wrong repository.
+ */
+const recordShellWorktreeAssociations = (options: {
+  readonly shell: SynchronizedShell;
+  readonly query: WorktreeListQuery;
+  readonly merged: Map<string, MutableWorktreeEvidence>;
+  readonly observationsMeta: Array<Observation>;
+  readonly unattributable: { count: number };
+}): void => {
+  const { shell, query, merged, observationsMeta, unattributable } = options;
+  for (const thread of shell.threads) {
+    if (thread.worktreePath === null) continue;
+    const project = shell.projects.find((entry) => entry.projectId === thread.projectId);
+    if (project === undefined) {
+      unattributable.count += 1;
+      continue;
+    }
+    if (project.repositoryPath !== query.repositoryPath) continue;
+    const existing = merged.get(thread.worktreePath) ?? { branch: null, evidence: new Set() };
+    existing.evidence.add("thread_association");
+    merged.set(thread.worktreePath, existing);
+  }
+  observationsMeta.push(freshShellObservation(shell, query.instanceId));
+};
+
+const recordVcsWorktreeAssociations = (options: {
+  readonly vcs: DiscoveredVcsRefs;
+  readonly query: WorktreeListQuery;
+  readonly merged: Map<string, MutableWorktreeEvidence>;
+  readonly observationsMeta: Array<Observation>;
+  readonly limitations: Array<string>;
+}): void => {
+  const { vcs, query, merged, observationsMeta, limitations } = options;
+  for (const ref of vcs.refs) {
+    const existing = merged.get(ref.worktreePath) ?? { branch: null, evidence: new Set() };
+    existing.evidence.add("vcs_ref");
+    if (existing.branch === null) existing.branch = ref.refName;
+    merged.set(ref.worktreePath, existing);
+  }
+  if (!vcs.isRepo) {
+    limitations.push(
+      "The repository path is not a VCS repository according to the target instance.",
+    );
+  }
+  limitations.push(...vcs.limitations);
+  observationsMeta.push({
+    instanceId: query.instanceId,
+    observedAt: vcs.observedAt,
+    freshness: "fresh",
+    sourceSequence: null,
+    coverage: vcs.truncated ? "partial" : "complete_for_query",
+    limitations: [],
+  });
+};
+
+const recordWorktreeFailure = (options: {
+  readonly failures: Array<WorktreeListPage["failures"][number]>;
+  readonly limitations: Array<string>;
+  readonly instanceId: string;
+  readonly error: LocalStoreError | T3CodeAdapterError | ObservationError;
+  readonly limitation: string;
+}): void => {
+  options.failures.push({
+    instanceId: options.instanceId,
+    error: toToolFailure(options.error),
+  });
+  options.limitations.push(options.limitation);
+};
+
+const sortedWorktreeItems = (
+  merged: ReadonlyMap<string, MutableWorktreeEvidence>,
+  query: WorktreeListQuery,
+): Array<WorktreeSummary> =>
+  [...merged.entries()]
+    .sort(([leftPath], [rightPath]) => (leftPath < rightPath ? -1 : leftPath > rightPath ? 1 : 0))
+    .map(([worktreePath, entry]) => ({
+      worktree: {
+        instanceId: query.instanceId,
+        repositoryPath: query.repositoryPath,
+        worktreePath,
+      },
+      branch: entry.branch,
+      evidence: worktreeEvidenceOrder.filter((kind) => entry.evidence.has(kind)),
+    }));
+
+/**
+ * Combine the supported thread-association and VCS evidence for one
+ * repository. Each source keeps its own observation metadata; a failed
+ * source degrades coverage to partial with its failure attached, never to an
+ * empty inventory.
+ */
+interface WorktreeReadFailure {
+  readonly error: LocalStoreError | T3CodeAdapterError | ObservationError;
+  readonly limitation: string;
+}
+
+const worktreeReadFailures = (options: {
+  readonly activeResult: WorktreeShellResult | null;
+  readonly archivedResult: WorktreeShellResult | null;
+  readonly vcsResult: WorktreeVcsResult | null;
+}): Array<WorktreeReadFailure> => {
+  const failures: Array<WorktreeReadFailure> = [];
+  const activeError = shellResultFailure(options.activeResult);
+  if (activeError !== null) {
+    failures.push({
+      error: activeError,
+      limitation: "The active thread inventory could not be read.",
+    });
+  }
+  const archivedError = shellResultFailure(options.archivedResult);
+  if (archivedError !== null) {
+    failures.push({
+      error: archivedError,
+      limitation: "The archived thread inventory could not be read.",
+    });
+  }
+  const vcsError = vcsResultFailure(options.vcsResult);
+  if (vcsError !== null) {
+    failures.push({ error: vcsError, limitation: "The VCS ref inventory could not be read." });
+  }
+  return failures;
+};
+
+/**
+ * The combined listing is complete for the query only when every evidence
+ * stream read cleanly and the VCS cursor did not stop at the supported read
+ * bound; anything else is partial with its limitation attached.
+ */
+const worktreeListingCoverage = (options: {
+  readonly readFailures: ReadonlyArray<WorktreeReadFailure>;
+  readonly vcsResult: WorktreeVcsResult | null;
+}): WorktreeListPage["coverage"] =>
+  options.readFailures.length > 0 ||
+  (options.vcsResult !== null &&
+    Result.isSuccess(options.vcsResult) &&
+    options.vcsResult.success.truncated)
+    ? "partial"
+    : "complete_for_query";
+
+const mergeWorktreeInventories = (options: {
+  readonly query: WorktreeListQuery;
+  readonly activeResult: WorktreeShellResult | null;
+  readonly archivedResult: WorktreeShellResult | null;
+  readonly vcsResult: WorktreeVcsResult | null;
+}): GatheredWorktreeInventory => {
+  const { query, activeResult, archivedResult, vcsResult } = options;
+  const merged = new Map<string, MutableWorktreeEvidence>();
+  const observationsMeta: Array<Observation> = [];
+  const failures: Array<WorktreeListPage["failures"][number]> = [];
+  const limitations: Array<string> = [...worktreeInventoryLimitations];
+  const unattributable = { count: 0 };
+
+  const shellSuccesses = [activeResult, archivedResult].flatMap((result) =>
+    result !== null && Result.isSuccess(result) ? [result.success] : [],
+  );
+  for (const shell of shellSuccesses) {
+    recordShellWorktreeAssociations({
+      shell,
+      query,
+      merged,
+      observationsMeta,
+      unattributable,
+    });
+  }
+  if (vcsResult !== null && Result.isSuccess(vcsResult)) {
+    recordVcsWorktreeAssociations({
+      vcs: vcsResult.success,
+      query,
+      merged,
+      observationsMeta,
+      limitations,
+    });
+  }
+
+  const readFailures = worktreeReadFailures({ activeResult, archivedResult, vcsResult });
+  for (const readFailure of readFailures) {
+    recordWorktreeFailure({
+      failures,
+      limitations,
+      instanceId: query.instanceId,
+      error: readFailure.error,
+      limitation: readFailure.limitation,
+    });
+  }
+  if (unattributable.count > 0) {
+    limitations.push(
+      `${unattributable.count} thread worktree association(s) could not be attributed to a repository because their project was missing from the synchronized inventory.`,
+    );
+  }
+
+  return {
+    items: sortedWorktreeItems(merged, query),
+    failures,
+    observations: observationsMeta,
+    coverage: worktreeListingCoverage({ readFailures, vcsResult }),
+    limitations,
+  };
+};
+
+/**
+ * Only transient connection failures make a failed fresh read eligible for a
+ * retained stale serve, mirroring the stale policy of
+ * InstanceConnections.inspect. Identity, pairing, compatibility, and
+ * registration-lifecycle failures propagate instead of serving data captured
+ * under different authority. A stale-generation observation rejection names
+ * a registration revision shift, so it is authority-class too, not a
+ * connection failure.
+ */
+const staleEligibleReadError = (
+  error: LocalStoreError | T3CodeAdapterError | ObservationError,
+): boolean =>
+  (error instanceof ObservationError && error.kind !== "stale_generation") ||
+  (error instanceof T3CodeAdapterError &&
+    (error.kind === "transport" || error.kind === "timeout" || error.kind === "capacity"));
+
+interface WorktreeFatalRead {
+  readonly error: LocalStoreError | T3CodeAdapterError | ObservationError;
+  readonly staleEligible: boolean;
+}
+
+/**
+ * All three evidence streams failed. A non-connection failure on any stream
+ * takes precedence so retained data is never served under a different
+ * authority; only an all-transient failure set is stale-eligible.
+ */
+const fatalWorktreeRead = (
+  activeError: LocalStoreError | T3CodeAdapterError | ObservationError | null,
+  archivedError: LocalStoreError | T3CodeAdapterError | ObservationError | null,
+  vcsError: LocalStoreError | T3CodeAdapterError | null,
+): WorktreeFatalRead | null => {
+  if (activeError === null || archivedError === null || vcsError === null) return null;
+  const authorityFailure = [activeError, archivedError, vcsError].find(
+    (error) => !staleEligibleReadError(error),
+  );
+  return authorityFailure !== undefined
+    ? { error: authorityFailure, staleEligible: false }
+    : { error: activeError, staleEligible: true };
+};
+
+const discoverWorktreePage = (options: {
+  readonly store: LocalStoreService;
+  readonly observations: ObservationsService;
+  readonly connections: InstanceConnectionsService;
+  readonly query: WorktreeListQuery;
+  readonly limit: number | undefined;
+  readonly allowStale: boolean;
+}): Effect.Effect<
+  ReturnType<typeof makeWorktreeListToolSuccess>,
+  LocalStoreError | T3CodeAdapterError | ObservationError
+> =>
+  Effect.gen(function* () {
+    const { store, observations, connections, query, limit, allowStale } = options;
+    const activeResult: WorktreeShellResult = yield* Effect.result(
+      observations.activeShell(query.instanceId),
+    );
+    const archivedResult: WorktreeShellResult = yield* Effect.result(
+      observations.archivedShell(query.instanceId),
+    );
+    const vcsResult: WorktreeVcsResult = yield* Effect.result(
+      connections.discoverVcsRefs(query.instanceId, query.repositoryPath),
+    );
+
+    const fatal = fatalWorktreeRead(
+      shellResultFailure(activeResult),
+      shellResultFailure(archivedResult),
+      vcsResultFailure(vcsResult),
+    );
+    if (fatal !== null) {
+      if (!allowStale || !fatal.staleEligible) return yield* Effect.fail(fatal.error);
+      return yield* serveRetainedWorktreePage({ store, query, limit, error: fatal.error });
+    }
+
+    const gathered = mergeWorktreeInventories({ query, activeResult, archivedResult, vcsResult });
+
+    const metadata: WorktreeCaptureMetadata = {
+      failures: gathered.failures,
+      coverage: gathered.coverage,
+      limitations: gathered.limitations,
+      observations: gathered.observations,
+    };
+    const captured = yield* store.captureWorktreePage({
+      query,
+      items: gathered.items,
+      metadata,
+      ...(limit === undefined ? {} : { limit }),
+    });
+    return makeWorktreeListToolSuccess(captured.page, captured.observations);
   });
 
 const sessionStateByNativeStatus: Record<string, ThreadState["session"]["state"]> = {
@@ -2952,6 +3415,37 @@ const serverToolHandlers = ServerToolkit.of({
       });
     }).pipe(
       Effect.catch((error: LocalStoreError | T3CodeAdapterError) =>
+        Effect.succeed({
+          result: { kind: "error" as const, error: toToolFailure(error) },
+          observations: [],
+          warnings: [],
+        }),
+      ),
+    ),
+  worktree_list: ({ instanceId, repositoryPath, cursor, limit, allowStale }) =>
+    Effect.gen(function* () {
+      const store = yield* LocalStore;
+      const observations = yield* Observations;
+      const connections = yield* InstanceConnections;
+      const query: WorktreeListQuery = { instanceId, repositoryPath };
+      if (cursor !== undefined) {
+        const captured = yield* store.readWorktreePage({
+          query,
+          cursor,
+          ...(limit === undefined ? {} : { limit }),
+        });
+        return makeWorktreeListToolSuccess(captured.page, captured.observations);
+      }
+      return yield* discoverWorktreePage({
+        store,
+        observations,
+        connections,
+        query,
+        limit,
+        allowStale: allowStale ?? false,
+      });
+    }).pipe(
+      Effect.catch((error: LocalStoreError | T3CodeAdapterError | ObservationError) =>
         Effect.succeed({
           result: { kind: "error" as const, error: toToolFailure(error) },
           observations: [],

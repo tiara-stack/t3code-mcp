@@ -14,6 +14,7 @@ import {
   T3CodeAdapterError,
   type DiscoveredProject,
   type DiscoveredProvider,
+  type DiscoveredVcsWorktreeRef,
   type PairingExchangeInput,
   type ShellSnapshot,
   type ShellStreamItem,
@@ -34,6 +35,15 @@ export interface DiscoveredProjects {
 export interface DiscoveredModels {
   readonly providers: ReadonlyArray<DiscoveredProvider>;
   readonly limitations: ReadonlyArray<string>;
+  readonly observedAt: string;
+}
+
+export interface DiscoveredVcsRefs {
+  readonly isRepo: boolean;
+  readonly refs: ReadonlyArray<DiscoveredVcsWorktreeRef>;
+  readonly limitations: ReadonlyArray<string>;
+  /** True when unread upstream ref pages remain past the supported read bound. */
+  readonly truncated: boolean;
   readonly observedAt: string;
 }
 
@@ -77,6 +87,15 @@ export interface InstanceConnectionsService {
   readonly discoverModels: (
     instanceId: string,
   ) => Effect.Effect<DiscoveredModels, LocalStoreError | T3CodeAdapterError>;
+  /**
+   * Read the VCS refs for one repository path on the target instance, keeping
+   * only refs that report a worktree checkout. A missing registration or an
+   * unpaired credential fails explicitly like every targeted read.
+   */
+  readonly discoverVcsRefs: (
+    instanceId: string,
+    repositoryPath: string,
+  ) => Effect.Effect<DiscoveredVcsRefs, LocalStoreError | T3CodeAdapterError>;
   /**
    * Open a scoped shell observation stream for the current registration
    * revision. The per-instance RPC capacity permit is held until the returned
@@ -236,9 +255,12 @@ export class InstanceConnections extends Context.Service<
           });
         const invalidate = (instanceId: string) => Effect.sync(() => evictCached(instanceId));
 
-        const discoverProjects = (
-          instanceId: string,
-        ): Effect.Effect<DiscoveredProjects, LocalStoreError | T3CodeAdapterError> =>
+        /**
+         * Resolve the registration for one targeted read, failing with the
+         * shared registration_not_found result or the per-operation
+         * pairing_required message before any connection work begins.
+         */
+        const requireReadableRegistration = (instanceId: string, pairingMessage: string) =>
           Effect.gen(function* () {
             const registration = yield* store.getRegistration(instanceId);
             if (registration === null) {
@@ -253,12 +275,23 @@ export class InstanceConnections extends Context.Service<
               return yield* Effect.fail(
                 new T3CodeAdapterError({
                   kind: "pairing_required",
-                  message: "The saved registration requires pairing before projects can be listed.",
+                  message: pairingMessage,
                   uncertain: false,
                   status: null,
                 }),
               );
             }
+            return registration;
+          });
+
+        const discoverProjects = (
+          instanceId: string,
+        ): Effect.Effect<DiscoveredProjects, LocalStoreError | T3CodeAdapterError> =>
+          Effect.gen(function* () {
+            yield* requireReadableRegistration(
+              instanceId,
+              "The saved registration requires pairing before projects can be listed.",
+            );
             const connection = yield* acquire(instanceId);
             const listing = yield* withInstanceCapacity(
               instanceId,
@@ -275,31 +308,38 @@ export class InstanceConnections extends Context.Service<
           instanceId: string,
         ): Effect.Effect<DiscoveredModels, LocalStoreError | T3CodeAdapterError> =>
           Effect.gen(function* () {
-            const registration = yield* store.getRegistration(instanceId);
-            if (registration === null) {
-              return yield* Effect.fail(
-                new LocalStoreError({
-                  kind: "registration_not_found",
-                  message: "The saved registration was not found.",
-                }),
-              );
-            }
-            if (registration.credential === null) {
-              return yield* Effect.fail(
-                new T3CodeAdapterError({
-                  kind: "pairing_required",
-                  message: "The saved registration requires pairing before models can be listed.",
-                  uncertain: false,
-                  status: null,
-                }),
-              );
-            }
+            yield* requireReadableRegistration(
+              instanceId,
+              "The saved registration requires pairing before models can be listed.",
+            );
             const connection = yield* acquire(instanceId);
             const listing = yield* withInstanceCapacity(
               instanceId,
               adapter.listProviderModels({
                 endpoint: connection.endpoint,
                 credential: connection.credential,
+              }),
+            );
+            const observedAt = new Date(yield* Clock.currentTimeMillis).toISOString();
+            return { ...listing, observedAt };
+          });
+
+        const discoverVcsRefs = (
+          instanceId: string,
+          repositoryPath: string,
+        ): Effect.Effect<DiscoveredVcsRefs, LocalStoreError | T3CodeAdapterError> =>
+          Effect.gen(function* () {
+            yield* requireReadableRegistration(
+              instanceId,
+              "The saved registration requires pairing before VCS refs can be listed.",
+            );
+            const connection = yield* acquire(instanceId);
+            const listing = yield* withInstanceCapacity(
+              instanceId,
+              adapter.listVcsRefs({
+                endpoint: connection.endpoint,
+                credential: connection.credential,
+                cwd: repositoryPath,
               }),
             );
             const observedAt = new Date(yield* Clock.currentTimeMillis).toISOString();
@@ -322,25 +362,7 @@ export class InstanceConnections extends Context.Service<
         ): Stream.Stream<Item, LocalStoreError | T3CodeAdapterError> =>
           Stream.unwrap(
             Effect.gen(function* () {
-              const registration = yield* store.getRegistration(instanceId);
-              if (registration === null) {
-                return yield* Effect.fail(
-                  new LocalStoreError({
-                    kind: "registration_not_found",
-                    message: "The saved registration was not found.",
-                  }),
-                );
-              }
-              if (registration.credential === null) {
-                return yield* Effect.fail(
-                  new T3CodeAdapterError({
-                    kind: "pairing_required",
-                    message: unsupportedMessage,
-                    uncertain: false,
-                    status: null,
-                  }),
-                );
-              }
+              yield* requireReadableRegistration(instanceId, unsupportedMessage);
               const connection = yield* acquire(instanceId);
               const semaphore = capacityFor(instanceId);
               // The non-blocking take and the release finalizer register
@@ -408,26 +430,10 @@ export class InstanceConnections extends Context.Service<
           instanceId: string,
         ): Effect.Effect<ObservedShellSnapshot, LocalStoreError | T3CodeAdapterError> =>
           Effect.gen(function* () {
-            const registration = yield* store.getRegistration(instanceId);
-            if (registration === null) {
-              return yield* Effect.fail(
-                new LocalStoreError({
-                  kind: "registration_not_found",
-                  message: "The saved registration was not found.",
-                }),
-              );
-            }
-            if (registration.credential === null) {
-              return yield* Effect.fail(
-                new T3CodeAdapterError({
-                  kind: "pairing_required",
-                  message:
-                    "The saved registration requires pairing before archived threads can be listed.",
-                  uncertain: false,
-                  status: null,
-                }),
-              );
-            }
+            yield* requireReadableRegistration(
+              instanceId,
+              "The saved registration requires pairing before archived threads can be listed.",
+            );
             const connection = yield* acquire(instanceId);
             const snapshot = yield* withInstanceCapacity(
               instanceId,
@@ -662,6 +668,7 @@ export class InstanceConnections extends Context.Service<
           inspect,
           discoverProjects,
           discoverModels,
+          discoverVcsRefs,
           openShellStream,
           openThreadStream,
           readArchivedShell,

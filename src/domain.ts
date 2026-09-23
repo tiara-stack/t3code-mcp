@@ -1508,6 +1508,121 @@ export const ThreadListToolResultSchema = toolResultFields(ThreadListPageSchema)
 
 export type ThreadListToolResult = typeof ThreadListToolResultSchema.Type;
 
+const worktreeEvidenceKinds = ["thread_association", "vcs_ref", "verified_checkout"] as const;
+
+/**
+ * One discovered worktree carries the published instance-qualified reference,
+ * the nullable branch known for its checkout, and the evidence categories that
+ * established it. The pinned baseline listing never emits verified_checkout;
+ * that category stays representable for verified per-checkout reads without
+ * letting a passive listing claim one.
+ */
+export const WorktreeSummarySchema = Schema.Struct({
+  worktree: worktreeReferenceSchema,
+  branch: Schema.NullOr(nonEmptyString),
+  evidence: Schema.Array(Schema.Literals(worktreeEvidenceKinds)),
+});
+
+export type WorktreeSummary = typeof WorktreeSummarySchema.Type;
+
+// fallow-ignore-next-line unused-export
+export const WorktreeListPageSchema = Schema.Struct({
+  items: Schema.Array(WorktreeSummarySchema),
+  nextCursor: Schema.NullOr(nonEmptyString),
+  coverage: Schema.Literals(coverageStates),
+  limitations: Schema.Array(Schema.String),
+  failures: projectPageFailuresSchema,
+});
+
+export type WorktreeListPage = typeof WorktreeListPageSchema.Type;
+
+export const WorktreeListToolResultSchema = toolResultFields(WorktreeListPageSchema);
+
+export type WorktreeListToolResult = typeof WorktreeListToolResultSchema.Type;
+
+/**
+ * A worktree list binds one saved instance registration and one repository
+ * path on the target instance. Path identity is preserved as reported by the
+ * instance; the listing never resolves paths through the MCP host.
+ */
+export type WorktreeListQuery = {
+  readonly instanceId: string;
+  readonly repositoryPath: string;
+};
+
+/**
+ * Repository and worktree paths belong to the target instance. Tool inputs
+ * accept exactly one trimmed, non-empty path; whitespace-padded values are
+ * rejected as invalid arguments instead of reaching the instance.
+ */
+const instancePath = nonEmptyString.check(
+  Schema.makeFilter((value) => value.trim() === value, {
+    message: "expected a trimmed non-empty path",
+  }),
+);
+
+const worktreeListFields = Schema.Struct({
+  instanceId: nonEmptyString,
+  repositoryPath: instancePath,
+  cursor: Schema.optionalKey(nonEmptyString),
+  limit: Schema.optionalKey(pageLimit),
+  allowStale: Schema.optionalKey(Schema.Boolean),
+});
+
+const unknownWorktreeListField = Schema.String.check(
+  Schema.makeFilter(
+    (key) =>
+      key !== "instanceId" &&
+      key !== "repositoryPath" &&
+      key !== "cursor" &&
+      key !== "limit" &&
+      key !== "allowStale",
+    {
+      message: "unknown worktree_list argument",
+    },
+  ),
+);
+
+const worktreeListRuntimeShape = Schema.StructWithRest(worktreeListFields, [
+  Schema.Record(unknownWorktreeListField, Schema.Never),
+]);
+
+const worktreeListJsonShape = Schema.StructWithRest(worktreeListFields, [
+  Schema.Record(Schema.String, Schema.Never),
+]);
+
+/**
+ * The worktree list accepts one saved instance registration and one repository
+ * path, with the shared page inputs and stale-read policy. It rejects unknown
+ * arguments like every other tool input.
+ */
+export const WorktreeListInputSchema = Schema.declare<{
+  readonly instanceId: string;
+  readonly repositoryPath: string;
+  readonly cursor?: string;
+  readonly limit?: number;
+  readonly allowStale?: boolean;
+}>(
+  (
+    input,
+  ): input is {
+    readonly instanceId: string;
+    readonly repositoryPath: string;
+    readonly cursor?: string;
+    readonly limit?: number;
+    readonly allowStale?: boolean;
+  } => Schema.is(worktreeListRuntimeShape)(input),
+  {
+    toCodecJson: () =>
+      Schema.link()(worktreeListJsonShape, {
+        decode: SchemaGetter.passthrough({ strict: false }),
+        encode: SchemaGetter.passthrough({ strict: false }),
+      } as never),
+  },
+);
+
+export type WorktreeListInput = typeof WorktreeListInputSchema.Type;
+
 export const THREAD_SNAPSHOT_TURN_LIMIT = 20;
 export const MAX_ACTIVE_THREAD_SUBSCRIPTIONS_PER_INSTANCE = 32;
 export const MAX_PENDING_REQUEST_QUESTIONS = 32;
@@ -1840,6 +1955,8 @@ export const staleModelReadLimitation = staleProjectReadLimitation;
 
 export const staleThreadReadLimitation = staleProjectReadLimitation;
 
+export const staleWorktreeReadLimitation = staleProjectReadLimitation;
+
 /**
  * The conditional guarantees reported for a provider/model. The pinned
  * T3Code 0.0.38 server configuration does not advertise per-model steering or
@@ -1905,6 +2022,24 @@ export const makeThreadListToolSuccess = (
           {
             code: "fresh_read_failed" as const,
             message: observation.limitations[0] ?? staleThreadReadLimitation,
+          },
+        ]
+      : [],
+  ),
+});
+
+export const makeWorktreeListToolSuccess = (
+  value: WorktreeListPage,
+  observations: ReadonlyArray<Observation>,
+): WorktreeListToolResult => ({
+  result: { kind: "ok" as const, value },
+  observations,
+  warnings: observations.flatMap((observation) =>
+    observation.freshness === "stale"
+      ? [
+          {
+            code: "fresh_read_failed" as const,
+            message: observation.limitations[0] ?? staleWorktreeReadLimitation,
           },
         ]
       : [],

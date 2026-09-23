@@ -271,6 +271,7 @@ const observationsLayer = (
         inspect: () => Effect.die("not used"),
         discoverProjects: () => Effect.die("not used"),
         discoverModels: () => Effect.die("not used"),
+        discoverVcsRefs: () => Effect.die("not used"),
         openShellStream: (instanceId, options) => {
           seenAfterSequences.push(options?.afterSequence);
           return scripts.openShellStream(instanceId, options);
@@ -441,6 +442,7 @@ describe("Observations coalescing", () => {
               inspect: () => Effect.die("not used"),
               discoverProjects: () => Effect.die("not used"),
               discoverModels: () => Effect.die("not used"),
+              discoverVcsRefs: () => Effect.die("not used"),
               openShellStream: (_instanceId, options) => {
                 streamOpens += 1;
                 seenAfterSequences.push(options?.afterSequence);
@@ -924,6 +926,7 @@ const threadObservationsLayer = (
         inspect: () => Effect.die("not used"),
         discoverProjects: () => Effect.die("not used"),
         discoverModels: () => Effect.die("not used"),
+        discoverVcsRefs: () => Effect.die("not used"),
         openShellStream: () => Stream.die("not used"),
         openThreadStream: (instanceId, threadId, options) => {
           seenThreadReads.push({
@@ -1233,6 +1236,7 @@ describe("InstanceConnections observation capacity", () => {
               ),
             subscribeThread: () => Stream.die("not used"),
             getArchivedShellSnapshot: () => Effect.die("not used"),
+            listVcsRefs: () => Effect.die("not used"),
           };
           const layer = InstanceConnections.layerWithAdapter(
             Layer.succeed(T3CodeAdapter, adapter),
@@ -1319,6 +1323,7 @@ describe("InstanceConnections observation capacity", () => {
             Stream.make(snapshotItem(1, [project("project-a")], []), synchronizedItem),
           subscribeThread: () => Stream.die("not used"),
           getArchivedShellSnapshot: () => Effect.die("not used"),
+          listVcsRefs: () => Effect.die("not used"),
         };
         const layer = InstanceConnections.layerWithAdapter(
           Layer.succeed(T3CodeAdapter, adapter),

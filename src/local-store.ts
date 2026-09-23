@@ -34,6 +34,7 @@ import {
   ProjectSummarySchema,
   ThreadOutputCaptureFrameSchema,
   ThreadSummarySchema,
+  WorktreeSummarySchema,
   type CapturedThreadState,
   type Evidence,
   type ModelListPage,
@@ -57,12 +58,16 @@ import {
   type ThreadOutputCaptureQuery,
   type ThreadSummary,
   type TurnReference,
+  type WorktreeListPage,
+  type WorktreeListQuery,
+  type WorktreeSummary,
   makeToolSuccess,
   makeModelListToolSuccess,
   makeProjectListToolSuccess,
   makeThreadGetToolSuccess,
   makeThreadListToolSuccess,
   makeThreadOutputToolSuccess,
+  makeWorktreeListToolSuccess,
   serializedByteLength,
   ToolFailureSchema,
 } from "./domain";
@@ -90,6 +95,8 @@ const MODEL_CAPTURE_SCOPE = "model_list";
 const MODEL_CAPTURE_ORDER = "provider_instance_id_model_asc";
 const THREAD_CAPTURE_SCOPE = "thread_list";
 const THREAD_CAPTURE_ORDER = "instance_id_thread_id_asc";
+const WORKTREE_CAPTURE_SCOPE = "worktree_list";
+const WORKTREE_CAPTURE_ORDER = "repository_path_worktree_path_asc";
 const THREAD_GET_CAPTURE_SCOPE = "thread_get";
 const THREAD_GET_CAPTURE_ORDER = "activity_id_asc";
 const THREAD_OUTPUT_CAPTURE_SCOPE = "thread_output";
@@ -135,6 +142,15 @@ const threadQueriesEqual = (left: ThreadListQuery, right: ThreadListQuery): bool
     : right.scope.kind === "project" &&
       right.scope.project.instanceId === left.scope.project.instanceId &&
       right.scope.project.projectId === left.scope.project.projectId);
+
+// The scope key uses JSON encoding like the model scope key so instance IDs
+// and repository paths containing the separator cannot collide with other
+// scopes.
+const worktreeScopeKeyForQuery = (query: WorktreeListQuery): string =>
+  JSON.stringify([WORKTREE_CAPTURE_SCOPE, query.instanceId, query.repositoryPath]);
+
+const worktreeQueriesEqual = (left: WorktreeListQuery, right: WorktreeListQuery): boolean =>
+  left.instanceId === right.instanceId && left.repositoryPath === right.repositoryPath;
 
 // The scope key uses JSON encoding like the model scope key so instance and
 // thread IDs containing the separator cannot collide with other scopes.
@@ -343,6 +359,29 @@ const ThreadCursorPayloadSchema = Schema.Struct({
   position: Schema.Natural,
 });
 
+type WorktreeCursorPayload = {
+  readonly version: 1;
+  readonly databaseId: string;
+  readonly captureId: string;
+  readonly scope: typeof WORKTREE_CAPTURE_SCOPE;
+  readonly order: typeof WORKTREE_CAPTURE_ORDER;
+  readonly query: WorktreeListQuery;
+  readonly position: number;
+};
+
+const WorktreeCursorPayloadSchema = Schema.Struct({
+  version: Schema.Literal(1),
+  databaseId: Schema.NonEmptyString,
+  captureId: Schema.NonEmptyString,
+  scope: Schema.Literal(WORKTREE_CAPTURE_SCOPE),
+  order: Schema.Literal(WORKTREE_CAPTURE_ORDER),
+  query: Schema.Struct({
+    instanceId: Schema.NonEmptyString,
+    repositoryPath: Schema.NonEmptyString,
+  }),
+  position: Schema.Natural,
+});
+
 type ThreadGetCursorPayload = {
   readonly version: 1;
   readonly databaseId: string;
@@ -453,6 +492,9 @@ export type RetainedModelCapture = RetainedCapture<ModelSummary>;
 export type ThreadCaptureMetadata = ListCaptureMetadata;
 export type ThreadCapturePage = ListCapturePage<ThreadListPage>;
 export type RetainedThreadCapture = RetainedCapture<ThreadSummary>;
+export type WorktreeCaptureMetadata = ListCaptureMetadata;
+export type WorktreeCapturePage = ListCapturePage<WorktreeListPage>;
+export type RetainedWorktreeCapture = RetainedCapture<WorktreeSummary>;
 export type ThreadGetCaptureMetadata = ListCaptureMetadata & {
   readonly state: CapturedThreadState;
 };
@@ -719,6 +761,22 @@ export interface LocalStoreService {
   readonly findRetainedThreadCapture: (
     query: ThreadListQuery,
   ) => Effect.Effect<RetainedThreadCapture | null, LocalStoreError>;
+  readonly captureWorktreePage: (input: {
+    readonly query: WorktreeListQuery;
+    readonly items: ReadonlyArray<WorktreeSummary>;
+    readonly metadata: WorktreeCaptureMetadata;
+    readonly limit?: number;
+    readonly maxBytes?: number;
+  }) => Effect.Effect<WorktreeCapturePage, LocalStoreError>;
+  readonly readWorktreePage: (options: {
+    readonly query: WorktreeListQuery;
+    readonly cursor: string;
+    readonly limit?: number;
+    readonly maxBytes?: number;
+  }) => Effect.Effect<WorktreeCapturePage, LocalStoreError>;
+  readonly findRetainedWorktreeCapture: (
+    query: WorktreeListQuery,
+  ) => Effect.Effect<RetainedWorktreeCapture | null, LocalStoreError>;
   readonly captureThreadStatePage: (input: {
     readonly query: ThreadGetCaptureQuery;
     readonly items: ReadonlyArray<PendingRequest>;
@@ -992,6 +1050,32 @@ export class LocalStore extends Context.Service<LocalStore, LocalStoreService>()
         const findRetainedThreadCapture = (query: ThreadListQuery) =>
           findRetainedThreadCaptureInDatabase(sql, query, verifySchemaForOperation);
 
+        const captureWorktreePage = (input: {
+          readonly query: WorktreeListQuery;
+          readonly items: ReadonlyArray<WorktreeSummary>;
+          readonly metadata: WorktreeCaptureMetadata;
+          readonly limit?: number;
+          readonly maxBytes?: number;
+        }) =>
+          captureWorktreePageInDatabase(
+            sql,
+            crypto,
+            config,
+            databaseId,
+            input,
+            verifySchemaForOperation,
+          );
+
+        const readWorktreePage = (options: {
+          readonly query: WorktreeListQuery;
+          readonly cursor: string;
+          readonly limit?: number;
+          readonly maxBytes?: number;
+        }) => readWorktreePageFromDatabase(sql, databaseId, options, verifySchemaForOperation);
+
+        const findRetainedWorktreeCapture = (query: WorktreeListQuery) =>
+          findRetainedWorktreeCaptureInDatabase(sql, query, verifySchemaForOperation);
+
         const captureThreadStatePage = (input: {
           readonly query: ThreadGetCaptureQuery;
           readonly items: ReadonlyArray<PendingRequest>;
@@ -1143,6 +1227,9 @@ export class LocalStore extends Context.Service<LocalStore, LocalStoreService>()
           captureThreadPage,
           readThreadPage,
           findRetainedThreadCapture,
+          captureWorktreePage,
+          readWorktreePage,
+          findRetainedWorktreeCapture,
           captureThreadStatePage,
           readThreadStatePage,
           findRetainedThreadStateCapture,
@@ -2367,6 +2454,38 @@ const captureThreadPageInDatabase = (
     verify,
   );
 
+const captureWorktreePageInDatabase = (
+  sql: SqlClient.SqlClient,
+  crypto: Crypto.Crypto,
+  config: Required<LocalStoreConfigValue>,
+  databaseId: string,
+  input: {
+    readonly query: WorktreeListQuery;
+    readonly items: ReadonlyArray<WorktreeSummary>;
+    readonly metadata: WorktreeCaptureMetadata;
+    readonly limit?: number;
+    readonly maxBytes?: number;
+  },
+  verify: SchemaVerifier,
+): Effect.Effect<WorktreeCapturePage, LocalStoreError> =>
+  captureListPageInDatabase(
+    sql,
+    crypto,
+    config,
+    databaseId,
+    {
+      scopeKey: worktreeScopeKeyForQuery(input.query),
+      order: WORKTREE_CAPTURE_ORDER,
+      captureKind: "worktree",
+      items: input.items,
+      metadata: input.metadata,
+      ...(input.limit === undefined ? {} : { limit: input.limit }),
+      ...(input.maxBytes === undefined ? {} : { maxBytes: input.maxBytes }),
+    },
+    worktreeCaptureCodec(input.query),
+    verify,
+  );
+
 /**
  * A thread-get capture persists the thread-state frame in the capture's
  * state column so every pending-request page is accompanied by the one
@@ -2582,6 +2701,37 @@ const readThreadPageFromDatabase = (
     verify,
   );
 
+const readWorktreePageFromDatabase = (
+  sql: SqlClient.SqlClient,
+  databaseId: string,
+  options: {
+    readonly query: WorktreeListQuery;
+    readonly cursor: string;
+    readonly limit?: number;
+    readonly maxBytes?: number;
+  },
+  verify: SchemaVerifier,
+): Effect.Effect<WorktreeCapturePage, LocalStoreError> =>
+  readListPageFromDatabase(
+    sql,
+    databaseId,
+    {
+      scopeKey: worktreeScopeKeyForQuery(options.query),
+      cursor: options.cursor,
+      ...(options.limit === undefined ? {} : { limit: options.limit }),
+      ...(options.maxBytes === undefined ? {} : { maxBytes: options.maxBytes }),
+    },
+    decodeWorktreeCursor,
+    (payload) =>
+      payload.databaseId === databaseId &&
+      payload.scope === WORKTREE_CAPTURE_SCOPE &&
+      payload.order === WORKTREE_CAPTURE_ORDER &&
+      worktreeQueriesEqual(payload.query, options.query),
+    "The worktree cursor does not match this list.",
+    worktreeCaptureCodec(options.query),
+    verify,
+  );
+
 /**
  * Read one pending-request page from a retained thread-state capture. The
  * captured thread-state frame accompanies the page so a cursor continuation
@@ -2705,6 +2855,19 @@ const findRetainedThreadCaptureInDatabase = (
     threadScopeKeyForQuery(query),
     THREAD_CAPTURE_ORDER,
     decodeThreadCaptureItem,
+    verify,
+  );
+
+const findRetainedWorktreeCaptureInDatabase = (
+  sql: SqlClient.SqlClient,
+  query: WorktreeListQuery,
+  verify: SchemaVerifier,
+): Effect.Effect<RetainedWorktreeCapture | null, LocalStoreError> =>
+  findRetainedCaptureInDatabase(
+    sql,
+    worktreeScopeKeyForQuery(query),
+    WORKTREE_CAPTURE_ORDER,
+    decodeWorktreeCaptureItem,
     verify,
   );
 
@@ -3289,6 +3452,20 @@ const threadCaptureCodec = (
     makeThreadCaptureCursor(databaseId, captureId, query, position),
 });
 
+const worktreeCaptureCodec = (
+  query: WorktreeListQuery,
+): CapturePageCodec<WorktreeSummary, ListCaptureMetadata, WorktreeListPage> => ({
+  order: WORKTREE_CAPTURE_ORDER,
+  cursorKind: "worktree",
+  decodeMetadata: decodeListCaptureMetadata,
+  decodeItem: decodeWorktreeCaptureItem,
+  buildPage: (items, nextCursor, metadata) => makeListPage(items, nextCursor, metadata),
+  measureResult: (page, metadata) =>
+    serializedByteLength(makeWorktreeListToolSuccess(page, metadata.observations)),
+  makeNextCursor: (databaseId, captureId, position) =>
+    makeWorktreeCaptureCursor(databaseId, captureId, query, position),
+});
+
 const threadStateCaptureCodec = (
   query: ThreadGetCaptureQuery,
 ): CapturePageCodec<PendingRequest, ThreadGetCaptureMetadata, PendingRequestPage> => ({
@@ -3581,6 +3758,11 @@ const decodeModelCaptureItem = (payload: unknown): Effect.Effect<ModelSummary, L
 
 const decodeThreadCaptureItem = (payload: unknown): Effect.Effect<ThreadSummary, LocalStoreError> =>
   decodeListCaptureItem(payload, ThreadSummarySchema);
+
+const decodeWorktreeCaptureItem = (
+  payload: unknown,
+): Effect.Effect<WorktreeSummary, LocalStoreError> =>
+  decodeListCaptureItem(payload, WorktreeSummarySchema);
 
 const decodeThreadGetCaptureMetadata = (
   capture: CaptureRow,
@@ -4974,6 +5156,22 @@ const makeThreadCaptureCursor = (
     position,
   } satisfies ThreadCursorPayload);
 
+const makeWorktreeCaptureCursor = (
+  databaseId: string,
+  captureId: string,
+  query: WorktreeListQuery,
+  position: number,
+): string =>
+  encodeCursor({
+    version: 1,
+    databaseId,
+    captureId,
+    scope: WORKTREE_CAPTURE_SCOPE,
+    order: WORKTREE_CAPTURE_ORDER,
+    query,
+    position,
+  } satisfies WorktreeCursorPayload);
+
 const makeThreadGetCaptureCursor = (
   databaseId: string,
   captureId: string,
@@ -5028,6 +5226,7 @@ const encodeCursor = (
     | ProjectCursorPayload
     | ModelCursorPayload
     | ThreadCursorPayload
+    | WorktreeCursorPayload
     | ThreadGetCursorPayload
     | ThreadOutputCursorPayload,
 ): string => Encoding.encodeBase64Url(JSON.stringify(payload));
@@ -5035,7 +5234,14 @@ const encodeCursor = (
 const decodeCursorPayload = <Payload>(
   value: string,
   schema: Schema.ConstraintDecoder<Payload>,
-  kind: "registration" | "project" | "model" | "thread" | "thread state" | "thread output",
+  kind:
+    | "registration"
+    | "project"
+    | "model"
+    | "thread"
+    | "worktree"
+    | "thread state"
+    | "thread output",
 ): Effect.Effect<Payload, LocalStoreError> => {
   const malformed = new LocalStoreError({
     kind: "cursor_mismatch",
@@ -5063,6 +5269,11 @@ const decodeModelCursor = (value: string): Effect.Effect<ModelCursorPayload, Loc
 
 const decodeThreadCursor = (value: string): Effect.Effect<ThreadCursorPayload, LocalStoreError> =>
   decodeCursorPayload(value, ThreadCursorPayloadSchema, "thread");
+
+const decodeWorktreeCursor = (
+  value: string,
+): Effect.Effect<WorktreeCursorPayload, LocalStoreError> =>
+  decodeCursorPayload(value, WorktreeCursorPayloadSchema, "worktree");
 
 const decodeThreadGetCursor = (
   value: string,
