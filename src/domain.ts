@@ -16,6 +16,12 @@ export const MAX_OPERATION_WAIT_MILLIS = 30_000;
 export const DEFAULT_THREAD_WAIT_MILLIS = 10_000;
 // fallow-ignore-next-line unused-export
 export const MAX_THREAD_WAIT_MILLIS = 30_000;
+/**
+ * Retained compact turn evidence expires thirty days after it was observed,
+ * within its own budget, separate from the shared capture budgets.
+ */
+export const TURN_EVIDENCE_RETENTION_MILLIS = 30 * 24 * 60 * 60 * 1000;
+export const TURN_EVIDENCE_BUDGET_BYTES = 64 * 1024 * 1024;
 export const MAX_OPERATION_CAPACITY = 128;
 export const MAX_INSTANCE_RPC_CAPACITY = 8;
 export const MAX_TOTAL_RPC_CAPACITY = 32;
@@ -932,6 +938,79 @@ export const ThreadWaitInputSchema = Schema.declare<{
 
 export type ThreadWaitInput = typeof ThreadWaitInputSchema.Type;
 
+const turnWaitTurnReferenceRuntimeShape = Schema.StructWithRest(
+  Schema.Struct({
+    instanceId: nonEmptyString,
+    threadId: nonEmptyString,
+    turnId: nonEmptyString,
+  }),
+  [
+    Schema.Record(
+      Schema.String.check(
+        Schema.makeFilter((key) => key !== "instanceId" && key !== "threadId" && key !== "turnId", {
+          message: "unknown turn_wait turn argument",
+        }),
+      ),
+      Schema.Never,
+    ),
+  ],
+);
+
+const turnWaitTurnReferenceJsonShape = Schema.StructWithRest(
+  Schema.Struct({
+    instanceId: nonEmptyString,
+    threadId: nonEmptyString,
+    turnId: nonEmptyString,
+  }),
+  [Schema.Record(Schema.String, Schema.Never)],
+);
+
+const turnWaitFields = Schema.Struct({
+  turn: turnWaitTurnReferenceRuntimeShape,
+  waitMs: Schema.optionalKey(threadWaitWaitMs),
+});
+
+const turnWaitJsonFields = Schema.Struct({
+  turn: turnWaitTurnReferenceJsonShape,
+  waitMs: Schema.optionalKey(threadWaitWaitMs),
+});
+
+const unknownTurnWaitField = Schema.String.check(
+  Schema.makeFilter((key) => key !== "turn" && key !== "waitMs", {
+    message: "unknown turn_wait argument",
+  }),
+);
+
+const turnWaitRuntimeShape = Schema.StructWithRest(turnWaitFields, [
+  Schema.Record(unknownTurnWaitField, Schema.Never),
+]);
+
+const turnWaitJsonShape = Schema.StructWithRest(turnWaitJsonFields, [
+  Schema.Record(Schema.String, Schema.Never),
+]);
+
+/**
+ * The exact-turn wait accepts one direct instance-qualified native turn
+ * reference and a wait budget of zero (check now) to thirty seconds,
+ * defaulting to ten seconds like every dedicated wait.
+ */
+export const TurnWaitInputSchema = Schema.declare<{
+  readonly turn: TurnReference;
+  readonly waitMs?: number;
+}>(
+  (input): input is { readonly turn: TurnReference; readonly waitMs?: number } =>
+    Schema.is(turnWaitRuntimeShape)(input),
+  {
+    toCodecJson: () =>
+      Schema.link()(turnWaitJsonShape, {
+        decode: SchemaGetter.passthrough({ strict: false }),
+        encode: SchemaGetter.passthrough({ strict: false }),
+      } as never),
+  },
+);
+
+export type TurnWaitInput = typeof TurnWaitInputSchema.Type;
+
 /**
  * A thread-output capture binds one direct thread reference; its cursor pages
  * one immutable latest-first view of retained conversation and activity
@@ -1609,6 +1688,40 @@ export type ThreadState = typeof ThreadStateSchema.Type;
 export const ThreadGetToolResultSchema = toolResultFields(ThreadStateSchema);
 
 export type ThreadGetToolResult = typeof ThreadGetToolResultSchema.Type;
+
+const turnWaitExecutionStates = [
+  "running",
+  "completed",
+  "interrupted",
+  "failed",
+  "awaiting_approval",
+  "awaiting_input",
+  "outcome_unknown",
+] as const;
+
+export type TurnWaitExecution = (typeof turnWaitExecutionStates)[number];
+
+/**
+ * An exact-turn wait reports its observation separately from the turn's
+ * execution: timeout, unavailable observation, and history gaps never imply
+ * anything about the outcome, and only supported evidence establishes
+ * completion, interruption, or failure. The target turn is echoed so a newer
+ * turn can never be mistaken for the requested one.
+ */
+// fallow-ignore-next-line unused-export
+export const TurnWaitResultSchema = Schema.Struct({
+  target: turnReferenceSchema,
+  observation: Schema.Literals(["condition_met", "timed_out", "unavailable", "history_gap"]),
+  execution: Schema.Literals(turnWaitExecutionStates),
+  evidence: Schema.Array(EvidenceSchema),
+  pendingRequests: Schema.Array(PendingRequestSchema),
+});
+
+export type TurnWaitResult = typeof TurnWaitResultSchema.Type;
+
+export const TurnWaitToolResultSchema = toolResultFields(TurnWaitResultSchema);
+
+export type TurnWaitToolResult = typeof TurnWaitToolResultSchema.Type;
 
 /**
  * A thread wait reports its observation separately from the thread state:

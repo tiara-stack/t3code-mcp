@@ -116,6 +116,7 @@ describe("stdio transport", () => {
               "thread_get",
               "thread_output",
               "thread_wait",
+              "turn_wait",
               "operation_get",
             ]);
             for (const tool of toolsMessage.result?.tools ?? []) {
@@ -176,6 +177,25 @@ describe("stdio transport", () => {
             let failedLookup = await nextMessage();
             while (failedLookup.id !== 6) failedLookup = await nextMessage();
             expect(failedLookup.result?.isError).toBe(false);
+
+            send(child, {
+              jsonrpc: "2.0",
+              id: 7,
+              method: "tools/call",
+              params: {
+                name: "turn_wait",
+                arguments: {
+                  turn: { instanceId: "missing-instance", threadId: "thread-a", turnId: "turn-1" },
+                  waitMs: 0,
+                },
+              },
+            });
+            let missingTurnWait = await nextMessage();
+            while (missingTurnWait.id !== 7) missingTurnWait = await nextMessage();
+            expect(missingTurnWait.result?.isError).toBe(true);
+            expect(missingTurnWait.result?.structuredContent).toMatchObject({
+              result: { kind: "error", error: { code: "registration_not_found" } },
+            });
           }),
         ({ directory, child }) =>
           Effect.promise(async () => {

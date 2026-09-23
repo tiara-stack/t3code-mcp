@@ -17,7 +17,7 @@ import {
   THREAD_SNAPSHOT_TURN_LIMIT,
   serializedByteLength,
 } from "./domain";
-import { LocalStore, LocalStoreError } from "./local-store";
+import { LocalStore, LocalStoreError, type LocalStoreService } from "./local-store";
 import { InstanceConnections } from "./instance-connections";
 import {
   T3CodeAdapterError,
@@ -409,6 +409,71 @@ const staleGenerationError = new ObservationError({
   message: "A newer observation generation superseded this synchronization.",
 });
 
+/**
+ * The compact signature of the turn evidence one detail carries. Comparing
+ * signatures lets repeated observations of an unchanged projection skip the
+ * retention write entirely, keeping them free of durability cost.
+ */
+interface RecordedTurnEvidence {
+  readonly projectedTurnState: boolean;
+  readonly latestTurnId: string | null;
+  readonly latestTurnState: string | null;
+}
+
+const recordedTurnEvidenceSignature = (detail: SynchronizedThreadDetail): RecordedTurnEvidence => ({
+  projectedTurnState: detail.projectedTurnState,
+  latestTurnId: detail.thread.latestTurn?.turnId ?? null,
+  latestTurnState: detail.thread.latestTurn?.state ?? null,
+});
+
+/**
+ * Whether one published detail carries the same turn evidence that was
+ * already recorded successfully: same projection marker and same latest-turn
+ * identity and state. A watermark advance alone does not change what the
+ * evidence knows about the turn.
+ */
+const turnEvidenceUnchanged = (
+  recorded: RecordedTurnEvidence | undefined,
+  detail: SynchronizedThreadDetail,
+): boolean => {
+  if (recorded === undefined) return false;
+  const signature = recordedTurnEvidenceSignature(detail);
+  return (
+    recorded.projectedTurnState === signature.projectedTurnState &&
+    recorded.latestTurnId === signature.latestTurnId &&
+    recorded.latestTurnState === signature.latestTurnState
+  );
+};
+
+/**
+ * Retain compact evidence of the turn one published projection observed, so
+ * a later exact-turn wait can answer for a turn that has since been
+ * superseded. Projected states are recorded as projections; they can never
+ * establish completion later. A restatement of the already-recorded detail
+ * skips the write entirely.
+ */
+const recordPublishedTurnEvidence = (options: {
+  readonly store: LocalStoreService;
+  readonly instanceId: string;
+  readonly threadId: string;
+  readonly recorded: RecordedTurnEvidence | undefined;
+  readonly detail: SynchronizedThreadDetail;
+}): Effect.Effect<void, LocalStoreError> => {
+  const { store, instanceId, threadId, recorded, detail } = options;
+  const latestTurn = detail.thread.latestTurn;
+  if (latestTurn === null || turnEvidenceUnchanged(recorded, detail)) return Effect.void;
+  return store.recordTurnEvidence({
+    turn: { instanceId, threadId, turnId: latestTurn.turnId },
+    state: latestTurn.state,
+    projected: detail.projectedTurnState,
+    sourceSequence: detail.snapshotSequence,
+    observedAt: detail.observedAt,
+    detail: detail.projectedTurnState
+      ? `The latest turn state ${latestTurn.state} was projected from a session transition racing the snapshot, not observed as authoritative turn evidence.`
+      : `The thread detail snapshot published the latest turn as ${latestTurn.state}.`,
+  });
+};
+
 const boundaryMissingError = new ObservationError({
   kind: "boundary_missing",
   message: "The observation stream ended before its synchronized boundary.",
@@ -722,6 +787,12 @@ export class Observations extends Context.Service<Observations, ObservationsServ
       }
       const inflight = new Map<string, InflightSync<SynchronizedShell, ObservationServiceError>>();
       const threadGenerations = new Map<string, number>();
+      /**
+       * The turn evidence signature last written successfully per thread, so
+       * unchanged projections skip the write and a failed write retries on
+       * the next observation instead of being skipped forever.
+       */
+      const recordedTurnEvidence = new Map<string, RecordedTurnEvidence>();
       const threadInflight = new Map<
         string,
         InflightSync<SynchronizedThreadDetail, ObservationServiceError>
@@ -974,6 +1045,31 @@ export class Observations extends Context.Service<Observations, ObservationsServ
               publishedAtMillis,
             );
             if (budgetError !== null) return yield* Effect.fail(budgetError);
+            // Retaining turn evidence is auxiliary to the read itself: a
+            // failed retention write never aborts an already-published fresh
+            // observation, and the resulting coverage loss is reported
+            // honestly by later exact-turn waits.
+            const retentionKey = threadRetentionKey(instanceId, threadId);
+            yield* recordPublishedTurnEvidence({
+              store,
+              instanceId,
+              threadId,
+              recorded: recordedTurnEvidence.get(retentionKey),
+              detail,
+            }).pipe(
+              // Advance the recorded signature only after the write succeeds
+              // so a failed retention is retried by the next observation.
+              Effect.tap(() =>
+                Effect.sync(() => {
+                  recordedTurnEvidence.set(retentionKey, recordedTurnEvidenceSignature(detail));
+                }),
+              ),
+              Effect.catch((error: LocalStoreError) =>
+                Effect.logWarning(
+                  `Retained turn evidence could not be recorded (${error.kind}): ${error.message}`,
+                ),
+              ),
+            );
             return detail;
           }),
         );

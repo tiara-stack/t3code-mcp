@@ -1,5 +1,6 @@
 import { NodeStdio } from "@effect/platform-node";
 import * as Layer from "effect/Layer";
+import { LogToStderr } from "effect/Logger";
 import { McpProtocol, McpServer } from "effect/unstable/ai";
 import { LocalStore } from "./local-store";
 import { InstanceConnections } from "./instance-connections";
@@ -19,6 +20,9 @@ const mcpLayer = McpServer.layerStdio({
 
 export const serverLayer = mcpServerToolkitLayer.pipe(
   Layer.provideMerge(mcpLayer),
+  // stdout carries the MCP protocol: every Effect log, including retention
+  // warnings, must go to stderr.
+  Layer.provideMerge(Layer.succeed(LogToStderr, true)),
   Layer.provide(serverToolkitLayer),
   Layer.provide(InstanceConnections.layer),
   Layer.provide(LocalStore.layerFromEnvironment),

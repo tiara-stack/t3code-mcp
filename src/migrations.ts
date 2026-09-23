@@ -3,13 +3,14 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { cachedConnectionLimitation } from "./domain";
 
 export const MIGRATION_TABLE = "effect_sql_migrations";
-export const SUPPORTED_SCHEMA_VERSION = 6;
+export const SUPPORTED_SCHEMA_VERSION = 7;
 export const MIGRATION_NAME = "create_local_registration_store";
 export const CAPTURE_MIGRATION_NAME = "add_capture_metadata";
 export const LATEST_MIGRATION_NAME = "add_mutation_receipts";
 export const PAIRING_MIGRATION_NAME = "add_pairing_recovery";
 export const OBSERVATION_MIGRATION_NAME = "add_capture_observations";
 export const THREAD_STATE_MIGRATION_NAME = "add_thread_state_captures";
+export const TURN_EVIDENCE_MIGRATION_NAME = "add_retained_turn_evidence";
 
 export const migrations = {
   [`0001_${MIGRATION_NAME}`]: Effect.gen(function* () {
@@ -240,5 +241,35 @@ export const migrations = {
     yield* sql`ALTER TABLE captures ADD COLUMN state_json TEXT`;
     yield* sql`UPDATE local_store_meta SET value = '6' WHERE key = 'schema_version'`;
     yield* sql.unsafe("PRAGMA user_version = 6");
+  }),
+  [`0007_${TURN_EVIDENCE_MIGRATION_NAME}`]: Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+
+    // Retained compact turn evidence backs exact-turn waits: one row per
+    // observed turn keeps the latest observed state, whether it is supported
+    // snapshot evidence or a session-transition projection that can never
+    // establish completion by itself. Age and budget eviction remove oldest
+    // rows first, never rows pinned by unresolved operations.
+    yield* sql`
+      CREATE TABLE turn_evidence (
+        instance_id TEXT NOT NULL,
+        thread_id TEXT NOT NULL,
+        turn_id TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('running', 'interrupted', 'completed', 'error')),
+        projected INTEGER NOT NULL CHECK (projected IN (0, 1)),
+        source_sequence INTEGER NOT NULL CHECK (source_sequence >= 0),
+        observed_at TEXT NOT NULL,
+        detail TEXT NOT NULL,
+        evidence_bytes INTEGER NOT NULL CHECK (evidence_bytes >= 0),
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (instance_id, thread_id, turn_id)
+      )
+    `;
+    yield* sql`
+      CREATE INDEX turn_evidence_observed_idx
+      ON turn_evidence (observed_at, source_sequence, instance_id, thread_id, turn_id)
+    `;
+    yield* sql`UPDATE local_store_meta SET value = '7' WHERE key = 'schema_version'`;
+    yield* sql.unsafe("PRAGMA user_version = 7");
   }),
 } as const;

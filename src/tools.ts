@@ -75,6 +75,11 @@ import {
   ThreadWaitInputSchema,
   ThreadWaitToolResultSchema,
   type ThreadWaitToolResult,
+  TurnWaitInputSchema,
+  TurnWaitToolResultSchema,
+  type TurnWaitResult,
+  type TurnWaitToolResult,
+  type TurnReference,
   ToolResultSchema,
   type ModelListPage,
   type ModelListQuery,
@@ -99,6 +104,7 @@ import {
   type ThreadCaptureMetadata,
   type ThreadGetCaptureMetadata,
   type ThreadOutputCaptureMetadata,
+  type TurnEvidenceRecord,
 } from "./local-store";
 import { OperationServiceError, Operations } from "./operations";
 import {
@@ -229,6 +235,20 @@ export const ThreadWaitTool = Tool.make("thread_wait", {
   .annotate(Tool.Idempotent, true)
   .annotate(Tool.OpenWorld, true);
 
+// fallow-ignore-next-line unused-export
+export const TurnWaitTool = Tool.make("turn_wait", {
+  description:
+    "Wait for one exact observed turn's outcome (completed, interrupted, failed, awaiting approval/input, running, or outcome unknown) with supported evidence, retaining the requested target even after a newer turn starts; reports timeout, unavailable observation, and history gaps separately from execution.",
+  parameters: TurnWaitInputSchema,
+  success: TurnWaitToolResultSchema,
+})
+  .addDependency(LocalStore)
+  .addDependency(Observations)
+  .annotate(Tool.Readonly, true)
+  .annotate(Tool.Destructive, false)
+  .annotate(Tool.Idempotent, true)
+  .annotate(Tool.OpenWorld, true);
+
 /**
  * The registration mutations share one admission/supervision dependency set
  * and differ only in their destructive and open-world hints.
@@ -322,6 +342,7 @@ export const ServerToolkit = Toolkit.make(
   ThreadGetTool,
   ThreadOutputTool,
   ThreadWaitTool,
+  TurnWaitTool,
   OperationGetTool,
 );
 
@@ -2327,6 +2348,57 @@ const retriableWaitObservationError = (
   return false;
 };
 
+type WaitObservationFailure =
+  | { readonly kind: "propagate" }
+  | { readonly kind: "unavailable" }
+  | { readonly kind: "retry"; readonly pollInterval: number };
+
+/**
+ * Classify one failed observation attempt inside a bounded wait: the first
+ * failure propagates as the typed error, transient failures sleep within the
+ * remaining budget and retry, and anything else ends the wait so the caller
+ * can report an unavailable observation.
+ */
+const classifyWaitObservationFailure = (options: {
+  readonly failure: LocalStoreError | T3CodeAdapterError | ObservationError;
+  readonly firstEvaluation: boolean;
+  readonly deadline: number;
+  readonly pollInterval: number;
+}): Effect.Effect<WaitObservationFailure, never> =>
+  Effect.gen(function* () {
+    const { failure, firstEvaluation, deadline, pollInterval } = options;
+    if (firstEvaluation) return { kind: "propagate" } as const;
+    const failedAt = yield* Clock.currentTimeMillis;
+    if (!retriableWaitObservationError(failure) || failedAt >= deadline) {
+      return { kind: "unavailable" } as const;
+    }
+    yield* Effect.sleep(Duration.millis(Math.min(pollInterval, Math.max(0, deadline - failedAt))));
+    return {
+      kind: "retry" as const,
+      pollInterval: Math.min(THREAD_WAIT_MAX_POLL_INTERVAL_MILLIS, pollInterval * 2),
+    };
+  });
+
+/**
+ * Sleep until the next wait poll, reporting whether the deadline already
+ * passed so the caller can return its timed-out result instead of polling
+ * again.
+ */
+const sleepBeforeNextWaitPoll = (options: {
+  readonly deadline: number;
+  readonly pollInterval: number;
+}): Effect.Effect<{ readonly elapsed: boolean }, never> =>
+  Effect.gen(function* () {
+    const now = yield* Clock.currentTimeMillis;
+    const remaining = options.deadline - now;
+    if (remaining <= 0) return { elapsed: true };
+    yield* Effect.sleep(Duration.millis(Math.min(options.pollInterval, remaining)));
+    return { elapsed: false };
+  });
+
+const nextWaitPollInterval = (pollInterval: number): number =>
+  Math.min(THREAD_WAIT_MAX_POLL_INTERVAL_MILLIS, pollInterval * 2);
+
 /**
  * Observe one thread until its condition is met, the deadline passes, the
  * observation becomes unavailable, or a cursor gap demands resynchronization.
@@ -2376,9 +2448,14 @@ const runThreadWait = (
         // A wait that never observed its target fails with the typed error;
         // losing the observation later ends the wait as unavailable instead
         // of implying the work ended.
-        if (firstEvaluation) return yield* Effect.fail(detailResult.failure);
-        const failedAt = yield* Clock.currentTimeMillis;
-        if (!retriableWaitObservationError(detailResult.failure) || failedAt >= deadline) {
+        const failure = yield* classifyWaitObservationFailure({
+          failure: detailResult.failure,
+          firstEvaluation,
+          deadline,
+          pollInterval,
+        });
+        if (failure.kind === "propagate") return yield* Effect.fail(detailResult.failure);
+        if (failure.kind === "unavailable") {
           return threadWaitObservationResult({
             condition,
             observation: "unavailable",
@@ -2387,8 +2464,7 @@ const runThreadWait = (
             warnings: [{ code: "observation_unavailable", message: detailResult.failure.message }],
           });
         }
-        yield* Effect.sleep(Duration.millis(Math.min(pollInterval, deadline - failedAt)));
-        pollInterval = Math.min(THREAD_WAIT_MAX_POLL_INTERVAL_MILLIS, pollInterval * 2);
+        pollInterval = failure.pollInterval;
         continue;
       }
       firstEvaluation = false;
@@ -2401,8 +2477,8 @@ const runThreadWait = (
         detail: detailResult.success,
       });
       if (poll.terminal !== null) return poll.terminal;
-      const now = yield* Clock.currentTimeMillis;
-      if (now >= deadline) {
+      const next = yield* sleepBeforeNextWaitPoll({ deadline, pollInterval });
+      if (next.elapsed) {
         return threadWaitObservationResult({
           condition,
           observation: "timed_out",
@@ -2411,8 +2487,351 @@ const runThreadWait = (
           warnings: [],
         });
       }
-      yield* Effect.sleep(Duration.millis(Math.min(pollInterval, deadline - now)));
-      pollInterval = Math.min(THREAD_WAIT_MAX_POLL_INTERVAL_MILLIS, pollInterval * 2);
+      pollInterval = nextWaitPollInterval(pollInterval);
+    }
+  });
+
+const TURN_HISTORY_GAP_LIMITATION =
+  "The target turn is not covered by the current observation and no retained evidence establishes its outcome; a newer turn may have superseded it, and a fresh thread_get may not recover the target. Resynchronize before deciding on a new explicit request.";
+
+const TURN_RETAINED_EVIDENCE_LIMITATION =
+  "The target turn is no longer covered by the current observation; the outcome was established from retained turn evidence rather than a live projection.";
+
+interface TurnWaitEvaluation {
+  readonly execution: TurnWaitResult["execution"];
+  readonly satisfied: boolean;
+  readonly evidence: ReadonlyArray<Evidence>;
+}
+
+const terminalExecutionFromState = (
+  state: "interrupted" | "completed" | "error",
+): TurnWaitResult["execution"] =>
+  state === "completed" ? "completed" : state === "interrupted" ? "interrupted" : "failed";
+
+const retainedTurnEvidence = (record: TurnEvidenceRecord): Evidence => ({
+  kind: "snapshot",
+  observedAt: record.observedAt,
+  sourceSequence: record.sourceSequence,
+  nativeEventId: null,
+  detail: record.detail,
+});
+
+const requestKindOf = (request: PendingRequest): "approval" | "input" | null => {
+  if (request.form.kind === "approval") return "approval";
+  if (request.form.kind === "input") return "input";
+  return request.form.requestKind === "approval"
+    ? "approval"
+    : request.form.requestKind === "input"
+      ? "input"
+      : null;
+};
+
+const awaitingRequestEvidence = (options: {
+  readonly detail: SynchronizedThreadDetail;
+  readonly request: PendingRequest;
+  readonly kind: "approval" | "input";
+}): Evidence => ({
+  kind: "snapshot",
+  observedAt: options.detail.observedAt,
+  sourceSequence: options.detail.snapshotSequence,
+  nativeEventId: options.request.activityId,
+  detail: `The retained activity ${options.request.activityId} published an unresolved ${options.kind} request correlated to the turn.`,
+});
+
+/**
+ * The awaiting outcome established by one correlated still-pending approval
+ * or input request, or null when no correlated pending request exists. A
+ * request whose lifecycle is unknown was never established as pending, so it
+ * can never manufacture an awaiting outcome; it stays visible in the result's
+ * pending requests instead.
+ */
+const awaitingTurnOutcome = (options: {
+  readonly detail: SynchronizedThreadDetail;
+  readonly pending: ReadonlyArray<PendingRequest>;
+}): TurnWaitEvaluation | null => {
+  const { detail, pending } = options;
+  const approval = pending.find((request) => requestKindOf(request) === "approval");
+  if (approval !== undefined) {
+    return {
+      execution: "awaiting_approval",
+      satisfied: true,
+      evidence: [awaitingRequestEvidence({ detail, request: approval, kind: "approval" })],
+    };
+  }
+  const input = pending.find((request) => requestKindOf(request) === "input");
+  if (input !== undefined) {
+    return {
+      execution: "awaiting_input",
+      satisfied: true,
+      evidence: [awaitingRequestEvidence({ detail, request: input, kind: "input" })],
+    };
+  }
+  return null;
+};
+
+/**
+ * Classify one exact-turn outcome from one published thread detail and the
+ * retained evidence row. Pure: no I/O. Only supported, non-projected
+ * evidence establishes completion, interruption, or failure; projected
+ * states, supersession, settlement, session readiness, and catch-up never
+ * do. Only correlated requests observed pending establish awaiting outcomes,
+ * and only while the target is the latest observed turn.
+ */
+// fallow-ignore-next-line complexity
+const evaluateTurnOutcome = (options: {
+  readonly turn: TurnReference;
+  readonly detail: SynchronizedThreadDetail;
+  readonly evidence: TurnEvidenceRecord | null;
+  readonly pendingRequests: ReadonlyArray<PendingRequest>;
+}): TurnWaitEvaluation => {
+  const { turn, detail, evidence, pendingRequests } = options;
+  const latest = detail.thread.latestTurn;
+  if (latest !== null && latest.turnId === turn.turnId) {
+    if (!detail.projectedTurnState && latest.state !== "running") {
+      return {
+        execution: terminalExecutionFromState(latest.state),
+        satisfied: true,
+        evidence: threadSnapshotEvidence(
+          detail,
+          `The thread detail snapshot published the latest turn as ${latest.state}.`,
+        ),
+      };
+    }
+    const awaiting = awaitingTurnOutcome({
+      detail,
+      pending: pendingRequests.filter((request) => request.state === "pending"),
+    });
+    if (awaiting !== null) return awaiting;
+    if (latest.state === "running") {
+      return {
+        execution: "running",
+        satisfied: false,
+        evidence: threadSnapshotEvidence(
+          detail,
+          "The thread detail snapshot published the latest turn as running.",
+        ),
+      };
+    }
+    // A projected terminal state — session readiness or an interruption
+    // racing the snapshot — can never establish completion by itself.
+    return {
+      execution: "outcome_unknown",
+      satisfied: false,
+      evidence: threadSnapshotEvidence(
+        detail,
+        `The latest turn state ${latest.state} was projected from a session transition racing the snapshot, not observed as authoritative turn evidence.`,
+      ),
+    };
+  }
+  // The target is not the latest observed turn: a newer turn never replaces
+  // the target. Only retained non-projected terminal evidence answers here;
+  // anything else is an honest unknown with lost coverage.
+  if (evidence !== null && !evidence.projected && evidence.state !== "running") {
+    return {
+      execution: terminalExecutionFromState(evidence.state),
+      satisfied: true,
+      evidence: [retainedTurnEvidence(evidence)],
+    };
+  }
+  return {
+    execution: "outcome_unknown",
+    satisfied: false,
+    evidence: evidence === null ? [] : [retainedTurnEvidence(evidence)],
+  };
+};
+
+const turnWaitResult = (options: {
+  readonly turn: TurnReference;
+  readonly observation: TurnWaitResult["observation"];
+  readonly evaluation: TurnWaitEvaluation;
+  readonly pendingRequests: ReadonlyArray<PendingRequest>;
+  readonly observations: ReadonlyArray<Observation>;
+  readonly warnings: ReadonlyArray<{ readonly code: string; readonly message: string }>;
+}): TurnWaitToolResult => ({
+  result: {
+    kind: "ok" as const,
+    value: {
+      target: options.turn,
+      observation: options.observation,
+      execution: options.evaluation.execution,
+      evidence: options.evaluation.evidence,
+      pendingRequests: options.pendingRequests,
+    },
+  },
+  observations: options.observations,
+  warnings: options.warnings,
+});
+
+interface TurnWaitPollEvaluation {
+  readonly evaluation: TurnWaitEvaluation;
+  readonly correlated: ReadonlyArray<PendingRequest>;
+  readonly observation: Observation;
+}
+
+/**
+ * Evaluate one published thread detail against the exact-turn target. The
+ * wait's observation records the limited-history and coverage-gap
+ * limitations so a caller can tell fresh evidence from lost coverage.
+ */
+const pollTurnWait = (options: {
+  readonly turn: TurnReference;
+  readonly detail: SynchronizedThreadDetail;
+  readonly evidence: TurnEvidenceRecord | null;
+}): TurnWaitPollEvaluation => {
+  const { turn, detail, evidence } = options;
+  const all = pendingRequestsFromActivities(
+    { instanceId: turn.instanceId, threadId: turn.threadId },
+    detail.thread.activities,
+  );
+  const correlated = all.filter(
+    (request) => request.turn !== null && request.turn.turnId === turn.turnId,
+  );
+  const evaluation = evaluateTurnOutcome({ turn, detail, evidence, pendingRequests: correlated });
+  const covered = detail.thread.latestTurn?.turnId === turn.turnId;
+  // Retained evidence that answers the wait is partial coverage with an
+  // explicit note; an unanswered uncovered target is a history gap.
+  const answeredFromRetained = !covered && evaluation.satisfied;
+  const limitations = [
+    ...(detail.limitedHistory ? [limitedHistoryLimitation] : []),
+    ...(covered
+      ? []
+      : [answeredFromRetained ? TURN_RETAINED_EVIDENCE_LIMITATION : TURN_HISTORY_GAP_LIMITATION]),
+  ];
+  return {
+    evaluation,
+    correlated,
+    observation: freshThreadStateObservation({
+      instanceId: turn.instanceId,
+      detail,
+      coverage: covered && !detail.limitedHistory ? "complete_for_query" : "partial",
+      limitations,
+    }),
+  };
+};
+
+const unknownTurnWaitEvaluation: TurnWaitEvaluation = {
+  execution: "outcome_unknown",
+  satisfied: false,
+  evidence: [],
+};
+
+type TurnWaitPollOutcome =
+  | { readonly kind: "result"; readonly result: TurnWaitToolResult }
+  | { readonly kind: "pending"; readonly poll: TurnWaitPollEvaluation };
+
+/**
+ * Evaluate one published thread detail against the exact-turn target: a
+ * satisfied evaluation or a coverage gap ends the wait with its result,
+ * while a covered, unsatisfied evaluation stays pending until the deadline.
+ * Retained evidence is consulted only when the target is not the latest
+ * turn; a covered target is classified from the fresh detail.
+ */
+const runTurnWaitPoll = (options: {
+  readonly turn: TurnReference;
+  readonly store: LocalStoreService;
+  readonly detail: SynchronizedThreadDetail;
+}): Effect.Effect<TurnWaitPollOutcome, LocalStoreError> =>
+  Effect.gen(function* () {
+    const { turn, store, detail } = options;
+    const evidence =
+      detail.thread.latestTurn?.turnId === turn.turnId ? null : yield* store.findTurnEvidence(turn);
+    const poll = pollTurnWait({ turn, detail, evidence });
+    if (poll.evaluation.satisfied) {
+      return {
+        kind: "result" as const,
+        result: turnWaitResult({
+          turn,
+          observation: "condition_met",
+          evaluation: poll.evaluation,
+          pendingRequests: poll.correlated,
+          observations: [poll.observation],
+          warnings: [],
+        }),
+      };
+    }
+    const covered = detail.thread.latestTurn?.turnId === turn.turnId;
+    if (!covered) {
+      return {
+        kind: "result" as const,
+        result: turnWaitResult({
+          turn,
+          observation: "history_gap",
+          evaluation: poll.evaluation,
+          pendingRequests: poll.correlated,
+          observations: [poll.observation],
+          warnings: [],
+        }),
+      };
+    }
+    return { kind: "pending" as const, poll };
+  });
+
+/**
+ * Observe one exact turn until supported evidence satisfies the wait, the
+ * deadline passes, the observation becomes unavailable, or the target slips
+ * out of coverage with no retained evidence. Every synchronization is
+ * scoped: cancelling the wait interrupts only this observation and never
+ * dispatches an interruption, settlement, session shutdown, or any other
+ * provider mutation.
+ */
+const runTurnWait = (options: {
+  readonly store: LocalStoreService;
+  readonly observations: ObservationsService;
+  readonly turn: TurnReference;
+  readonly waitMs: number;
+}): Effect.Effect<TurnWaitToolResult, LocalStoreError | T3CodeAdapterError | ObservationError> =>
+  Effect.gen(function* () {
+    const { store, observations, turn, waitMs } = options;
+    const { instanceId, threadId } = turn;
+    const startedAt = yield* Clock.currentTimeMillis;
+    const deadline = startedAt + waitMs;
+    let firstEvaluation = true;
+    let pollInterval = THREAD_WAIT_POLL_INTERVAL_MILLIS;
+    while (true) {
+      const detailResult = yield* Effect.result(observations.threadDetail(instanceId, threadId));
+      if (Result.isFailure(detailResult)) {
+        // A wait that never observed its target fails with the typed error;
+        // losing the observation later ends the wait as unavailable instead
+        // of implying the work ended.
+        const failure = yield* classifyWaitObservationFailure({
+          failure: detailResult.failure,
+          firstEvaluation,
+          deadline,
+          pollInterval,
+        });
+        if (failure.kind === "propagate") return yield* Effect.fail(detailResult.failure);
+        if (failure.kind === "unavailable") {
+          return turnWaitResult({
+            turn,
+            observation: "unavailable",
+            evaluation: unknownTurnWaitEvaluation,
+            pendingRequests: [],
+            observations: [],
+            warnings: [{ code: "observation_unavailable", message: detailResult.failure.message }],
+          });
+        }
+        pollInterval = failure.pollInterval;
+        continue;
+      }
+      firstEvaluation = false;
+      const outcome = yield* runTurnWaitPoll({
+        turn,
+        store,
+        detail: detailResult.success,
+      });
+      if (outcome.kind === "result") return outcome.result;
+      const next = yield* sleepBeforeNextWaitPoll({ deadline, pollInterval });
+      if (next.elapsed) {
+        return turnWaitResult({
+          turn,
+          observation: "timed_out",
+          evaluation: outcome.poll.evaluation,
+          pendingRequests: outcome.poll.correlated,
+          observations: [outcome.poll.observation],
+          warnings: [],
+        });
+      }
+      pollInterval = nextWaitPollInterval(pollInterval);
     }
   });
 
@@ -2691,6 +3110,25 @@ const serverToolHandlers = ServerToolkit.of({
         thread,
         condition,
         cursor,
+        waitMs: waitMs ?? DEFAULT_THREAD_WAIT_MILLIS,
+      });
+    }).pipe(
+      Effect.catch((error: LocalStoreError | T3CodeAdapterError | ObservationError) =>
+        Effect.succeed({
+          result: { kind: "error" as const, error: toToolFailure(error) },
+          observations: [],
+          warnings: [],
+        }),
+      ),
+    ),
+  turn_wait: ({ turn, waitMs }) =>
+    Effect.gen(function* () {
+      const observations = yield* Observations;
+      const store = yield* LocalStore;
+      return yield* runTurnWait({
+        store,
+        observations,
+        turn,
         waitMs: waitMs ?? DEFAULT_THREAD_WAIT_MILLIS,
       });
     }).pipe(

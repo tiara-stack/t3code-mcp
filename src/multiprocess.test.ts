@@ -120,6 +120,7 @@ const startServer = async (databasePath: string): Promise<Server> => {
       "thread_get",
       "thread_output",
       "thread_wait",
+      "turn_wait",
       "operation_get",
     ]);
     return server;
@@ -570,6 +571,70 @@ describe("shared SQLite mutation admission", () => {
         }),
       ),
     60000,
+  );
+});
+
+describe("shared SQLite retained turn evidence", () => {
+  it.live("reads retained turn evidence written through an independent store connection", () =>
+    withServers("t3code-mcp-turn-evidence-", ({ databasePath }) =>
+      Effect.gen(function* () {
+        // A fixed timestamp would eventually age out of the retention window;
+        // the observation time must stay relative to the current clock.
+        const observedAt = new Date().toISOString();
+        // One process records compact turn evidence through its scoped store
+        // connection; a completely fresh connection on the same database
+        // file reads the same row back.
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const store = yield* LocalStore;
+            yield* store.recordTurnEvidence({
+              turn: { instanceId: "evidence-instance", threadId: "thread-a", turnId: "turn-9" },
+              state: "completed",
+              projected: false,
+              sourceSequence: 42,
+              observedAt,
+              detail: "The thread detail snapshot published the latest turn as completed.",
+            });
+          }).pipe(Effect.provide(LocalStore.layer({ databasePath }))),
+        );
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const store = yield* LocalStore;
+            const record = yield* store.findTurnEvidence({
+              instanceId: "evidence-instance",
+              threadId: "thread-a",
+              turnId: "turn-9",
+            });
+            expect(record).toEqual({
+              turn: { instanceId: "evidence-instance", threadId: "thread-a", turnId: "turn-9" },
+              state: "completed",
+              projected: false,
+              sourceSequence: 42,
+              observedAt,
+              detail: "The thread detail snapshot published the latest turn as completed.",
+            });
+          }).pipe(Effect.provide(LocalStore.layer({ databasePath }))),
+        );
+        // The row is durable in the shared database file itself.
+        yield* Effect.sync(() => {
+          const database = new DatabaseSync(databasePath);
+          try {
+            const rows = database
+              .prepare(
+                "SELECT state, projected, source_sequence FROM turn_evidence WHERE instance_id = ? AND thread_id = ? AND turn_id = ?",
+              )
+              .all("evidence-instance", "thread-a", "turn-9") as unknown as ReadonlyArray<{
+              state: string;
+              projected: number;
+              source_sequence: number;
+            }>;
+            expect(rows).toEqual([{ state: "completed", projected: 0, source_sequence: 42 }]);
+          } finally {
+            database.close();
+          }
+        });
+      }),
+    ),
   );
 });
 

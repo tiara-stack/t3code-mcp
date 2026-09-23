@@ -5,11 +5,14 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
+import { TURN_EVIDENCE_BUDGET_BYTES, TURN_EVIDENCE_RETENTION_MILLIS } from "./domain";
 
 export interface LocalStoreConfigValue {
   readonly databasePath: string;
   readonly captureRetentionMillis?: number;
   readonly captureBudgetBytes?: number;
+  readonly turnEvidenceRetentionMillis?: number;
+  readonly turnEvidenceBudgetBytes?: number;
 }
 
 const DEFAULT_CAPTURE_RETENTION_MILLIS = 10 * 60 * 1000;
@@ -45,6 +48,8 @@ export class LocalStoreConfig extends Context.Service<LocalStoreConfig, LocalSto
       databasePath,
       captureRetentionMillis: DEFAULT_CAPTURE_RETENTION_MILLIS,
       captureBudgetBytes: DEFAULT_CAPTURE_BUDGET_BYTES,
+      turnEvidenceRetentionMillis: TURN_EVIDENCE_RETENTION_MILLIS,
+      turnEvidenceBudgetBytes: TURN_EVIDENCE_BUDGET_BYTES,
     } satisfies LocalStoreConfigValue;
   });
 }
@@ -58,4 +63,6 @@ export const normalizeLocalStoreConfig = (
   databasePath: config.databasePath,
   captureRetentionMillis: config.captureRetentionMillis ?? DEFAULT_CAPTURE_RETENTION_MILLIS,
   captureBudgetBytes: config.captureBudgetBytes ?? DEFAULT_CAPTURE_BUDGET_BYTES,
+  turnEvidenceRetentionMillis: config.turnEvidenceRetentionMillis ?? TURN_EVIDENCE_RETENTION_MILLIS,
+  turnEvidenceBudgetBytes: config.turnEvidenceBudgetBytes ?? TURN_EVIDENCE_BUDGET_BYTES,
 });

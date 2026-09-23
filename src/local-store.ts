@@ -56,6 +56,7 @@ import {
   type ThreadOutputCaptureFrame,
   type ThreadOutputCaptureQuery,
   type ThreadSummary,
+  type TurnReference,
   makeToolSuccess,
   makeModelListToolSuccess,
   makeProjectListToolSuccess,
@@ -76,6 +77,7 @@ import {
   PAIRING_MIGRATION_NAME,
   OBSERVATION_MIGRATION_NAME,
   THREAD_STATE_MIGRATION_NAME,
+  TURN_EVIDENCE_MIGRATION_NAME,
   migrations,
   SUPPORTED_SCHEMA_VERSION,
 } from "./migrations";
@@ -644,6 +646,23 @@ export type RegistrationRemoval = {
   readonly removedByRequestId: string | null;
 };
 
+const turnEvidenceStateSchema = Schema.Literals(["running", "interrupted", "completed", "error"]);
+
+/**
+ * One compact retained observation of one native turn's latest published
+ * state. A projected row records a session-transition projection that can
+ * never establish completion by itself; only a non-projected row carries
+ * supported outcome evidence.
+ */
+export interface TurnEvidenceRecord {
+  readonly turn: TurnReference;
+  readonly state: typeof turnEvidenceStateSchema.Type;
+  readonly projected: boolean;
+  readonly sourceSequence: number;
+  readonly observedAt: string;
+  readonly detail: string;
+}
+
 export interface LocalStoreService {
   readonly listRegistrations: (
     options: ListRegistrationsOptions,
@@ -783,6 +802,10 @@ export interface LocalStoreService {
     instanceId: string,
     requestId?: string,
   ) => Effect.Effect<RegistrationRemoval, LocalStoreError>;
+  readonly recordTurnEvidence: (record: TurnEvidenceRecord) => Effect.Effect<void, LocalStoreError>;
+  readonly findTurnEvidence: (
+    turn: TurnReference,
+  ) => Effect.Effect<TurnEvidenceRecord | null, LocalStoreError>;
 }
 
 export class LocalStore extends Context.Service<LocalStore, LocalStoreService>()(
@@ -1102,6 +1125,12 @@ export class LocalStore extends Context.Service<LocalStore, LocalStoreService>()
         const removeRegistration = (instanceId: string, requestId?: string) =>
           removeRegistrationInDatabase(sql, instanceId, requestId, verifySchemaForOperation);
 
+        const recordTurnEvidence = (record: TurnEvidenceRecord) =>
+          recordTurnEvidenceInDatabase(sql, config, record, verifySchemaForOperation);
+
+        const findTurnEvidence = (turn: TurnReference) =>
+          findTurnEvidenceInDatabase(sql, turn, verifySchemaForOperation);
+
         return LocalStore.of({
           listRegistrations,
           listAllRegistrations,
@@ -1136,6 +1165,8 @@ export class LocalStore extends Context.Service<LocalStore, LocalStoreService>()
           updateOperation,
           inspectRegistration,
           removeRegistration,
+          recordTurnEvidence,
+          findTurnEvidence,
         });
       }).pipe(
         Effect.mapError((error) =>
@@ -1256,7 +1287,7 @@ const verifySchema = (
       "SELECT value FROM local_store_meta WHERE key = 'schema_version'",
     );
     const tables = yield* sql.unsafe<{ name: string }>(
-      "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('local_store_meta', 'registrations', 'captures', 'capture_items', 'registration_credentials', 'registration_tombstones', 'request_keys', 'operations', 'operation_steps', 'operation_evidence', 'staged_pairings') ORDER BY name",
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('local_store_meta', 'registrations', 'captures', 'capture_items', 'registration_credentials', 'registration_tombstones', 'request_keys', 'operations', 'operation_steps', 'operation_evidence', 'staged_pairings', 'turn_evidence') ORDER BY name",
     );
     const metaColumns = yield* sql.unsafe<{ name: string }>("PRAGMA table_info(local_store_meta)");
     const registrationColumns = yield* sql.unsafe<{ name: string }>(
@@ -1285,6 +1316,9 @@ const verifySchema = (
     const stagedPairingColumns = yield* sql.unsafe<{ name: string }>(
       "PRAGMA table_info(staged_pairings)",
     );
+    const turnEvidenceColumns = yield* sql.unsafe<{ name: string }>(
+      "PRAGMA table_info(turn_evidence)",
+    );
     const foreignKeys = [
       ...(yield* sql.unsafe<{ table: string; on_delete: string }>(
         "PRAGMA foreign_key_list(capture_items)",
@@ -1303,7 +1337,7 @@ const verifySchema = (
       )),
     ];
     const definitions = yield* sql.unsafe<{ name: string; sql: string | null }>(
-      "SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name IN ('registrations', 'captures', 'capture_items', 'operations', 'operation_steps', 'staged_pairings')",
+      "SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name IN ('registrations', 'captures', 'capture_items', 'operations', 'operation_steps', 'staged_pairings', 'turn_evidence')",
     );
 
     const hasColumns = (actual: ReadonlyArray<{ name: string }>, expected: ReadonlyArray<string>) =>
@@ -1331,8 +1365,10 @@ const verifySchema = (
       journal[3]?.name !== PAIRING_MIGRATION_NAME ||
       journal[4]?.migration_id !== 5 ||
       journal[4]?.name !== OBSERVATION_MIGRATION_NAME ||
-      journal[5]?.migration_id !== SUPPORTED_SCHEMA_VERSION ||
-      journal[5]?.name !== THREAD_STATE_MIGRATION_NAME
+      journal[5]?.migration_id !== 6 ||
+      journal[5]?.name !== THREAD_STATE_MIGRATION_NAME ||
+      journal[6]?.migration_id !== SUPPORTED_SCHEMA_VERSION ||
+      journal[6]?.name !== TURN_EVIDENCE_MIGRATION_NAME
     ) {
       return yield* Effect.fail(
         new LocalStoreStartupError({
@@ -1348,7 +1384,7 @@ const verifySchema = (
     if (
       userVersion[0]?.user_version !== SUPPORTED_SCHEMA_VERSION ||
       schemaMetadata[0]?.value !== String(SUPPORTED_SCHEMA_VERSION) ||
-      tables.length !== 11 ||
+      tables.length !== 12 ||
       !hasColumns(metaColumns, ["key", "value"]) ||
       !hasColumns(registrationColumns, [
         "instance_id",
@@ -1430,6 +1466,18 @@ const verifySchema = (
         "expires_at",
         "created_at",
       ]) ||
+      !hasColumns(turnEvidenceColumns, [
+        "instance_id",
+        "thread_id",
+        "turn_id",
+        "state",
+        "projected",
+        "source_sequence",
+        "observed_at",
+        "detail",
+        "evidence_bytes",
+        "updated_at",
+      ]) ||
       !hasForeignKey(foreignKeys, "captures", "CASCADE") ||
       !hasForeignKey(foreignKeys, "registrations", "CASCADE") ||
       !hasForeignKey(foreignKeys, "request_keys", "NO ACTION") ||
@@ -1437,7 +1485,7 @@ const verifySchema = (
     ) {
       return yield* Effect.fail(
         new LocalStoreStartupError({
-          kind: tables.length === 11 ? "incompatible_schema" : "migration_not_ready",
+          kind: tables.length === 12 ? "incompatible_schema" : "migration_not_ready",
           message: "The local store schema is not ready or is unsupported.",
         }),
       );
@@ -1607,6 +1655,399 @@ const operationRecoverableUntil = (
   if (policy !== "resolved") return currentDeadline;
   return currentDeadline ?? operationRetentionDeadline(now);
 };
+
+/**
+ * Pin keys use scoped JSON encoding so arbitrary opaque native identifiers
+ * cannot collide across instance, thread, or turn boundaries.
+ */
+const turnEvidenceThreadPinKey = (instanceId: string, threadId: string): string =>
+  JSON.stringify(["thread-pin", instanceId, threadId]);
+
+const turnEvidenceTurnPinKey = (instanceId: string, threadId: string, turnId: string): string =>
+  JSON.stringify(["turn-pin", instanceId, threadId, turnId]);
+
+/**
+ * Whether an eviction candidate is pinned by an unresolved operation: either
+ * a thread-wide pin (the operation names no exact turn and may need any of
+ * the thread's turns) or an exact-turn pin from its target or established
+ * turn correlation.
+ */
+const isTurnEvidencePinned = (
+  pins: ReadonlySet<string>,
+  instanceId: string,
+  threadId: string,
+  turnId: string,
+): boolean =>
+  pins.has(turnEvidenceThreadPinKey(instanceId, threadId)) ||
+  pins.has(turnEvidenceTurnPinKey(instanceId, threadId, turnId));
+
+const turnEvidencePinTargetSchema = Schema.Struct({
+  instanceId: Schema.String,
+  threadId: Schema.String,
+  turnId: Schema.optional(Schema.String),
+});
+
+const turnEvidencePinCorrelationSchema = Schema.Struct({
+  kind: Schema.Literal("established"),
+  turn: Schema.Struct({
+    instanceId: Schema.String,
+    threadId: Schema.String,
+    turnId: Schema.String,
+  }),
+});
+
+/**
+ * The pins one unresolved operation contributes: exact-turn pins whenever it
+ * names a turn, and a thread-wide pin only as the fallback when no turn
+ * identity exists.
+ */
+interface OperationTurnEvidencePins {
+  readonly thread: string | null;
+  readonly turns: ReadonlySet<string>;
+}
+
+const collectTurnEvidencePins = (
+  targetJson: string | null,
+  correlationJson: string | null,
+): OperationTurnEvidencePins => {
+  let thread: string | null = null;
+  const turns = new Set<string>();
+  const parse = (json: string | null): void => {
+    if (json === null) return;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(json);
+    } catch {
+      return;
+    }
+    const target = Schema.decodeUnknownResult(turnEvidencePinTargetSchema)(parsed);
+    if (Result.isSuccess(target)) {
+      const { instanceId, threadId, turnId } = target.success;
+      if (turnId === undefined) thread = turnEvidenceThreadPinKey(instanceId, threadId);
+      else turns.add(turnEvidenceTurnPinKey(instanceId, threadId, turnId));
+      return;
+    }
+    const correlation = Schema.decodeUnknownResult(turnEvidencePinCorrelationSchema)(parsed);
+    if (Result.isSuccess(correlation)) {
+      const { instanceId, threadId, turnId } = correlation.success.turn;
+      turns.add(turnEvidenceTurnPinKey(instanceId, threadId, turnId));
+    }
+  };
+  parse(targetJson);
+  parse(correlationJson);
+  return { thread, turns };
+};
+
+/**
+ * Turn evidence an unresolved operation may still need stays pinned against
+ * bounded-cache eviction, keyed by exact turn whenever the operation names
+ * one. A live attempt (admitted or pending) that names no turn
+ * conservatively pins its whole thread; an `outcome_unknown` record is
+ * terminal to reconciliation and never evaluates thread evidence again, so
+ * it pins nothing beyond the exact turn its record already names.
+ */
+const unresolvedTurnEvidencePins = (
+  sql: SqlClient.SqlClient,
+): Effect.Effect<ReadonlySet<string>, SqlError.SqlError> =>
+  Effect.gen(function* () {
+    const rows = yield* sql<{
+      readonly state: string;
+      readonly target_json: string | null;
+      readonly correlation_json: string | null;
+    }>`
+      SELECT state, target_json, correlation_json FROM operations
+      WHERE state IN ('admitted', 'pending', 'outcome_unknown')
+        AND (target_json IS NOT NULL OR correlation_json IS NOT NULL)
+    `;
+    const pins = new Set<string>();
+    for (const row of rows) {
+      const operation = collectTurnEvidencePins(row.target_json, row.correlation_json);
+      if (operation.turns.size > 0) {
+        for (const turn of operation.turns) pins.add(turn);
+      } else if (
+        operation.thread !== null &&
+        (row.state === "admitted" || row.state === "pending")
+      ) {
+        pins.add(operation.thread);
+      }
+    }
+    return pins;
+  });
+
+const measureTurnEvidence = (record: TurnEvidenceRecord): number =>
+  serializedByteLength({
+    i: record.turn.instanceId,
+    t: record.turn.threadId,
+    u: record.turn.turnId,
+    s: record.state,
+    p: record.projected,
+    q: record.sourceSequence,
+    o: record.observedAt,
+    d: record.detail,
+  });
+
+const isJustWrittenTurnEvidence = (
+  written: TurnReference | null,
+  row: { readonly instance_id: string; readonly thread_id: string; readonly turn_id: string },
+): boolean =>
+  written !== null &&
+  row.instance_id === written.instanceId &&
+  row.thread_id === written.threadId &&
+  row.turn_id === written.turnId;
+
+const TURN_EVIDENCE_EVICTION_BATCH_SIZE = 64;
+
+/**
+ * The full deterministic eviction ordering. Keyset pagination over this
+ * ordering stays correct while rows are deleted mid-scan.
+ */
+interface TurnEvidenceEvictionCursor {
+  readonly observed_at: string;
+  readonly source_sequence: number;
+  readonly instance_id: string;
+  readonly thread_id: string;
+  readonly turn_id: string;
+}
+
+const deleteTurnEvidenceRow = (
+  sql: SqlClient.SqlClient,
+  key: {
+    readonly instance_id: string;
+    readonly thread_id: string;
+    readonly turn_id: string;
+  },
+): Effect.Effect<void, SqlError.SqlError> =>
+  sql`
+    DELETE FROM turn_evidence
+    WHERE instance_id = ${key.instance_id}
+      AND thread_id = ${key.thread_id}
+      AND turn_id = ${key.turn_id}
+  `.pipe(Effect.asVoid);
+
+/**
+ * Age eviction removes expired rows explicitly, oldest observed first and
+ * never a pinned row, bounding deletion work per recording: the keyset scan
+ * advances past pinned rows, deletes at most one batch, and the next
+ * recording continues where it left off.
+ */
+const evictExpiredTurnEvidence = (
+  sql: SqlClient.SqlClient,
+  pins: ReadonlySet<string>,
+  retentionCutoff: string,
+): Effect.Effect<void, SqlError.SqlError> =>
+  Effect.gen(function* () {
+    let cursor: TurnEvidenceEvictionCursor | null = null;
+    let deletions = 0;
+    while (deletions < TURN_EVIDENCE_EVICTION_BATCH_SIZE) {
+      const expired: ReadonlyArray<TurnEvidenceEvictionCursor> =
+        yield* sql<TurnEvidenceEvictionCursor>`
+        SELECT instance_id, thread_id, turn_id, observed_at, source_sequence
+        FROM turn_evidence
+        WHERE observed_at < ${retentionCutoff}
+          ${
+            cursor === null
+              ? sql``
+              : sql`AND (observed_at, source_sequence, instance_id, thread_id, turn_id) > (
+                    ${cursor.observed_at}, ${cursor.source_sequence},
+                    ${cursor.instance_id}, ${cursor.thread_id}, ${cursor.turn_id}
+                  )`
+          }
+        ORDER BY observed_at ASC, source_sequence ASC,
+          instance_id ASC, thread_id ASC, turn_id ASC
+        LIMIT ${TURN_EVIDENCE_EVICTION_BATCH_SIZE}
+      `;
+      if (expired.length === 0) return;
+      for (const row of expired) {
+        cursor = row;
+        if (isTurnEvidencePinned(pins, row.instance_id, row.thread_id, row.turn_id)) continue;
+        yield* deleteTurnEvidenceRow(sql, row);
+        deletions += 1;
+        if (deletions >= TURN_EVIDENCE_EVICTION_BATCH_SIZE) return;
+      }
+    }
+  });
+
+/**
+ * One bounded keyset page of eviction candidates over the full deterministic
+ * ordering; correct while rows are deleted mid-scan.
+ */
+const turnEvidenceEvictionCandidates = (
+  sql: SqlClient.SqlClient,
+  cursor: TurnEvidenceEvictionCursor | null,
+  limit: number,
+): Effect.Effect<
+  ReadonlyArray<TurnEvidenceEvictionCursor & { readonly evidence_bytes: number }>,
+  SqlError.SqlError
+> =>
+  sql<TurnEvidenceEvictionCursor & { readonly evidence_bytes: number }>`
+    SELECT instance_id, thread_id, turn_id, observed_at, source_sequence, evidence_bytes
+    FROM turn_evidence
+    ${
+      cursor === null
+        ? sql``
+        : sql`WHERE (observed_at, source_sequence, instance_id, thread_id, turn_id) > (
+              ${cursor.observed_at}, ${cursor.source_sequence},
+              ${cursor.instance_id}, ${cursor.thread_id}, ${cursor.turn_id}
+            )`
+    }
+    ORDER BY observed_at ASC, source_sequence ASC,
+      instance_id ASC, thread_id ASC, turn_id ASC
+    LIMIT ${limit}
+  `;
+
+/**
+ * Capacity eviction removes whole oldest rows until the retained evidence
+ * fits its separate budget; pinned rows and the row just written stay
+ * retained.
+ */
+const evictTurnEvidenceOverBudget = (
+  sql: SqlClient.SqlClient,
+  config: Required<LocalStoreConfigValue>,
+  pins: ReadonlySet<string>,
+  written: TurnReference | null,
+): Effect.Effect<void, SqlError.SqlError> =>
+  Effect.gen(function* () {
+    const totals = yield* sql<{ readonly total: number }>`
+      SELECT COALESCE(SUM(evidence_bytes), 0) AS total FROM turn_evidence
+    `;
+    let remaining = Number(totals[0]?.total ?? 0);
+    let cursor: TurnEvidenceEvictionCursor | null = null;
+    while (remaining > config.turnEvidenceBudgetBytes) {
+      const candidates: ReadonlyArray<
+        TurnEvidenceEvictionCursor & { readonly evidence_bytes: number }
+      > = yield* turnEvidenceEvictionCandidates(sql, cursor, TURN_EVIDENCE_EVICTION_BATCH_SIZE);
+      if (candidates.length === 0) return;
+      for (const row of candidates) {
+        cursor = row;
+        if (isTurnEvidencePinned(pins, row.instance_id, row.thread_id, row.turn_id)) continue;
+        // The row just written is never evicted by its own recording: if
+        // nothing else can make room, the freshest evidence stays and the
+        // cache exceeds the budget by that row until older evidence expires.
+        if (isJustWrittenTurnEvidence(written, row)) continue;
+        yield* deleteTurnEvidenceRow(sql, row);
+        remaining -= Number(row.evidence_bytes);
+        if (remaining <= config.turnEvidenceBudgetBytes) return;
+      }
+    }
+  });
+
+/**
+ * Enforce the retained turn-evidence policy: rows older than the retention
+ * window are always removed, and when a row was just written, oldest rows
+ * over the separate budget are removed too. Eviction is explicit, oldest
+ * observed first, and never removes a row pinned by an unresolved operation
+ * or the row this recording just wrote.
+ */
+const evictRetainedTurnEvidence = (
+  sql: SqlClient.SqlClient,
+  config: Required<LocalStoreConfigValue>,
+  pins: ReadonlySet<string>,
+  now: number,
+  writtenTurn: TurnReference | null,
+): Effect.Effect<void, SqlError.SqlError> =>
+  Effect.gen(function* () {
+    const retentionCutoff = new Date(now - config.turnEvidenceRetentionMillis).toISOString();
+    yield* evictExpiredTurnEvidence(sql, pins, retentionCutoff);
+    // A no-op precedence update cannot change the budget state, so the
+    // capacity pass runs only after an actual write.
+    if (writtenTurn !== null) yield* evictTurnEvidenceOverBudget(sql, config, pins, writtenTurn);
+  });
+
+const recordTurnEvidenceInDatabase = (
+  sql: SqlClient.SqlClient,
+  config: Required<LocalStoreConfigValue>,
+  record: TurnEvidenceRecord,
+  verify: SchemaVerifier,
+): Effect.Effect<void, LocalStoreError> =>
+  retryStorage(
+    Effect.gen(function* () {
+      yield* verify();
+      return yield* sql.withTransaction(
+        Effect.gen(function* () {
+          const now = yield* Clock.currentTimeMillis;
+          const bytes = measureTurnEvidence(record);
+          const { instanceId, threadId, turnId } = record.turn;
+          // A non-projected observation always beats a projected one, and the
+          // newer sequence wins within the same evidentiary class; a projected
+          // completion can never overwrite supported observation. The common
+          // restatement of an already-retained row writes nothing.
+          const written = yield* sql<{ readonly instance_id: string }>`
+            INSERT INTO turn_evidence (
+              instance_id, thread_id, turn_id, state, projected, source_sequence,
+              observed_at, detail, evidence_bytes, updated_at
+            ) VALUES (
+              ${instanceId}, ${threadId}, ${turnId}, ${record.state},
+              ${record.projected ? 1 : 0}, ${record.sourceSequence},
+              ${record.observedAt}, ${record.detail}, ${bytes}, ${now}
+            )
+            ON CONFLICT(instance_id, thread_id, turn_id) DO UPDATE SET
+              state = excluded.state,
+              projected = excluded.projected,
+              source_sequence = excluded.source_sequence,
+              observed_at = excluded.observed_at,
+              detail = excluded.detail,
+              evidence_bytes = excluded.evidence_bytes,
+              updated_at = excluded.updated_at
+            WHERE (turn_evidence.projected = 1 AND excluded.projected = 0)
+               OR (turn_evidence.projected = excluded.projected
+                   AND excluded.source_sequence > turn_evidence.source_sequence)
+            RETURNING instance_id
+          `;
+          const pins = yield* unresolvedTurnEvidencePins(sql);
+          yield* evictRetainedTurnEvidence(
+            sql,
+            config,
+            pins,
+            now,
+            written.length > 0 ? record.turn : null,
+          );
+        }),
+      );
+    }).pipe(Effect.mapError(toStoreError)),
+  );
+
+const findTurnEvidenceInDatabase = (
+  sql: SqlClient.SqlClient,
+  turn: TurnReference,
+  verify: SchemaVerifier,
+): Effect.Effect<TurnEvidenceRecord | null, LocalStoreError> =>
+  retryStorage(
+    Effect.gen(function* () {
+      yield* verify();
+      const rows = yield* sql<{
+        readonly state: string;
+        readonly projected: number;
+        readonly source_sequence: number;
+        readonly observed_at: string;
+        readonly detail: string;
+      }>`
+        SELECT state, projected, source_sequence, observed_at, detail
+        FROM turn_evidence
+        WHERE instance_id = ${turn.instanceId}
+          AND thread_id = ${turn.threadId}
+          AND turn_id = ${turn.turnId}
+      `;
+      const row = rows[0];
+      if (row === undefined) return null;
+      const state = Schema.decodeUnknownResult(turnEvidenceStateSchema)(row.state);
+      if (Result.isFailure(state)) {
+        return yield* Effect.fail(
+          new LocalStoreError({
+            kind: "malformed_row",
+            message: "The retained turn evidence is malformed.",
+          }),
+        );
+      }
+      return {
+        turn,
+        state: state.success,
+        projected: row.projected === 1,
+        sourceSequence: Number(row.source_sequence),
+        observedAt: row.observed_at,
+        detail: row.detail,
+      };
+    }).pipe(Effect.mapError(toStoreError)),
+  );
 
 type SchemaVerifier = () => Effect.Effect<void, LocalStoreError>;
 
