@@ -4,6 +4,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import * as Duration from "effect/Duration";
@@ -19,9 +20,10 @@ import {
   decodeProviderModelListing,
   type DiscoveredProvider,
   type ShellStreamItem,
+  type T3CodeAdapterService,
   type ThreadStreamItem,
 } from "./t3code-adapter";
-import { encodeThreadObservationCursor } from "./domain";
+import { encodeThreadObservationCursor, WorktreeCreateInputSchema } from "./domain";
 import type { ThreadListPage, WorktreeListPage } from "./domain";
 import { ServerToolkit, serverToolkitLayer } from "./tools";
 
@@ -214,6 +216,7 @@ const fakeConnections = (options?: {
           status: null,
         }),
       ),
+    createWorktree: () => Effect.die("not used"),
     invalidate: () => Effect.void,
   });
 };
@@ -221,17 +224,20 @@ const fakeConnections = (options?: {
 const fakeAdapterLayer = (
   failure: { current: T3CodeAdapterError | null },
   environmentByEndpoint: Readonly<Record<string, string>> = {},
+  createWorktree: T3CodeAdapterService["createWorktree"] = () =>
+    Effect.succeed({ path: "/remote/worktrees/app/feature", refName: "feature" }),
+  verifyCredential: T3CodeAdapterService["verifyCredential"] = () =>
+    Effect.succeed({
+      environmentId: "environment-a",
+      serverVersion: "0.0.38",
+      scopes: ["orchestration:read", "orchestration:operate"],
+      capabilities: {},
+    }),
 ) =>
   Layer.succeed(T3CodeAdapter, {
     exchangePairingCode: () =>
       Effect.succeed({ credential: "secret-token", expiresAtMillis: null }),
-    verifyCredential: () =>
-      Effect.succeed({
-        environmentId: "environment-a",
-        serverVersion: "0.0.38",
-        scopes: ["orchestration:read", "orchestration:operate"],
-        capabilities: {},
-      }),
+    verifyCredential,
     inspectCredential: ({ endpoint }: { readonly endpoint: string }) =>
       failure.current === null
         ? Effect.succeed({
@@ -286,6 +292,7 @@ const fakeAdapterLayer = (
           status: null,
         }),
       ),
+    createWorktree,
     listVcsRefs: () =>
       Effect.fail(
         new T3CodeAdapterError({
@@ -1534,6 +1541,7 @@ describe("instance_pair_again", () => {
             status: null,
           }),
         ),
+      createWorktree: () => Effect.die("not used"),
       invalidate: () => Effect.void,
     });
   };
@@ -1940,6 +1948,7 @@ describe("instance_pair_again", () => {
                 status: null,
               }),
             ),
+          createWorktree: () => Effect.die("not used"),
           invalidate: () => Effect.void,
         });
         const result = yield* Effect.scoped(
@@ -2770,6 +2779,7 @@ const projectFixtures = (
           status: null,
         }),
       ),
+    createWorktree: () => Effect.die("not used"),
     listVcsRefs: () =>
       Effect.fail(
         new T3CodeAdapterError({
@@ -2794,6 +2804,523 @@ const seedProjectRegistration = (instanceId: string, endpoint: string, credentia
       ...(credential === undefined ? {} : { credential }),
     });
   });
+
+describe("WorktreeCreateInputSchema", () => {
+  it("requires explicit target and start ref, rejects unknown fields, and permits omitted path", () => {
+    const input = {
+      requestId: "create-schema",
+      instanceId: "instance-a",
+      repositoryPath: "/remote/repository",
+      startRef: "main",
+    };
+
+    expect(Schema.is(WorktreeCreateInputSchema)(input)).toBe(true);
+    expect(Schema.is(WorktreeCreateInputSchema)({ ...input, unrecognized: true })).toBe(false);
+    expect(Schema.is(WorktreeCreateInputSchema)({ ...input, startRef: " " })).toBe(false);
+    expect(Schema.is(WorktreeCreateInputSchema)({ ...input, path: "" })).toBe(false);
+  });
+});
+
+describe("worktree_create", () => {
+  it.live("persists the observed remote worktree and never replays an admitted request", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const calls: Array<Parameters<T3CodeAdapterService["createWorktree"]>[0]> = [];
+        const adapter = fakeAdapterLayer({ current: null }, {}, (input) =>
+          Effect.sync(() => {
+            calls.push(input);
+            return { path: "/remote/worktrees/app/work-feature", refName: "work/feature" };
+          }),
+        );
+        const layer = appLayer(databasePath, InstanceConnections.layerWithAdapter(adapter));
+        const results = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration(
+              "instance-remote",
+              "https://remote.test",
+              "secret-remote",
+            );
+            const request = {
+              requestId: "create-worktree-1",
+              instanceId: "instance-remote",
+              repositoryPath: "/srv/projects/app",
+              startRef: "main",
+              newBranch: "work/feature",
+            };
+            const first = yield* callTool("worktree_create", request);
+            const replay = yield* callTool("worktree_create", request);
+            const conflict = yield* callTool("worktree_create", {
+              ...request,
+              path: "/srv/other/app",
+            });
+            return { first, replay, conflict };
+          }).pipe(Effect.provide(layer)),
+        );
+
+        expect(calls).toEqual([
+          {
+            endpoint: "https://remote.test",
+            credential: "secret-remote",
+            repositoryPath: "/srv/projects/app",
+            startRef: "main",
+            newBranch: "work/feature",
+            path: null,
+          },
+        ]);
+        const first = results.first[0]?.result as unknown as {
+          result: { kind: "ok"; value: { state: string; created: { worktree?: unknown } } };
+        };
+        const replay = results.replay[0]?.result as unknown as typeof first;
+        const conflict = results.conflict[0]?.result as unknown as {
+          result: { kind: "error"; error: { code: string } };
+        };
+        expect(first.result).toMatchObject({
+          kind: "ok",
+          value: {
+            state: "completed",
+            dispatch: "accepted",
+            completionMeans: "worktree_created",
+            created: {
+              worktree: {
+                instanceId: "instance-remote",
+                repositoryPath: "/srv/projects/app",
+                worktreePath: "/remote/worktrees/app/work-feature",
+              },
+            },
+          },
+        });
+        expect(replay.result).toEqual(first.result);
+        expect(conflict.result).toMatchObject({
+          kind: "error",
+          error: { code: "request_id_conflict" },
+        });
+      }),
+    ),
+  );
+
+  it.live("maps a known worktree authorization failure to the operate scope", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const adapter = fakeAdapterLayer({ current: null }, {}, () =>
+          Effect.fail(
+            new T3CodeAdapterError({
+              kind: "authorization",
+              message: "The T3Code credential lacks the required orchestration:operate scope.",
+              uncertain: false,
+              status: null,
+              requiredScopes: ["orchestration:operate"],
+            }),
+          ),
+        );
+        const layer = appLayer(databasePath, InstanceConnections.layerWithAdapter(adapter));
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration(
+              "instance-remote",
+              "https://remote.test",
+              "secret-remote",
+            );
+            return yield* callTool("worktree_create", {
+              requestId: "create-worktree-operate-denied",
+              instanceId: "instance-remote",
+              repositoryPath: "/srv/projects/app",
+              startRef: "main",
+            });
+          }).pipe(Effect.provide(layer)),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "failed",
+              dispatch: "rejected",
+              error: {
+                code: "operate_denied",
+                retry: "change_request",
+                details: { requiredScopes: ["orchestration:operate"] },
+              },
+            },
+          },
+        });
+      }),
+    ),
+  );
+
+  it.live("preserves read-scope denial from credential verification", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        let calls = 0;
+        const adapter = fakeAdapterLayer(
+          { current: null },
+          {},
+          () => {
+            calls += 1;
+            return Effect.succeed({ path: "/remote/worktrees/app/feature", refName: "feature" });
+          },
+          () =>
+            Effect.fail(
+              new T3CodeAdapterError({
+                kind: "authorization",
+                message: "The credential lacks the required orchestration:read scope.",
+                uncertain: false,
+                status: null,
+                requiredScopes: ["orchestration:read"],
+              }),
+            ),
+        );
+        const layer = appLayer(databasePath, InstanceConnections.layerWithAdapter(adapter));
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration(
+              "instance-remote",
+              "https://remote.test",
+              "secret-remote",
+            );
+            return yield* callTool("worktree_create", {
+              requestId: "create-worktree-read-denied",
+              instanceId: "instance-remote",
+              repositoryPath: "/srv/projects/app",
+              startRef: "main",
+            });
+          }).pipe(Effect.provide(layer)),
+        );
+
+        expect(calls).toBe(0);
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "failed",
+              dispatch: "rejected",
+              error: {
+                code: "read_denied",
+                retry: "change_request",
+                details: { requiredScopes: ["orchestration:read"] },
+              },
+            },
+          },
+        });
+      }),
+    ),
+  );
+
+  it.live("rejects an unpaired registration before VCS worktree creation", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        let calls = 0;
+        const adapter = fakeAdapterLayer({ current: null }, {}, () => {
+          calls += 1;
+          return Effect.succeed({ path: "/remote/worktrees/app/feature", refName: "feature" });
+        });
+        const layer = appLayer(databasePath, InstanceConnections.layerWithAdapter(adapter));
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-remote", "https://remote.test");
+            return yield* callTool("worktree_create", {
+              requestId: "create-worktree-pairing-required",
+              instanceId: "instance-remote",
+              repositoryPath: "/srv/projects/app",
+              startRef: "main",
+            });
+          }).pipe(Effect.provide(layer)),
+        );
+
+        expect(calls).toBe(0);
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "failed",
+              dispatch: "rejected",
+              error: { code: "pairing_required", retry: "change_request" },
+            },
+          },
+        });
+      }),
+    ),
+  );
+
+  it.live("retains an unknown outcome after a lost VCS reply without retrying", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        let calls = 0;
+        const adapter = fakeAdapterLayer({ current: null }, {}, () => {
+          calls += 1;
+          return Effect.fail(
+            new T3CodeAdapterError({
+              kind: "transport",
+              message: "The test VCS reply was lost.",
+              uncertain: true,
+              status: null,
+            }),
+          );
+        });
+        const layer = appLayer(databasePath, InstanceConnections.layerWithAdapter(adapter));
+        const results = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration(
+              "instance-remote",
+              "https://remote.test",
+              "secret-remote",
+            );
+            const request = {
+              requestId: "create-worktree-lost-reply",
+              instanceId: "instance-remote",
+              repositoryPath: "/srv/projects/app",
+              startRef: "main",
+              path: "/srv/worktrees/app/feature",
+            };
+            const first = yield* callTool("worktree_create", request);
+            const replay = yield* callTool("worktree_create", request);
+            return { first, replay };
+          }).pipe(Effect.provide(layer)),
+        );
+
+        expect(calls).toBe(1);
+        const first = results.first[0]?.result as unknown as {
+          result: {
+            kind: "ok";
+            value: {
+              state: string;
+              dispatch: string;
+              recovery: string;
+              error: { retry: string };
+            };
+          };
+        };
+        const replay = results.replay[0]?.result as unknown as typeof first;
+        expect(first.result).toMatchObject({
+          kind: "ok",
+          value: {
+            state: "outcome_unknown",
+            dispatch: "unknown",
+            recovery: "observe_operation",
+            error: { code: "unavailable", retry: "reconcile_first" },
+          },
+        });
+        expect(replay.result).toEqual(first.result);
+      }),
+    ),
+  );
+
+  it.live("does not retry when the target instance rejects a reused worktree path", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        let calls = 0;
+        const adapter = fakeAdapterLayer({ current: null }, {}, () => {
+          calls += 1;
+          return Effect.fail(
+            new T3CodeAdapterError({
+              kind: "upstream_failure",
+              message: "The T3Code VCS command failed.",
+              uncertain: true,
+              status: null,
+            }),
+          );
+        });
+        const layer = appLayer(databasePath, InstanceConnections.layerWithAdapter(adapter));
+        const results = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration(
+              "instance-remote",
+              "https://remote.test",
+              "secret-remote",
+            );
+            const request = {
+              requestId: "create-worktree-reused-path",
+              instanceId: "instance-remote",
+              repositoryPath: "/srv/projects/app",
+              startRef: "main",
+              path: "/srv/worktrees/app/existing",
+            };
+            const first = yield* callTool("worktree_create", request);
+            const replay = yield* callTool("worktree_create", request);
+            return { first, replay };
+          }).pipe(Effect.provide(layer)),
+        );
+
+        expect(calls).toBe(1);
+        expect(results.first[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "outcome_unknown",
+              dispatch: "unknown",
+              error: { code: "upstream_failure", retry: "reconcile_first" },
+            },
+          },
+        });
+        expect(results.replay[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: { state: "outcome_unknown", dispatch: "unknown" },
+          },
+        });
+      }),
+    ),
+  );
+
+  it.live("keeps an admitted VCS attempt running when the MCP wait is cancelled", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const dispatched = yield* Deferred.make<void>();
+        const reply = yield* Deferred.make<{ readonly path: string; readonly refName: string }>();
+        let calls = 0;
+        const adapter = fakeAdapterLayer({ current: null }, {}, () =>
+          Effect.gen(function* () {
+            calls += 1;
+            yield* Deferred.succeed(dispatched, undefined);
+            return yield* Deferred.await(reply);
+          }),
+        );
+        const layer = appLayer(databasePath, InstanceConnections.layerWithAdapter(adapter));
+        const completed = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration(
+              "instance-remote",
+              "https://remote.test",
+              "secret-remote",
+            );
+            const request = {
+              requestId: "create-worktree-cancelled-wait",
+              instanceId: "instance-remote",
+              repositoryPath: "/srv/projects/app",
+              startRef: "main",
+            };
+            const caller = yield* callTool("worktree_create", request).pipe(Effect.forkDetach);
+            yield* Deferred.await(dispatched);
+            yield* Fiber.interrupt(caller);
+            yield* Deferred.succeed(reply, {
+              path: "/remote/worktrees/app/feature",
+              refName: "feature",
+            });
+            return yield* callTool("operation_get", {
+              requestId: request.requestId,
+              waitMs: 5_000,
+            });
+          }).pipe(Effect.provide(layer)),
+        );
+
+        expect(calls).toBe(1);
+        expect(completed[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              operation: {
+                state: "completed",
+                created: {
+                  worktree: {
+                    instanceId: "instance-remote",
+                    repositoryPath: "/srv/projects/app",
+                    worktreePath: "/remote/worktrees/app/feature",
+                  },
+                },
+              },
+              wait: "terminal",
+            },
+          },
+        });
+      }),
+    ),
+  );
+
+  it.live("reconciles a prior-process creation as unknown without redispatching", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        let calls = 0;
+        const adapter = fakeAdapterLayer({ current: null }, {}, () =>
+          Effect.sync(() => {
+            calls += 1;
+            return { path: "/remote/worktrees/app/feature", refName: "feature" };
+          }),
+        );
+        const layer = appLayer(databasePath, InstanceConnections.layerWithAdapter(adapter));
+        const recovered = yield* Effect.scoped(
+          Effect.gen(function* () {
+            const store = yield* LocalStore;
+            const request = {
+              requestId: "create-worktree-prior-process",
+              instanceId: "instance-remote",
+              repositoryPath: "/srv/projects/app",
+              startRef: "main",
+              newBranch: "feature",
+              path: "/srv/worktrees/app/feature",
+            };
+            const intent = {
+              instanceId: request.instanceId,
+              repositoryPath: request.repositoryPath,
+              startRef: request.startRef,
+              newBranch: request.newBranch,
+              path: request.path,
+            };
+            const admittedAt = new Date().toISOString();
+            const fingerprint = yield* store.fingerprintRequest("worktree_create", request);
+            yield* store.admitOperation({
+              requestId: request.requestId,
+              tool: "worktree_create",
+              fingerprint,
+              processNonce: "previous-process",
+              admittedAt,
+              intent,
+              completionMeans: "worktree_created",
+              steps: ["create_worktree"],
+            });
+            yield* store.updateOperation(request.requestId, {
+              now: admittedAt,
+              state: "pending",
+              dispatch: "unknown",
+              stepState: "pending",
+              recovery: "observe_operation",
+            });
+            yield* Effect.acquireUseRelease(
+              Effect.sync(() => new DatabaseSync(databasePath)),
+              (database) =>
+                Effect.sync(() => {
+                  database
+                    .prepare("UPDATE operations SET updated_at = ? WHERE request_id = ?")
+                    .run(new Date(Date.now() - 120_000).toISOString(), request.requestId);
+                }),
+              (database) => Effect.sync(() => database.close()),
+            );
+
+            const lookup = yield* callTool("operation_get", { requestId: request.requestId });
+            const replay = yield* callTool("worktree_create", request);
+            const stored = yield* store.getOperation(request.requestId);
+            return { lookup, replay, intent: stored?.intent };
+          }).pipe(Effect.provide(layer)),
+        );
+
+        expect(calls).toBe(0);
+        expect(recovered.lookup[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              operation: {
+                state: "outcome_unknown",
+                dispatch: "unknown",
+                recovery: "observe_operation",
+              },
+            },
+          },
+        });
+        expect(recovered.replay[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: { state: "outcome_unknown", dispatch: "unknown" },
+          },
+        });
+        expect(recovered.intent).toMatchObject({
+          instanceId: "instance-remote",
+          repositoryPath: "/srv/projects/app",
+          startRef: "main",
+          newBranch: "feature",
+          path: "/srv/worktrees/app/feature",
+        });
+      }),
+    ),
+  );
+});
 
 describe("project_list", () => {
   it.live("discovers existing projects with nullable defaults on a targeted instance", () =>
@@ -3488,6 +4015,7 @@ const modelFixtures = (
           status: null,
         }),
       ),
+    createWorktree: () => Effect.die("not used"),
     listVcsRefs: () =>
       Effect.fail(
         new T3CodeAdapterError({
@@ -4075,6 +4603,7 @@ describe("model_list", () => {
                     status: null,
                   }),
                 ),
+              createWorktree: () => Effect.die("not used"),
               listVcsRefs: () =>
                 Effect.fail(
                   new T3CodeAdapterError({
@@ -4517,6 +5046,7 @@ const threadConnections = (options: ThreadFixtureOptions) =>
       }
       return scripted();
     },
+    createWorktree: () => Effect.die("not used"),
     invalidate: () => Effect.void,
   });
 

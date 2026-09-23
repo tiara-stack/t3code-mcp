@@ -114,6 +114,7 @@ const startServer = async (databasePath: string): Promise<Server> => {
       "instance_update",
       "instance_pair_again",
       "instance_remove",
+      "worktree_create",
       "project_list",
       "model_list",
       "worktree_list",

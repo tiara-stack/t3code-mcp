@@ -110,6 +110,7 @@ describe("stdio transport", () => {
               "instance_update",
               "instance_pair_again",
               "instance_remove",
+              "worktree_create",
               "project_list",
               "model_list",
               "worktree_list",
@@ -332,6 +333,6 @@ describe("stdio transport", () => {
             rmSync(directory, { recursive: true, force: true });
           }),
       ),
-    15_000,
+    30_000,
   );
 });

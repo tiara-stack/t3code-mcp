@@ -278,6 +278,7 @@ const observationsLayer = (
         },
         openThreadStream: () => Stream.die("not used"),
         readArchivedShell: (instanceId) => scripts.readArchivedShell(instanceId),
+        createWorktree: () => Effect.die("not used"),
         invalidate: () => Effect.void,
       }),
     ),
@@ -453,6 +454,7 @@ describe("Observations coalescing", () => {
               },
               openThreadStream: () => Stream.die("not used"),
               readArchivedShell: () => Effect.die("not used"),
+              createWorktree: () => Effect.die("not used"),
               invalidate: () => Effect.void,
             }),
           ),
@@ -937,6 +939,7 @@ const threadObservationsLayer = (
           return scripts.openThreadStream(instanceId, threadId, options);
         },
         readArchivedShell: () => Effect.die("not used"),
+        createWorktree: () => Effect.die("not used"),
         invalidate: () => Effect.void,
       }),
     ),
@@ -1236,6 +1239,7 @@ describe("InstanceConnections observation capacity", () => {
               ),
             subscribeThread: () => Stream.die("not used"),
             getArchivedShellSnapshot: () => Effect.die("not used"),
+            createWorktree: () => Effect.die("not used"),
             listVcsRefs: () => Effect.die("not used"),
           };
           const layer = InstanceConnections.layerWithAdapter(
@@ -1323,6 +1327,7 @@ describe("InstanceConnections observation capacity", () => {
             Stream.make(snapshotItem(1, [project("project-a")], []), synchronizedItem),
           subscribeThread: () => Stream.die("not used"),
           getArchivedShellSnapshot: () => Effect.die("not used"),
+          createWorktree: () => Effect.die("not used"),
           listVcsRefs: () => Effect.die("not used"),
         };
         const layer = InstanceConnections.layerWithAdapter(

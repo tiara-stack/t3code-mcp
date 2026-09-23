@@ -21,6 +21,7 @@ import {
   InstancePairAgainInputSchema,
   InstancePairInputSchema,
   InstanceUpdateInputSchema,
+  WorktreeCreateInputSchema,
   DEFAULT_THREAD_WAIT_MILLIS,
   MAX_ACTIVE_THREAD_SUBSCRIPTIONS_PER_INSTANCE,
   MAX_OPERATION_CAPACITY,
@@ -77,6 +78,7 @@ import {
   ThreadWaitInputSchema,
   ThreadWaitToolResultSchema,
   type ThreadWaitToolResult,
+  type WorktreeCreateInput,
   TurnWaitInputSchema,
   TurnWaitToolResultSchema,
   type TurnWaitResult,
@@ -137,6 +139,7 @@ import {
   type ObservedThreadActivity,
   type ObservedThreadDetail,
 } from "./t3code-adapter";
+import { adapterErrorFailure } from "./tool-failure";
 
 // fallow-ignore-next-line unused-export
 export const InstanceListTool = Tool.make("instance_list", {
@@ -343,6 +346,20 @@ export const InstancePairAgainTool = asRegistrationMutation(
 );
 
 // fallow-ignore-next-line unused-export
+export const WorktreeCreateTool = Tool.make("worktree_create", {
+  description:
+    "Create a worktree on one T3Code instance. Reusing its request ID reads the original creation receipt and never repeats the VCS operation.",
+  parameters: WorktreeCreateInputSchema,
+  success: OperationToolResultSchema,
+})
+  .addDependency(LocalStore)
+  .addDependency(Operations)
+  .annotate(Tool.Readonly, false)
+  .annotate(Tool.Destructive, false)
+  .annotate(Tool.Idempotent, false)
+  .annotate(Tool.OpenWorld, true);
+
+// fallow-ignore-next-line unused-export
 export const OperationGetTool = Tool.make("operation_get", {
   description: "Recover an admitted mutation receipt by request ID.",
   parameters: OperationGetInputSchema,
@@ -362,6 +379,7 @@ export const ServerToolkit = Toolkit.make(
   InstanceUpdateTool,
   InstancePairAgainTool,
   InstanceRemoveTool,
+  WorktreeCreateTool,
   ProjectListTool,
   ModelListTool,
   WorktreeListTool,
@@ -411,32 +429,7 @@ const toToolFailure = (
         });
     }
   }
-  if (error instanceof T3CodeAdapterError) {
-    switch (error.kind) {
-      case "pairing_required":
-        return makeToolFailure(error.message, "pairing_required", "change_request", {
-          action: "pair_instance",
-        });
-      case "incompatible_instance":
-      case "wire_incompatible":
-        return makeToolFailure(error.message, "incompatible_instance", "change_request");
-      case "authorization":
-        return makeToolFailure(error.message, "read_denied", "change_request");
-      case "identity_mismatch":
-        return makeToolFailure(error.message, "identity_mismatch", "reconcile_first");
-      case "identity_conflict":
-        return makeToolFailure(error.message, "identity_conflict", "change_request");
-      case "capacity":
-      case "timeout":
-      case "transport":
-        return makeToolFailure(error.message, "unavailable", "safe_read");
-      case "invalid_pairing_code":
-      case "pairing_code_used":
-        return makeToolFailure(error.message, "pairing_failed", "change_request");
-      case "resource_not_found":
-        return makeToolFailure(error.message, "resource_not_found", "reconcile_first");
-    }
-  }
+  if (error instanceof T3CodeAdapterError) return adapterErrorFailure(error, "read");
   if (error instanceof OperationServiceError) {
     return {
       code: "unavailable" as const,
@@ -489,7 +482,7 @@ const toToolFailure = (
   }
 };
 
-const registrationMutationResult = (
+const operationMutationResult = (
   operation: Effect.Effect<OperationRecord, LocalStoreError | OperationServiceError>,
 ): Effect.Effect<
   | {
@@ -3360,7 +3353,7 @@ const serverToolHandlers = ServerToolkit.of({
   instance_remove: (input) =>
     Effect.gen(function* () {
       const operations = yield* Operations;
-      return yield* registrationMutationResult(operations.removeRegistration(input));
+      return yield* operationMutationResult(operations.removeRegistration(input));
     }),
   project_list: ({ scope, cursor, limit, allowStale }) =>
     Effect.gen(function* () {
@@ -3637,17 +3630,22 @@ const serverToolHandlers = ServerToolkit.of({
   instance_update: (input) =>
     Effect.gen(function* () {
       const operations = yield* Operations;
-      return yield* registrationMutationResult(operations.updateRegistration(input));
+      return yield* operationMutationResult(operations.updateRegistration(input));
     }),
   instance_pair: (input) =>
     Effect.gen(function* () {
       const operations = yield* Operations;
-      return yield* registrationMutationResult(operations.pairInstance(input));
+      return yield* operationMutationResult(operations.pairInstance(input));
     }),
   instance_pair_again: (input) =>
     Effect.gen(function* () {
       const operations = yield* Operations;
-      return yield* registrationMutationResult(operations.pairInstanceAgain(input));
+      return yield* operationMutationResult(operations.pairInstanceAgain(input));
+    }),
+  worktree_create: (input: WorktreeCreateInput) =>
+    Effect.gen(function* () {
+      const operations = yield* Operations;
+      return yield* operationMutationResult(operations.createWorktree(input));
     }),
   operation_get: (input) =>
     Effect.gen(function* () {
@@ -3692,19 +3690,21 @@ const toStructuredContent = (value: unknown): Schema.JsonObject | undefined =>
     ? (value as Schema.JsonObject)
     : undefined;
 
+const operationMutatorTools: ReadonlySet<string> = new Set([
+  "instance_remove",
+  "instance_pair",
+  "instance_update",
+  "instance_pair_again",
+  "worktree_create",
+]);
+
 // fallow-ignore-next-line complexity
 const mutatorResultIsError = (toolName: string, value: unknown): boolean => {
   if (typeof value !== "object" || value === null) return false;
   const result = (value as { result?: unknown }).result;
   if (typeof result !== "object" || result === null) return false;
   if ((result as { kind?: unknown }).kind === "error") return true;
-  if (
-    toolName !== "instance_remove" &&
-    toolName !== "instance_pair" &&
-    toolName !== "instance_update" &&
-    toolName !== "instance_pair_again"
-  )
-    return false;
+  if (!operationMutatorTools.has(toolName)) return false;
   const operation = (result as { value?: { state?: unknown } }).value;
   return (
     (result as { kind?: unknown }).kind === "ok" &&

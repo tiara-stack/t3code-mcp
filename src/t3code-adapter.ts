@@ -6,6 +6,7 @@ import * as Data from "effect/Data";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Match from "effect/Match";
 import * as Option from "effect/Option";
 import * as Predicate from "effect/Predicate";
 import * as Result from "effect/Result";
@@ -299,6 +300,25 @@ const EnvironmentAuthorizationErrorWireSchema = Schema.Struct({
   requiredScope: Schema.String,
 });
 
+const VcsCreateWorktreeGitCommandErrorWireSchema = Schema.Struct({
+  _tag: Schema.Literal("GitCommandError"),
+  operation: Schema.String,
+  command: Schema.String,
+  cwd: Schema.String,
+  argumentCount: Schema.optionalKey(Schema.Number),
+  exitCode: Schema.optionalKey(Schema.Number),
+  stdoutLength: Schema.optionalKey(Schema.Number),
+  stderrLength: Schema.optionalKey(Schema.Number),
+  outputLength: Schema.optionalKey(Schema.Number),
+  detail: Schema.String,
+  cause: Schema.optionalKey(Schema.Unknown),
+});
+
+const VcsCreateWorktreeErrorWireSchema = Schema.Union([
+  EnvironmentAuthorizationErrorWireSchema,
+  VcsCreateWorktreeGitCommandErrorWireSchema,
+]);
+
 // The pinned tagged errors carry extra fields the adapter does not consume;
 // only the discriminating tag is required.
 const KeybindingsConfigErrorWireSchema = Schema.Struct({
@@ -420,6 +440,28 @@ const ServerGetConfigRpc = Rpc.make("server.getConfig", {
   ]),
 });
 
+/**
+ * The pinned 0.0.38 VCS RPC uses cwd/refName/newRefName/baseRefName/path and
+ * returns the effective path and ref. These adapter-owned schemas keep the
+ * beta server contract out of the rc application runtime.
+ */
+const VcsCreateWorktreeRpc = Rpc.make("vcs.createWorktree", {
+  payload: Schema.Struct({
+    cwd: trimmedNonEmptyWireString,
+    refName: trimmedNonEmptyWireString,
+    newRefName: Schema.optionalKey(trimmedNonEmptyWireString),
+    baseRefName: Schema.optionalKey(trimmedNonEmptyWireString),
+    path: Schema.NullOr(trimmedNonEmptyWireString),
+  }),
+  success: Schema.Struct({
+    worktree: Schema.Struct({
+      path: trimmedNonEmptyWireString,
+      refName: trimmedNonEmptyWireString,
+    }),
+  }),
+  error: VcsCreateWorktreeErrorWireSchema,
+});
+
 const SubscribeShellRpc = Rpc.make("orchestration.subscribeShell", {
   payload: SubscribeShellInputWireSchema,
   success: ShellStreamItemWireSchema,
@@ -462,6 +504,7 @@ const VcsListRefsRpc = Rpc.make("vcs.listRefs", {
 const AdapterRpcGroup = RpcGroup.make(
   ServerProbeRpc,
   ServerGetConfigRpc,
+  VcsCreateWorktreeRpc,
   SubscribeShellRpc,
   GetArchivedShellSnapshotRpc,
   SubscribeThreadRpc,
@@ -659,6 +702,56 @@ const mapAuthenticatedChannelError = (error: unknown): T3CodeAdapterError => {
   });
 };
 
+const worktreeCreateNoEffectKinds = new Set<T3CodeAdapterErrorKind>([
+  "authorization",
+  "capacity",
+  "pairing_required",
+  "incompatible_instance",
+  "identity_mismatch",
+  "identity_conflict",
+  "resource_not_found",
+  "invalid_pairing_code",
+  "pairing_code_used",
+]);
+
+const worktreeCreateRpcError = (error: typeof VcsCreateWorktreeErrorWireSchema.Type) =>
+  Match.value(error).pipe(
+    Match.tag(
+      "EnvironmentAuthorizationError",
+      (authorizationError) =>
+        new T3CodeAdapterError({
+          kind: "authorization",
+          message: "The T3Code credential lacks authorization for VCS operations.",
+          uncertain: false,
+          status: null,
+          requiredScopes: [authorizationError.requiredScope],
+        }),
+    ),
+    Match.tag(
+      "GitCommandError",
+      () =>
+        new T3CodeAdapterError({
+          kind: "upstream_failure",
+          message: "T3Code reported a VCS creation failure; the worktree may already exist.",
+          uncertain: true,
+          status: null,
+        }),
+    ),
+    Match.exhaustive,
+  );
+
+const worktreeCreateError = (error: unknown): T3CodeAdapterError => {
+  if (Schema.is(VcsCreateWorktreeErrorWireSchema)(error)) return worktreeCreateRpcError(error);
+  const mapped = mapAuthenticatedChannelError(error);
+  if (mapped.uncertain || worktreeCreateNoEffectKinds.has(mapped.kind)) return mapped;
+  return new T3CodeAdapterError({
+    kind: mapped.kind,
+    message: mapped.message,
+    uncertain: true,
+    status: mapped.status,
+  });
+};
+
 const mapShellStreamError = (error: unknown): T3CodeAdapterError => {
   const mapped = mapOrchestrationReadError("The T3Code shell observation stream failed.")(error);
   return mapped instanceof T3CodeAdapterError ? mapped : mapAuthenticatedChannelError(mapped);
@@ -722,6 +815,7 @@ export type T3CodeAdapterErrorKind =
   | "invalid_pairing_code"
   | "pairing_code_used"
   | "pairing_required"
+  | "upstream_failure"
   | "transport"
   | "timeout"
   | "authorization"
@@ -737,11 +831,24 @@ export class T3CodeAdapterError extends Data.TaggedError("T3CodeAdapterError")<{
   readonly message: string;
   readonly uncertain: boolean;
   readonly status: number | null;
+  readonly requiredScopes?: ReadonlyArray<string>;
 }> {}
 
 export interface PairingExchangeInput {
   readonly endpoint: string;
   readonly pairingCode: string;
+}
+
+export interface WorktreeCreateRequest {
+  readonly repositoryPath: string;
+  readonly startRef: string;
+  readonly newBranch?: string;
+  readonly path: string | null;
+}
+
+export interface CreatedWorktree {
+  readonly path: string;
+  readonly refName: string;
 }
 
 export interface StagedPairingToken {
@@ -999,6 +1106,9 @@ export interface T3CodeAdapterService {
     readonly endpoint: string;
     readonly credential: string;
   }) => Effect.Effect<ShellSnapshot, T3CodeAdapterError>;
+  readonly createWorktree: (
+    input: { readonly endpoint: string; readonly credential: string } & WorktreeCreateRequest,
+  ) => Effect.Effect<CreatedWorktree, T3CodeAdapterError>;
   /**
    * List the VCS refs for one repository path on the target instance and keep
    * every ref that reports a worktree checkout. The pinned upstream paginates
@@ -1958,6 +2068,25 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
           ),
         );
 
+      const createWorktree = (
+        input: { readonly endpoint: string; readonly credential: string } & WorktreeCreateRequest,
+      ): Effect.Effect<CreatedWorktree, T3CodeAdapterError> =>
+        withCapacity(
+          withAuthenticatedRpc(input.endpoint, input.credential, (client) =>
+            client["vcs.createWorktree"]({
+              cwd: input.repositoryPath,
+              refName: input.startRef,
+              ...(input.newBranch === undefined
+                ? {}
+                : { newRefName: input.newBranch, baseRefName: input.startRef }),
+              path: input.path,
+            }).pipe(
+              Effect.map((result) => result.worktree),
+              Effect.mapError(worktreeCreateError),
+            ),
+          ),
+        ).pipe(Effect.mapError(worktreeCreateError));
+
       /**
        * Open one authenticated streaming RPC subscription. The shared
        * adapter capacity permit is held for the whole stream lifetime; the
@@ -2131,12 +2260,19 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
             probe.diagnostics.authorization.read !== "allowed" ||
             probe.diagnostics.authorization.operate !== "allowed"
           ) {
+            const requiredScopes = [
+              ...(probe.diagnostics.authorization.read !== "allowed" ? ["orchestration:read"] : []),
+              ...(probe.diagnostics.authorization.operate !== "allowed"
+                ? ["orchestration:operate"]
+                : []),
+            ];
             return yield* Effect.fail(
               new T3CodeAdapterError({
                 kind: "authorization",
                 message: "The pairing credential lacks the required orchestration scopes.",
                 uncertain: false,
                 status: null,
+                requiredScopes,
               }),
             );
           }
@@ -2157,6 +2293,7 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
         subscribeShell,
         subscribeThread,
         getArchivedShellSnapshot,
+        createWorktree,
         listVcsRefs,
       });
     }),

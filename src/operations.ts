@@ -6,6 +6,7 @@ import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Match from "effect/Match";
 import {
   MAX_OPERATION_CAPACITY,
   MAX_OPERATION_WAIT_MILLIS,
@@ -21,11 +22,13 @@ import {
   type OperationGetValue,
   type OperationRecord,
   type ToolFailure,
+  type WorktreeCreateInput,
 } from "./domain";
 import { LocalStore, LocalStoreError, REQUEST_RECORD_UNAVAILABLE_MESSAGE } from "./local-store";
 import type { OperationIntent, StoredOperation } from "./local-store";
 import { InstanceConnections } from "./instance-connections";
 import { T3CodeAdapterError } from "./t3code-adapter";
+import { adapterErrorFailure } from "./tool-failure";
 
 export class OperationServiceError extends Data.TaggedError("OperationServiceError")<{
   readonly kind: "capacity";
@@ -44,6 +47,9 @@ export interface OperationsService {
   ) => Effect.Effect<OperationRecord, LocalStoreError | OperationServiceError>;
   readonly updateRegistration: (
     input: InstanceUpdateInput,
+  ) => Effect.Effect<OperationRecord, LocalStoreError | OperationServiceError>;
+  readonly createWorktree: (
+    input: WorktreeCreateInput,
   ) => Effect.Effect<OperationRecord, LocalStoreError | OperationServiceError>;
   readonly getOperation: (
     input: OperationGetInput,
@@ -167,77 +173,8 @@ export class Operations extends Context.Service<Operations, OperationsService>()
         }
       };
 
-      // fallow-ignore-next-line complexity
-      const pairingFailure = (error: T3CodeAdapterError): ToolFailure => {
-        switch (error.kind) {
-          case "incompatible_instance":
-          case "wire_incompatible":
-            return {
-              code: "incompatible_instance",
-              message: error.message,
-              retry: "change_request",
-              details: {},
-            };
-          case "authorization":
-            return {
-              code: "pairing_failed",
-              message: error.message,
-              retry: "change_request",
-              details: { reason: "authorization" },
-            };
-          case "pairing_required":
-            return {
-              code: "pairing_failed",
-              message: error.message,
-              retry: "change_request",
-              details: { reason: "pairing_required" },
-            };
-          case "identity_mismatch":
-            return {
-              code: "identity_mismatch",
-              message: error.message,
-              retry: "reconcile_first",
-              details: {},
-            };
-          case "identity_conflict":
-            return {
-              code: "identity_conflict",
-              message: error.message,
-              retry: "change_request",
-              details: {},
-            };
-          case "invalid_pairing_code":
-          case "pairing_code_used":
-            return {
-              code: "pairing_failed",
-              message: error.message,
-              retry: "change_request",
-              details: {},
-            };
-          case "capacity":
-            return {
-              code: "unavailable",
-              message: error.message,
-              retry: "safe_read",
-              details: {},
-            };
-          case "timeout":
-          case "transport":
-            return {
-              code: "unavailable",
-              message: error.message,
-              retry: "reconcile_first",
-              details: {},
-            };
-          case "resource_not_found":
-            return {
-              code: "resource_not_found",
-              message: error.message,
-              retry: "reconcile_first",
-              details: {},
-            };
-        }
-      };
+      const pairingFailure = (error: T3CodeAdapterError): ToolFailure =>
+        adapterErrorFailure(error, "pairing");
 
       const evidence = (
         detail: string,
@@ -270,8 +207,12 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           const observed = yield* evidence(detail, "adapter_inference");
           yield* store.updateOperation(stored.record.requestId, {
             now: observed.observedAt,
-            // Retain only the recovery identity after a prior dispatch attempt.
-            intent: { instanceId: stored.intent.instanceId },
+            // Worktree intent is non-secret and identifies what must be
+            // inspected before a new explicit creation request is made.
+            intent:
+              stored.record.tool === "worktree_create"
+                ? stored.intent
+                : { instanceId: stored.intent.instanceId },
             state: "outcome_unknown",
             dispatch: "unknown",
             stepPosition: 0,
@@ -362,6 +303,14 @@ export class Operations extends Context.Service<Operations, OperationsService>()
               record.tool === "instance_update"
                 ? "A previous process left this update without confirmed publication evidence; its outcome is unknown and it will not be redispatched."
                 : "A previous process left this re-pairing without confirmed publication evidence; its outcome is unknown, the one-use exchange will not be replayed, and an unfinished staged credential is never published automatically.",
+            );
+          }
+          if (record.tool === "worktree_create") {
+            if (previousOwner && !previousOwnerStale) return record;
+            return yield* markOutcomeUnknown(
+              stored,
+              record,
+              "A worktree-create attempt stopped without a durable T3Code result. Native VCS creation will not be replayed; inspect the target instance before starting a new explicit request.",
             );
           }
           if (record.tool !== "instance_remove") return record;
@@ -1170,6 +1119,144 @@ export class Operations extends Context.Service<Operations, OperationsService>()
         );
       };
 
+      type WorktreeCreationReference = NonNullable<OperationRecord["created"]["worktree"]>;
+
+      const worktreeCreateFailure = (error: LocalStoreError | T3CodeAdapterError): ToolFailure =>
+        Match.value(error).pipe(
+          Match.tag("LocalStoreError", operationFailure),
+          Match.tag("T3CodeAdapterError", (adapterError) =>
+            adapterErrorFailure(adapterError, "worktree"),
+          ),
+          Match.exhaustive,
+        );
+
+      const finishWorktreeCreation = (
+        requestId: string,
+        reference: WorktreeCreationReference,
+        responseEvidence: Evidence,
+      ): Effect.Effect<void, LocalStoreError> =>
+        store
+          .updateOperation(requestId, {
+            now: responseEvidence.observedAt,
+            state: "completed",
+            dispatch: "accepted",
+            target: reference,
+            created: { worktree: reference },
+            stepState: "succeeded",
+            evidence: [responseEvidence],
+            evidenceStepPosition: 0,
+            error: null,
+            recovery: "none",
+            recoverableUntil: new Date(
+              Date.parse(responseEvidence.observedAt) + OPERATION_DETAIL_RETENTION_MILLIS,
+            ).toISOString(),
+          })
+          .pipe(Effect.andThen(signalCompletion(requestId)));
+
+      const recordWorktreeCreateFailure = (
+        input: WorktreeCreateInput,
+        error: LocalStoreError | T3CodeAdapterError,
+        knownFailure: boolean,
+        reference: WorktreeCreationReference | null,
+        responseEvidence: Evidence | null,
+      ): Effect.Effect<void, never> =>
+        reference !== null && responseEvidence !== null
+          ? finishWorktreeCreation(input.requestId, reference, responseEvidence).pipe(
+              Effect.catch(() => signalCompletion(input.requestId)),
+            )
+          : nowIso.pipe(
+              Effect.flatMap((now) => {
+                const failure = worktreeCreateFailure(error);
+                return store
+                  .updateOperation(input.requestId, {
+                    now,
+                    state: knownFailure ? "failed" : "outcome_unknown",
+                    dispatch: knownFailure ? "rejected" : "unknown",
+                    stepState: knownFailure ? "failed" : "outcome_unknown",
+                    stepError: failure,
+                    error: failure,
+                    recovery: knownFailure ? "new_explicit_request" : "observe_operation",
+                    recoverableUntil: knownFailure
+                      ? new Date(Date.parse(now) + OPERATION_DETAIL_RETENTION_MILLIS).toISOString()
+                      : null,
+                  })
+                  .pipe(
+                    Effect.andThen(signalCompletion(input.requestId)),
+                    Effect.catch(() => Effect.void),
+                  );
+              }),
+            );
+
+      const executeWorktreeCreate = (input: WorktreeCreateInput): Effect.Effect<void, never> => {
+        let reference: WorktreeCreationReference | null = null;
+        let responseEvidence: Evidence | null = null;
+        return Effect.gen(function* () {
+          const registration = yield* store.getRegistration(input.instanceId);
+          if (registration === null) {
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: "registration_not_found",
+                message: "The saved T3Code registration was not found.",
+              }),
+            );
+          }
+
+          const started = yield* evidence(
+            "Worktree creation admission was committed; this process owns the single VCS attempt.",
+            "adapter_inference",
+          );
+          const intent = {
+            instanceId: input.instanceId,
+            repositoryPath: input.repositoryPath,
+            startRef: input.startRef,
+            ...(input.newBranch === undefined ? {} : { newBranch: input.newBranch }),
+            ...(input.path === undefined ? {} : { path: input.path }),
+          };
+          yield* store.updateOperation(input.requestId, {
+            now: started.observedAt,
+            intent,
+            state: "pending",
+            dispatch: "unknown",
+            target: registration.registration,
+            stepState: "pending",
+            evidence: [started],
+            evidenceStepPosition: 0,
+            recovery: "observe_operation",
+          });
+
+          const created = yield* connections.createWorktree(input.instanceId, {
+            repositoryPath: input.repositoryPath,
+            startRef: input.startRef,
+            ...(input.newBranch === undefined ? {} : { newBranch: input.newBranch }),
+            path: input.path ?? null,
+          });
+          reference = {
+            instanceId: input.instanceId,
+            repositoryPath: input.repositoryPath,
+            worktreePath: created.path,
+          };
+          responseEvidence = yield* evidence(
+            `T3Code returned worktree path ${created.path} on ref ${created.refName}.`,
+            "rpc_result",
+          );
+          yield* finishWorktreeCreation(input.requestId, reference, responseEvidence);
+        }).pipe(
+          Effect.catchTags({
+            LocalStoreError: (error) =>
+              recordWorktreeCreateFailure(input, error, true, reference, responseEvidence),
+            T3CodeAdapterError: (error) =>
+              recordWorktreeCreateFailure(
+                input,
+                error,
+                !error.uncertain,
+                reference,
+                responseEvidence,
+              ),
+          }),
+          Effect.asVoid,
+        );
+      };
+
       type AdmitAndRunInput = {
         readonly requestId: string;
         readonly fingerprint: string;
@@ -1457,11 +1544,56 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           });
         });
 
+      const createWorktree = (
+        input: WorktreeCreateInput,
+      ): Effect.Effect<OperationRecord, LocalStoreError | OperationServiceError> =>
+        Effect.gen(function* () {
+          const fingerprint = yield* store.fingerprintRequest("worktree_create", input);
+          const known = yield* store.findRequest(input.requestId);
+          if (known !== null) {
+            if (known.fingerprint !== fingerprint) {
+              return yield* Effect.fail(
+                new LocalStoreError({
+                  kind: "request_id_conflict",
+                  message: "The request ID was already used for different mutation input.",
+                }),
+              );
+            }
+            const existing = yield* store.getOperation(input.requestId);
+            if (existing === null) {
+              return yield* Effect.fail(
+                new LocalStoreError({
+                  kind: "request_record_unavailable",
+                  message: REQUEST_RECORD_UNAVAILABLE_MESSAGE,
+                }),
+              );
+            }
+            return yield* reconcile(existing);
+          }
+
+          return yield* admitAndRun({
+            requestId: input.requestId,
+            fingerprint,
+            tool: "worktree_create",
+            intent: {
+              instanceId: input.instanceId,
+              repositoryPath: input.repositoryPath,
+              startRef: input.startRef,
+              ...(input.newBranch === undefined ? {} : { newBranch: input.newBranch }),
+              ...(input.path === undefined ? {} : { path: input.path }),
+            },
+            completionMeans: "worktree_created",
+            steps: ["create_worktree"],
+            execute: executeWorktreeCreate(input),
+          });
+        });
+
       return Operations.of({
         pairInstance,
         pairInstanceAgain,
         removeRegistration,
         updateRegistration,
+        createWorktree,
         getOperation: readOperation,
       });
     }),

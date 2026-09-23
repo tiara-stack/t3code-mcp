@@ -22,6 +22,8 @@ import {
   type T3CodeAdapterService,
   type ThreadStreamItem,
   type VerifiedInstance,
+  type CreatedWorktree,
+  type WorktreeCreateRequest,
 } from "./t3code-adapter";
 
 export type VerifiedPairing = StagedPairingToken & VerifiedInstance;
@@ -87,6 +89,10 @@ export interface InstanceConnectionsService {
   readonly discoverModels: (
     instanceId: string,
   ) => Effect.Effect<DiscoveredModels, LocalStoreError | T3CodeAdapterError>;
+  readonly createWorktree: (
+    instanceId: string,
+    input: WorktreeCreateRequest,
+  ) => Effect.Effect<CreatedWorktree, LocalStoreError | T3CodeAdapterError>;
   /**
    * Read the VCS refs for one repository path on the target instance, keeping
    * only refs that report a worktree checkout. A missing registration or an
@@ -604,8 +610,8 @@ export class InstanceConnections extends Context.Service<
             if (credential === null) {
               return yield* Effect.fail(
                 new T3CodeAdapterError({
-                  kind: "authorization",
-                  message: "The saved registration has no private credential.",
+                  kind: "pairing_required",
+                  message: "The saved registration requires pairing before it can be used.",
                   uncertain: false,
                   status: null,
                 }),
@@ -659,6 +665,39 @@ export class InstanceConnections extends Context.Service<
             yield* ensureWatcher();
             return connection;
           });
+        const createWorktree = (instanceId: string, input: WorktreeCreateRequest) =>
+          Effect.gen(function* () {
+            // Preserve the pairing-specific failure before acquire can reuse a cached connection.
+            const registration = yield* store.getRegistration(instanceId);
+            if (registration === null) {
+              return yield* Effect.fail(
+                new LocalStoreError({
+                  kind: "registration_not_found",
+                  message: "The saved registration was not found.",
+                }),
+              );
+            }
+            if (registration.credential === null) {
+              return yield* Effect.fail(
+                new T3CodeAdapterError({
+                  kind: "pairing_required",
+                  message:
+                    "The saved registration requires pairing before worktrees can be created.",
+                  uncertain: false,
+                  status: null,
+                }),
+              );
+            }
+            const connection = yield* acquire(instanceId);
+            return yield* withInstanceCapacity(
+              instanceId,
+              adapter.createWorktree({
+                endpoint: connection.endpoint,
+                credential: connection.credential,
+                ...input,
+              }),
+            );
+          });
         return InstanceConnections.of({
           exchangePairingCode,
           verifyCredential,
@@ -668,6 +707,7 @@ export class InstanceConnections extends Context.Service<
           inspect,
           discoverProjects,
           discoverModels,
+          createWorktree,
           discoverVcsRefs,
           openShellStream,
           openThreadStream,

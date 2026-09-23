@@ -312,6 +312,71 @@ export const InstancePairAgainInputSchema = Schema.declare<{
 
 export type InstancePairAgainInput = typeof InstancePairAgainInputSchema.Type;
 
+const worktreeCreateString = Schema.String.check(
+  Schema.makeFilter((value) => value.length > 0 && value.trim() === value, {
+    message: "expected a trimmed non-empty string",
+  }),
+);
+
+const worktreeCreateFields = Schema.Struct({
+  requestId,
+  instanceId: worktreeCreateString,
+  repositoryPath: worktreeCreateString,
+  startRef: worktreeCreateString,
+  newBranch: Schema.optionalKey(worktreeCreateString),
+  path: Schema.optionalKey(worktreeCreateString),
+});
+
+const unknownWorktreeCreateField = Schema.String.check(
+  Schema.makeFilter(
+    (key) =>
+      key !== "requestId" &&
+      key !== "instanceId" &&
+      key !== "repositoryPath" &&
+      key !== "startRef" &&
+      key !== "newBranch" &&
+      key !== "path",
+    { message: "unknown worktree_create argument" },
+  ),
+);
+
+const worktreeCreateRuntimeShape = Schema.StructWithRest(worktreeCreateFields, [
+  Schema.Record(unknownWorktreeCreateField, Schema.Never),
+]);
+
+const worktreeCreateJsonShape = Schema.StructWithRest(worktreeCreateFields, [
+  Schema.Record(Schema.String, Schema.Never),
+]);
+
+export const WorktreeCreateInputSchema = Schema.declare<{
+  readonly requestId: string;
+  readonly instanceId: string;
+  readonly repositoryPath: string;
+  readonly startRef: string;
+  readonly newBranch?: string;
+  readonly path?: string;
+}>(
+  (
+    input,
+  ): input is {
+    readonly requestId: string;
+    readonly instanceId: string;
+    readonly repositoryPath: string;
+    readonly startRef: string;
+    readonly newBranch?: string;
+    readonly path?: string;
+  } => Schema.is(worktreeCreateRuntimeShape)(input),
+  {
+    toCodecJson: () =>
+      Schema.link()(worktreeCreateJsonShape, {
+        decode: SchemaGetter.passthrough({ strict: false }),
+        encode: SchemaGetter.passthrough({ strict: false }),
+      } as never),
+  },
+);
+
+export type WorktreeCreateInput = typeof WorktreeCreateInputSchema.Type;
+
 const instanceGetFields = Schema.Struct({
   instanceId: nonEmptyString,
   allowStale: Schema.optionalKey(Schema.Boolean),
