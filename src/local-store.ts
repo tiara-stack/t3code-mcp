@@ -646,6 +646,8 @@ export interface OperationAdmissionInput {
   readonly admittedAt: string;
   readonly intent: OperationIntent;
   readonly completionMeans: OperationRecord["completionMeans"];
+  readonly target?: OperationRecord["target"];
+  readonly commandId?: string;
   readonly steps?: ReadonlyArray<string>;
   readonly created?: OperationRecord["created"];
 }
@@ -853,6 +855,13 @@ export interface LocalStoreService {
     requestId: string,
     update: OperationUpdate,
   ) => Effect.Effect<void, LocalStoreError>;
+  readonly compareAndSetApprovalDispatch: (
+    requestId: string,
+    ownerProcessNonce: string,
+    expectedState: "admitted" | "pending",
+    update: OperationUpdate,
+    expectedDispatch?: "not_dispatched" | "unknown",
+  ) => Effect.Effect<boolean, LocalStoreError>;
   readonly inspectRegistration: (
     instanceId: string,
   ) => Effect.Effect<RegistrationInspection, LocalStoreError>;
@@ -1203,6 +1212,23 @@ export class LocalStore extends Context.Service<LocalStore, LocalStoreService>()
         const updateOperation = (requestId: string, update: OperationUpdate) =>
           updateOperationInDatabase(sql, requestId, update, verifySchemaForOperation);
 
+        const compareAndSetApprovalDispatch = (
+          requestId: string,
+          ownerProcessNonce: string,
+          expectedState: "admitted" | "pending",
+          update: OperationUpdate,
+          expectedDispatch?: "not_dispatched" | "unknown",
+        ) =>
+          compareAndSetApprovalDispatchInDatabase(
+            sql,
+            requestId,
+            ownerProcessNonce,
+            expectedState,
+            update,
+            verifySchemaForOperation,
+            expectedDispatch,
+          );
+
         const inspectRegistration = (instanceId: string) =>
           inspectRegistrationInDatabase(sql, instanceId, verifySchemaForOperation);
 
@@ -1250,6 +1276,7 @@ export class LocalStore extends Context.Service<LocalStore, LocalStoreService>()
           admitOperation,
           getOperation,
           updateOperation,
+          compareAndSetApprovalDispatch,
           inspectRegistration,
           removeRegistration,
           recordTurnEvidence,
@@ -4525,6 +4552,15 @@ const findRequestInDatabase = (
     }).pipe(Effect.mapError(toStoreError)),
   );
 
+const operationAdmissionMetadata = (input: OperationAdmissionInput) => {
+  const target = input.target ?? null;
+  return {
+    target,
+    targetJson: target === null ? null : JSON.stringify(target),
+    commandId: input.commandId ?? null,
+  };
+};
+
 const admitOperationInDatabase = (
   sql: SqlClient.SqlClient,
   input: OperationAdmissionInput,
@@ -4532,8 +4568,9 @@ const admitOperationInDatabase = (
 ): Effect.Effect<
   { readonly kind: "inserted" | "existing"; readonly operation: StoredOperation },
   LocalStoreError
-> =>
-  retryStorage(
+> => {
+  const admission = operationAdmissionMetadata(input);
+  return retryStorage(
     Effect.gen(function* () {
       yield* verify();
       return yield* sql.withTransaction(
@@ -4574,10 +4611,10 @@ const admitOperationInDatabase = (
             admittedAt: input.admittedAt,
             updatedAt: input.admittedAt,
             recoverableUntil: null,
-            target: null,
+            target: admission.target,
             completionMeans: input.completionMeans,
             dispatch: "not_dispatched",
-            commandId: null,
+            commandId: admission.commandId,
             messageId: null,
             correlation: null,
             created: input.created ?? {},
@@ -4607,8 +4644,9 @@ const admitOperationInDatabase = (
               recovery, owner_process_nonce
             ) VALUES (
               ${input.requestId}, ${input.tool}, 0, 'admitted', ${input.admittedAt},
-              ${input.admittedAt}, NULL, ${JSON.stringify(input.intent)}, NULL,
-              ${input.completionMeans}, 'not_dispatched', NULL, NULL, NULL,
+              ${input.admittedAt}, NULL, ${JSON.stringify(input.intent)},
+              ${admission.targetJson},
+              ${input.completionMeans}, 'not_dispatched', ${admission.commandId}, NULL, NULL,
               ${JSON.stringify(input.created ?? {})}, NULL,
               'observe_operation', ${input.processNonce}
             )
@@ -4633,6 +4671,7 @@ const admitOperationInDatabase = (
       );
     }).pipe(Effect.mapError(toStoreError)),
   );
+};
 
 const getOperationFromDatabase = (
   sql: SqlClient.SqlClient,
@@ -4652,16 +4691,21 @@ const getOperationFromDatabase = (
     }).pipe(Effect.mapError(toStoreError)),
   );
 
-const updateOperationInDatabase = (
+const updateOperationWithOwnerExpectationInDatabase = (
   sql: SqlClient.SqlClient,
   requestId: string,
   update: OperationUpdate,
   verify: SchemaVerifier,
-): Effect.Effect<void, LocalStoreError> =>
+  expectation?: {
+    readonly ownerProcessNonce: string;
+    readonly state: "admitted" | "pending";
+    readonly dispatch?: "not_dispatched" | "unknown";
+  },
+): Effect.Effect<boolean, LocalStoreError> =>
   retryStorage(
     Effect.gen(function* () {
       yield* verify();
-      yield* sql.withTransaction(
+      return yield* sql.withTransaction(
         // fallow-ignore-next-line complexity
         Effect.gen(function* () {
           const transactionNow = yield* Clock.currentTimeMillis;
@@ -4681,6 +4725,15 @@ const updateOperationInDatabase = (
                 message: "The mutation operation record is unavailable.",
               }),
             );
+          }
+          if (
+            expectation !== undefined &&
+            (row.tool !== "approval_respond" ||
+              row.owner_process_nonce !== expectation.ownerProcessNonce ||
+              row.state !== expectation.state ||
+              row.dispatch !== (expectation.dispatch ?? "not_dispatched"))
+          ) {
+            return false;
           }
 
           const targetJson =
@@ -4767,10 +4820,34 @@ const updateOperationInDatabase = (
               position += 1;
             }
           }
+          return true;
         }),
       );
     }).pipe(Effect.mapError(toStoreError)),
   );
+
+const updateOperationInDatabase = (
+  sql: SqlClient.SqlClient,
+  requestId: string,
+  update: OperationUpdate,
+  verify: SchemaVerifier,
+): Effect.Effect<void, LocalStoreError> =>
+  updateOperationWithOwnerExpectationInDatabase(sql, requestId, update, verify).pipe(Effect.asVoid);
+
+const compareAndSetApprovalDispatchInDatabase = (
+  sql: SqlClient.SqlClient,
+  requestId: string,
+  ownerProcessNonce: string,
+  expectedState: "admitted" | "pending",
+  update: OperationUpdate,
+  verify: SchemaVerifier,
+  expectedDispatch?: "not_dispatched" | "unknown",
+): Effect.Effect<boolean, LocalStoreError> =>
+  updateOperationWithOwnerExpectationInDatabase(sql, requestId, update, verify, {
+    ownerProcessNonce,
+    state: expectedState,
+    ...(expectedDispatch === undefined ? {} : { dispatch: expectedDispatch }),
+  });
 
 const inspectRegistrationInDatabase = (
   sql: SqlClient.SqlClient,

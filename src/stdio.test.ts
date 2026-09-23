@@ -116,6 +116,7 @@ describe("stdio transport", () => {
               "worktree_list",
               "thread_list",
               "thread_get",
+              "approval_respond",
               "thread_output",
               "thread_wait",
               "turn_wait",

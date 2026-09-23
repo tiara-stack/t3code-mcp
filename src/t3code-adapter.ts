@@ -23,10 +23,12 @@ import * as Socket from "effect/unstable/socket/Socket";
 import * as HttpClient from "effect/unstable/http/HttpClient";
 import * as HttpClientRequest from "effect/unstable/http/HttpClientRequest";
 import {
+  ApprovalDecisionSchema,
   INSTANCE_CAPABILITY_NAMES,
   MAX_TOTAL_RPC_CAPACITY,
   MUTATION_RPC_DEADLINE_MILLIS,
   type Authorization,
+  type ApprovalResponseCommand,
   type Capability,
   type InstanceCapabilityName,
 } from "./domain";
@@ -487,6 +489,33 @@ const SubscribeThreadRpc = Rpc.make("orchestration.subscribeThread", {
   stream: true,
 });
 
+const ApprovalResponseCommandWireSchema = Schema.Struct({
+  type: Schema.Literal("thread.approval.respond"),
+  commandId: trimmedNonEmptyWireString,
+  threadId: trimmedNonEmptyWireString,
+  requestId: trimmedNonEmptyWireString,
+  decision: ApprovalDecisionSchema,
+  createdAt: Schema.String,
+});
+
+const DispatchCommandResultWireSchema = Schema.Struct({ sequence: nonNegativeWireInt });
+
+const OrchestrationDispatchCommandErrorWireSchema = Schema.Struct({
+  _tag: Schema.Literal("OrchestrationDispatchCommandError"),
+  message: Schema.String,
+  cause: Schema.optionalKey(Schema.Unknown),
+  bootstrapThreadDisposition: Schema.optionalKey(Schema.Literal("deleted")),
+});
+
+const DispatchApprovalResponseRpc = Rpc.make("orchestration.dispatchCommand", {
+  payload: ApprovalResponseCommandWireSchema,
+  success: DispatchCommandResultWireSchema,
+  error: Schema.Union([
+    OrchestrationDispatchCommandErrorWireSchema,
+    EnvironmentAuthorizationErrorWireSchema,
+  ]),
+});
+
 const VcsListRefsRpc = Rpc.make("vcs.listRefs", {
   payload: Schema.Struct({
     cwd: trimmedNonEmptyWireString,
@@ -508,6 +537,7 @@ const AdapterRpcGroup = RpcGroup.make(
   SubscribeShellRpc,
   GetArchivedShellSnapshotRpc,
   SubscribeThreadRpc,
+  DispatchApprovalResponseRpc,
   VcsListRefsRpc,
 );
 
@@ -752,6 +782,36 @@ const worktreeCreateError = (error: unknown): T3CodeAdapterError => {
   });
 };
 
+const mapApprovalDispatchError = (
+  error: unknown,
+): T3CodeAdapterError | RpcClientError.RpcClientError => {
+  if (error instanceof T3CodeAdapterError) return error;
+  const reason = error instanceof RpcClientError.RpcClientError ? error.reason : error;
+  if (Predicate.hasProperty(reason, "_tag")) {
+    if (reason._tag === "OrchestrationDispatchCommandError") {
+      return new T3CodeAdapterError({
+        kind: "command_rejected",
+        message: "The T3Code instance rejected the approval response command.",
+        uncertain: false,
+        status: null,
+      });
+    }
+    if (reason._tag === "EnvironmentAuthorizationError") {
+      return mapOrchestrationReadError("The T3Code credential lacks the required operate scope.")(
+        reason,
+      );
+    }
+  }
+  const mapped = mapAuthenticatedChannelError(error);
+  if (mapped.kind !== "wire_incompatible") return mapped;
+  return new T3CodeAdapterError({
+    kind: "transport",
+    message: "The T3Code approval response reply could not be interpreted; its outcome is unknown.",
+    uncertain: true,
+    status: null,
+  });
+};
+
 const mapShellStreamError = (error: unknown): T3CodeAdapterError => {
   const mapped = mapOrchestrationReadError("The T3Code shell observation stream failed.")(error);
   return mapped instanceof T3CodeAdapterError ? mapped : mapAuthenticatedChannelError(mapped);
@@ -823,6 +883,7 @@ export type T3CodeAdapterErrorKind =
   | "identity_conflict"
   | "incompatible_instance"
   | "wire_incompatible"
+  | "command_rejected"
   | "resource_not_found"
   | "capacity";
 
@@ -1109,6 +1170,13 @@ export interface T3CodeAdapterService {
   readonly createWorktree: (
     input: { readonly endpoint: string; readonly credential: string } & WorktreeCreateRequest,
   ) => Effect.Effect<CreatedWorktree, T3CodeAdapterError>;
+  readonly respondToApproval: <E>(
+    input: ApprovalResponseCommand & {
+      readonly endpoint: string;
+      readonly credential: string;
+      readonly onDispatch: Effect.Effect<void, E, never>;
+    },
+  ) => Effect.Effect<{ readonly sequence: number }, T3CodeAdapterError | E>;
   /**
    * List the VCS refs for one repository path on the target instance and keep
    * every ref that reports a worktree checkout. The pinned upstream paginates
@@ -1599,7 +1667,7 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
       const capacity = Semaphore.makeUnsafe(MAX_TOTAL_RPC_CAPACITY);
       const pairingCodes = new Map<string, number>();
 
-      const withCapacity = <A>(effect: Effect.Effect<A, T3CodeAdapterError>) =>
+      const withCapacity = <A, E>(effect: Effect.Effect<A, T3CodeAdapterError | E>) =>
         capacity
           .withPermitsIfAvailable(1)(effect)
           .pipe(
@@ -1851,6 +1919,7 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
 
       const withRpcChannelBoundaries = <A, R>(
         effect: Effect.Effect<A, unknown, R>,
+        options?: { readonly uncertainOnTimeout?: boolean },
       ): Effect.Effect<A, T3CodeAdapterError, R> =>
         effect.pipe(
           Effect.timeoutOrElse({
@@ -1860,7 +1929,7 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
                 new T3CodeAdapterError({
                   kind: "timeout",
                   message: "The authenticated T3Code RPC request timed out.",
-                  uncertain: false,
+                  uncertain: options?.uncertainOnTimeout ?? false,
                   status: null,
                 }),
               ),
@@ -1872,6 +1941,7 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
         endpoint: string,
         credential: string,
         use: (client: AdapterRpcClient) => Effect.Effect<A, unknown>,
+        options?: { readonly uncertainOnTimeout?: boolean },
       ): Effect.Effect<A, T3CodeAdapterError> =>
         withRpcChannelBoundaries(
           Effect.scoped(
@@ -1882,6 +1952,7 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
               }).pipe(Effect.provide(protocolLayer)),
             ),
           ),
+          options,
         );
 
       const verifyEnvironmentSession = (input: {
@@ -2250,6 +2321,46 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
           }),
         );
 
+      const respondToApproval = <E>(
+        input: ApprovalResponseCommand & {
+          readonly endpoint: string;
+          readonly credential: string;
+          readonly onDispatch: Effect.Effect<void, E, never>;
+        },
+      ): Effect.Effect<{ readonly sequence: number }, T3CodeAdapterError | E> =>
+        Effect.flatMap(
+          withCapacity(
+            withAuthenticatedRpc(
+              input.endpoint,
+              input.credential,
+              (client) =>
+                Effect.gen(function* () {
+                  yield* client["server.probe"]({}).pipe(
+                    Effect.mapError(mapAuthenticatedChannelError),
+                  );
+                  const dispatchGate = yield* Effect.result(input.onDispatch);
+                  if (Result.isFailure(dispatchGate)) {
+                    return { _tag: "pre_dispatch_failed" as const, error: dispatchGate.failure };
+                  }
+                  const response = yield* client["orchestration.dispatchCommand"]({
+                    type: "thread.approval.respond",
+                    commandId: input.commandId,
+                    threadId: input.threadId,
+                    requestId: input.pendingRequestId,
+                    decision: input.decision,
+                    createdAt: input.createdAt,
+                  }).pipe(Effect.mapError(mapApprovalDispatchError));
+                  return { _tag: "accepted" as const, response };
+                }),
+              { uncertainOnTimeout: true },
+            ),
+          ),
+          (result) =>
+            result._tag === "pre_dispatch_failed"
+              ? Effect.fail(result.error)
+              : Effect.succeed(result.response),
+        );
+
       const verifyCredential = (input: {
         readonly endpoint: string;
         readonly credential: string;
@@ -2294,6 +2405,7 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
         subscribeThread,
         getArchivedShellSnapshot,
         createWorktree,
+        respondToApproval,
         listVcsRefs,
       });
     }),

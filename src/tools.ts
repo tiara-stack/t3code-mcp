@@ -14,6 +14,7 @@ import * as Stream from "effect/Stream";
 import type { JsonObject } from "effect/Schema";
 import { Tool, Toolkit } from "effect/unstable/ai";
 import {
+  ApprovalRespondInputSchema,
   InstanceRemoveInputSchema,
   InstanceListInputSchema,
   InstanceGetInputSchema,
@@ -208,75 +209,89 @@ export const WorktreeListTool = Tool.make("worktree_list", {
   .annotate(Tool.Idempotent, true)
   .annotate(Tool.OpenWorld, true);
 
+const asThreadReadTool = <
+  Name extends string,
+  Config extends {
+    readonly parameters: Schema.Constraint;
+    readonly success: Schema.Constraint;
+    readonly failure: Schema.Constraint;
+    readonly failureMode: Tool.FailureMode;
+  },
+  Requirements,
+>(
+  tool: Tool.Tool<Name, Config, Requirements>,
+): Tool.Tool<Name, Config, Requirements | LocalStore | Observations> =>
+  tool
+    .addDependency(LocalStore)
+    .addDependency(Observations)
+    .annotate(Tool.Readonly, true)
+    .annotate(Tool.Destructive, false)
+    .annotate(Tool.Idempotent, true)
+    .annotate(Tool.OpenWorld, true);
+
 // fallow-ignore-next-line unused-export
-export const ThreadListTool = Tool.make("thread_list", {
+export const ThreadListTool = asThreadReadTool(
+  Tool.make("thread_list", {
+    description:
+      "List existing and archived threads on one saved T3Code instance or one explicit project scope, with stable pagination.",
+    parameters: ThreadListInputSchema,
+    success: ThreadListToolResultSchema,
+  }),
+);
+
+// fallow-ignore-next-line unused-export
+export const ThreadGetTool = asThreadReadTool(
+  Tool.make("thread_get", {
+    description:
+      "Inspect one thread's compact configuration, execution, provider session, settlement, and pending requests through a synchronized native thread snapshot.",
+    parameters: ThreadGetInputSchema,
+    success: ThreadGetToolResultSchema,
+  }),
+);
+
+// fallow-ignore-next-line unused-export
+export const ApprovalRespondTool = Tool.make("approval_respond", {
   description:
-    "List existing and archived threads on one saved T3Code instance or one explicit project scope, with stable pagination.",
-  parameters: ThreadListInputSchema,
-  success: ThreadListToolResultSchema,
+    "Respond to one freshly observed approval request with an offered decision, preserving its native scope.",
+  parameters: ApprovalRespondInputSchema,
+  success: OperationToolResultSchema,
 })
-  .addDependency(LocalStore)
+  .addDependency(Operations)
   .addDependency(Observations)
-  .annotate(Tool.Readonly, true)
-  .annotate(Tool.Destructive, false)
+  .annotate(Tool.Readonly, false)
+  .annotate(Tool.Destructive, true)
   .annotate(Tool.Idempotent, true)
   .annotate(Tool.OpenWorld, true);
 
 // fallow-ignore-next-line unused-export
-export const ThreadGetTool = Tool.make("thread_get", {
-  description:
-    "Inspect one thread's compact configuration, execution, provider session, settlement, and pending requests through a synchronized native thread snapshot.",
-  parameters: ThreadGetInputSchema,
-  success: ThreadGetToolResultSchema,
-})
-  .addDependency(LocalStore)
-  .addDependency(Observations)
-  .annotate(Tool.Readonly, true)
-  .annotate(Tool.Destructive, false)
-  .annotate(Tool.Idempotent, true)
-  .annotate(Tool.OpenWorld, true);
+export const ThreadOutputTool = asThreadReadTool(
+  Tool.make("thread_output", {
+    description:
+      "Read one thread's retained conversation and activity output as bounded latest-first UTF-8 chunks with native identities, turn correlation, and explicit truncation.",
+    parameters: ThreadOutputInputSchema,
+    success: ThreadOutputToolResultSchema,
+  }),
+);
 
 // fallow-ignore-next-line unused-export
-export const ThreadOutputTool = Tool.make("thread_output", {
-  description:
-    "Read one thread's retained conversation and activity output as bounded latest-first UTF-8 chunks with native identities, turn correlation, and explicit truncation.",
-  parameters: ThreadOutputInputSchema,
-  success: ThreadOutputToolResultSchema,
-})
-  .addDependency(LocalStore)
-  .addDependency(Observations)
-  .annotate(Tool.Readonly, true)
-  .annotate(Tool.Destructive, false)
-  .annotate(Tool.Idempotent, true)
-  .annotate(Tool.OpenWorld, true);
+export const ThreadWaitTool = asThreadReadTool(
+  Tool.make("thread_wait", {
+    description:
+      "Wait for one observable thread condition (changed, inactive, settled, unsettled, session_stopped, needs_response) across all clients' activity, reporting condition_met, timed_out, unavailable, and history_gap separately from the observed thread state.",
+    parameters: ThreadWaitInputSchema,
+    success: ThreadWaitToolResultSchema,
+  }),
+);
 
 // fallow-ignore-next-line unused-export
-export const ThreadWaitTool = Tool.make("thread_wait", {
-  description:
-    "Wait for one observable thread condition (changed, inactive, settled, unsettled, session_stopped, needs_response) across all clients' activity, reporting condition_met, timed_out, unavailable, and history_gap separately from the observed thread state.",
-  parameters: ThreadWaitInputSchema,
-  success: ThreadWaitToolResultSchema,
-})
-  .addDependency(LocalStore)
-  .addDependency(Observations)
-  .annotate(Tool.Readonly, true)
-  .annotate(Tool.Destructive, false)
-  .annotate(Tool.Idempotent, true)
-  .annotate(Tool.OpenWorld, true);
-
-// fallow-ignore-next-line unused-export
-export const TurnWaitTool = Tool.make("turn_wait", {
-  description:
-    "Wait for one exact observed turn's outcome (completed, interrupted, failed, awaiting approval/input, running, or outcome unknown) with supported evidence, retaining the requested target even after a newer turn starts; reports timeout, unavailable observation, and history gaps separately from execution.",
-  parameters: TurnWaitInputSchema,
-  success: TurnWaitToolResultSchema,
-})
-  .addDependency(LocalStore)
-  .addDependency(Observations)
-  .annotate(Tool.Readonly, true)
-  .annotate(Tool.Destructive, false)
-  .annotate(Tool.Idempotent, true)
-  .annotate(Tool.OpenWorld, true);
+export const TurnWaitTool = asThreadReadTool(
+  Tool.make("turn_wait", {
+    description:
+      "Wait for one exact observed turn's outcome (completed, interrupted, failed, awaiting approval/input, running, or outcome unknown) with supported evidence, retaining the requested target even after a newer turn starts; reports timeout, unavailable observation, and history gaps separately from execution.",
+    parameters: TurnWaitInputSchema,
+    success: TurnWaitToolResultSchema,
+  }),
+);
 
 /**
  * The registration mutations share one admission/supervision dependency set
@@ -385,6 +400,7 @@ export const ServerToolkit = Toolkit.make(
   WorktreeListTool,
   ThreadListTool,
   ThreadGetTool,
+  ApprovalRespondTool,
   ThreadOutputTool,
   ThreadWaitTool,
   TurnWaitTool,
@@ -429,8 +445,16 @@ const toToolFailure = (
         });
     }
   }
-  if (error instanceof T3CodeAdapterError) return adapterErrorFailure(error, "read");
+  if (error instanceof T3CodeAdapterError) {
+    return adapterErrorFailure(error, "read");
+  }
   if (error instanceof OperationServiceError) {
+    if (error.kind === "stale_approval") {
+      return makeToolFailure(error.message, "pending_request_not_current", "reconcile_first");
+    }
+    if (error.kind === "unsupported_approval_decision") {
+      return makeToolFailure(error.message, "invalid_argument", "change_request");
+    }
     return {
       code: "unavailable" as const,
       message: error.message,
@@ -483,7 +507,10 @@ const toToolFailure = (
 };
 
 const operationMutationResult = (
-  operation: Effect.Effect<OperationRecord, LocalStoreError | OperationServiceError>,
+  operation: Effect.Effect<
+    OperationRecord,
+    LocalStoreError | OperationServiceError | T3CodeAdapterError | ObservationError
+  >,
 ): Effect.Effect<
   | {
       readonly result: { readonly kind: "ok"; readonly value: OperationRecord };
@@ -525,12 +552,13 @@ const operationMutationResult = (
       warnings: [],
     };
   }).pipe(
-    Effect.catch((error: LocalStoreError | OperationServiceError) =>
-      Effect.succeed({
-        result: { kind: "error" as const, error: toToolFailure(error) },
-        observations: [],
-        warnings: [],
-      }),
+    Effect.catch(
+      (error: LocalStoreError | OperationServiceError | T3CodeAdapterError | ObservationError) =>
+        Effect.succeed({
+          result: { kind: "error" as const, error: toToolFailure(error) },
+          observations: [],
+          warnings: [],
+        }),
     ),
   );
 
@@ -1659,6 +1687,40 @@ interface DecodedApprovalOption {
   readonly label: string;
 }
 
+/**
+ * T3 Code 0.0.38's web client renders these choices when an approval event
+ * omits provider options. Keep this fallback limited to request types the
+ * pinned runtime classifies, so an unknown form never becomes actionable.
+ */
+const defaultApprovalOptions: ReadonlyArray<DecodedApprovalOption> = [
+  { decision: "cancel", label: "Cancel" },
+  { decision: "decline", label: "Decline" },
+  { decision: "acceptForSession", label: "Always allow this session" },
+  { decision: "accept", label: "Approve" },
+];
+
+const defaultApprovalRequestKinds: Readonly<Record<string, string>> = {
+  command_execution_approval: "command",
+  exec_command_approval: "command",
+  file_read_approval: "file-read",
+  file_change_approval: "file-change",
+  apply_patch_approval: "file-change",
+  mcp_elicitation_approval: "mcp-elicitation",
+};
+
+const defaultApprovalOptionsForPayload = (
+  payload: Record<string, unknown>,
+): ReadonlyArray<DecodedApprovalOption> | null => {
+  const requestType = payload.requestType;
+  if (typeof requestType !== "string" || !Object.hasOwn(defaultApprovalRequestKinds, requestType)) {
+    return null;
+  }
+  const expectedRequestKind = defaultApprovalRequestKinds[requestType];
+  return typeof expectedRequestKind === "string" && expectedRequestKind === payload.requestKind
+    ? defaultApprovalOptions
+    : null;
+};
+
 const decodeApprovalOption = (element: unknown): DecodedApprovalOption | null => {
   if (typeof element !== "object" || element === null) return null;
   const candidate = element as Record<string, unknown>;
@@ -1676,6 +1738,7 @@ const decodeApprovalOption = (element: unknown): DecodedApprovalOption | null =>
 const decodeApprovalOptions = (
   payload: Record<string, unknown>,
 ): ReadonlyArray<DecodedApprovalOption> | null => {
+  if (payload.options === undefined) return defaultApprovalOptionsForPayload(payload);
   if (!Array.isArray(payload.options)) return null;
   // A request with no offered decisions cannot be answered; an oversized
   // list exceeds the bounded-form limit. Both stay unactionable.
@@ -1790,12 +1853,15 @@ const activityPayloadRecord = (activity: ObservedThreadActivity): Record<string,
 const MISSING_REQUEST_ID_REASON =
   "The native request ID is missing; the request cannot be answered.";
 const RESOLVED_REQUEST_REASON = "The request is already resolved.";
+const UNKNOWN_REQUEST_LIFECYCLE_REASON =
+  "The thread history is incomplete, so the request lifecycle cannot be established.";
 const UNREPRESENTABLE_APPROVAL_REASON = "The offered approval decisions could not be represented.";
 const UNREPRESENTABLE_INPUT_REASON = "The input form could not be represented.";
 
 interface PendingRequestContext {
   readonly thread: ThreadState["summary"]["thread"];
   readonly resolvedRequestIds: ReadonlySet<string>;
+  readonly historyLimited: boolean;
 }
 
 const collectResolvedRequestIds = (
@@ -1845,33 +1911,48 @@ const pendingRequestWithLifecycle = (options: {
   readonly representable: RepresentableForm | UnrepresentableForm;
 }): PendingRequest => {
   const { context, base, requestId, representable } = options;
+  const resolved = context.resolvedRequestIds.has(requestId);
+  const lifecycleKnown = !context.historyLimited || base.turn !== null;
+  const state = resolved ? "resolved" : lifecycleKnown ? "pending" : "unknown";
   if (!representable.actionable) {
     return {
       ...base,
-      state: context.resolvedRequestIds.has(requestId) ? "resolved" : "pending",
+      state,
       actionable: false,
       pendingRequestId: requestId,
-      unavailableReason: representable.unavailableReason,
+      unavailableReason:
+        state === "unknown" ? UNKNOWN_REQUEST_LIFECYCLE_REASON : representable.unavailableReason,
       form: representable.form,
     };
   }
-  return context.resolvedRequestIds.has(requestId)
-    ? {
-        ...base,
-        state: "resolved" as const,
-        actionable: false,
-        pendingRequestId: requestId,
-        unavailableReason: RESOLVED_REQUEST_REASON,
-        form: representable.form,
-      }
-    : {
-        ...base,
-        state: "pending" as const,
-        actionable: true,
-        pendingRequestId: requestId,
-        unavailableReason: null,
-        form: representable.form,
-      };
+  if (state === "resolved") {
+    return {
+      ...base,
+      state,
+      actionable: false,
+      pendingRequestId: requestId,
+      unavailableReason: RESOLVED_REQUEST_REASON,
+      form: representable.form,
+    };
+  }
+  if (state === "unknown") {
+    return {
+      ...base,
+      state,
+      actionable: false,
+      pendingRequestId: requestId,
+      unavailableReason: UNKNOWN_REQUEST_LIFECYCLE_REASON,
+      form: representable.form,
+    };
+  }
+  return {
+    ...base,
+    state,
+    actionable: true,
+    pendingRequestId: requestId,
+    unavailableReason: null,
+    form: representable.form,
+  };
 };
 
 const approvalPendingRequest = (
@@ -1973,11 +2054,13 @@ const requestedPendingRequest = (
 const pendingRequestsFromActivities = (
   thread: ThreadState["summary"]["thread"],
   activities: ReadonlyArray<ObservedThreadActivity>,
+  historyLimited = false,
 ): ReadonlyArray<PendingRequest> => {
   const requested = activities.filter(isRequestActivity).slice().sort(compareActivities);
   const context: PendingRequestContext = {
     thread,
     resolvedRequestIds: collectResolvedRequestIds(activities),
+    historyLimited,
   };
   // The pinned snapshot keeps the latest requested row per native request
   // ID; deduplicate from the newest row backwards so the same rule holds
@@ -2354,7 +2437,11 @@ const discoverThreadState = (options: {
     const detail = outcome.detail;
     const project = yield* lookupThreadProject({ observations, instanceId, detail });
     const { state, frame } = buildThreadState({ instanceId, detail, project });
-    const items = pendingRequestsFromActivities(query.thread, detail.thread.activities);
+    const items = pendingRequestsFromActivities(
+      query.thread,
+      detail.thread.activities,
+      detail.limitedHistory,
+    );
     const coverage = project.limitations.length > 0 ? "partial" : "complete_for_query";
     return yield* serveThreadStatePage({
       store,
@@ -2734,7 +2821,11 @@ const pollThreadWait = (options: {
   const { thread, condition, cursor, project, detail } = options;
   const { instanceId } = thread;
   const { state, frame } = buildThreadState({ instanceId, detail, project });
-  const items = pendingRequestsFromActivities(thread, detail.thread.activities);
+  const items = pendingRequestsFromActivities(
+    thread,
+    detail.thread.activities,
+    detail.limitedHistory,
+  );
   const coverage =
     project.limitations.length > 0 ? ("partial" as const) : ("complete_for_query" as const);
   // A wait is not a paging read: the state carries every observed pending
@@ -2835,6 +2926,29 @@ const classifyWaitObservationFailure = (options: {
     };
   });
 
+type WaitObservationOutcome<Value> =
+  | { readonly kind: "unavailable"; readonly value: Value }
+  | { readonly kind: "retry"; readonly pollInterval: number };
+
+const waitObservationFailure = <Value>(options: {
+  readonly failure: LocalStoreError | T3CodeAdapterError | ObservationError;
+  readonly firstEvaluation: boolean;
+  readonly deadline: number;
+  readonly pollInterval: number;
+  readonly unavailableValue: () => Value;
+}): Effect.Effect<
+  WaitObservationOutcome<Value>,
+  LocalStoreError | T3CodeAdapterError | ObservationError
+> =>
+  Effect.gen(function* () {
+    const classification = yield* classifyWaitObservationFailure(options);
+    if (classification.kind === "propagate") return yield* Effect.fail(options.failure);
+    if (classification.kind === "unavailable") {
+      return { kind: "unavailable" as const, value: options.unavailableValue() };
+    }
+    return classification;
+  });
+
 /**
  * Sleep until the next wait poll, reporting whether the deadline already
  * passed so the caller can return its timed-out result instead of polling
@@ -2901,25 +3015,23 @@ const runThreadWait = (
     while (true) {
       const detailResult = yield* Effect.result(observations.threadDetail(instanceId, threadId));
       if (Result.isFailure(detailResult)) {
-        // A wait that never observed its target fails with the typed error;
-        // losing the observation later ends the wait as unavailable instead
-        // of implying the work ended.
-        const failure = yield* classifyWaitObservationFailure({
+        const failure = yield* waitObservationFailure({
           failure: detailResult.failure,
           firstEvaluation,
           deadline,
           pollInterval,
+          unavailableValue: () =>
+            threadWaitObservationResult({
+              condition,
+              observation: "unavailable",
+              state: null,
+              observations: [],
+              warnings: [
+                { code: "observation_unavailable", message: detailResult.failure.message },
+              ],
+            }),
         });
-        if (failure.kind === "propagate") return yield* Effect.fail(detailResult.failure);
-        if (failure.kind === "unavailable") {
-          return threadWaitObservationResult({
-            condition,
-            observation: "unavailable",
-            state: null,
-            observations: [],
-            warnings: [{ code: "observation_unavailable", message: detailResult.failure.message }],
-          });
-        }
+        if (failure.kind === "unavailable") return failure.value;
         pollInterval = failure.pollInterval;
         continue;
       }
@@ -3138,6 +3250,7 @@ const pollTurnWait = (options: {
   const all = pendingRequestsFromActivities(
     { instanceId: turn.instanceId, threadId: turn.threadId },
     detail.thread.activities,
+    detail.limitedHistory,
   );
   const correlated = all.filter(
     (request) => request.turn !== null && request.turn.turnId === turn.turnId,
@@ -3246,26 +3359,24 @@ const runTurnWait = (options: {
     while (true) {
       const detailResult = yield* Effect.result(observations.threadDetail(instanceId, threadId));
       if (Result.isFailure(detailResult)) {
-        // A wait that never observed its target fails with the typed error;
-        // losing the observation later ends the wait as unavailable instead
-        // of implying the work ended.
-        const failure = yield* classifyWaitObservationFailure({
+        const failure = yield* waitObservationFailure({
           failure: detailResult.failure,
           firstEvaluation,
           deadline,
           pollInterval,
+          unavailableValue: () =>
+            turnWaitResult({
+              turn,
+              observation: "unavailable",
+              evaluation: unknownTurnWaitEvaluation,
+              pendingRequests: [],
+              observations: [],
+              warnings: [
+                { code: "observation_unavailable", message: detailResult.failure.message },
+              ],
+            }),
         });
-        if (failure.kind === "propagate") return yield* Effect.fail(detailResult.failure);
-        if (failure.kind === "unavailable") {
-          return turnWaitResult({
-            turn,
-            observation: "unavailable",
-            evaluation: unknownTurnWaitEvaluation,
-            pendingRequests: [],
-            observations: [],
-            warnings: [{ code: "observation_unavailable", message: detailResult.failure.message }],
-          });
-        }
+        if (failure.kind === "unavailable") return failure.value;
         pollInterval = failure.pollInterval;
         continue;
       }
@@ -3507,6 +3618,29 @@ const serverToolHandlers = ServerToolkit.of({
         }),
       ),
     ),
+  approval_respond: (input) =>
+    Effect.gen(function* () {
+      const operations = yield* Operations;
+      const observations = yield* Observations;
+      const observeRequest = Effect.gen(function* () {
+        const detail = yield* observations.threadDetail(
+          input.pendingRequest.instanceId,
+          input.pendingRequest.threadId,
+        );
+        return (
+          pendingRequestsFromActivities(
+            {
+              instanceId: input.pendingRequest.instanceId,
+              threadId: input.pendingRequest.threadId,
+            },
+            detail.thread.activities,
+            detail.limitedHistory,
+          ).find((request) => request.pendingRequestId === input.pendingRequest.pendingRequestId) ??
+          null
+        );
+      });
+      return yield* operationMutationResult(operations.respondToApproval(input, observeRequest));
+    }),
   thread_output: ({ thread, cursor, maxBytes, allowStale }) =>
     Effect.gen(function* () {
       const store = yield* LocalStore;
@@ -3696,6 +3830,7 @@ const operationMutatorTools: ReadonlySet<string> = new Set([
   "instance_update",
   "instance_pair_again",
   "worktree_create",
+  "approval_respond",
 ]);
 
 // fallow-ignore-next-line complexity

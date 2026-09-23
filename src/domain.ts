@@ -26,7 +26,8 @@ export const MAX_OPERATION_CAPACITY = 128;
 export const MAX_INSTANCE_RPC_CAPACITY = 8;
 export const MAX_TOTAL_RPC_CAPACITY = 32;
 export const MUTATION_RPC_DEADLINE_MILLIS = 30_000;
-export const LIVE_EFFECT_OBSERVATION_MILLIS = 60_000;
+/** Exceeds the bounded credential and RPC setup calls that can precede dispatch. */
+export const LIVE_EFFECT_OBSERVATION_MILLIS = 120_000;
 export const STAGED_PAIRING_RETENTION_MILLIS = 24 * 60 * 60 * 1000;
 export const OPERATION_DETAIL_RETENTION_MILLIS = 30 * 24 * 60 * 60 * 1000;
 export const REVISION_POLL_INTERVAL_MILLIS = 1_000;
@@ -1723,7 +1724,6 @@ export const ThreadConfigurationSchema = Schema.Struct({
 
 export type ThreadConfiguration = typeof ThreadConfigurationSchema.Type;
 
-// fallow-ignore-next-line unused-export
 export const ApprovalDecisionSchema = Schema.Literals([
   "accept",
   "acceptForSession",
@@ -1733,6 +1733,18 @@ export const ApprovalDecisionSchema = Schema.Literals([
 ]);
 
 export type ApprovalDecision = typeof ApprovalDecisionSchema.Type;
+
+/**
+ * The accepted native approval response command carried from durable
+ * operation admission through the instance connection to the T3 adapter.
+ */
+export type ApprovalResponseCommand = {
+  readonly threadId: string;
+  readonly pendingRequestId: string;
+  readonly commandId: string;
+  readonly decision: ApprovalDecision;
+  readonly createdAt: string;
+};
 
 const approvalChoiceSchema = Schema.Struct({
   decision: ApprovalDecisionSchema,
@@ -1803,6 +1815,83 @@ export const PendingRequestSchema = Schema.Union([
 ]);
 
 export type PendingRequest = typeof PendingRequestSchema.Type;
+
+export type PendingRequestReference = {
+  readonly instanceId: string;
+  readonly threadId: string;
+  readonly pendingRequestId: string;
+};
+
+const pendingRequestReferenceFields = Schema.Struct({
+  instanceId: nonEmptyString,
+  threadId: nonEmptyString,
+  pendingRequestId: nonEmptyString,
+});
+
+const unknownPendingRequestReferenceField = Schema.String.check(
+  Schema.makeFilter(
+    (key) => key !== "instanceId" && key !== "threadId" && key !== "pendingRequestId",
+    { message: "unknown approval_respond pendingRequest argument" },
+  ),
+);
+
+const pendingRequestReferenceRuntimeShape = Schema.StructWithRest(pendingRequestReferenceFields, [
+  Schema.Record(unknownPendingRequestReferenceField, Schema.Never),
+]);
+
+const pendingRequestReferenceJsonShape = Schema.StructWithRest(pendingRequestReferenceFields, [
+  Schema.Record(Schema.String, Schema.Never),
+]);
+
+const approvalRespondFields = Schema.Struct({
+  requestId,
+  pendingRequest: pendingRequestReferenceRuntimeShape,
+  decision: ApprovalDecisionSchema,
+});
+
+const approvalRespondJsonFields = Schema.Struct({
+  requestId,
+  pendingRequest: pendingRequestReferenceJsonShape,
+  decision: ApprovalDecisionSchema,
+});
+
+const unknownApprovalRespondField = Schema.String.check(
+  Schema.makeFilter(
+    (key) => key !== "requestId" && key !== "pendingRequest" && key !== "decision",
+    { message: "unknown approval_respond argument" },
+  ),
+);
+
+const approvalRespondRuntimeShape = Schema.StructWithRest(approvalRespondFields, [
+  Schema.Record(unknownApprovalRespondField, Schema.Never),
+]);
+
+const approvalRespondJsonShape = Schema.StructWithRest(approvalRespondJsonFields, [
+  Schema.Record(Schema.String, Schema.Never),
+]);
+
+export const ApprovalRespondInputSchema = Schema.declare<{
+  readonly requestId: string;
+  readonly pendingRequest: PendingRequestReference;
+  readonly decision: ApprovalDecision;
+}>(
+  (
+    input,
+  ): input is {
+    readonly requestId: string;
+    readonly pendingRequest: PendingRequestReference;
+    readonly decision: ApprovalDecision;
+  } => Schema.is(approvalRespondRuntimeShape)(input),
+  {
+    toCodecJson: () =>
+      Schema.link()(approvalRespondJsonShape, {
+        decode: SchemaGetter.passthrough({ strict: false }),
+        encode: SchemaGetter.passthrough({ strict: false }),
+      } as never),
+  },
+);
+
+export type ApprovalRespondInput = typeof ApprovalRespondInputSchema.Type;
 
 // fallow-ignore-next-line unused-export
 export const PendingRequestPageSchema = Schema.Struct({

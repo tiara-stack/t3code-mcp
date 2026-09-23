@@ -120,6 +120,7 @@ const startServer = async (databasePath: string): Promise<Server> => {
       "worktree_list",
       "thread_list",
       "thread_get",
+      "approval_respond",
       "thread_output",
       "thread_wait",
       "turn_wait",
@@ -569,6 +570,265 @@ describe("shared SQLite mutation admission", () => {
           );
           expect(receipt.result?.structuredContent).toMatchObject({
             result: { kind: "ok", value: { operation: { requestId: "update-race-victim" } } },
+          });
+        }),
+      ),
+    60000,
+  );
+
+  it.live(
+    "recovers an admitted approval response with its native identity in another MCP process",
+    () =>
+      withServers("t3code-mcp-approval-recovery-", ({ databasePath, servers }) =>
+        Effect.gen(function* () {
+          const input = {
+            requestId: "approval-response-process-request",
+            pendingRequest: {
+              instanceId: "approval-instance",
+              threadId: "approval-thread",
+              pendingRequestId: "native-approval-request",
+            },
+            decision: "acceptAlways",
+          };
+          const admittedAt = new Date().toISOString();
+          yield* Effect.scoped(
+            Effect.gen(function* () {
+              const store = yield* LocalStore;
+              const fingerprint = yield* store.fingerprintRequest("approval_respond", input);
+              const result = yield* store.admitOperation({
+                requestId: input.requestId,
+                tool: "approval_respond",
+                fingerprint,
+                processNonce: "approval-test-owner",
+                admittedAt,
+                intent: {
+                  instanceId: input.pendingRequest.instanceId,
+                  threadId: input.pendingRequest.threadId,
+                  pendingRequestId: input.pendingRequest.pendingRequestId,
+                  decision: input.decision,
+                },
+                target: {
+                  instanceId: input.pendingRequest.instanceId,
+                  threadId: input.pendingRequest.threadId,
+                },
+                commandId: "native-command-id",
+                completionMeans: "response_accepted",
+                steps: ["dispatch_approval_response"],
+              });
+              expect(result.kind).toBe("inserted");
+            }).pipe(Effect.provide(LocalStore.layer({ databasePath }))),
+          );
+
+          const server = yield* Effect.promise(() => startServer(databasePath));
+          servers.add(server);
+          const recovered = yield* Effect.promise(() => call(server, 3, "approval_respond", input));
+          expect(recovered.result?.structuredContent).toMatchObject({
+            result: {
+              kind: "ok",
+              value: {
+                requestId: input.requestId,
+                tool: "approval_respond",
+                state: "admitted",
+                completionMeans: "response_accepted",
+                dispatch: "not_dispatched",
+                commandId: "native-command-id",
+                target: {
+                  instanceId: input.pendingRequest.instanceId,
+                  threadId: input.pendingRequest.threadId,
+                },
+              },
+            },
+          });
+        }),
+      ),
+    60000,
+  );
+
+  it.live(
+    "reconciles stale approval responses from their persisted dispatch boundary without replay",
+    () =>
+      withServers("t3code-mcp-approval-dispatch-recovery-", ({ databasePath, servers }) =>
+        Effect.gen(function* () {
+          const inputs = [
+            {
+              requestId: "approval-not-dispatched",
+              pendingRequest: {
+                instanceId: "approval-instance",
+                threadId: "approval-thread",
+                pendingRequestId: "native-not-dispatched",
+              },
+              decision: "accept" as const,
+            },
+            {
+              requestId: "approval-dispatch-unknown",
+              pendingRequest: {
+                instanceId: "approval-instance",
+                threadId: "approval-thread",
+                pendingRequestId: "native-dispatch-unknown",
+              },
+              decision: "acceptAlways" as const,
+            },
+            {
+              requestId: "approval-admitted-not-dispatched",
+              pendingRequest: {
+                instanceId: "approval-instance",
+                threadId: "approval-thread",
+                pendingRequestId: "native-admitted-not-dispatched",
+              },
+              decision: "decline" as const,
+            },
+          ];
+          const admittedAt = new Date(Date.now() - 3 * 60_000).toISOString();
+          const dispatchAt = new Date().toISOString();
+          const dispatchUpdate = {
+            now: dispatchAt,
+            state: "pending" as const,
+            dispatch: "unknown" as const,
+            stepPosition: 0,
+            stepState: "pending" as const,
+            evidence: [
+              {
+                kind: "adapter_inference" as const,
+                observedAt: dispatchAt,
+                sourceSequence: null,
+                nativeEventId: "native-dispatch-race",
+                detail: "A stale owner must not cross the native dispatch boundary.",
+              },
+            ],
+            evidenceStepPosition: 0,
+            recovery: "observe_operation" as const,
+          };
+          yield* Effect.scoped(
+            Effect.gen(function* () {
+              const store = yield* LocalStore;
+              for (const input of inputs) {
+                const fingerprint = yield* store.fingerprintRequest("approval_respond", input);
+                const result = yield* store.admitOperation({
+                  requestId: input.requestId,
+                  tool: "approval_respond",
+                  fingerprint,
+                  processNonce: "approval-stale-test-owner",
+                  admittedAt,
+                  intent: {
+                    instanceId: input.pendingRequest.instanceId,
+                    threadId: input.pendingRequest.threadId,
+                    pendingRequestId: input.pendingRequest.pendingRequestId,
+                    decision: input.decision,
+                  },
+                  target: {
+                    instanceId: input.pendingRequest.instanceId,
+                    threadId: input.pendingRequest.threadId,
+                  },
+                  commandId: `native-command-${input.requestId}`,
+                  completionMeans: "response_accepted",
+                  steps: ["dispatch_approval_response"],
+                });
+                expect(result.kind).toBe("inserted");
+                if (input.requestId === "approval-admitted-not-dispatched") continue;
+                yield* store.updateOperation(input.requestId, {
+                  now: new Date(Date.parse(admittedAt) + 500).toISOString(),
+                  state: "pending",
+                  dispatch: "not_dispatched",
+                  stepPosition: 0,
+                  stepState: "pending",
+                  recovery: "observe_operation",
+                });
+              }
+              yield* store.updateOperation(inputs[1]!.requestId, {
+                now: new Date(Date.parse(admittedAt) + 1_000).toISOString(),
+                state: "pending",
+                dispatch: "unknown",
+                stepPosition: 0,
+                stepState: "pending",
+                recovery: "observe_operation",
+              });
+              const wrongOwnerClaim = yield* store.compareAndSetApprovalDispatch(
+                inputs[0]!.requestId,
+                "different-process-owner",
+                "pending",
+                dispatchUpdate,
+              );
+              expect(wrongOwnerClaim).toBe(false);
+            }).pipe(Effect.provide(LocalStore.layer({ databasePath }))),
+          );
+
+          const server = yield* Effect.promise(() => startServer(databasePath));
+          servers.add(server);
+          const recoveredNotDispatched = yield* Effect.promise(() =>
+            call(server, 3, "approval_respond", inputs[0]!),
+          );
+          const recoveredDispatchUnknown = yield* Effect.promise(() =>
+            call(server, 4, "approval_respond", inputs[1]!),
+          );
+          const recoveredAdmitted = yield* Effect.promise(() =>
+            call(server, 5, "approval_respond", inputs[2]!),
+          );
+          const reconciledClaims = yield* Effect.scoped(
+            Effect.gen(function* () {
+              const store = yield* LocalStore;
+              const notDispatchedClaim = yield* store.compareAndSetApprovalDispatch(
+                inputs[0]!.requestId,
+                "approval-stale-test-owner",
+                "pending",
+                dispatchUpdate,
+              );
+              const unknownClaim = yield* store.compareAndSetApprovalDispatch(
+                inputs[1]!.requestId,
+                "approval-stale-test-owner",
+                "pending",
+                dispatchUpdate,
+                "unknown",
+              );
+              return {
+                notDispatchedClaim,
+                unknownClaim,
+                notDispatchedRecord: yield* store.getOperation(inputs[0]!.requestId),
+                unknownRecord: yield* store.getOperation(inputs[1]!.requestId),
+              };
+            }).pipe(Effect.provide(LocalStore.layer({ databasePath }))),
+          );
+
+          expect(recoveredNotDispatched.result?.structuredContent).toMatchObject({
+            result: {
+              kind: "ok",
+              value: {
+                requestId: "approval-not-dispatched",
+                state: "failed",
+                dispatch: "not_dispatched",
+                recovery: "new_explicit_request",
+                error: { retry: "change_request" },
+              },
+            },
+          });
+          expect(recoveredDispatchUnknown.result?.structuredContent).toMatchObject({
+            result: {
+              kind: "ok",
+              value: {
+                requestId: "approval-dispatch-unknown",
+                state: "outcome_unknown",
+                dispatch: "unknown",
+                recovery: "observe_operation",
+                error: { retry: "reconcile_first" },
+              },
+            },
+          });
+          expect(recoveredAdmitted.result?.structuredContent).toMatchObject({
+            result: {
+              kind: "ok",
+              value: {
+                requestId: "approval-admitted-not-dispatched",
+                state: "failed",
+                dispatch: "not_dispatched",
+                recovery: "new_explicit_request",
+                error: { retry: "change_request" },
+              },
+            },
+          });
+          expect(reconciledClaims).toMatchObject({
+            notDispatchedClaim: false,
+            unknownClaim: false,
+            notDispatchedRecord: { record: { state: "failed", dispatch: "not_dispatched" } },
+            unknownRecord: { record: { state: "outcome_unknown", dispatch: "unknown" } },
           });
         }),
       ),

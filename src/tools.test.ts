@@ -23,8 +23,12 @@ import {
   type T3CodeAdapterService,
   type ThreadStreamItem,
 } from "./t3code-adapter";
-import { encodeThreadObservationCursor, WorktreeCreateInputSchema } from "./domain";
-import type { ThreadListPage, WorktreeListPage } from "./domain";
+import {
+  encodeThreadObservationCursor,
+  LIVE_EFFECT_OBSERVATION_MILLIS,
+  WorktreeCreateInputSchema,
+} from "./domain";
+import type { ApprovalResponseCommand, ThreadListPage, WorktreeListPage } from "./domain";
 import { ServerToolkit, serverToolkitLayer } from "./tools";
 
 const THIRTY_DAYS_MILLIS = 30 * 24 * 60 * 60 * 1000;
@@ -43,6 +47,16 @@ const withDatabasePath = <A, E, R>(
     ({ databasePath }) => use(databasePath),
     ({ directory }) => Effect.sync(() => rmSync(directory, { recursive: true, force: true })),
   );
+
+const approvalResponseUnavailable = () =>
+  new T3CodeAdapterError({
+    kind: "capacity",
+    message: "The test connection does not support approval responses.",
+    uncertain: false,
+    status: null,
+  });
+
+const failApprovalResponse = () => Effect.fail(approvalResponseUnavailable());
 
 const appLayer = (
   databasePath: string,
@@ -217,6 +231,7 @@ const fakeConnections = (options?: {
         }),
       ),
     createWorktree: () => Effect.die("not used"),
+    respondToApproval: failApprovalResponse,
     invalidate: () => Effect.void,
   });
 };
@@ -293,6 +308,7 @@ const fakeAdapterLayer = (
         }),
       ),
     createWorktree,
+    respondToApproval: failApprovalResponse,
     listVcsRefs: () =>
       Effect.fail(
         new T3CodeAdapterError({
@@ -1292,7 +1308,7 @@ describe("instance_update", () => {
             });
           }).pipe(Effect.provide(LocalStore.layer({ databasePath }))),
         );
-        yield* TestClock.adjust(Duration.millis(60_000));
+        yield* TestClock.adjust(Duration.millis(LIVE_EFFECT_OBSERVATION_MILLIS));
         const result = yield* Effect.scoped(
           Effect.gen(function* () {
             const store = yield* LocalStore;
@@ -1542,6 +1558,7 @@ describe("instance_pair_again", () => {
           }),
         ),
       createWorktree: () => Effect.die("not used"),
+      respondToApproval: failApprovalResponse,
       invalidate: () => Effect.void,
     });
   };
@@ -1949,6 +1966,7 @@ describe("instance_pair_again", () => {
               }),
             ),
           createWorktree: () => Effect.die("not used"),
+          respondToApproval: failApprovalResponse,
           invalidate: () => Effect.void,
         });
         const result = yield* Effect.scoped(
@@ -2242,7 +2260,7 @@ describe("instance_pair_again", () => {
             });
           }).pipe(Effect.provide(LocalStore.layer({ databasePath }))),
         );
-        yield* TestClock.adjust(Duration.millis(60_000));
+        yield* TestClock.adjust(Duration.millis(LIVE_EFFECT_OBSERVATION_MILLIS));
         const result = yield* Effect.scoped(
           Effect.gen(function* () {
             const store = yield* LocalStore;
@@ -2780,6 +2798,7 @@ const projectFixtures = (
         }),
       ),
     createWorktree: () => Effect.die("not used"),
+    respondToApproval: failApprovalResponse,
     listVcsRefs: () =>
       Effect.fail(
         new T3CodeAdapterError({
@@ -4016,6 +4035,7 @@ const modelFixtures = (
         }),
       ),
     createWorktree: () => Effect.die("not used"),
+    respondToApproval: failApprovalResponse,
     listVcsRefs: () =>
       Effect.fail(
         new T3CodeAdapterError({
@@ -4604,6 +4624,7 @@ describe("model_list", () => {
                   }),
                 ),
               createWorktree: () => Effect.die("not used"),
+              respondToApproval: failApprovalResponse,
               listVcsRefs: () =>
                 Effect.fail(
                   new T3CodeAdapterError({
@@ -4901,6 +4922,16 @@ interface ThreadFixtureOptions {
       ) => Effect.Effect<DiscoveredVcsRefs, LocalStoreError | T3CodeAdapterError>
     >
   >;
+  approvalResponse?: (input: {
+    readonly instanceId: string;
+    readonly threadId: string;
+    readonly pendingRequestId: string;
+    readonly commandId: string;
+    readonly decision: "accept" | "acceptForSession" | "acceptAlways" | "decline" | "cancel";
+    readonly createdAt: string;
+  }) => Effect.Effect<{ readonly sequence: number }, T3CodeAdapterError>;
+  approvalResponseBeforeDispatchFailure?: T3CodeAdapterError;
+  approvalDispatchRaceSetup?: () => void;
   readonly seenActive: Array<string>;
   readonly seenArchived: Array<string>;
   readonly seenThreads: Array<string>;
@@ -5047,6 +5078,28 @@ const threadConnections = (options: ThreadFixtureOptions) =>
       return scripted();
     },
     createWorktree: () => Effect.die("not used"),
+    respondToApproval: <E>(
+      input: ApprovalResponseCommand & {
+        readonly instanceId: string;
+        readonly onDispatch: Effect.Effect<void, E, never>;
+      },
+    ) => {
+      if (options.approvalResponseBeforeDispatchFailure !== undefined) {
+        return Effect.fail(options.approvalResponseBeforeDispatchFailure);
+      }
+      const dispatch = input.onDispatch.pipe(
+        Effect.andThen(
+          Effect.suspend(() =>
+            options.approvalResponse === undefined
+              ? failApprovalResponse()
+              : (options.approvalResponse?.(input) ?? failApprovalResponse()),
+          ),
+        ),
+      );
+      return options.approvalDispatchRaceSetup === undefined
+        ? dispatch
+        : Effect.sync(options.approvalDispatchRaceSetup).pipe(Effect.andThen(dispatch));
+    },
     invalidate: () => Effect.void,
   });
 
@@ -7031,6 +7084,8 @@ const approvalActivity = (
   overrides: Partial<{
     readonly detail: string;
     readonly options: ReadonlyArray<unknown>;
+    readonly requestKind: string;
+    readonly requestType: string;
     readonly summary: string;
     readonly turnId: string | null;
     readonly createdAt: string;
@@ -7043,6 +7098,8 @@ const approvalActivity = (
     ...(requestId === null ? {} : { requestId }),
     ...(overrides.detail === undefined ? {} : { detail: overrides.detail }),
     ...(overrides.options === undefined ? {} : { options: overrides.options }),
+    ...(overrides.requestKind === undefined ? {} : { requestKind: overrides.requestKind }),
+    ...(overrides.requestType === undefined ? {} : { requestType: overrides.requestType }),
   },
   turnId: overrides.turnId ?? null,
   createdAt: overrides.createdAt ?? "2026-09-22T00:00:00.000Z",
@@ -9551,6 +9608,820 @@ describe("thread_wait", () => {
           value: { condition: "changed", observation: "condition_met" },
         });
         expect(value.observations).toMatchObject([{ freshness: "fresh", sourceSequence: 11 }]);
+      }),
+    ),
+  );
+});
+
+describe("approval_respond", () => {
+  it.live("completes when the native response is accepted while the request remains pending", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const responses: Array<{
+          readonly instanceId: string;
+          readonly threadId: string;
+          readonly pendingRequestId: string;
+          readonly commandId: string;
+          readonly decision: string;
+          readonly createdAt: string;
+        }> = [];
+        options.approvalResponse = (input) => {
+          responses.push(input);
+          return Effect.succeed({ sequence: 43 });
+        };
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(41, [shellProjectFixture("project-a", "/srv/project-a")], []),
+              shellSynchronizedItem,
+            ),
+        };
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              42,
+              observedThreadFixture("thread-a", {
+                activities: [
+                  approvalActivity("activity-1", "request-native-1", {
+                    turnId: "turn-current",
+                    options: [
+                      { decision: "accept", label: "Accept once" },
+                      { decision: "acceptForSession", label: "Accept for session" },
+                    ],
+                  }),
+                ],
+              }),
+              { beforeCursor: "before:older", hasMore: true, threadSequence: 41 },
+            ),
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const approval = yield* callTool("approval_respond", {
+              requestId: "response-1",
+              pendingRequest: {
+                instanceId: "instance-a",
+                threadId: "thread-a",
+                pendingRequestId: "request-native-1",
+              },
+              decision: "acceptForSession",
+            });
+            const thread = yield* callTool("thread_get", {
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+            return { approval, thread };
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result.approval[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              requestId: "response-1",
+              tool: "approval_respond",
+              state: "completed",
+              completionMeans: "response_accepted",
+              dispatch: "accepted",
+              target: { instanceId: "instance-a", threadId: "thread-a" },
+            },
+          },
+        });
+        expect(responses).toHaveLength(1);
+        expect(responses[0]).toMatchObject({
+          instanceId: "instance-a",
+          threadId: "thread-a",
+          pendingRequestId: "request-native-1",
+          decision: "acceptForSession",
+        });
+        expect(responses[0]?.commandId).not.toBe("response-1");
+        expect(Date.parse(responses[0]?.createdAt ?? "")).not.toBeNaN();
+        const thread = result.thread[0]?.result as unknown as ThreadGetToolResultShape;
+        expect(thread.result).toMatchObject({
+          kind: "ok",
+          value: {
+            pendingRequests: {
+              items: [{ pendingRequestId: "request-native-1", state: "pending" }],
+            },
+          },
+        });
+      }),
+    ),
+  );
+
+  it.live("uses the pinned T3 default approval choices when the provider omits options", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const decisions: Array<string> = [];
+        options.approvalResponse = (input) => {
+          decisions.push(input.decision);
+          return Effect.succeed({ sequence: 44 });
+        };
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(41, [shellProjectFixture("project-a", "/srv/project-a")], []),
+              shellSynchronizedItem,
+            ),
+        };
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              42,
+              observedThreadFixture("thread-a", {
+                activities: [
+                  approvalActivity("activity-native-default", "native-default", {
+                    detail: "Run a command",
+                    requestKind: "command",
+                    requestType: "command_execution_approval",
+                  }),
+                ],
+              }),
+            ),
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const thread = yield* callTool("thread_get", {
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+            const approval = yield* callTool("approval_respond", {
+              requestId: "response-native-default",
+              pendingRequest: {
+                instanceId: "instance-a",
+                threadId: "thread-a",
+                pendingRequestId: "native-default",
+              },
+              decision: "acceptForSession",
+            });
+            return { thread, approval };
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        const thread = result.thread[0]?.result as unknown as ThreadGetToolResultShape;
+        expect(thread.result).toMatchObject({
+          kind: "ok",
+          value: {
+            pendingRequests: {
+              items: [
+                {
+                  pendingRequestId: "native-default",
+                  actionable: true,
+                  form: {
+                    kind: "approval",
+                    choices: [
+                      { decision: "cancel", label: "Cancel" },
+                      { decision: "decline", label: "Decline" },
+                      { decision: "acceptForSession", label: "Always allow this session" },
+                      { decision: "accept", label: "Approve" },
+                    ],
+                  },
+                },
+              ],
+            },
+          },
+        });
+        expect(decisions).toEqual(["acceptForSession"]);
+        expect(result.approval[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: { state: "completed", completionMeans: "response_accepted" },
+          },
+        });
+      }),
+    ),
+  );
+
+  it.live("keeps connection failures before the native dispatch boundary unsent", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const responses: Array<string> = [];
+        options.approvalResponseBeforeDispatchFailure = new T3CodeAdapterError({
+          kind: "timeout",
+          message: "The authenticated channel timed out before approval dispatch.",
+          uncertain: true,
+          status: null,
+        });
+        options.approvalResponse = (input) => {
+          responses.push(input.pendingRequestId);
+          return Effect.succeed({ sequence: 45 });
+        };
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              42,
+              observedThreadFixture("thread-a", {
+                activities: [
+                  approvalActivity("activity-before-dispatch", "native-before-dispatch", {
+                    turnId: "turn-current",
+                    options: [{ decision: "accept", label: "Approve" }],
+                  }),
+                ],
+              }),
+            ),
+        };
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("approval_respond", {
+              requestId: "response-before-dispatch",
+              pendingRequest: {
+                instanceId: "instance-a",
+                threadId: "thread-a",
+                pendingRequestId: "native-before-dispatch",
+              },
+              decision: "accept",
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "failed",
+              dispatch: "not_dispatched",
+              error: { code: "unavailable", retry: "change_request" },
+              evidence: expect.arrayContaining([
+                expect.objectContaining({
+                  kind: "adapter_inference",
+                  detail: "The approval response was not dispatched.",
+                }),
+              ]),
+            },
+          },
+        });
+        expect(responses).toEqual([]);
+      }),
+    ),
+  );
+
+  it.live("preserves reconciliation when the dispatch claim has already been lost", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const responses: Array<string> = [];
+        options.approvalDispatchRaceSetup = () => {
+          const now = new Date().toISOString();
+          const recoverableUntil = new Date(Date.parse(now) + THIRTY_DAYS_MILLIS).toISOString();
+          const failure = {
+            code: "unavailable" as const,
+            message: "The approval response was not dispatched.",
+            retry: "change_request" as const,
+            details: {},
+          };
+          const database = new DatabaseSync(databasePath);
+          try {
+            database.exec("PRAGMA busy_timeout = 5000");
+            database
+              .prepare(
+                "UPDATE operations SET revision = revision + 1, state = 'failed', updated_at = ?, recoverable_until = ?, dispatch = 'not_dispatched', error_json = ?, recovery = 'new_explicit_request' WHERE request_id = ?",
+              )
+              .run(
+                now,
+                recoverableUntil,
+                JSON.stringify(failure),
+                "response-reconciled-before-dispatch",
+              );
+            database
+              .prepare(
+                "UPDATE operation_steps SET state = 'failed', error_json = ? WHERE request_id = ? AND position = 0",
+              )
+              .run(JSON.stringify(failure), "response-reconciled-before-dispatch");
+          } finally {
+            database.close();
+          }
+        };
+        options.approvalResponse = (input) => {
+          responses.push(input.pendingRequestId);
+          return Effect.succeed({ sequence: 46 });
+        };
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              42,
+              observedThreadFixture("thread-a", {
+                activities: [
+                  approvalActivity("activity-reconcile-race", "native-reconcile-race", {
+                    turnId: "turn-current",
+                    options: [{ decision: "accept", label: "Approve" }],
+                  }),
+                ],
+              }),
+            ),
+        };
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("approval_respond", {
+              requestId: "response-reconciled-before-dispatch",
+              pendingRequest: {
+                instanceId: "instance-a",
+                threadId: "thread-a",
+                pendingRequestId: "native-reconcile-race",
+              },
+              decision: "accept",
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              requestId: "response-reconciled-before-dispatch",
+              state: "failed",
+              dispatch: "not_dispatched",
+              recovery: "new_explicit_request",
+              error: { retry: "change_request" },
+            },
+          },
+        });
+        expect(responses).toEqual([]);
+      }),
+    ),
+  );
+
+  it.live("forwards every offered decision without changing its native scope", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const decisions = [
+          "accept",
+          "acceptForSession",
+          "acceptAlways",
+          "decline",
+          "cancel",
+        ] as const;
+        const requestIds = decisions.map((_, index) => `native-request-${index}`);
+        const responses: Array<{ readonly decision: string; readonly pendingRequestId: string }> =
+          [];
+        let current = 0;
+        let snapshotSequence = 50;
+        options.approvalResponse = (input) => {
+          responses.push({ decision: input.decision, pendingRequestId: input.pendingRequestId });
+          return Effect.succeed({ sequence: 100 + responses.length });
+        };
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              snapshotSequence++,
+              observedThreadFixture("thread-a", {
+                activities: [
+                  approvalActivity("activity-1", requestIds[current]!, {
+                    options: decisions.map((decision) => ({ decision, label: decision })),
+                  }),
+                ],
+              }),
+            ),
+        };
+
+        const results = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const values = [];
+            for (const decision of decisions) {
+              values.push(
+                yield* callTool("approval_respond", {
+                  requestId: `response-${current}`,
+                  pendingRequest: {
+                    instanceId: "instance-a",
+                    threadId: "thread-a",
+                    pendingRequestId: requestIds[current],
+                  },
+                  decision,
+                }),
+              );
+              current += 1;
+            }
+            return values;
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(responses).toEqual(
+          decisions.map((decision, index) => ({ decision, pendingRequestId: requestIds[index] })),
+        );
+        expect(results.map((result) => result[0]?.result)).toEqual(
+          decisions.map(() =>
+            expect.objectContaining({
+              result: expect.objectContaining({
+                kind: "ok",
+                value: expect.objectContaining({
+                  state: "completed",
+                  completionMeans: "response_accepted",
+                  dispatch: "accepted",
+                }),
+              }),
+            }),
+          ),
+        );
+      }),
+    ),
+  );
+
+  it.live(
+    "rejects missing, unresolved, unrepresentable, and unsupported approvals before dispatch",
+    () =>
+      withDatabasePath((databasePath) =>
+        Effect.gen(function* () {
+          const { options, connections } = emptyThreadFixtures();
+          const responses: Array<string> = [];
+          let activities: ReadonlyArray<
+            ReturnType<typeof approvalActivity> | ReturnType<typeof resolvedApprovalActivity>
+          > = [];
+          let snapshotSequence = 70;
+          options.approvalResponse = (input) => {
+            responses.push(input.pendingRequestId);
+            return Effect.succeed({ sequence: 200 });
+          };
+          options.threadStreams = {
+            "instance-a:thread-a": () =>
+              detailSnapshotStream(
+                snapshotSequence++,
+                observedThreadFixture("thread-a", { activities }),
+              ),
+          };
+          const cases = [
+            {
+              requestId: "not-current",
+              pendingRequestId: "native-missing",
+              decision: "accept" as const,
+              activities: [] as typeof activities,
+              code: "pending_request_not_current",
+            },
+            {
+              requestId: "missing-native-id",
+              pendingRequestId: "synthetic-native-id",
+              decision: "accept" as const,
+              activities: [
+                approvalActivity("activity-no-id", null, {
+                  options: [{ decision: "accept", label: "Accept" }],
+                }),
+              ],
+              code: "pending_request_not_current",
+            },
+            {
+              requestId: "resolved-request",
+              pendingRequestId: "native-resolved",
+              decision: "accept" as const,
+              activities: [
+                approvalActivity("activity-requested", "native-resolved", {
+                  options: [{ decision: "accept", label: "Accept" }],
+                }),
+                resolvedApprovalActivity("activity-resolved", "native-resolved"),
+              ],
+              code: "pending_request_not_current",
+            },
+            {
+              requestId: "unrepresentable-request",
+              pendingRequestId: "native-unrepresentable",
+              decision: "accept" as const,
+              activities: [
+                approvalActivity("activity-unrepresentable", "native-unrepresentable", {
+                  options: [{ decision: "future-choice", label: "Future" }],
+                }),
+              ],
+              code: "pending_request_not_current",
+            },
+            {
+              requestId: "unknown-request-type",
+              pendingRequestId: "native-unknown-type",
+              decision: "accept" as const,
+              activities: [
+                approvalActivity("activity-unknown-type", "native-unknown-type", {
+                  requestType: "future_approval_type",
+                }),
+              ],
+              code: "pending_request_not_current",
+            },
+            {
+              requestId: "unsupported-choice",
+              pendingRequestId: "native-offered-once",
+              decision: "acceptForSession" as const,
+              activities: [
+                approvalActivity("activity-offered-once", "native-offered-once", {
+                  options: [{ decision: "accept", label: "Accept once" }],
+                }),
+              ],
+              code: "invalid_argument",
+            },
+          ];
+
+          const result = yield* Effect.scoped(
+            Effect.gen(function* () {
+              yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+              const failures = [];
+              for (const testCase of cases) {
+                activities = testCase.activities;
+                const output = yield* callTool("approval_respond", {
+                  requestId: testCase.requestId,
+                  pendingRequest: {
+                    instanceId: "instance-a",
+                    threadId: "thread-a",
+                    pendingRequestId: testCase.pendingRequestId,
+                  },
+                  decision: testCase.decision,
+                });
+                failures.push(output[0]?.result);
+              }
+              const invalid = yield* Effect.exit(
+                callTool("approval_respond", {
+                  requestId: "missing-native-id-input",
+                  pendingRequest: { instanceId: "instance-a", threadId: "thread-a" },
+                  decision: "accept",
+                }),
+              );
+              return { failures, invalid };
+            }).pipe(Effect.provide(appLayer(databasePath, connections))),
+          );
+
+          expect(
+            result.failures.map(
+              (failure) =>
+                (failure as unknown as { result: { error: { code: string } } }).result.error.code,
+            ),
+          ).toEqual(cases.map((testCase) => testCase.code));
+          expect(Exit.isFailure(result.invalid)).toBe(true);
+          if (Exit.isFailure(result.invalid)) {
+            expect(String(result.invalid.cause)).toContain(
+              "Invalid parameters for tool 'approval_respond'",
+            );
+          }
+          expect(responses).toEqual([]);
+        }),
+      ),
+  );
+
+  it.live("rejects an approval whose lifecycle is unknown in truncated thread history", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const responses: Array<string> = [];
+        options.approvalResponse = (input) => {
+          responses.push(input.pendingRequestId);
+          return Effect.succeed({ sequence: 201 });
+        };
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              71,
+              observedThreadFixture("thread-a", {
+                activities: [
+                  approvalActivity("activity-pending", "native-partial", {
+                    options: [{ decision: "accept", label: "Accept" }],
+                  }),
+                ],
+              }),
+              { beforeCursor: "before:older", hasMore: true, threadSequence: 70 },
+            ),
+        };
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("approval_respond", {
+              requestId: "unknown-lifecycle",
+              pendingRequest: {
+                instanceId: "instance-a",
+                threadId: "thread-a",
+                pendingRequestId: "native-partial",
+              },
+              decision: "accept",
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: { error: { code: "pending_request_not_current" } },
+        });
+        expect(responses).toEqual([]);
+      }),
+    ),
+  );
+
+  it.live("reuses an identical request ID without redispatch and rejects conflicting reuse", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        let observations = 0;
+        const responses: Array<string> = [];
+        options.approvalResponse = (input) => {
+          responses.push(input.commandId);
+          return Effect.succeed({ sequence: 301 });
+        };
+        options.threadStreams = {
+          "instance-a:thread-a": () => {
+            observations += 1;
+            return detailSnapshotStream(
+              100 + observations,
+              observedThreadFixture("thread-a", {
+                activities: [
+                  approvalActivity("activity-repeat", "native-repeat", {
+                    options: [
+                      { decision: "accept", label: "Accept once" },
+                      { decision: "decline", label: "Decline" },
+                    ],
+                  }),
+                ],
+              }),
+            );
+          },
+        };
+        const input = {
+          requestId: "response-repeat",
+          pendingRequest: {
+            instanceId: "instance-a",
+            threadId: "thread-a",
+            pendingRequestId: "native-repeat",
+          },
+          decision: "accept" as const,
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const first = yield* callTool("approval_respond", input);
+            const repeated = yield* callTool("approval_respond", input);
+            const conflict = yield* callTool("approval_respond", {
+              ...input,
+              decision: "decline",
+            });
+            return { first, repeated, conflict };
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(responses).toHaveLength(1);
+        expect(observations).toBe(1);
+        expect(result.first[0]?.result).toMatchObject({
+          result: { kind: "ok", value: { requestId: "response-repeat", state: "completed" } },
+        });
+        expect(result.repeated[0]?.result).toMatchObject({
+          result: { kind: "ok", value: { requestId: "response-repeat", state: "completed" } },
+        });
+        expect(result.conflict[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "request_id_conflict" } },
+        });
+      }),
+    ),
+  );
+
+  it.live("keeps a lost reply unknown when another client resolves the request", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        let activities: ReadonlyArray<
+          ReturnType<typeof approvalActivity> | ReturnType<typeof resolvedApprovalActivity>
+        > = [
+          approvalActivity("activity-race", "native-race", {
+            options: [{ decision: "accept", label: "Accept once" }],
+          }),
+        ];
+        let snapshotSequence = 120;
+        const responses: Array<string> = [];
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(119, [shellProjectFixture("project-a", "/srv/project-a")], []),
+              shellSynchronizedItem,
+            ),
+        };
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              snapshotSequence++,
+              observedThreadFixture("thread-a", { activities }),
+            ),
+        };
+        options.approvalResponse = (input) => {
+          responses.push(input.commandId);
+          activities = [
+            approvalActivity("activity-race", "native-race", {
+              options: [{ decision: "accept", label: "Accept once" }],
+            }),
+            resolvedApprovalActivity("activity-resolved-by-ui", "native-race"),
+          ];
+          return Effect.fail(
+            new T3CodeAdapterError({
+              kind: "transport",
+              message: "The response reply was lost after another client resolved the request.",
+              uncertain: true,
+              status: null,
+            }),
+          );
+        };
+        const input = {
+          requestId: "response-race",
+          pendingRequest: {
+            instanceId: "instance-a",
+            threadId: "thread-a",
+            pendingRequestId: "native-race",
+          },
+          decision: "accept" as const,
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const first = yield* callTool("approval_respond", input);
+            const repeated = yield* callTool("approval_respond", input);
+            const thread = yield* callTool("thread_get", {
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+            return { first, repeated, thread };
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(responses).toHaveLength(1);
+        expect(result.first[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "outcome_unknown",
+              dispatch: "unknown",
+              error: { code: "unavailable", retry: "reconcile_first" },
+            },
+          },
+        });
+        expect(result.repeated[0]?.result).toMatchObject({
+          result: { kind: "ok", value: { state: "outcome_unknown", dispatch: "unknown" } },
+        });
+        const thread = result.thread[0]?.result as unknown as ThreadGetToolResultShape;
+        expect(thread.result).toMatchObject({
+          kind: "ok",
+          value: {
+            pendingRequests: { items: [{ pendingRequestId: "native-race", state: "resolved" }] },
+          },
+        });
+      }),
+    ),
+  );
+
+  it.live("continues admitted dispatch after the MCP response wait is cancelled", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const dispatchStarted = yield* Deferred.make<void>();
+        const dispatchGate = yield* Deferred.make<{ readonly sequence: number }>();
+        let dispatches = 0;
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              150,
+              observedThreadFixture("thread-a", {
+                activities: [
+                  approvalActivity("activity-cancel", "native-cancel", {
+                    options: [{ decision: "accept", label: "Accept once" }],
+                  }),
+                ],
+              }),
+            ),
+        };
+        options.approvalResponse = () =>
+          Effect.gen(function* () {
+            dispatches += 1;
+            yield* Deferred.succeed(dispatchStarted, undefined);
+            return yield* Deferred.await(dispatchGate);
+          });
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const request = yield* Effect.forkScoped(
+              callTool("approval_respond", {
+                requestId: "response-cancelled",
+                pendingRequest: {
+                  instanceId: "instance-a",
+                  threadId: "thread-a",
+                  pendingRequestId: "native-cancel",
+                },
+                decision: "accept",
+              }),
+            );
+            yield* Deferred.await(dispatchStarted);
+            yield* Fiber.interrupt(request);
+            yield* Deferred.succeed(dispatchGate, { sequence: 151 });
+            return yield* callTool("operation_get", {
+              requestId: "response-cancelled",
+              waitMs: 5_000,
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(dispatches).toBe(1);
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              operation: {
+                requestId: "response-cancelled",
+                tool: "approval_respond",
+                state: "completed",
+                dispatch: "accepted",
+              },
+            },
+          },
+        });
       }),
     ),
   );

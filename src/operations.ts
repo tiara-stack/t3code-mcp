@@ -13,6 +13,7 @@ import {
   LIVE_EFFECT_OBSERVATION_MILLIS,
   OPERATION_DETAIL_RETENTION_MILLIS,
   STAGED_PAIRING_RETENTION_MILLIS,
+  type ApprovalRespondInput,
   type Evidence,
   type InstancePairAgainInput,
   type InstancePairInput,
@@ -21,6 +22,7 @@ import {
   type OperationGetInput,
   type OperationGetValue,
   type OperationRecord,
+  type PendingRequest,
   type ToolFailure,
   type WorktreeCreateInput,
 } from "./domain";
@@ -29,11 +31,14 @@ import type { OperationIntent, StoredOperation } from "./local-store";
 import { InstanceConnections } from "./instance-connections";
 import { T3CodeAdapterError } from "./t3code-adapter";
 import { adapterErrorFailure } from "./tool-failure";
+import type { ObservationError } from "./observations";
 
 export class OperationServiceError extends Data.TaggedError("OperationServiceError")<{
-  readonly kind: "capacity";
+  readonly kind: "capacity" | "stale_approval" | "unsupported_approval_decision";
   readonly message: string;
 }> {}
+
+class ApprovalDispatchClaimLost extends Data.TaggedError("ApprovalDispatchClaimLost")<{}> {}
 
 export interface OperationsService {
   readonly pairInstance: (
@@ -51,10 +56,52 @@ export interface OperationsService {
   readonly createWorktree: (
     input: WorktreeCreateInput,
   ) => Effect.Effect<OperationRecord, LocalStoreError | OperationServiceError>;
+  readonly respondToApproval: (
+    input: ApprovalRespondInput,
+    observeRequest: Effect.Effect<
+      PendingRequest | null,
+      LocalStoreError | T3CodeAdapterError | ObservationError
+    >,
+  ) => Effect.Effect<
+    OperationRecord,
+    LocalStoreError | T3CodeAdapterError | OperationServiceError | ObservationError
+  >;
   readonly getOperation: (
     input: OperationGetInput,
   ) => Effect.Effect<OperationGetValue, LocalStoreError>;
 }
+
+const validateObservedApproval = (
+  input: ApprovalRespondInput,
+  observed: PendingRequest | null,
+): Effect.Effect<void, OperationServiceError> => {
+  if (
+    observed === null ||
+    !observed.actionable ||
+    observed.state !== "pending" ||
+    observed.pendingRequestId !== input.pendingRequest.pendingRequestId ||
+    observed.thread.instanceId !== input.pendingRequest.instanceId ||
+    observed.thread.threadId !== input.pendingRequest.threadId ||
+    observed.form.kind !== "approval"
+  ) {
+    return Effect.fail(
+      new OperationServiceError({
+        kind: "stale_approval",
+        message:
+          "The approval request is not current, actionable, and unresolved in the fresh thread observation.",
+      }),
+    );
+  }
+  if (!observed.form.choices.some((choice) => choice.decision === input.decision)) {
+    return Effect.fail(
+      new OperationServiceError({
+        kind: "unsupported_approval_decision",
+        message: "The requested decision was not offered for this approval request.",
+      }),
+    );
+  }
+  return Effect.void;
+};
 
 export class Operations extends Context.Service<Operations, OperationsService>()(
   "t3code-mcp/Operations",
@@ -176,6 +223,103 @@ export class Operations extends Context.Service<Operations, OperationsService>()
       const pairingFailure = (error: T3CodeAdapterError): ToolFailure =>
         adapterErrorFailure(error, "pairing");
 
+      const approvalResponseFailure = (error: T3CodeAdapterError): ToolFailure =>
+        adapterErrorFailure(error, "approval");
+
+      type ApprovalResponseFailureMode = "not_dispatched" | "rejected" | "unknown";
+
+      const approvalResponseFailureProfiles: Record<
+        ApprovalResponseFailureMode,
+        {
+          readonly state: "failed" | "outcome_unknown";
+          readonly dispatch: "not_dispatched" | "rejected" | "unknown";
+          readonly stepState: "failed" | "outcome_unknown";
+          readonly evidenceKind: Evidence["kind"];
+          readonly evidenceDetail: string;
+        }
+      > = {
+        not_dispatched: {
+          state: "failed",
+          dispatch: "not_dispatched",
+          stepState: "failed",
+          evidenceKind: "adapter_inference",
+          evidenceDetail: "The approval response was not dispatched.",
+        },
+        rejected: {
+          state: "failed",
+          dispatch: "rejected",
+          stepState: "failed",
+          evidenceKind: "rpc_result",
+          evidenceDetail: "The approval response did not receive native acceptance.",
+        },
+        unknown: {
+          state: "outcome_unknown",
+          dispatch: "unknown",
+          stepState: "outcome_unknown",
+          evidenceKind: "adapter_inference",
+          evidenceDetail:
+            "No reply proves whether T3Code accepted this approval response. The operation will not resend it.",
+        },
+      };
+
+      const approvalResponseFailureMode = (
+        error: LocalStoreError | T3CodeAdapterError,
+        dispatchStarted: boolean,
+      ): ApprovalResponseFailureMode => {
+        if (!dispatchStarted) return "not_dispatched";
+        if (
+          error instanceof T3CodeAdapterError &&
+          !error.uncertain &&
+          error.kind !== "transport" &&
+          error.kind !== "timeout"
+        ) {
+          return "rejected";
+        }
+        return "unknown";
+      };
+
+      const approvalResponseOperationFailure = (
+        mode: ApprovalResponseFailureMode,
+        error: LocalStoreError | T3CodeAdapterError,
+      ): ToolFailure => {
+        if (mode === "unknown") {
+          return {
+            code: "unavailable",
+            message:
+              "The approval response outcome is unknown; inspect the operation and current thread state before making a new request.",
+            retry: "reconcile_first",
+            details: {},
+          };
+        }
+        return error instanceof T3CodeAdapterError
+          ? approvalResponseFailure(error)
+          : operationFailure(error);
+      };
+
+      const classifyApprovalResponseFailure = (input: {
+        readonly error: LocalStoreError | T3CodeAdapterError;
+        readonly dispatchStarted: boolean;
+        readonly now: string;
+      }) => {
+        const mode = approvalResponseFailureMode(input.error, input.dispatchStarted);
+        const profile = approvalResponseFailureProfiles[mode];
+        const recovery =
+          mode === "unknown"
+            ? ("observe_operation" as const)
+            : input.error instanceof T3CodeAdapterError && input.error.kind === "command_rejected"
+              ? ("observe_thread" as const)
+              : ("new_explicit_request" as const);
+        return {
+          ...profile,
+          failure: approvalResponseOperationFailure(mode, input.error),
+          recovery,
+          recoverableUntil:
+            mode === "unknown"
+              ? null
+              : new Date(Date.parse(input.now) + OPERATION_DETAIL_RETENTION_MILLIS).toISOString(),
+        };
+      };
+
       const evidence = (
         detail: string,
         kind: Evidence["kind"] = "local_registration",
@@ -201,18 +345,20 @@ export class Operations extends Context.Service<Operations, OperationsService>()
         stored: StoredOperation,
         record: OperationRecord,
         detail: string,
+        recoveryIntent?: OperationIntent,
       ): Effect.Effect<OperationRecord, LocalStoreError> =>
         Effect.gen(function* () {
           if (record.evidence.some((item) => item.detail === detail)) return record;
           const observed = yield* evidence(detail, "adapter_inference");
           yield* store.updateOperation(stored.record.requestId, {
             now: observed.observedAt,
-            // Worktree intent is non-secret and identifies what must be
-            // inspected before a new explicit creation request is made.
+            // Worktree and approval intents are nonsecret recovery identities;
+            // other mutations retain only the instance identity after dispatch.
             intent:
-              stored.record.tool === "worktree_create"
+              recoveryIntent ??
+              (stored.record.tool === "worktree_create"
                 ? stored.intent
-                : { instanceId: stored.intent.instanceId },
+                : { instanceId: stored.intent.instanceId }),
             state: "outcome_unknown",
             dispatch: "unknown",
             stepPosition: 0,
@@ -227,6 +373,97 @@ export class Operations extends Context.Service<Operations, OperationsService>()
             },
             recovery: "observe_operation",
           });
+          yield* signalCompletion(stored.record.requestId);
+          const refreshed = yield* store.getOperation(stored.record.requestId);
+          return refreshed?.record ?? record;
+        });
+
+      const markApprovalNotDispatched = (
+        stored: StoredOperation,
+        record: OperationRecord,
+      ): Effect.Effect<OperationRecord, LocalStoreError> =>
+        Effect.gen(function* () {
+          if (record.state !== "admitted" && record.state !== "pending") return record;
+          const observed = yield* evidence(
+            "A previous process stopped before the native approval dispatch boundary; the response was not sent.",
+            "adapter_inference",
+          );
+          const failure: ToolFailure = {
+            code: "unavailable",
+            message:
+              "The approval response was not dispatched. Submit a new explicit request; this operation will not be replayed.",
+            retry: "change_request",
+            details: {},
+          };
+          const claimed = yield* store.compareAndSetApprovalDispatch(
+            stored.record.requestId,
+            stored.ownerProcessNonce,
+            record.state,
+            {
+              now: observed.observedAt,
+              state: "failed",
+              dispatch: "not_dispatched",
+              stepPosition: 0,
+              stepState: "failed",
+              stepError: failure,
+              error: failure,
+              evidence: [observed],
+              evidenceStepPosition: null,
+              recovery: "new_explicit_request",
+              recoverableUntil: new Date(
+                Date.parse(observed.observedAt) + OPERATION_DETAIL_RETENTION_MILLIS,
+              ).toISOString(),
+            },
+          );
+          if (!claimed) {
+            const refreshed = yield* store.getOperation(stored.record.requestId);
+            return refreshed?.record ?? record;
+          }
+          yield* signalCompletion(stored.record.requestId);
+          const refreshed = yield* store.getOperation(stored.record.requestId);
+          return refreshed?.record ?? record;
+        });
+
+      const markApprovalDispatchUnknown = (
+        stored: StoredOperation,
+        record: OperationRecord,
+        detail: string,
+      ): Effect.Effect<OperationRecord, LocalStoreError> =>
+        Effect.gen(function* () {
+          if (record.evidence.some((item) => item.detail === detail)) return record;
+          const observed = yield* evidence(detail, "adapter_inference");
+          const failure: ToolFailure = {
+            code: "unavailable",
+            message:
+              "The approval response outcome is unknown; inspect the operation and current thread state before making a new request.",
+            retry: "reconcile_first",
+            details: {},
+          };
+          const claimed = yield* store.compareAndSetApprovalDispatch(
+            stored.record.requestId,
+            stored.ownerProcessNonce,
+            "pending",
+            {
+              now: observed.observedAt,
+              intent: stored.intent,
+              state: "outcome_unknown",
+              dispatch: "unknown",
+              stepPosition: 0,
+              stepState: "outcome_unknown",
+              stepError: failure,
+              error: failure,
+              evidence: [observed],
+              evidenceStepPosition: null,
+              recovery: "observe_operation",
+              recoverableUntil: null,
+            },
+            "unknown",
+          );
+          if (!claimed) {
+            const refreshed = yield* store.getOperation(stored.record.requestId);
+            yield* signalCompletion(stored.record.requestId);
+            return refreshed?.record ?? record;
+          }
           yield* signalCompletion(stored.record.requestId);
           const refreshed = yield* store.getOperation(stored.record.requestId);
           return refreshed?.record ?? record;
@@ -311,6 +548,25 @@ export class Operations extends Context.Service<Operations, OperationsService>()
               stored,
               record,
               "A worktree-create attempt stopped without a durable T3Code result. Native VCS creation will not be replayed; inspect the target instance before starting a new explicit request.",
+            );
+          }
+          if (record.tool === "approval_respond") {
+            if (previousOwner && !previousOwnerStale) return record;
+            if (record.dispatch === "not_dispatched") {
+              return yield* markApprovalNotDispatched(stored, record);
+            }
+            if (record.dispatch === "unknown") {
+              return yield* markApprovalDispatchUnknown(
+                stored,
+                record,
+                "The admitted approval response has no confirmed native reply; the current thread state cannot attribute request resolution to this command, so it will not be redispatched.",
+              );
+            }
+            return yield* markOutcomeUnknown(
+              stored,
+              record,
+              "The admitted approval response has no confirmed native reply; the current thread state cannot attribute request resolution to this command, so it will not be redispatched.",
+              stored.intent,
             );
           }
           if (record.tool !== "instance_remove") return record;
@@ -1257,11 +1513,167 @@ export class Operations extends Context.Service<Operations, OperationsService>()
         );
       };
 
+      const executeApprovalResponse = (
+        input: ApprovalRespondInput,
+        commandId: string,
+      ): Effect.Effect<void, never> => {
+        let dispatchStarted = false;
+        let acceptedEvidence: Evidence | null = null;
+        const target = {
+          instanceId: input.pendingRequest.instanceId,
+          threadId: input.pendingRequest.threadId,
+        };
+        const intent: OperationIntent = {
+          ...target,
+          pendingRequestId: input.pendingRequest.pendingRequestId,
+          decision: input.decision,
+        };
+        const finishAcceptedResponse = (accepted: Evidence) =>
+          store
+            .updateOperation(input.requestId, {
+              now: accepted.observedAt,
+              state: "completed",
+              dispatch: "accepted",
+              target,
+              stepPosition: 0,
+              stepState: "succeeded",
+              evidence: [accepted],
+              evidenceStepPosition: 0,
+              error: null,
+              recovery: "none",
+              recoverableUntil: new Date(
+                Date.parse(accepted.observedAt) + OPERATION_DETAIL_RETENTION_MILLIS,
+              ).toISOString(),
+            })
+            .pipe(Effect.andThen(signalCompletion(input.requestId)));
+        return Effect.gen(function* () {
+          const admitted = yield* evidence(
+            "The approval response and its native request identity were durably admitted for this process.",
+            "adapter_inference",
+          );
+          const claimed = yield* store.compareAndSetApprovalDispatch(
+            input.requestId,
+            processNonce,
+            "admitted",
+            {
+              now: admitted.observedAt,
+              intent,
+              state: "pending",
+              dispatch: "not_dispatched",
+              target,
+              stepPosition: 0,
+              stepState: "pending",
+              evidence: [admitted],
+              evidenceStepPosition: 0,
+              recovery: "observe_operation",
+            },
+          );
+          if (!claimed) return yield* Effect.fail(new ApprovalDispatchClaimLost());
+
+          const createdAt = yield* nowIso;
+          const response = yield* connections.respondToApproval({
+            instanceId: input.pendingRequest.instanceId,
+            threadId: input.pendingRequest.threadId,
+            pendingRequestId: input.pendingRequest.pendingRequestId,
+            commandId,
+            decision: input.decision,
+            createdAt,
+            onDispatch: Effect.gen(function* () {
+              const dispatchAt = yield* nowIso;
+              const claimed = yield* store.compareAndSetApprovalDispatch(
+                input.requestId,
+                processNonce,
+                "pending",
+                {
+                  now: dispatchAt,
+                  state: "pending",
+                  dispatch: "unknown",
+                  stepPosition: 0,
+                  stepState: "pending",
+                  evidence: [
+                    {
+                      kind: "adapter_inference",
+                      observedAt: dispatchAt,
+                      sourceSequence: null,
+                      nativeEventId: commandId,
+                      detail:
+                        "The native approval response is being sent; provider consumption and request resolution are not yet observed.",
+                    },
+                  ],
+                  evidenceStepPosition: 0,
+                  recovery: "observe_operation",
+                },
+              );
+              if (!claimed) return yield* Effect.fail(new ApprovalDispatchClaimLost());
+              dispatchStarted = true;
+            }),
+          });
+          const acceptedAt = yield* nowIso;
+          const accepted: Evidence = {
+            kind: "rpc_result",
+            observedAt: acceptedAt,
+            sourceSequence: response.sequence,
+            nativeEventId: commandId,
+            detail:
+              "T3Code accepted the native approval response command. Provider consumption and request resolution remain separate thread observations.",
+          };
+          acceptedEvidence = accepted;
+          yield* finishAcceptedResponse(accepted);
+        }).pipe(
+          Effect.catch((error: LocalStoreError | T3CodeAdapterError | ApprovalDispatchClaimLost) =>
+            error instanceof ApprovalDispatchClaimLost
+              ? signalCompletion(input.requestId)
+              : acceptedEvidence !== null
+                ? finishAcceptedResponse(acceptedEvidence).pipe(
+                    Effect.catch(() => signalCompletion(input.requestId)),
+                  )
+                : nowIso.pipe(
+                    Effect.flatMap((now) => {
+                      const outcome = classifyApprovalResponseFailure({
+                        error,
+                        dispatchStarted,
+                        now,
+                      });
+                      return store
+                        .updateOperation(input.requestId, {
+                          now,
+                          state: outcome.state,
+                          dispatch: outcome.dispatch,
+                          stepPosition: 0,
+                          stepState: outcome.stepState,
+                          stepError: outcome.failure,
+                          error: outcome.failure,
+                          evidence: [
+                            {
+                              kind: outcome.evidenceKind,
+                              observedAt: now,
+                              sourceSequence: null,
+                              nativeEventId: commandId,
+                              detail: outcome.evidenceDetail,
+                            },
+                          ],
+                          evidenceStepPosition: 0,
+                          recovery: outcome.recovery,
+                          recoverableUntil: outcome.recoverableUntil,
+                        })
+                        .pipe(
+                          Effect.andThen(signalCompletion(input.requestId)),
+                          Effect.catch(() => Effect.void),
+                        );
+                    }),
+                  ),
+          ),
+          Effect.asVoid,
+        );
+      };
+
       type AdmitAndRunInput = {
         readonly requestId: string;
         readonly fingerprint: string;
         readonly tool: string;
         readonly intent: OperationIntent;
+        readonly target?: OperationRecord["target"];
+        readonly commandId?: string;
         readonly completionMeans: OperationRecord["completionMeans"];
         readonly steps?: ReadonlyArray<string>;
         readonly created?: OperationRecord["created"];
@@ -1294,6 +1706,8 @@ export class Operations extends Context.Service<Operations, OperationsService>()
                   processNonce,
                   admittedAt,
                   intent: input.intent,
+                  ...(input.target === undefined ? {} : { target: input.target }),
+                  ...(input.commandId === undefined ? {} : { commandId: input.commandId }),
                   completionMeans: input.completionMeans,
                   ...(input.steps === undefined ? {} : { steps: input.steps }),
                   ...(input.created === undefined ? {} : { created: input.created }),
@@ -1588,12 +2002,95 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           });
         });
 
+      const readExistingOperation = (
+        requestId: string,
+        fingerprint: string,
+      ): Effect.Effect<OperationRecord | null, LocalStoreError> =>
+        Effect.gen(function* () {
+          const known = yield* store.findRequest(requestId);
+          if (known === null) return null;
+          if (known.fingerprint !== fingerprint) {
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: "request_id_conflict",
+                message: "The request ID was already used for different mutation input.",
+              }),
+            );
+          }
+          const existing = yield* store.getOperation(requestId);
+          if (existing === null) {
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: "request_record_unavailable",
+                message: REQUEST_RECORD_UNAVAILABLE_MESSAGE,
+              }),
+            );
+          }
+          return yield* reconcile(existing);
+        });
+
+      const admitApprovalResponse = (
+        input: ApprovalRespondInput,
+        fingerprint: string,
+      ): Effect.Effect<OperationRecord, LocalStoreError | OperationServiceError> =>
+        Effect.gen(function* () {
+          const commandId = yield* crypto.randomUUIDv4.pipe(
+            Effect.mapError(
+              () =>
+                new LocalStoreError({
+                  kind: "storage",
+                  message:
+                    "The operation supervisor could not create an approval response identity.",
+                }),
+            ),
+          );
+          const target = {
+            instanceId: input.pendingRequest.instanceId,
+            threadId: input.pendingRequest.threadId,
+          };
+          const intent: OperationIntent = {
+            ...target,
+            pendingRequestId: input.pendingRequest.pendingRequestId,
+            decision: input.decision,
+          };
+          return yield* admitAndRun({
+            requestId: input.requestId,
+            fingerprint,
+            tool: "approval_respond",
+            intent,
+            target,
+            commandId,
+            completionMeans: "response_accepted",
+            steps: ["dispatch_approval_response"],
+            execute: executeApprovalResponse(input, commandId),
+          });
+        });
+
+      const respondToApproval = (
+        input: ApprovalRespondInput,
+        observeRequest: Effect.Effect<
+          PendingRequest | null,
+          LocalStoreError | T3CodeAdapterError | ObservationError
+        >,
+      ): Effect.Effect<
+        OperationRecord,
+        LocalStoreError | T3CodeAdapterError | OperationServiceError | ObservationError
+      > =>
+        Effect.gen(function* () {
+          const fingerprint = yield* store.fingerprintRequest("approval_respond", input);
+          const existing = yield* readExistingOperation(input.requestId, fingerprint);
+          if (existing !== null) return existing;
+          yield* validateObservedApproval(input, yield* observeRequest);
+          return yield* admitApprovalResponse(input, fingerprint);
+        });
+
       return Operations.of({
         pairInstance,
         pairInstanceAgain,
         removeRegistration,
         updateRegistration,
         createWorktree,
+        respondToApproval,
         getOperation: readOperation,
       });
     }),

@@ -6,7 +6,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
-import type { InstanceDetails } from "./domain";
+import type { ApprovalResponseCommand, InstanceDetails } from "./domain";
 import { MAX_INSTANCE_RPC_CAPACITY, REVISION_POLL_INTERVAL_MILLIS } from "./domain";
 import { LocalStore, LocalStoreError } from "./local-store";
 import {
@@ -127,6 +127,12 @@ export interface InstanceConnectionsService {
   readonly readArchivedShell: (
     instanceId: string,
   ) => Effect.Effect<ObservedShellSnapshot, LocalStoreError | T3CodeAdapterError>;
+  readonly respondToApproval: <E>(
+    input: ApprovalResponseCommand & {
+      readonly instanceId: string;
+      readonly onDispatch: Effect.Effect<void, E, never>;
+    },
+  ) => Effect.Effect<{ readonly sequence: number }, LocalStoreError | T3CodeAdapterError | E>;
   readonly invalidate: (instanceId: string) => Effect.Effect<void>;
 }
 
@@ -228,9 +234,9 @@ export class InstanceConnections extends Context.Service<
           }
           return semaphore;
         };
-        const withInstanceCapacity = <A>(
+        const withInstanceCapacity = <A, E>(
           instanceId: string,
-          effect: Effect.Effect<A, T3CodeAdapterError>,
+          effect: Effect.Effect<A, T3CodeAdapterError | E>,
         ) =>
           capacityFor(instanceId)
             .withPermitsIfAvailable(1)(effect)
@@ -450,6 +456,33 @@ export class InstanceConnections extends Context.Service<
             );
             const observedAt = new Date(yield* Clock.currentTimeMillis).toISOString();
             return { ...snapshot, observedAt };
+          });
+
+        const respondToApproval = <E>(
+          input: ApprovalResponseCommand & {
+            readonly instanceId: string;
+            readonly onDispatch: Effect.Effect<void, E, never>;
+          },
+        ): Effect.Effect<{ readonly sequence: number }, LocalStoreError | T3CodeAdapterError | E> =>
+          Effect.gen(function* () {
+            yield* requireReadableRegistration(
+              input.instanceId,
+              "The saved registration requires pairing before approvals can be answered.",
+            );
+            const connection = yield* acquire(input.instanceId);
+            return yield* withInstanceCapacity(
+              input.instanceId,
+              adapter.respondToApproval({
+                endpoint: connection.endpoint,
+                credential: connection.credential,
+                commandId: input.commandId,
+                threadId: input.threadId,
+                pendingRequestId: input.pendingRequestId,
+                decision: input.decision,
+                createdAt: input.createdAt,
+                onDispatch: input.onDispatch,
+              }),
+            );
           });
 
         const inspectFresh = (
@@ -712,6 +745,7 @@ export class InstanceConnections extends Context.Service<
           openShellStream,
           openThreadStream,
           readArchivedShell,
+          respondToApproval,
           invalidate,
         });
       }),
