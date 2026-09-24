@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { LocalStore } from "./local-store";
+import type { ThreadSummary, WorktreeInspectionFrame, WorktreeReference } from "./domain";
 
 const tsxCliPath = createRequire(import.meta.url).resolve("tsx/cli");
 
@@ -14,6 +15,7 @@ type JsonRpcMessage = {
   readonly id?: number;
   readonly result?: {
     readonly tools?: ReadonlyArray<{ readonly name: string }>;
+    readonly isError?: boolean;
     readonly structuredContent?: Record<string, unknown>;
   };
 };
@@ -119,6 +121,7 @@ const startServer = async (databasePath: string): Promise<Server> => {
       "model_list",
       "worktree_list",
       "thread_list",
+      "worktree_inspect",
       "thread_get",
       "approval_respond",
       "thread_output",
@@ -206,6 +209,121 @@ const withServers = <A, E, R>(
         rmSync(directory, { recursive: true, force: true });
       }),
   );
+
+describe("shared SQLite worktree inspection captures", () => {
+  it.live(
+    "continues an inspection page in another MCP process",
+    () =>
+      withServers("t3code-mcp-worktree-capture-", ({ databasePath, servers }) =>
+        Effect.gen(function* () {
+          const worktree: WorktreeReference = {
+            instanceId: "capture-instance",
+            repositoryPath: "/srv/repo",
+            worktreePath: "/srv/worktrees/feature-multiprocess",
+          };
+          const summary = (threadId: string): ThreadSummary => ({
+            thread: { instanceId: worktree.instanceId, threadId },
+            project: { instanceId: worktree.instanceId, projectId: "project-a" },
+            title: threadId,
+            archived: false,
+            worktree,
+            latestTurn: null,
+            settlement: "unsettled",
+          });
+          const frame: WorktreeInspectionFrame = {
+            summary: {
+              worktree,
+              branch: "feature/multiprocess",
+              evidence: ["thread_association", "vcs_ref", "verified_checkout"],
+            },
+            status: {
+              hasWorkingTreeChanges: true,
+              changedFiles: 7,
+              stagedFiles: null,
+              untrackedFiles: null,
+              ahead: 1,
+              behind: 2,
+            },
+            checks: [
+              { name: "target_identity", state: "passed", detail: "target checked" },
+              { name: "association", state: "passed", detail: "association checked" },
+              { name: "reference_coverage", state: "passed", detail: "references checked" },
+              { name: "inactive_execution", state: "passed", detail: "execution checked" },
+              { name: "no_pending_requests", state: "passed", detail: "requests checked" },
+              { name: "session_stopped", state: "passed", detail: "sessions checked" },
+            ],
+            discardConsequences: {
+              deletesWorktreeContents: true,
+              retainsBranch: true,
+              requiresExplicitSoleThreadForThreadRemoval: true,
+              atomicReferenceGuard: false,
+            },
+          };
+          const first = yield* Effect.scoped(
+            Effect.gen(function* () {
+              const store = yield* LocalStore;
+              return yield* store.captureWorktreeInspectionPage({
+                query: { worktree },
+                items: [summary("thread-a"), summary("thread-b")],
+                metadata: {
+                  failures: [],
+                  coverage: "complete_for_query",
+                  limitations: [],
+                  observations: [
+                    {
+                      instanceId: worktree.instanceId,
+                      observedAt: "2026-09-22T10:00:00.000Z",
+                      freshness: "fresh",
+                      sourceSequence: 42,
+                      coverage: "complete_for_query",
+                      limitations: [],
+                    },
+                  ],
+                  frame,
+                },
+                limit: 1,
+              });
+            }).pipe(Effect.provide(LocalStore.layer({ databasePath }))),
+          );
+          const cursor = first.page.referencingThreads.nextCursor;
+          expect(cursor).toEqual(expect.any(String));
+
+          const server = yield* Effect.promise(() => startServer(databasePath));
+          servers.add(server);
+          const continuation = yield* Effect.promise(() =>
+            call(server, 3, "worktree_inspect", { worktree, cursor, limit: 1 }),
+          );
+          expect(continuation.result?.isError).toBe(false);
+          expect(continuation.result?.structuredContent).toMatchObject({
+            result: {
+              kind: "ok",
+              value: {
+                summary: { branch: "feature/multiprocess" },
+                status: { changedFiles: 7, ahead: 1, behind: 2 },
+                checks: [
+                  { name: "target_identity", state: "passed", detail: "target checked" },
+                  { name: "association", state: "passed", detail: "association checked" },
+                  { name: "reference_coverage", state: "passed", detail: "references checked" },
+                  { name: "inactive_execution", state: "passed", detail: "execution checked" },
+                  { name: "no_pending_requests", state: "passed", detail: "requests checked" },
+                  { name: "session_stopped", state: "passed", detail: "sessions checked" },
+                ],
+                referencingThreads: {
+                  items: [{ thread: { threadId: "thread-b" } }],
+                  nextCursor: null,
+                  coverage: "complete_for_query",
+                },
+                discardConsequences: { retainsBranch: true, atomicReferenceGuard: false },
+              },
+            },
+            observations: [{ instanceId: worktree.instanceId, freshness: "fresh" }],
+            warnings: [],
+          });
+        }),
+      ),
+    30_000,
+  );
+});
 
 describe("shared SQLite mutation admission", () => {
   it.live(

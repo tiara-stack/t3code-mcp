@@ -8,6 +8,7 @@ import * as Layer from "effect/Layer";
 import * as McpSchema from "effect/unstable/ai/McpSchema";
 import * as McpServer from "effect/unstable/ai/McpServer";
 import * as Option from "effect/Option";
+import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
@@ -53,6 +54,7 @@ import {
   makeProjectListToolSuccess,
   makeThreadGetToolSuccess,
   makeThreadListToolSuccess,
+  makeWorktreeInspectionToolSuccess,
   makeThreadOutputToolSuccess,
   makeWorktreeListToolSuccess,
   staleModelReadLimitation,
@@ -74,6 +76,8 @@ import {
   ThreadGetToolResultSchema,
   ThreadListInputSchema,
   ThreadListToolResultSchema,
+  WorktreeInspectInputSchema,
+  WorktreeInspectionToolResultSchema,
   ThreadOutputInputSchema,
   ThreadOutputToolResultSchema,
   ThreadWaitInputSchema,
@@ -99,6 +103,9 @@ import {
   type ThreadSummary,
   type WorktreeListPage,
   type WorktreeListQuery,
+  type WorktreeGuardCheck,
+  type WorktreeInspectionFrame,
+  type WorktreeInspectionQuery,
   type WorktreeSummary,
 } from "./domain";
 import type { ToolFailure } from "./domain";
@@ -116,6 +123,7 @@ import {
   type ThreadCaptureMetadata,
   type ThreadGetCaptureMetadata,
   type ThreadOutputCaptureMetadata,
+  type WorktreeInspectionCaptureMetadata,
   type TurnEvidenceRecord,
   type WorktreeCaptureMetadata,
 } from "./local-store";
@@ -126,6 +134,8 @@ import {
   type DiscoveredProjects,
   type DiscoveredVcsRefs,
   type InstanceConnectionsService,
+  type DiscoveredVcsWorktreeRefs,
+  type ObservedVcsWorktreeStatus,
 } from "./instance-connections";
 import {
   ObservationError,
@@ -142,57 +152,95 @@ import {
 } from "./t3code-adapter";
 import { adapterErrorFailure } from "./tool-failure";
 
-// fallow-ignore-next-line unused-export
-export const InstanceListTool = Tool.make("instance_list", {
-  description: "List saved T3Code instance registrations without probing them.",
-  parameters: InstanceListInputSchema,
-  success: ToolResultSchema,
-})
-  .addDependency(LocalStore)
-  .annotate(Tool.Readonly, true)
-  .annotate(Tool.Destructive, false)
-  .annotate(Tool.Idempotent, true)
-  .annotate(Tool.OpenWorld, false);
+const withToolHints = <
+  Name extends string,
+  Config extends {
+    readonly parameters: Schema.Constraint;
+    readonly success: Schema.Constraint;
+    readonly failure: Schema.Constraint;
+    readonly failureMode: Tool.FailureMode;
+  },
+  Requirements,
+>(
+  tool: Tool.Tool<Name, Config, Requirements>,
+  hints: {
+    readonly readonly: boolean;
+    readonly destructive: boolean;
+    readonly idempotent: boolean;
+    readonly openWorld: boolean;
+  },
+): Tool.Tool<Name, Config, Requirements> =>
+  tool
+    .annotate(Tool.Readonly, hints.readonly)
+    .annotate(Tool.Destructive, hints.destructive)
+    .annotate(Tool.Idempotent, hints.idempotent)
+    .annotate(Tool.OpenWorld, hints.openWorld);
 
-const InstanceGetTool = Tool.make("instance_get", {
-  description:
-    "Inspect a saved T3Code registration and its current authorization and capabilities.",
-  parameters: InstanceGetInputSchema,
-  success: InstanceDetailsToolResultSchema,
-})
-  .addDependency(InstanceConnections)
-  .annotate(Tool.Readonly, true)
-  .annotate(Tool.Destructive, false)
-  .annotate(Tool.Idempotent, true)
-  .annotate(Tool.OpenWorld, true);
+const asReadTool = <
+  Name extends string,
+  Config extends {
+    readonly parameters: Schema.Constraint;
+    readonly success: Schema.Constraint;
+    readonly failure: Schema.Constraint;
+    readonly failureMode: Tool.FailureMode;
+  },
+  Requirements,
+>(
+  tool: Tool.Tool<Name, Config, Requirements>,
+  openWorld: boolean,
+): Tool.Tool<Name, Config, Requirements> =>
+  withToolHints(tool, {
+    readonly: true,
+    destructive: false,
+    idempotent: true,
+    openWorld,
+  });
 
 // fallow-ignore-next-line unused-export
-export const ProjectListTool = Tool.make("project_list", {
-  description:
-    "List existing projects on one saved T3Code instance or across all saved instances, with per-instance failures.",
-  parameters: ProjectListInputSchema,
-  success: ProjectListToolResultSchema,
-})
-  .addDependency(LocalStore)
-  .addDependency(InstanceConnections)
-  .annotate(Tool.Readonly, true)
-  .annotate(Tool.Destructive, false)
-  .annotate(Tool.Idempotent, true)
-  .annotate(Tool.OpenWorld, true);
+export const InstanceListTool = asReadTool(
+  Tool.make("instance_list", {
+    description: "List saved T3Code instance registrations without probing them.",
+    parameters: InstanceListInputSchema,
+    success: ToolResultSchema,
+  }).addDependency(LocalStore),
+  false,
+);
+
+const InstanceGetTool = asReadTool(
+  Tool.make("instance_get", {
+    description:
+      "Inspect a saved T3Code registration and its current authorization and capabilities.",
+    parameters: InstanceGetInputSchema,
+    success: InstanceDetailsToolResultSchema,
+  }).addDependency(InstanceConnections),
+  true,
+);
 
 // fallow-ignore-next-line unused-export
-export const ModelListTool = Tool.make("model_list", {
-  description:
-    "List the provider/model choices, option descriptors, availability, and verified capability limits for one saved T3Code instance.",
-  parameters: ModelListInputSchema,
-  success: ModelListToolResultSchema,
-})
-  .addDependency(LocalStore)
-  .addDependency(InstanceConnections)
-  .annotate(Tool.Readonly, true)
-  .annotate(Tool.Destructive, false)
-  .annotate(Tool.Idempotent, true)
-  .annotate(Tool.OpenWorld, true);
+export const ProjectListTool = asReadTool(
+  Tool.make("project_list", {
+    description:
+      "List existing projects on one saved T3Code instance or across all saved instances, with per-instance failures.",
+    parameters: ProjectListInputSchema,
+    success: ProjectListToolResultSchema,
+  })
+    .addDependency(LocalStore)
+    .addDependency(InstanceConnections),
+  true,
+);
+
+// fallow-ignore-next-line unused-export
+export const ModelListTool = asReadTool(
+  Tool.make("model_list", {
+    description:
+      "List the provider/model choices, option descriptors, availability, and verified capability limits for one saved T3Code instance.",
+    parameters: ModelListInputSchema,
+    success: ModelListToolResultSchema,
+  })
+    .addDependency(LocalStore)
+    .addDependency(InstanceConnections),
+  true,
+);
 
 // fallow-ignore-next-line unused-export
 export const WorktreeListTool = Tool.make("worktree_list", {
@@ -209,44 +257,49 @@ export const WorktreeListTool = Tool.make("worktree_list", {
   .annotate(Tool.Idempotent, true)
   .annotate(Tool.OpenWorld, true);
 
-const asThreadReadTool = <
-  Name extends string,
-  Config extends {
-    readonly parameters: Schema.Constraint;
-    readonly success: Schema.Constraint;
-    readonly failure: Schema.Constraint;
-    readonly failureMode: Tool.FailureMode;
-  },
-  Requirements,
->(
-  tool: Tool.Tool<Name, Config, Requirements>,
-): Tool.Tool<Name, Config, Requirements | LocalStore | Observations> =>
-  tool
-    .addDependency(LocalStore)
-    .addDependency(Observations)
-    .annotate(Tool.Readonly, true)
-    .annotate(Tool.Destructive, false)
-    .annotate(Tool.Idempotent, true)
-    .annotate(Tool.OpenWorld, true);
-
 // fallow-ignore-next-line unused-export
-export const ThreadListTool = asThreadReadTool(
+export const ThreadListTool = asReadTool(
   Tool.make("thread_list", {
     description:
       "List existing and archived threads on one saved T3Code instance or one explicit project scope, with stable pagination.",
     parameters: ThreadListInputSchema,
     success: ThreadListToolResultSchema,
-  }),
+  })
+    .addDependency(LocalStore)
+    .addDependency(Observations),
+  true,
 );
 
 // fallow-ignore-next-line unused-export
-export const ThreadGetTool = asThreadReadTool(
+export const WorktreeInspectTool = withToolHints(
+  Tool.make("worktree_inspect", {
+    description:
+      "Inspect one instance-qualified worktree with fresh VCS status, complete active and archived thread references, guard checks, and fixed discard consequences. Refreshing status may fetch and update local remote-tracking refs.",
+    parameters: WorktreeInspectInputSchema,
+    success: WorktreeInspectionToolResultSchema,
+  })
+    .addDependency(LocalStore)
+    .addDependency(InstanceConnections)
+    .addDependency(Observations),
+  {
+    readonly: false,
+    destructive: false,
+    idempotent: false,
+    openWorld: true,
+  },
+);
+
+// fallow-ignore-next-line unused-export
+export const ThreadGetTool = asReadTool(
   Tool.make("thread_get", {
     description:
       "Inspect one thread's compact configuration, execution, provider session, settlement, and pending requests through a synchronized native thread snapshot.",
     parameters: ThreadGetInputSchema,
     success: ThreadGetToolResultSchema,
-  }),
+  })
+    .addDependency(LocalStore)
+    .addDependency(Observations),
+  true,
 );
 
 // fallow-ignore-next-line unused-export
@@ -264,33 +317,42 @@ export const ApprovalRespondTool = Tool.make("approval_respond", {
   .annotate(Tool.OpenWorld, true);
 
 // fallow-ignore-next-line unused-export
-export const ThreadOutputTool = asThreadReadTool(
+export const ThreadOutputTool = asReadTool(
   Tool.make("thread_output", {
     description:
       "Read one thread's retained conversation and activity output as bounded latest-first UTF-8 chunks with native identities, turn correlation, and explicit truncation.",
     parameters: ThreadOutputInputSchema,
     success: ThreadOutputToolResultSchema,
-  }),
+  })
+    .addDependency(LocalStore)
+    .addDependency(Observations),
+  true,
 );
 
 // fallow-ignore-next-line unused-export
-export const ThreadWaitTool = asThreadReadTool(
+export const ThreadWaitTool = asReadTool(
   Tool.make("thread_wait", {
     description:
       "Wait for one observable thread condition (changed, inactive, settled, unsettled, session_stopped, needs_response) across all clients' activity, reporting condition_met, timed_out, unavailable, and history_gap separately from the observed thread state.",
     parameters: ThreadWaitInputSchema,
     success: ThreadWaitToolResultSchema,
-  }),
+  })
+    .addDependency(LocalStore)
+    .addDependency(Observations),
+  true,
 );
 
 // fallow-ignore-next-line unused-export
-export const TurnWaitTool = asThreadReadTool(
+export const TurnWaitTool = asReadTool(
   Tool.make("turn_wait", {
     description:
       "Wait for one exact observed turn's outcome (completed, interrupted, failed, awaiting approval/input, running, or outcome unknown) with supported evidence, retaining the requested target even after a newer turn starts; reports timeout, unavailable observation, and history gaps separately from execution.",
     parameters: TurnWaitInputSchema,
     success: TurnWaitToolResultSchema,
-  }),
+  })
+    .addDependency(LocalStore)
+    .addDependency(Observations),
+  true,
 );
 
 /**
@@ -399,6 +461,7 @@ export const ServerToolkit = Toolkit.make(
   ModelListTool,
   WorktreeListTool,
   ThreadListTool,
+  WorktreeInspectTool,
   ThreadGetTool,
   ApprovalRespondTool,
   ThreadOutputTool,
@@ -432,6 +495,14 @@ const toToolFailure = (
         return makeToolFailure(error.message, "unavailable", "safe_read", {
           action: "retry_observation",
         });
+      case "ambiguous_target":
+        return makeToolFailure(error.message, "unavailable", "safe_read", {
+          action: "retry_observation",
+        });
+      case "repository_mismatch":
+        return makeToolFailure(error.message, "uncheckable_target", "change_request");
+      case "uncheckable_target":
+        return makeToolFailure(error.message, "uncheckable_target", "change_request");
       case "stale_generation":
         return makeToolFailure(error.message, "stale_state", "reconcile_first");
       case "retention_budget":
@@ -938,9 +1009,43 @@ const settlementFromNative = (
     ? "settled"
     : "unsettled";
 
-const threadSettlement = (
-  thread: SynchronizedShell["threads"][number],
-): ThreadSummary["settlement"] => settlementFromNative(thread.settledOverride, thread.settledAt);
+const projectThreadSummary = (options: {
+  readonly instanceId: string;
+  readonly threadId: string;
+  readonly projectId: string;
+  readonly title: string;
+  readonly archivedAt: string | null;
+  readonly repositoryPath: string | null;
+  readonly worktreePath: string | null;
+  readonly latestTurnId: string | null;
+  readonly settledOverride: "settled" | "active" | null;
+  readonly settledAt: string | null;
+}): ThreadSummary => {
+  const {
+    instanceId,
+    threadId,
+    projectId,
+    title,
+    archivedAt,
+    repositoryPath,
+    worktreePath,
+    latestTurnId,
+    settledOverride,
+    settledAt,
+  } = options;
+  return {
+    thread: { instanceId, threadId },
+    project: { instanceId, projectId },
+    title,
+    archived: archivedAt !== null,
+    worktree:
+      worktreePath === null || repositoryPath === null
+        ? null
+        : { instanceId, repositoryPath, worktreePath },
+    latestTurn: latestTurnId === null ? null : { instanceId, threadId, turnId: latestTurnId },
+    settlement: settlementFromNative(settledOverride, settledAt),
+  };
+};
 
 const toThreadSummaries = (
   shell: SynchronizedShell,
@@ -958,25 +1063,18 @@ const toThreadSummaries = (
       .filter((thread) => query.archived !== "exclude" || thread.archivedAt === null)
       .map((thread) => {
         const project = shell.projects.find((entry) => entry.projectId === thread.projectId);
-        return {
-          thread: { instanceId, threadId: thread.threadId },
-          project: { instanceId, projectId: thread.projectId },
+        return projectThreadSummary({
+          instanceId,
+          threadId: thread.threadId,
+          projectId: thread.projectId,
           title: thread.title,
-          archived: thread.archivedAt !== null,
-          worktree:
-            thread.worktreePath !== null && project !== undefined
-              ? {
-                  instanceId,
-                  repositoryPath: project.repositoryPath,
-                  worktreePath: thread.worktreePath,
-                }
-              : null,
-          latestTurn:
-            thread.latestTurnId !== null
-              ? { instanceId, threadId: thread.threadId, turnId: thread.latestTurnId }
-              : null,
-          settlement: threadSettlement(thread),
-        } satisfies ThreadSummary;
+          archivedAt: thread.archivedAt,
+          repositoryPath: project?.repositoryPath ?? null,
+          worktreePath: thread.worktreePath,
+          latestTurnId: thread.latestTurnId,
+          settledOverride: thread.settledOverride,
+          settledAt: thread.settledAt,
+        });
       })
   );
 };
@@ -1557,18 +1655,20 @@ const mergeWorktreeInventories = (options: {
 };
 
 /**
- * Only transient connection failures make a failed fresh read eligible for a
- * retained stale serve, mirroring the stale policy of
- * InstanceConnections.inspect. Identity, pairing, compatibility, and
- * registration-lifecycle failures propagate instead of serving data captured
- * under different authority. A stale-generation observation rejection names
- * a registration revision shift, so it is authority-class too, not a
- * connection failure.
+ * Recoverable connection and observation failures may use retained data,
+ * mirroring the stale policy of InstanceConnections.inspect. Identity,
+ * pairing, compatibility, registration-lifecycle, target-identity,
+ * repository-association, and stale-generation failures propagate instead of
+ * serving data captured under different authority.
  */
 const staleEligibleReadError = (
   error: LocalStoreError | T3CodeAdapterError | ObservationError,
 ): boolean =>
-  (error instanceof ObservationError && error.kind !== "stale_generation") ||
+  (error instanceof ObservationError &&
+    error.kind !== "stale_generation" &&
+    error.kind !== "uncheckable_target" &&
+    error.kind !== "repository_mismatch" &&
+    error.kind !== "ambiguous_target") ||
   (error instanceof T3CodeAdapterError &&
     (error.kind === "transport" || error.kind === "timeout" || error.kind === "capacity"));
 
@@ -1644,6 +1744,1023 @@ const discoverWorktreePage = (options: {
       ...(limit === undefined ? {} : { limit }),
     });
     return makeWorktreeListToolSuccess(captured.page, captured.observations);
+  });
+
+const MAX_WORKTREE_INSPECTION_REFERENCES = 128;
+const WORKTREE_INSPECTION_BOUND_MILLIS = 60_000;
+const worktreeInspectionCapacityRetrySchedule = Schedule.exponential("25 millis").pipe(
+  Schedule.jittered,
+  Schedule.modifyDelay(({ duration }) =>
+    Effect.succeed(Duration.millis(Math.min(250, Math.max(25, Duration.toMillis(duration))))),
+  ),
+  Schedule.upTo({ duration: Duration.millis(WORKTREE_INSPECTION_BOUND_MILLIS) }),
+);
+
+const retryWorktreeInspectionCapacity = <A>(
+  effect: Effect.Effect<A, LocalStoreError | T3CodeAdapterError | ObservationError>,
+): Effect.Effect<A, LocalStoreError | T3CodeAdapterError | ObservationError> =>
+  Effect.retry(effect, {
+    schedule: worktreeInspectionCapacityRetrySchedule,
+    while: (error) => error instanceof T3CodeAdapterError && error.kind === "capacity",
+  });
+
+interface WorktreeReferenceCandidate {
+  readonly summary: ThreadSummary;
+  readonly repositoryPath: string;
+}
+
+interface WorktreeRepositoryMismatch {
+  readonly threadId: string;
+  readonly projectId: string;
+  readonly repositoryPath: string;
+}
+
+interface WorktreeUnresolvedProject {
+  readonly threadId: string;
+  readonly projectId: string;
+}
+
+interface WorktreeReferenceInventory {
+  readonly items: ReadonlyArray<WorktreeReferenceCandidate>;
+  readonly observations: ReadonlyArray<Observation>;
+  readonly signature: string;
+}
+
+const shellReferenceObservation = (shell: SynchronizedShell, instanceId: string): Observation =>
+  freshShellObservation(shell, instanceId);
+
+const worktreeThreadSummary = (options: {
+  readonly instanceId: string;
+  readonly project: SynchronizedShell["projects"][number];
+  readonly thread: SynchronizedShell["threads"][number];
+}): ThreadSummary => {
+  const { instanceId, project, thread } = options;
+  return projectThreadSummary({
+    instanceId,
+    threadId: thread.threadId,
+    projectId: thread.projectId,
+    title: thread.title,
+    archivedAt: thread.archivedAt,
+    repositoryPath: project.repositoryPath,
+    worktreePath: thread.worktreePath,
+    latestTurnId: thread.latestTurnId,
+    settledOverride: thread.settledOverride,
+    settledAt: thread.settledAt,
+  });
+};
+
+const worktreeReferenceSignature = (items: ReadonlyArray<WorktreeReferenceCandidate>): string =>
+  JSON.stringify(
+    items.map(({ summary }) => [
+      summary.thread.instanceId,
+      summary.thread.threadId,
+      summary.project.projectId,
+      summary.worktree?.repositoryPath ?? null,
+      summary.worktree?.worktreePath ?? null,
+      summary.archived,
+      summary.latestTurn?.turnId ?? null,
+    ]),
+  );
+
+const shellProjectsById = (
+  shell: SynchronizedShell,
+): ReadonlyMap<string, ReadonlyArray<SynchronizedShell["projects"][number]>> => {
+  const projectsById = new Map<string, Array<SynchronizedShell["projects"][number]>>();
+  for (const project of shell.projects) {
+    const projects = projectsById.get(project.projectId) ?? [];
+    projects.push(project);
+    projectsById.set(project.projectId, projects);
+  }
+  return projectsById;
+};
+
+const worktreeProjectsById = (
+  active: SynchronizedShell,
+  archived: SynchronizedShell,
+): ReadonlyMap<string, ReadonlyArray<SynchronizedShell["projects"][number]>> => {
+  const activeProjects = shellProjectsById(active);
+  const archivedProjects = shellProjectsById(archived);
+  const projectIds = new Set([...activeProjects.keys(), ...archivedProjects.keys()]);
+  const projectsById = new Map<string, ReadonlyArray<SynchronizedShell["projects"][number]>>();
+  for (const projectId of projectIds) {
+    const activeMatches = activeProjects.get(projectId) ?? [];
+    const archivedMatches = archivedProjects.get(projectId) ?? [];
+    const activeProject = activeMatches[0];
+    const archivedProject = archivedMatches[0];
+    if (
+      activeMatches.length === 1 &&
+      archivedMatches.length === 1 &&
+      activeProject !== undefined &&
+      archivedProject !== undefined &&
+      activeProject.repositoryPath === archivedProject.repositoryPath
+    ) {
+      projectsById.set(projectId, [activeProject]);
+    } else {
+      projectsById.set(projectId, [...activeMatches, ...archivedMatches]);
+    }
+  }
+  return projectsById;
+};
+
+const candidateForShellThread = (options: {
+  readonly instanceId: string;
+  readonly worktree: WorktreeInspectionQuery["worktree"];
+  readonly projectsById: ReadonlyMap<string, ReadonlyArray<SynchronizedShell["projects"][number]>>;
+  readonly thread: SynchronizedShell["threads"][number];
+}): {
+  readonly candidate: WorktreeReferenceCandidate | null;
+  readonly ambiguous: boolean;
+  readonly repositoryMismatch: WorktreeRepositoryMismatch | null;
+  readonly unresolvedProject: WorktreeUnresolvedProject | null;
+} => {
+  const { instanceId, worktree, projectsById, thread } = options;
+  if (thread.worktreePath !== worktree.worktreePath) {
+    return {
+      candidate: null,
+      ambiguous: false,
+      repositoryMismatch: null,
+      unresolvedProject: null,
+    };
+  }
+  const projects = projectsById.get(thread.projectId) ?? [];
+  if (projects.length === 0) {
+    return {
+      candidate: null,
+      ambiguous: false,
+      repositoryMismatch: null,
+      unresolvedProject: { threadId: thread.threadId, projectId: thread.projectId },
+    };
+  }
+  if (projects.length > 1) {
+    return {
+      candidate: null,
+      ambiguous: true,
+      repositoryMismatch: null,
+      unresolvedProject: null,
+    };
+  }
+  const project = projects[0];
+  if (project === undefined) {
+    return {
+      candidate: null,
+      ambiguous: false,
+      repositoryMismatch: null,
+      unresolvedProject: { threadId: thread.threadId, projectId: thread.projectId },
+    };
+  }
+  if (project.repositoryPath !== worktree.repositoryPath) {
+    return {
+      candidate: null,
+      ambiguous: false,
+      repositoryMismatch: {
+        threadId: thread.threadId,
+        projectId: thread.projectId,
+        repositoryPath: project.repositoryPath,
+      },
+      unresolvedProject: null,
+    };
+  }
+  return {
+    candidate: {
+      summary: worktreeThreadSummary({ instanceId, project, thread }),
+      repositoryPath: project.repositoryPath,
+    },
+    ambiguous: false,
+    repositoryMismatch: null,
+    unresolvedProject: null,
+  };
+};
+
+const collectWorktreeReferencesFromShell = (options: {
+  readonly worktree: WorktreeInspectionQuery["worktree"];
+  readonly shell: SynchronizedShell;
+  readonly projectsById: ReadonlyMap<string, ReadonlyArray<SynchronizedShell["projects"][number]>>;
+}): {
+  readonly candidates: ReadonlyArray<WorktreeReferenceCandidate>;
+  readonly ambiguousAssociation: boolean;
+  readonly conflictingReference: boolean;
+  readonly repositoryMismatches: ReadonlyArray<WorktreeRepositoryMismatch>;
+  readonly unresolvedProjects: ReadonlyArray<WorktreeUnresolvedProject>;
+} => {
+  const { worktree, shell, projectsById } = options;
+  const byThread = new Map<string, WorktreeReferenceCandidate>();
+  let ambiguousAssociation = false;
+  let conflictingReference = false;
+  const repositoryMismatches: Array<WorktreeRepositoryMismatch> = [];
+  const unresolvedProjects: Array<WorktreeUnresolvedProject> = [];
+  for (const thread of shell.threads) {
+    const result = candidateForShellThread({
+      instanceId: worktree.instanceId,
+      worktree,
+      projectsById,
+      thread,
+    });
+    if (result.ambiguous) {
+      ambiguousAssociation = true;
+      continue;
+    }
+    if (result.repositoryMismatch !== null) {
+      repositoryMismatches.push(result.repositoryMismatch);
+      continue;
+    }
+    if (result.unresolvedProject !== null) {
+      unresolvedProjects.push(result.unresolvedProject);
+      continue;
+    }
+    if (result.candidate === null) continue;
+    conflictingReference =
+      mergeWorktreeReferenceCandidates(byThread, [result.candidate]) || conflictingReference;
+  }
+  return {
+    candidates: [...byThread.values()],
+    ambiguousAssociation,
+    conflictingReference,
+    repositoryMismatches,
+    unresolvedProjects,
+  };
+};
+
+const mergeWorktreeReferenceCandidates = (
+  byThread: Map<string, WorktreeReferenceCandidate>,
+  candidates: ReadonlyArray<WorktreeReferenceCandidate>,
+): boolean => {
+  let conflictingReference = false;
+  for (const candidate of candidates) {
+    const threadId = candidate.summary.thread.threadId;
+    const prior = byThread.get(threadId);
+    if (
+      prior !== undefined &&
+      JSON.stringify(prior.summary) !== JSON.stringify(candidate.summary)
+    ) {
+      conflictingReference = true;
+    }
+    byThread.set(threadId, candidate);
+  }
+  return conflictingReference;
+};
+
+const worktreeReferenceAssociationError = (options: {
+  readonly worktree: WorktreeInspectionQuery["worktree"];
+  readonly repositoryPathAnchored: boolean;
+  readonly ambiguousAssociation: boolean;
+  readonly conflictingReference: boolean;
+  readonly repositoryMismatches: ReadonlyArray<WorktreeRepositoryMismatch>;
+  readonly unresolvedProjects: ReadonlyArray<WorktreeUnresolvedProject>;
+}): ObservationError | null => {
+  const mismatch = [...options.repositoryMismatches].sort((left, right) =>
+    left.threadId.localeCompare(right.threadId),
+  )[0];
+  if (mismatch !== undefined) {
+    return new ObservationError({
+      kind: "repository_mismatch",
+      message: `Thread ${mismatch.threadId} in project ${mismatch.projectId} reports repository path ${JSON.stringify(mismatch.repositoryPath)}, but the requested repository path is ${JSON.stringify(options.worktree.repositoryPath)}.`,
+    });
+  }
+  if (!options.repositoryPathAnchored) {
+    return new ObservationError({
+      kind: "uncheckable_target",
+      message: `The supplied repository path ${JSON.stringify(options.worktree.repositoryPath)} was absent from the synchronized active and archived project inventories.`,
+    });
+  }
+  const unresolvedProject = [...options.unresolvedProjects].sort((left, right) =>
+    left.threadId.localeCompare(right.threadId),
+  )[0];
+  if (unresolvedProject !== undefined) {
+    return new ObservationError({
+      kind: "boundary_missing",
+      message: `Thread ${unresolvedProject.threadId} references project ${unresolvedProject.projectId}, which was absent from both active and archived project inventories.`,
+    });
+  }
+  if (options.ambiguousAssociation || options.conflictingReference) {
+    return new ObservationError({
+      kind: "ambiguous_target",
+      message:
+        "The active and archived snapshots disagree about a thread association for this worktree.",
+    });
+  }
+  return null;
+};
+
+const collectWorktreeReferences = (options: {
+  readonly worktree: WorktreeInspectionQuery["worktree"];
+  readonly active: SynchronizedShell;
+  readonly archived: SynchronizedShell;
+}): Effect.Effect<WorktreeReferenceInventory, ObservationError> => {
+  const { worktree, active, archived } = options;
+  const projectsById = worktreeProjectsById(active, archived);
+  const repositoryPathAnchored = [active, archived].some((shell) =>
+    shell.projects.some((project) => project.repositoryPath === worktree.repositoryPath),
+  );
+  const byThread = new Map<string, WorktreeReferenceCandidate>();
+  let ambiguousAssociation = false;
+  let conflictingReference = false;
+  const repositoryMismatches: Array<WorktreeRepositoryMismatch> = [];
+  const unresolvedProjects: Array<WorktreeUnresolvedProject> = [];
+  for (const shell of [active, archived]) {
+    const collected = collectWorktreeReferencesFromShell({ worktree, shell, projectsById });
+    ambiguousAssociation ||= collected.ambiguousAssociation;
+    repositoryMismatches.push(...collected.repositoryMismatches);
+    unresolvedProjects.push(...collected.unresolvedProjects);
+    const duplicateConflict = mergeWorktreeReferenceCandidates(byThread, collected.candidates);
+    conflictingReference =
+      conflictingReference || collected.conflictingReference || duplicateConflict;
+  }
+
+  const items = [...byThread.values()].sort((left, right) =>
+    compareThreadSummaries(left.summary, right.summary),
+  );
+  const associationError = worktreeReferenceAssociationError({
+    worktree,
+    repositoryPathAnchored,
+    ambiguousAssociation,
+    conflictingReference,
+    repositoryMismatches,
+    unresolvedProjects,
+  });
+  if (associationError !== null) return Effect.fail(associationError);
+  if (items.length > MAX_WORKTREE_INSPECTION_REFERENCES) {
+    return Effect.fail(
+      new ObservationError({
+        kind: "uncheckable_target",
+        message: `The worktree has more than ${MAX_WORKTREE_INSPECTION_REFERENCES} referencing threads; the complete guard check exceeds its supported bound.`,
+      }),
+    );
+  }
+  return Effect.succeed({
+    items,
+    observations: [
+      shellReferenceObservation(active, worktree.instanceId),
+      shellReferenceObservation(archived, worktree.instanceId),
+    ],
+    signature: worktreeReferenceSignature(items),
+  });
+};
+
+const readWorktreeReferenceInventory = (options: {
+  readonly observations: ObservationsService;
+  readonly worktree: WorktreeInspectionQuery["worktree"];
+}): Effect.Effect<
+  WorktreeReferenceInventory,
+  LocalStoreError | T3CodeAdapterError | ObservationError
+> =>
+  Effect.gen(function* () {
+    const [active, archived] = yield* Effect.all(
+      [
+        retryWorktreeInspectionCapacity(
+          options.observations.activeShell(options.worktree.instanceId),
+        ),
+        retryWorktreeInspectionCapacity(
+          options.observations.archivedShell(options.worktree.instanceId),
+        ),
+      ],
+      { concurrency: "unbounded" },
+    );
+    return yield* collectWorktreeReferences({
+      worktree: options.worktree,
+      active,
+      archived,
+    });
+  });
+
+const vcsStatusObservation = (
+  instanceId: string,
+  status: ObservedVcsWorktreeStatus,
+): Observation => ({
+  instanceId,
+  observedAt: status.observedAt,
+  freshness: "fresh",
+  sourceSequence: null,
+  coverage: "complete_for_query",
+  limitations: [...status.limitations],
+});
+
+const vcsRefsObservation = (instanceId: string, refs: DiscoveredVcsWorktreeRefs): Observation => ({
+  instanceId,
+  observedAt: refs.observedAt,
+  freshness: refs.truncated ? "unknown" : "fresh",
+  sourceSequence: null,
+  coverage: refs.truncated ? "partial" : "complete_for_query",
+  limitations: [...refs.limitations],
+});
+
+const verifyCompleteVcsRefInventory = (
+  refs: DiscoveredVcsWorktreeRefs,
+): Effect.Effect<void, T3CodeAdapterError | ObservationError> => {
+  if (!refs.isRepo) {
+    return Effect.fail(
+      new T3CodeAdapterError({
+        kind: "resource_not_found",
+        message: "The repository path does not resolve to a local repository.",
+        uncertain: false,
+        status: null,
+      }),
+    );
+  }
+  if (refs.pageLimitExceeded === true) {
+    return Effect.fail(
+      new ObservationError({
+        kind: "uncheckable_target",
+        message:
+          refs.limitations[0] ?? "The complete VCS ref inventory exceeds its supported page bound.",
+      }),
+    );
+  }
+  if (refs.truncated || refs.limitations.length > 0) {
+    return Effect.fail(
+      new ObservationError({
+        kind: "boundary_missing",
+        message: refs.limitations[0] ?? "The complete VCS ref inventory could not be established.",
+      }),
+    );
+  }
+  return Effect.void;
+};
+
+const worktreeRefForPath = (
+  refs: DiscoveredVcsWorktreeRefs,
+  worktreePath: string,
+): Effect.Effect<DiscoveredVcsWorktreeRefs["refs"][number], ObservationError> => {
+  const matches = refs.refs.filter((ref) => ref.worktreePath === worktreePath);
+  if (matches.length === 1 && matches[0] !== undefined) return Effect.succeed(matches[0]);
+  return Effect.fail(
+    new ObservationError({
+      kind: matches.length === 0 ? "uncheckable_target" : "ambiguous_target",
+      message:
+        matches.length === 0
+          ? "The supplied path is not attached to a verifiable local VCS ref in the supplied repository."
+          : "The supplied worktree path maps to more than one VCS ref.",
+    }),
+  );
+};
+
+const verifyWorktreeVcsIdentity = (options: {
+  readonly worktree: WorktreeInspectionQuery["worktree"];
+  readonly status: ObservedVcsWorktreeStatus;
+  readonly refs: DiscoveredVcsWorktreeRefs;
+}): Effect.Effect<string, T3CodeAdapterError | ObservationError> =>
+  Effect.gen(function* () {
+    const { worktree, status, refs } = options;
+    if (!status.isRepo) {
+      return yield* Effect.fail(
+        new T3CodeAdapterError({
+          kind: "resource_not_found",
+          message: "The worktree path does not resolve to a repository-backed checkout.",
+          uncertain: false,
+          status: null,
+        }),
+      );
+    }
+    yield* verifyCompleteVcsRefInventory(refs);
+    if (worktree.worktreePath === worktree.repositoryPath) {
+      return yield* Effect.fail(
+        new ObservationError({
+          kind: "uncheckable_target",
+          message:
+            "The supplied worktree path is the repository root; discard consequences apply only to linked worktrees.",
+        }),
+      );
+    }
+    const ref = yield* worktreeRefForPath(refs, worktree.worktreePath);
+    if (status.branch === null || status.branch !== ref.branch) {
+      return yield* Effect.fail(
+        new ObservationError({
+          kind: "stale_generation",
+          message: "The worktree branch changed while its target identity was being checked.",
+        }),
+      );
+    }
+    return ref.branch;
+  });
+
+const readWorktreeVcsEvidence = (options: {
+  readonly connections: InstanceConnectionsService;
+  readonly worktree: WorktreeInspectionQuery["worktree"];
+}): Effect.Effect<
+  {
+    readonly branch: string;
+    readonly status: ObservedVcsWorktreeStatus;
+    readonly refs: DiscoveredVcsWorktreeRefs;
+    readonly observations: ReadonlyArray<Observation>;
+  },
+  LocalStoreError | T3CodeAdapterError | ObservationError
+> =>
+  Effect.gen(function* () {
+    const [status, refs] = yield* Effect.all(
+      [
+        retryWorktreeInspectionCapacity(
+          options.connections.readVcsWorktreeStatus(
+            options.worktree.instanceId,
+            options.worktree.worktreePath,
+          ),
+        ),
+        retryWorktreeInspectionCapacity(
+          options.connections.discoverVcsWorktreeRefs(
+            options.worktree.instanceId,
+            options.worktree.repositoryPath,
+          ),
+        ),
+      ],
+      { concurrency: "unbounded" },
+    );
+    const branch = yield* verifyWorktreeVcsIdentity({
+      worktree: options.worktree,
+      status,
+      refs,
+    });
+    return {
+      branch,
+      status,
+      refs,
+      observations: [
+        vcsStatusObservation(options.worktree.instanceId, status),
+        vcsRefsObservation(options.worktree.instanceId, refs),
+      ],
+    };
+  });
+
+const guardCheck = (
+  name: WorktreeGuardCheck["name"],
+  state: WorktreeGuardCheck["state"],
+  detail: string,
+): WorktreeGuardCheck => ({ name, state, detail });
+
+interface WorktreeThreadInspectionRecord {
+  readonly detail: SynchronizedThreadDetail;
+  readonly summary: ThreadSummary;
+  readonly execution: ThreadState["execution"];
+  readonly session: ThreadState["session"];
+  readonly pendingRequests: ReadonlyArray<PendingRequest>;
+  readonly observation: Observation;
+}
+
+const worktreeThreadGuardChecks = (options: {
+  readonly instanceId: string;
+  readonly records: ReadonlyArray<WorktreeThreadInspectionRecord>;
+}): ReadonlyArray<WorktreeGuardCheck> => {
+  const { records, instanceId } = options;
+  if (records.length === 0) {
+    return [
+      guardCheck("inactive_execution", "not_applicable", "No thread references this worktree."),
+      guardCheck("no_pending_requests", "not_applicable", "No thread references this worktree."),
+      guardCheck("session_stopped", "not_applicable", "No thread references this worktree."),
+    ];
+  }
+
+  const activeThreads = records
+    .filter((record) => record.execution.state === "active")
+    .map((record) => record.detail.thread.threadId);
+  const unknownExecutionThreads = records
+    .filter((record) => record.execution.state === "unknown")
+    .map((record) => record.detail.thread.threadId);
+  const inactiveExecution =
+    activeThreads.length > 0
+      ? guardCheck(
+          "inactive_execution",
+          "failed",
+          `Execution is active on thread(s): ${activeThreads.join(", ")}.`,
+        )
+      : unknownExecutionThreads.length > 0
+        ? guardCheck(
+            "inactive_execution",
+            "unavailable",
+            `Execution state is unknown for thread(s): ${unknownExecutionThreads.join(", ")}.`,
+          )
+        : guardCheck(
+            "inactive_execution",
+            "passed",
+            "Every referencing thread has fresh evidence of inactive execution.",
+          );
+
+  const pendingThreads = records
+    .filter((record) => record.pendingRequests.some((request) => request.state === "pending"))
+    .map((record) => record.detail.thread.threadId);
+  const unknownRequestThreads = records
+    .filter((record) => record.pendingRequests.some((request) => request.state === "unknown"))
+    .map((record) => record.detail.thread.threadId);
+  const noPendingRequests =
+    pendingThreads.length > 0
+      ? guardCheck(
+          "no_pending_requests",
+          "failed",
+          `Pending requests are present on thread(s): ${pendingThreads.join(", ")}.`,
+        )
+      : unknownRequestThreads.length > 0
+        ? guardCheck(
+            "no_pending_requests",
+            "unavailable",
+            `Request lifecycle is unknown on thread(s): ${unknownRequestThreads.join(", ")}.`,
+          )
+        : guardCheck(
+            "no_pending_requests",
+            "passed",
+            "Every referencing thread has fresh evidence with no unresolved requests.",
+          );
+
+  const runningSessions = records
+    .filter((record) => record.session.state !== "stopped" && record.session.state !== "unknown")
+    .map((record) => record.detail.thread.threadId);
+  const unknownSessionThreads = records
+    .filter((record) => record.session.state === "unknown")
+    .map((record) => record.detail.thread.threadId);
+  const sessionStopped =
+    runningSessions.length > 0
+      ? guardCheck(
+          "session_stopped",
+          "failed",
+          `A provider session is not stopped on thread(s): ${runningSessions.join(", ")}.`,
+        )
+      : unknownSessionThreads.length > 0
+        ? guardCheck(
+            "session_stopped",
+            "unavailable",
+            `Provider-session state is unknown on thread(s): ${unknownSessionThreads.join(", ")}.`,
+          )
+        : guardCheck(
+            "session_stopped",
+            "passed",
+            `Every referencing thread on ${instanceId} has fresh evidence that its provider session is stopped.`,
+          );
+
+  return [inactiveExecution, noPendingRequests, sessionStopped];
+};
+
+const assertSameWorktreeReferenceInventory = (
+  before: WorktreeReferenceInventory,
+  after: WorktreeReferenceInventory,
+): Effect.Effect<void, ObservationError> =>
+  before.signature === after.signature
+    ? Effect.void
+    : Effect.fail(
+        new ObservationError({
+          kind: "stale_generation",
+          message:
+            "The active or archived thread associations changed while the worktree references were being checked.",
+        }),
+      );
+
+const threadDetailMatchesWorktreeReference = (options: {
+  readonly detail: SynchronizedThreadDetail;
+  readonly candidate: WorktreeReferenceCandidate;
+  readonly worktree: WorktreeInspectionQuery["worktree"];
+}): boolean => {
+  const { detail, candidate, worktree } = options;
+  return (
+    detail.thread.projectId === candidate.summary.project.projectId &&
+    detail.thread.worktreePath === worktree.worktreePath &&
+    (detail.thread.archivedAt !== null) === candidate.summary.archived
+  );
+};
+
+const inspectWorktreeThread = (options: {
+  readonly observations: ObservationsService;
+  readonly candidate: WorktreeReferenceCandidate;
+  readonly worktree: WorktreeInspectionQuery["worktree"];
+}): Effect.Effect<
+  WorktreeThreadInspectionRecord,
+  LocalStoreError | T3CodeAdapterError | ObservationError
+> =>
+  Effect.gen(function* () {
+    const { observations, candidate, worktree } = options;
+    const detail = yield* retryWorktreeInspectionCapacity(
+      observations.threadDetail(worktree.instanceId, candidate.summary.thread.threadId),
+    );
+    if (!threadDetailMatchesWorktreeReference({ detail, candidate, worktree })) {
+      return yield* Effect.fail(
+        new ObservationError({
+          kind: "stale_generation",
+          message: `Thread ${detail.thread.threadId} changed its worktree association while the inspection was running.`,
+        }),
+      );
+    }
+    const summary = threadSummaryFromDetail({
+      instanceId: worktree.instanceId,
+      detail,
+      project: { repositoryPath: candidate.repositoryPath, limitations: [] },
+    });
+    const execution = threadExecutionState(worktree.instanceId, detail);
+    const session = threadSessionStateOf(detail);
+    const pendingRequests = pendingRequestsFromActivities(summary.thread, detail.thread.activities);
+    const observation: Observation = {
+      instanceId: worktree.instanceId,
+      observedAt: detail.observedAt,
+      freshness: "fresh",
+      sourceSequence: detail.threadSequence ?? detail.snapshotSequence,
+      coverage: "complete_for_query",
+      limitations: detail.limitedHistory
+        ? [
+            `T3Code limited the retained history for thread ${detail.thread.threadId}; its current pending-request projection remains available.`,
+          ]
+        : [],
+    };
+    return { detail, summary, execution, session, pendingRequests, observation };
+  });
+
+const inspectWorktreeThreads = (options: {
+  readonly observations: ObservationsService;
+  readonly worktree: WorktreeInspectionQuery["worktree"];
+  readonly candidates: ReadonlyArray<WorktreeReferenceCandidate>;
+}): Effect.Effect<
+  ReadonlyArray<WorktreeThreadInspectionRecord>,
+  LocalStoreError | T3CodeAdapterError | ObservationError
+> =>
+  Effect.forEach(
+    options.candidates,
+    (candidate) => inspectWorktreeThread({ ...options, candidate }),
+    { concurrency: 4 },
+  );
+
+const worktreeThreadMatchesFinalReference = (options: {
+  readonly current: ThreadSummary | undefined;
+  readonly record: WorktreeThreadInspectionRecord;
+  readonly worktreePath: string;
+}): boolean => {
+  const { current, record, worktreePath } = options;
+  if (current === undefined) return false;
+  return [
+    current.project.projectId === record.summary.project.projectId,
+    current.worktree?.worktreePath === worktreePath,
+    current.archived === record.summary.archived,
+    (current.latestTurn?.turnId ?? null) === (record.summary.latestTurn?.turnId ?? null),
+  ].every(Boolean);
+};
+
+const assertWorktreeThreadsUnchanged = (options: {
+  readonly worktree: WorktreeInspectionQuery["worktree"];
+  readonly references: WorktreeReferenceInventory;
+  readonly records: ReadonlyArray<WorktreeThreadInspectionRecord>;
+}): Effect.Effect<void, ObservationError> => {
+  const currentByThread = new Map(
+    options.references.items.map((candidate) => [
+      candidate.summary.thread.threadId,
+      candidate.summary,
+    ]),
+  );
+  for (const record of options.records) {
+    const current = currentByThread.get(record.summary.thread.threadId);
+    if (
+      !worktreeThreadMatchesFinalReference({
+        current,
+        record,
+        worktreePath: options.worktree.worktreePath,
+      })
+    ) {
+      return Effect.fail(
+        new ObservationError({
+          kind: "stale_generation",
+          message: `Thread ${record.summary.thread.threadId} changed while its execution and request state were being checked.`,
+        }),
+      );
+    }
+  }
+  return Effect.void;
+};
+
+const assertWorktreeThreadBranchesMatch = (
+  records: ReadonlyArray<WorktreeThreadInspectionRecord>,
+  liveBranch: string,
+): Effect.Effect<void, ObservationError> => {
+  const mismatch = records.find(
+    (record) => record.detail.thread.branch !== null && record.detail.thread.branch !== liveBranch,
+  );
+  return mismatch === undefined
+    ? Effect.void
+    : Effect.fail(
+        new ObservationError({
+          kind: "uncheckable_target",
+          message: `Thread ${mismatch.detail.thread.threadId} records branch ${JSON.stringify(mismatch.detail.thread.branch)}, but the live worktree branch is ${JSON.stringify(liveBranch)}.`,
+        }),
+      );
+};
+
+const buildWorktreeInspectionFrame = (options: {
+  readonly worktree: WorktreeInspectionQuery["worktree"];
+  readonly branch: string;
+  readonly status: ObservedVcsWorktreeStatus;
+  readonly records: ReadonlyArray<WorktreeThreadInspectionRecord>;
+}): {
+  readonly frame: WorktreeInspectionFrame;
+  readonly summaries: ReadonlyArray<ThreadSummary>;
+} => {
+  const { worktree, branch, status, records } = options;
+  const summaries = records.map((record) => record.summary).sort(compareThreadSummaries);
+  const evidence: WorktreeSummary["evidence"] = [
+    ...(summaries.length > 0 ? (["thread_association"] as const) : []),
+    "vcs_ref",
+    "verified_checkout",
+  ];
+  return {
+    summaries,
+    frame: {
+      summary: { worktree, branch, evidence },
+      status: {
+        hasWorkingTreeChanges: status.hasWorkingTreeChanges,
+        changedFiles: status.changedFiles,
+        stagedFiles: status.stagedFiles,
+        untrackedFiles: status.untrackedFiles,
+        ahead: status.ahead,
+        behind: status.behind,
+      },
+      checks: [
+        guardCheck(
+          "target_identity",
+          "passed",
+          "The worktree path resolved to one local VCS ref with the same branch reported by its status.",
+        ),
+        guardCheck(
+          "association",
+          "passed",
+          "The repository path, VCS ref, and every observed thread association agree on this worktree.",
+        ),
+        guardCheck(
+          "reference_coverage",
+          "passed",
+          "Fresh active and archived thread inventories were fully checked before display pagination.",
+        ),
+        ...worktreeThreadGuardChecks({ instanceId: worktree.instanceId, records }),
+      ],
+      discardConsequences: {
+        deletesWorktreeContents: true,
+        retainsBranch: true,
+        requiresExplicitSoleThreadForThreadRemoval: true,
+        atomicReferenceGuard: false,
+      },
+    },
+  };
+};
+
+const assertSameWorktreeBranch = (
+  before: string,
+  after: string,
+): Effect.Effect<void, ObservationError> =>
+  before === after
+    ? Effect.void
+    : Effect.fail(
+        new ObservationError({
+          kind: "stale_generation",
+          message: "The target worktree branch changed while its status was being inspected.",
+        }),
+      );
+
+const inspectWorktreeFresh = (options: {
+  readonly store: LocalStoreService;
+  readonly connections: InstanceConnectionsService;
+  readonly observations: ObservationsService;
+  readonly query: WorktreeInspectionQuery;
+  readonly limit: number | undefined;
+}): Effect.Effect<
+  ReturnType<typeof makeWorktreeInspectionToolSuccess>,
+  LocalStoreError | T3CodeAdapterError | ObservationError
+> => {
+  const inspection = Effect.gen(function* () {
+    const { store, connections, observations, query, limit } = options;
+    const worktree = query.worktree;
+    const initialVcs = yield* readWorktreeVcsEvidence({ connections, worktree });
+    const initialReferences = yield* readWorktreeReferenceInventory({ observations, worktree });
+    const records = yield* inspectWorktreeThreads({
+      observations,
+      worktree,
+      candidates: initialReferences.items,
+    });
+    const finalReferences = yield* readWorktreeReferenceInventory({ observations, worktree });
+    yield* assertSameWorktreeReferenceInventory(initialReferences, finalReferences);
+    yield* assertWorktreeThreadsUnchanged({ worktree, references: finalReferences, records });
+
+    const finalVcs = yield* readWorktreeVcsEvidence({ connections, worktree });
+    yield* assertSameWorktreeBranch(initialVcs.branch, finalVcs.branch);
+    yield* assertWorktreeThreadBranchesMatch(records, finalVcs.branch);
+
+    const { frame, summaries } = buildWorktreeInspectionFrame({
+      worktree,
+      branch: finalVcs.branch,
+      status: finalVcs.status,
+      records,
+    });
+    const metadata: WorktreeInspectionCaptureMetadata = {
+      failures: [],
+      coverage: "complete_for_query",
+      limitations: [
+        "The page limit controls displayed references only; guard checks use the complete fresh inventory.",
+      ],
+      observations: [
+        ...initialVcs.observations,
+        ...initialReferences.observations,
+        ...records.map((record) => record.observation),
+        ...finalReferences.observations,
+        ...finalVcs.observations,
+      ],
+      frame,
+    };
+    const captured = yield* store.captureWorktreeInspectionPage({
+      query,
+      items: summaries,
+      metadata,
+      ...(limit === undefined ? {} : { limit }),
+    });
+    return makeWorktreeInspectionToolSuccess(captured.page, captured.observations);
+  });
+  return inspection.pipe(
+    Effect.timeoutOrElse({
+      duration: Duration.millis(WORKTREE_INSPECTION_BOUND_MILLIS),
+      orElse: () =>
+        Effect.fail(
+          new ObservationError({
+            kind: "synchronization_timeout",
+            message: `The complete worktree inspection exceeded its ${WORKTREE_INSPECTION_BOUND_MILLIS} millisecond time bound.`,
+          }),
+        ),
+    }),
+  );
+};
+
+const serveRetainedWorktreeInspection = (options: {
+  readonly store: LocalStoreService;
+  readonly query: WorktreeInspectionQuery;
+  readonly instanceId: string;
+  readonly limit: number | undefined;
+  readonly error: LocalStoreError | T3CodeAdapterError | ObservationError;
+}): Effect.Effect<
+  ReturnType<typeof makeWorktreeInspectionToolSuccess>,
+  LocalStoreError | T3CodeAdapterError | ObservationError
+> =>
+  Effect.gen(function* () {
+    const retained = yield* options.store.findRetainedWorktreeInspectionCapture(options.query);
+    if (retained === null) return yield* Effect.fail(options.error);
+
+    const limitation = `Fresh worktree inspection failed (${options.error.message}); the returned status and thread page are retained evidence.`;
+    const observedAt =
+      retained.observations[0]?.observedAt ??
+      new Date(yield* Clock.currentTimeMillis).toISOString();
+    const observations =
+      retained.observations.length > 0
+        ? retained.observations.map((observation) => ({
+            ...observation,
+            freshness: "stale" as const,
+            coverage: "partial" as const,
+            limitations: [
+              ...observation.limitations.filter(
+                (existing) => !existing.startsWith("Fresh worktree inspection failed ("),
+              ),
+              limitation,
+            ],
+          }))
+        : [
+            {
+              instanceId: options.instanceId,
+              observedAt,
+              freshness: "stale" as const,
+              sourceSequence: null,
+              coverage: "partial" as const,
+              limitations: [limitation],
+            },
+          ];
+    const frame: WorktreeInspectionFrame = {
+      ...retained.frame,
+      checks: retained.frame.checks.map((check) => ({
+        ...check,
+        state: "unavailable" as const,
+        detail: limitation,
+      })),
+    };
+    const metadata: WorktreeInspectionCaptureMetadata = {
+      failures: [{ instanceId: options.instanceId, error: toToolFailure(options.error) }],
+      coverage: "partial",
+      limitations: [limitation],
+      observations,
+      frame,
+    };
+    const captured = yield* options.store.captureWorktreeInspectionPage({
+      query: options.query,
+      items: retained.items,
+      metadata,
+      ...(options.limit === undefined ? {} : { limit: options.limit }),
+    });
+    return makeWorktreeInspectionToolSuccess(captured.page, captured.observations);
+  });
+
+const discoverWorktreeInspection = (options: {
+  readonly store: LocalStoreService;
+  readonly connections: InstanceConnectionsService;
+  readonly observations: ObservationsService;
+  readonly query: WorktreeInspectionQuery;
+  readonly limit: number | undefined;
+  readonly allowStale: boolean;
+}): Effect.Effect<
+  ReturnType<typeof makeWorktreeInspectionToolSuccess>,
+  LocalStoreError | T3CodeAdapterError | ObservationError
+> =>
+  Effect.gen(function* () {
+    const fresh = yield* Effect.result(inspectWorktreeFresh(options));
+    if (Result.isSuccess(fresh)) return fresh.success;
+    if (!options.allowStale || !staleEligibleReadError(fresh.failure)) {
+      return yield* Effect.fail(fresh.failure);
+    }
+    return yield* serveRetainedWorktreeInspection({
+      store: options.store,
+      query: options.query,
+      instanceId: options.query.worktree.instanceId,
+      limit: options.limit,
+      error: fresh.failure,
+    });
   });
 
 const sessionStateByNativeStatus: Record<string, ThreadState["session"]["state"]> = {
@@ -2218,25 +3335,18 @@ const threadSummaryFromDetail = (options: {
 }): ThreadSummary => {
   const { instanceId, detail, project } = options;
   const { thread } = detail;
-  return {
-    thread: { instanceId, threadId: thread.threadId },
-    project: { instanceId, projectId: thread.projectId },
+  return projectThreadSummary({
+    instanceId,
+    threadId: thread.threadId,
+    projectId: thread.projectId,
     title: thread.title,
-    archived: thread.archivedAt !== null,
-    worktree:
-      thread.worktreePath !== null && project.repositoryPath !== null
-        ? {
-            instanceId,
-            repositoryPath: project.repositoryPath,
-            worktreePath: thread.worktreePath,
-          }
-        : null,
-    latestTurn:
-      thread.latestTurn === null
-        ? null
-        : { instanceId, threadId: thread.threadId, turnId: thread.latestTurn.turnId },
-    settlement: settlementFromNative(thread.settledOverride, thread.settledAt),
-  };
+    archivedAt: thread.archivedAt,
+    repositoryPath: project.repositoryPath,
+    worktreePath: thread.worktreePath,
+    latestTurnId: thread.latestTurn?.turnId ?? null,
+    settledOverride: thread.settledOverride,
+    settledAt: thread.settledAt,
+  });
 };
 
 /**
@@ -2926,27 +4036,46 @@ const classifyWaitObservationFailure = (options: {
     };
   });
 
-type WaitObservationOutcome<Value> =
-  | { readonly kind: "unavailable"; readonly value: Value }
-  | { readonly kind: "retry"; readonly pollInterval: number };
+type WaitThreadDetailRead<UnavailableResult> =
+  | { readonly kind: "observed"; readonly detail: SynchronizedThreadDetail }
+  | { readonly kind: "retry"; readonly pollInterval: number }
+  | { readonly kind: "unavailable"; readonly result: UnavailableResult };
 
-const waitObservationFailure = <Value>(options: {
-  readonly failure: LocalStoreError | T3CodeAdapterError | ObservationError;
+const unavailableObservationData = (message: string) => ({
+  observations: [] as ReadonlyArray<Observation>,
+  warnings: [{ code: "observation_unavailable" as const, message }],
+});
+
+const readThreadDetailForWait = <UnavailableResult>(options: {
+  readonly observations: ObservationsService;
+  readonly instanceId: string;
+  readonly threadId: string;
   readonly firstEvaluation: boolean;
   readonly deadline: number;
   readonly pollInterval: number;
-  readonly unavailableValue: () => Value;
+  readonly unavailableResult: (
+    failure: LocalStoreError | T3CodeAdapterError | ObservationError,
+  ) => UnavailableResult;
 }): Effect.Effect<
-  WaitObservationOutcome<Value>,
+  WaitThreadDetailRead<UnavailableResult>,
   LocalStoreError | T3CodeAdapterError | ObservationError
 > =>
   Effect.gen(function* () {
-    const classification = yield* classifyWaitObservationFailure(options);
-    if (classification.kind === "propagate") return yield* Effect.fail(options.failure);
-    if (classification.kind === "unavailable") {
-      return { kind: "unavailable" as const, value: options.unavailableValue() };
+    const result = yield* Effect.result(
+      options.observations.threadDetail(options.instanceId, options.threadId),
+    );
+    if (Result.isSuccess(result)) return { kind: "observed", detail: result.success } as const;
+    const failure = yield* classifyWaitObservationFailure({
+      failure: result.failure,
+      firstEvaluation: options.firstEvaluation,
+      deadline: options.deadline,
+      pollInterval: options.pollInterval,
+    });
+    if (failure.kind === "propagate") return yield* Effect.fail(result.failure);
+    if (failure.kind === "unavailable") {
+      return { kind: "unavailable", result: options.unavailableResult(result.failure) } as const;
     }
-    return classification;
+    return failure;
   });
 
 /**
@@ -3013,36 +4142,34 @@ const runThreadWait = (
     let firstEvaluation = true;
     let pollInterval = THREAD_WAIT_POLL_INTERVAL_MILLIS;
     while (true) {
-      const detailResult = yield* Effect.result(observations.threadDetail(instanceId, threadId));
-      if (Result.isFailure(detailResult)) {
-        const failure = yield* waitObservationFailure({
-          failure: detailResult.failure,
-          firstEvaluation,
-          deadline,
-          pollInterval,
-          unavailableValue: () =>
-            threadWaitObservationResult({
-              condition,
-              observation: "unavailable",
-              state: null,
-              observations: [],
-              warnings: [
-                { code: "observation_unavailable", message: detailResult.failure.message },
-              ],
-            }),
-        });
-        if (failure.kind === "unavailable") return failure.value;
-        pollInterval = failure.pollInterval;
+      const detailRead = yield* readThreadDetailForWait({
+        observations,
+        instanceId,
+        threadId,
+        firstEvaluation,
+        deadline,
+        pollInterval,
+        unavailableResult: (failure) =>
+          threadWaitObservationResult({
+            condition,
+            observation: "unavailable",
+            state: null,
+            ...unavailableObservationData(failure.message),
+          }),
+      });
+      if (detailRead.kind === "retry") {
+        pollInterval = detailRead.pollInterval;
         continue;
       }
+      if (detailRead.kind === "unavailable") return detailRead.result;
       firstEvaluation = false;
-      const project = yield* projectLookupFor(detailResult.success);
+      const project = yield* projectLookupFor(detailRead.detail);
       const poll = pollThreadWait({
         thread,
         condition,
         cursor,
         project,
-        detail: detailResult.success,
+        detail: detailRead.detail,
       });
       if (poll.terminal !== null) return poll.terminal;
       const next = yield* sleepBeforeNextWaitPoll({ deadline, pollInterval });
@@ -3357,34 +4484,32 @@ const runTurnWait = (options: {
     let firstEvaluation = true;
     let pollInterval = THREAD_WAIT_POLL_INTERVAL_MILLIS;
     while (true) {
-      const detailResult = yield* Effect.result(observations.threadDetail(instanceId, threadId));
-      if (Result.isFailure(detailResult)) {
-        const failure = yield* waitObservationFailure({
-          failure: detailResult.failure,
-          firstEvaluation,
-          deadline,
-          pollInterval,
-          unavailableValue: () =>
-            turnWaitResult({
-              turn,
-              observation: "unavailable",
-              evaluation: unknownTurnWaitEvaluation,
-              pendingRequests: [],
-              observations: [],
-              warnings: [
-                { code: "observation_unavailable", message: detailResult.failure.message },
-              ],
-            }),
-        });
-        if (failure.kind === "unavailable") return failure.value;
-        pollInterval = failure.pollInterval;
+      const detailRead = yield* readThreadDetailForWait({
+        observations,
+        instanceId,
+        threadId,
+        firstEvaluation,
+        deadline,
+        pollInterval,
+        unavailableResult: (failure) =>
+          turnWaitResult({
+            turn,
+            observation: "unavailable",
+            evaluation: unknownTurnWaitEvaluation,
+            pendingRequests: [],
+            ...unavailableObservationData(failure.message),
+          }),
+      });
+      if (detailRead.kind === "retry") {
+        pollInterval = detailRead.pollInterval;
         continue;
       }
+      if (detailRead.kind === "unavailable") return detailRead.result;
       firstEvaluation = false;
       const outcome = yield* runTurnWaitPoll({
         turn,
         store,
-        detail: detailResult.success,
+        detail: detailRead.detail,
       });
       if (outcome.kind === "result") return outcome.result;
       const next = yield* sleepBeforeNextWaitPoll({ deadline, pollInterval });
@@ -3572,6 +4697,37 @@ const serverToolHandlers = ServerToolkit.of({
       }
       return yield* discoverThreadPage({
         store,
+        observations,
+        query,
+        limit,
+        allowStale: allowStale ?? false,
+      });
+    }).pipe(
+      Effect.catch((error: LocalStoreError | T3CodeAdapterError | ObservationError) =>
+        Effect.succeed({
+          result: { kind: "error" as const, error: toToolFailure(error) },
+          observations: [],
+          warnings: [],
+        }),
+      ),
+    ),
+  worktree_inspect: ({ worktree, cursor, limit, allowStale }) =>
+    Effect.gen(function* () {
+      const store = yield* LocalStore;
+      const connections = yield* InstanceConnections;
+      const observations = yield* Observations;
+      const query: WorktreeInspectionQuery = { worktree };
+      if (cursor !== undefined) {
+        const captured = yield* store.readWorktreeInspectionPage({
+          query,
+          cursor,
+          ...(limit === undefined ? {} : { limit }),
+        });
+        return makeWorktreeInspectionToolSuccess(captured.page, captured.observations);
+      }
+      return yield* discoverWorktreeInspection({
+        store,
+        connections,
         observations,
         query,
         limit,

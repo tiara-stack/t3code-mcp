@@ -339,26 +339,85 @@ const GetSnapshotErrorWireSchema = Schema.Struct({
 const GitCommandErrorWireSchema = Schema.Struct({
   _tag: Schema.Literal("GitCommandError"),
   operation: Schema.String,
+  command: Schema.optionalKey(Schema.String),
+  cwd: Schema.optionalKey(Schema.String),
+  argumentCount: Schema.optionalKey(nonNegativeWireInt),
+  exitCode: Schema.optionalKey(Schema.Int),
+  stdoutLength: Schema.optionalKey(nonNegativeWireInt),
+  stderrLength: Schema.optionalKey(nonNegativeWireInt),
+  outputLength: Schema.optionalKey(nonNegativeWireInt),
   detail: Schema.String,
+  cause: Schema.optionalKey(Schema.Unknown),
 });
 
 const GitManagerErrorWireSchema = Schema.Struct({
   _tag: Schema.Literal("GitManagerError"),
   operation: Schema.String,
+  cwd: Schema.optionalKey(Schema.String),
   detail: Schema.String,
+  cause: Schema.optionalKey(Schema.Unknown),
 });
 
-/**
- * VCS ref wire shapes for the pinned vcs.listRefs RPC. Only the fields the
- * worktree discovery consumes are declared; each ref may carry the worktree
- * path checked out to it, which is the pinned baseline's only inventory-level
- * VCS worktree evidence. The path decodes as any string — a checkout path is
- * evidence exactly as reported, not revalidated against host filesystem
- * conventions — and unconsumed fields stay optional so a server variant that
- * omits them cannot fail the whole read.
- */
+const SourceControlProviderErrorWireSchema = Schema.Struct({
+  _tag: Schema.Literal("SourceControlProviderError"),
+  provider: Schema.Literals(["github", "gitlab", "azure-devops", "bitbucket", "unknown"]),
+  operation: Schema.String,
+  cwd: Schema.String,
+  command: Schema.optionalKey(Schema.String),
+  repository: Schema.optionalKey(Schema.String),
+  reference: Schema.optionalKey(Schema.String),
+  detail: Schema.String,
+  cause: Schema.optionalKey(Schema.Unknown),
+});
+
+const TextGenerationErrorWireSchema = Schema.Struct({
+  _tag: Schema.Literal("TextGenerationError"),
+  operation: Schema.String,
+  detail: Schema.String,
+  cause: Schema.optionalKey(Schema.Unknown),
+});
+
+const GitPullRequestMaterializationErrorWireSchema = Schema.Struct({
+  _tag: Schema.Literal("GitPullRequestMaterializationError"),
+  cwd: trimmedNonEmptyWireString,
+  pullRequestNumber: Schema.Int.check(Schema.isGreaterThan(0)),
+  headRepository: Schema.NullOr(trimmedNonEmptyWireString),
+  headBranch: trimmedNonEmptyWireString,
+  localBranch: trimmedNonEmptyWireString,
+  cause: Schema.Unknown,
+});
+
+const VcsWorktreeStatusWireSchema = Schema.Struct({
+  isRepo: Schema.Boolean,
+  sourceControlProvider: Schema.optionalKey(Schema.Unknown),
+  hasPrimaryRemote: Schema.Boolean,
+  isDefaultRef: Schema.Boolean,
+  refName: Schema.NullOr(trimmedNonEmptyWireString),
+  hasWorkingTreeChanges: Schema.Boolean,
+  workingTree: Schema.Struct({
+    files: Schema.Array(
+      Schema.Struct({
+        path: Schema.NonEmptyString,
+        insertions: nonNegativeWireInt,
+        deletions: nonNegativeWireInt,
+      }),
+    ),
+    insertions: nonNegativeWireInt,
+    deletions: nonNegativeWireInt,
+  }),
+  hasUpstream: Schema.Boolean,
+  aheadCount: nonNegativeWireInt,
+  behindCount: nonNegativeWireInt,
+  aheadOfDefaultCount: Schema.optionalKey(nonNegativeWireInt),
+  pr: Schema.NullOr(Schema.Unknown),
+});
+
 const VcsRefWireSchema = Schema.Struct({
   name: trimmedNonEmptyWireString,
+  isRemote: Schema.optionalKey(Schema.Boolean),
+  remoteName: Schema.optionalKey(trimmedNonEmptyWireString),
+  current: Schema.optionalKey(Schema.Boolean),
+  isDefault: Schema.optionalKey(Schema.Boolean),
   worktreePath: Schema.NullOr(Schema.String),
 });
 
@@ -516,11 +575,28 @@ const DispatchApprovalResponseRpc = Rpc.make("orchestration.dispatchCommand", {
   ]),
 });
 
+const VcsRefreshStatusRpc = Rpc.make("vcs.refreshStatus", {
+  payload: Schema.Struct({ cwd: trimmedNonEmptyWireString }),
+  success: VcsWorktreeStatusWireSchema,
+  error: Schema.Union([
+    GitCommandErrorWireSchema,
+    GitManagerErrorWireSchema,
+    GitPullRequestMaterializationErrorWireSchema,
+    SourceControlProviderErrorWireSchema,
+    TextGenerationErrorWireSchema,
+    EnvironmentAuthorizationErrorWireSchema,
+  ]),
+});
+
 const VcsListRefsRpc = Rpc.make("vcs.listRefs", {
   payload: Schema.Struct({
     cwd: trimmedNonEmptyWireString,
     cursor: Schema.optionalKey(nonNegativeWireInt),
-    limit: Schema.optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))),
+    limit: Schema.optionalKey(
+      Schema.Int.check(Schema.isGreaterThanOrEqualTo(1), Schema.isLessThanOrEqualTo(200)),
+    ),
+    refKind: Schema.optionalKey(Schema.Literals(["all", "local", "remote"])),
+    refresh: Schema.optionalKey(Schema.Boolean),
   }),
   success: VcsListRefsResultWireSchema,
   error: Schema.Union([
@@ -538,6 +614,7 @@ const AdapterRpcGroup = RpcGroup.make(
   GetArchivedShellSnapshotRpc,
   SubscribeThreadRpc,
   DispatchApprovalResponseRpc,
+  VcsRefreshStatusRpc,
   VcsListRefsRpc,
 );
 
@@ -565,6 +642,8 @@ const MAX_VCS_LIST_REFS_PAGES = 50;
  */
 const VCS_LIST_REFS_PAGE_TIMEOUT_MILLIS = 10_000;
 const VCS_LIST_REFS_DEADLINE_MARGIN_MILLIS = 1_000;
+const VCS_WORKTREE_REF_PAGE_LIMIT = VCS_LIST_REFS_PAGE_LIMIT;
+const MAX_VCS_WORKTREE_REF_PAGES = MAX_VCS_LIST_REFS_PAGES;
 
 const capabilityKeys: Record<InstanceCapabilityName, ReadonlyArray<string>> = {
   steer_current: ["steer_current", "steerCurrent"],
@@ -814,6 +893,31 @@ const mapApprovalDispatchError = (
 
 const mapShellStreamError = (error: unknown): T3CodeAdapterError => {
   const mapped = mapOrchestrationReadError("The T3Code shell observation stream failed.")(error);
+  return mapped instanceof T3CodeAdapterError ? mapped : mapAuthenticatedChannelError(mapped);
+};
+
+const mapVcsReadError = (operation: "status" | "refs", error: unknown): T3CodeAdapterError => {
+  const operationMessage =
+    operation === "status"
+      ? "The T3Code VCS status could not be read"
+      : "The T3Code VCS refs could not be read";
+  const message = `${operationMessage}.`;
+  if (
+    Predicate.hasProperty(error, "_tag") &&
+    (error._tag === "GitCommandError" || error._tag === "GitManagerError")
+  ) {
+    const detail =
+      Predicate.hasProperty(error, "detail") && typeof error.detail === "string"
+        ? error.detail
+        : null;
+    return new T3CodeAdapterError({
+      kind: "transport",
+      message: detail === null ? message : `${operationMessage}: ${detail}`,
+      uncertain: false,
+      status: null,
+    });
+  }
+  const mapped = mapOrchestrationReadError(message)(error);
   return mapped instanceof T3CodeAdapterError ? mapped : mapAuthenticatedChannelError(mapped);
 };
 
@@ -1130,6 +1234,32 @@ export interface VcsRefListing {
   readonly truncated: boolean;
 }
 
+export interface VcsWorktreeStatus {
+  readonly isRepo: boolean;
+  readonly branch: string | null;
+  readonly hasWorkingTreeChanges: boolean;
+  readonly changedFiles: number | null;
+  readonly stagedFiles: number | null;
+  readonly untrackedFiles: number | null;
+  readonly hasUpstream: boolean;
+  readonly ahead: number | null;
+  readonly behind: number | null;
+  readonly limitations: ReadonlyArray<string>;
+}
+
+export interface VcsWorktreeRef {
+  readonly branch: string;
+  readonly worktreePath: string;
+}
+
+export interface VcsWorktreeRefListing {
+  readonly isRepo: boolean;
+  readonly refs: ReadonlyArray<VcsWorktreeRef>;
+  readonly limitations: ReadonlyArray<string>;
+  readonly truncated: boolean;
+  readonly pageLimitExceeded?: boolean;
+}
+
 export interface T3CodeAdapterService {
   readonly exchangePairingCode: (
     input: PairingExchangeInput,
@@ -1150,6 +1280,16 @@ export interface T3CodeAdapterService {
     readonly endpoint: string;
     readonly credential: string;
   }) => Effect.Effect<ProviderModelListing, T3CodeAdapterError>;
+  readonly refreshVcsStatus: (input: {
+    readonly endpoint: string;
+    readonly credential: string;
+    readonly cwd: string;
+  }) => Effect.Effect<VcsWorktreeStatus, T3CodeAdapterError>;
+  readonly listVcsWorktreeRefs: (input: {
+    readonly endpoint: string;
+    readonly credential: string;
+    readonly cwd: string;
+  }) => Effect.Effect<VcsWorktreeRefListing, T3CodeAdapterError>;
   readonly subscribeShell: (input: {
     readonly endpoint: string;
     readonly credential: string;
@@ -1189,6 +1329,120 @@ export interface T3CodeAdapterService {
     readonly cwd: string;
   }) => Effect.Effect<VcsRefListing, T3CodeAdapterError>;
 }
+
+type VcsListRefsPage = typeof VcsListRefsResultWireSchema.Type;
+
+type VcsRefPageStep =
+  | { readonly kind: "done" }
+  | { readonly kind: "continue"; readonly cursor: number }
+  | {
+      readonly kind: "truncated";
+      readonly reason: "repeated_cursor" | "page_limit";
+      readonly limitation: string;
+    };
+
+const worktreeRefsFromPage = (page: VcsListRefsPage): ReadonlyArray<VcsWorktreeRef> =>
+  page.refs.flatMap((ref) =>
+    ref.isRemote !== true && ref.worktreePath !== null && ref.worktreePath.length > 0
+      ? [{ branch: ref.name, worktreePath: ref.worktreePath }]
+      : [],
+  );
+
+const vcsRefPageInconsistency = (options: {
+  readonly page: VcsListRefsPage;
+  readonly expectedTotal: number | null;
+  readonly expectedRepositoryState: boolean | null;
+}): string | null => {
+  const { page, expectedTotal, expectedRepositoryState } = options;
+  if (expectedTotal !== null && expectedTotal !== page.totalCount) {
+    return "The VCS ref inventory changed while its pages were being read; reference coverage is incomplete.";
+  }
+  if (expectedRepositoryState !== null && expectedRepositoryState !== page.isRepo) {
+    return "The repository identity changed while the VCS ref pages were being read.";
+  }
+  return null;
+};
+
+const nextVcsRefPageStep = (options: {
+  readonly nextCursor: number | null;
+  readonly pageCount: number;
+  readonly seenCursors: ReadonlySet<number>;
+}): VcsRefPageStep => {
+  if (options.nextCursor === null) return { kind: "done" };
+  if (options.seenCursors.has(options.nextCursor)) {
+    return {
+      kind: "truncated",
+      reason: "repeated_cursor",
+      limitation: "The VCS ref inventory repeated a page cursor; reference coverage is incomplete.",
+    };
+  }
+  if (options.pageCount >= MAX_VCS_WORKTREE_REF_PAGES) {
+    return {
+      kind: "truncated",
+      reason: "page_limit",
+      limitation: `The VCS ref inventory exceeded the supported read bound of ${MAX_VCS_WORKTREE_REF_PAGES} pages; unread refs may include worktrees.`,
+    };
+  }
+  return { kind: "continue", cursor: options.nextCursor };
+};
+
+const collectVcsWorktreeRefPages = (
+  listPage: (cursor: number | undefined) => Effect.Effect<VcsListRefsPage, T3CodeAdapterError>,
+): Effect.Effect<VcsWorktreeRefListing, T3CodeAdapterError> =>
+  Effect.gen(function* () {
+    const refs: Array<VcsWorktreeRef> = [];
+    const limitations: Array<string> = [];
+    const seenCursors = new Set<number>();
+    let cursor: number | undefined;
+    let pageCount = 0;
+    let expectedTotal: number | null = null;
+    let expectedRepositoryState: boolean | null = null;
+    let isRepo = true;
+    let truncated = false;
+    let pageLimitExceeded = false;
+
+    while (true) {
+      const page = yield* listPage(cursor);
+      pageCount += 1;
+      const inconsistency = vcsRefPageInconsistency({
+        page,
+        expectedTotal,
+        expectedRepositoryState,
+      });
+      if (inconsistency !== null) {
+        truncated = true;
+        limitations.push(inconsistency);
+      }
+      if (expectedTotal === null) expectedTotal = page.totalCount;
+      if (expectedRepositoryState === null) expectedRepositoryState = page.isRepo;
+      isRepo = page.isRepo;
+      refs.push(...worktreeRefsFromPage(page));
+      if (truncated) break;
+
+      const step = nextVcsRefPageStep({
+        nextCursor: page.nextCursor,
+        pageCount,
+        seenCursors,
+      });
+      if (step.kind === "done") break;
+      if (step.kind === "truncated") {
+        truncated = true;
+        pageLimitExceeded = step.reason === "page_limit";
+        limitations.push(step.limitation);
+        break;
+      }
+      seenCursors.add(step.cursor);
+      cursor = step.cursor;
+    }
+
+    return {
+      isRepo,
+      refs,
+      limitations,
+      truncated,
+      pageLimitExceeded,
+    } satisfies VcsWorktreeRefListing;
+  });
 
 const decodeSelectOptionValues = (
   descriptor: typeof SelectProviderOptionDescriptorWireSchema.Type,
@@ -2007,6 +2261,24 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
           };
         });
 
+      const requireReadSession = (input: {
+        readonly endpoint: string;
+        readonly credential: string;
+      }) =>
+        Effect.gen(function* () {
+          const { authorization } = yield* verifyEnvironmentSession(input);
+          if (authorization.read !== "allowed") {
+            return yield* Effect.fail(
+              new T3CodeAdapterError({
+                kind: "authorization",
+                message: "The saved T3Code credential lacks the orchestration read scope.",
+                uncertain: false,
+                status: null,
+              }),
+            );
+          }
+        });
+
       const probeCredential = (input: { readonly endpoint: string; readonly credential: string }) =>
         withCapacity(
           Effect.gen(function* () {
@@ -2108,18 +2380,7 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
       }): Effect.Effect<ProjectListing, T3CodeAdapterError> =>
         withCapacity(
           Effect.gen(function* () {
-            const { authorization } = yield* verifyEnvironmentSession(input);
-            if (authorization.read !== "allowed") {
-              return yield* Effect.fail(
-                new T3CodeAdapterError({
-                  kind: "authorization",
-                  message: "The saved T3Code credential lacks the orchestration read scope.",
-                  uncertain: false,
-                  status: null,
-                }),
-              );
-            }
-
+            yield* requireReadSession(input);
             return yield* snapshotProjects(input);
           }),
         );
@@ -2267,19 +2528,68 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
       }): Effect.Effect<ProviderModelListing, T3CodeAdapterError> =>
         withCapacity(
           Effect.gen(function* () {
-            const { authorization } = yield* verifyEnvironmentSession(input);
-            if (authorization.read !== "allowed") {
-              return yield* Effect.fail(
-                new T3CodeAdapterError({
-                  kind: "authorization",
-                  message: "The saved T3Code credential lacks the orchestration read scope.",
-                  uncertain: false,
-                  status: null,
-                }),
+            yield* requireReadSession(input);
+            return yield* loadProviderModels(input);
+          }),
+        );
+
+      const refreshVcsStatus = (input: {
+        readonly endpoint: string;
+        readonly credential: string;
+        readonly cwd: string;
+      }): Effect.Effect<VcsWorktreeStatus, T3CodeAdapterError> =>
+        withCapacity(
+          Effect.gen(function* () {
+            yield* requireReadSession(input);
+            const status = yield* withAuthenticatedRpc(input.endpoint, input.credential, (client) =>
+              client["vcs.refreshStatus"]({ cwd: input.cwd }).pipe(
+                Effect.mapError((error) => mapVcsReadError("status", error)),
+              ),
+            );
+            const limitations: Array<string> = [
+              "The pinned T3Code VCS status does not publish staged or untracked file counts.",
+            ];
+            const fileCount = status.workingTree.files.length;
+            const changedFiles = status.hasWorkingTreeChanges === fileCount > 0 ? fileCount : null;
+            if (changedFiles === null) {
+              limitations.push(
+                "The VCS status file summary disagreed with its working-tree change flag.",
               );
             }
+            return {
+              isRepo: status.isRepo,
+              branch: status.refName,
+              hasWorkingTreeChanges: status.hasWorkingTreeChanges,
+              changedFiles: status.isRepo ? changedFiles : null,
+              stagedFiles: null,
+              untrackedFiles: null,
+              hasUpstream: status.hasUpstream,
+              ahead: status.isRepo && status.hasUpstream ? status.aheadCount : null,
+              behind: status.isRepo && status.hasUpstream ? status.behindCount : null,
+              limitations,
+            } satisfies VcsWorktreeStatus;
+          }),
+        );
 
-            return yield* loadProviderModels(input);
+      const listVcsWorktreeRefs = (input: {
+        readonly endpoint: string;
+        readonly credential: string;
+        readonly cwd: string;
+      }): Effect.Effect<VcsWorktreeRefListing, T3CodeAdapterError> =>
+        withCapacity(
+          Effect.gen(function* () {
+            yield* requireReadSession(input);
+            return yield* withAuthenticatedRpc(input.endpoint, input.credential, (client) =>
+              collectVcsWorktreeRefPages((cursor) =>
+                client["vcs.listRefs"]({
+                  cwd: input.cwd,
+                  ...(cursor === undefined ? {} : { cursor }),
+                  limit: VCS_WORKTREE_REF_PAGE_LIMIT,
+                  refKind: "local",
+                  ...(cursor === undefined ? { refresh: true } : {}),
+                }).pipe(Effect.mapError((error) => mapVcsReadError("refs", error))),
+              ),
+            );
           }),
         );
 
@@ -2290,22 +2600,7 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
       }): Effect.Effect<VcsRefListing, T3CodeAdapterError> =>
         withCapacity(
           Effect.gen(function* () {
-            const { authorization } = yield* verifyEnvironmentSession(input);
-            if (authorization.read !== "allowed") {
-              return yield* Effect.fail(
-                new T3CodeAdapterError({
-                  kind: "authorization",
-                  message: "The saved T3Code credential lacks the orchestration read scope.",
-                  uncertain: false,
-                  status: null,
-                }),
-              );
-            }
-
-            // Every page of the upstream cursor runs through the one
-            // authenticated channel so the listing shares a single deadline
-            // instead of reopening a connection per page. The budget starts
-            // before the channel setup so ticket and socket time count.
+            yield* requireReadSession(input);
             const startedAtMillis = yield* Clock.currentTimeMillis;
             return yield* withAuthenticatedRpc(input.endpoint, input.credential, (client) =>
               collectVcsRefPages({
@@ -2401,6 +2696,8 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
         inspectCredential,
         listProjects,
         listProviderModels,
+        refreshVcsStatus,
+        listVcsWorktreeRefs,
         subscribeShell,
         subscribeThread,
         getArchivedShellSnapshot,

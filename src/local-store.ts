@@ -35,6 +35,7 @@ import {
   ThreadOutputCaptureFrameSchema,
   ThreadSummarySchema,
   WorktreeSummarySchema,
+  WorktreeInspectionFrameSchema,
   type CapturedThreadState,
   type Evidence,
   type ModelListPage,
@@ -57,6 +58,9 @@ import {
   type ThreadOutputCaptureFrame,
   type ThreadOutputCaptureQuery,
   type ThreadSummary,
+  type WorktreeInspection,
+  type WorktreeInspectionFrame,
+  type WorktreeInspectionQuery,
   type TurnReference,
   type WorktreeListPage,
   type WorktreeListQuery,
@@ -68,6 +72,7 @@ import {
   makeThreadListToolSuccess,
   makeThreadOutputToolSuccess,
   makeWorktreeListToolSuccess,
+  makeWorktreeInspectionToolSuccess,
   serializedByteLength,
   ToolFailureSchema,
 } from "./domain";
@@ -101,6 +106,8 @@ const THREAD_GET_CAPTURE_SCOPE = "thread_get";
 const THREAD_GET_CAPTURE_ORDER = "activity_id_asc";
 const THREAD_OUTPUT_CAPTURE_SCOPE = "thread_output";
 const THREAD_OUTPUT_CAPTURE_ORDER = "created_at_desc";
+const WORKTREE_INSPECT_CAPTURE_SCOPE = "worktree_inspect";
+const WORKTREE_INSPECT_CAPTURE_ORDER = "instance_id_thread_id_asc";
 const OPERATION_DETAIL_CLEANUP_BATCH_SIZE = 64;
 
 const projectScopeKey = (scope: ProjectListScope): string =>
@@ -151,6 +158,22 @@ const worktreeScopeKeyForQuery = (query: WorktreeListQuery): string =>
 
 const worktreeQueriesEqual = (left: WorktreeListQuery, right: WorktreeListQuery): boolean =>
   left.instanceId === right.instanceId && left.repositoryPath === right.repositoryPath;
+
+const worktreeInspectionScopeKey = (query: WorktreeInspectionQuery): string =>
+  JSON.stringify([
+    WORKTREE_INSPECT_CAPTURE_SCOPE,
+    query.worktree.instanceId,
+    query.worktree.repositoryPath,
+    query.worktree.worktreePath,
+  ]);
+
+const worktreeInspectionQueriesEqual = (
+  left: WorktreeInspectionQuery,
+  right: WorktreeInspectionQuery,
+): boolean =>
+  left.worktree.instanceId === right.worktree.instanceId &&
+  left.worktree.repositoryPath === right.worktree.repositoryPath &&
+  left.worktree.worktreePath === right.worktree.worktreePath;
 
 // The scope key uses JSON encoding like the model scope key so instance and
 // thread IDs containing the separator cannot collide with other scopes.
@@ -382,6 +405,32 @@ const WorktreeCursorPayloadSchema = Schema.Struct({
   position: Schema.Natural,
 });
 
+type WorktreeInspectionCursorPayload = {
+  readonly version: 1;
+  readonly databaseId: string;
+  readonly captureId: string;
+  readonly scope: typeof WORKTREE_INSPECT_CAPTURE_SCOPE;
+  readonly order: typeof WORKTREE_INSPECT_CAPTURE_ORDER;
+  readonly query: WorktreeInspectionQuery;
+  readonly position: number;
+};
+
+const WorktreeInspectionCursorPayloadSchema = Schema.Struct({
+  version: Schema.Literal(1),
+  databaseId: Schema.NonEmptyString,
+  captureId: Schema.NonEmptyString,
+  scope: Schema.Literal(WORKTREE_INSPECT_CAPTURE_SCOPE),
+  order: Schema.Literal(WORKTREE_INSPECT_CAPTURE_ORDER),
+  query: Schema.Struct({
+    worktree: Schema.Struct({
+      instanceId: Schema.NonEmptyString,
+      repositoryPath: Schema.NonEmptyString,
+      worktreePath: Schema.NonEmptyString,
+    }),
+  }),
+  position: Schema.Natural,
+});
+
 type ThreadGetCursorPayload = {
   readonly version: 1;
   readonly databaseId: string;
@@ -495,6 +544,16 @@ export type RetainedThreadCapture = RetainedCapture<ThreadSummary>;
 export type WorktreeCaptureMetadata = ListCaptureMetadata;
 export type WorktreeCapturePage = ListCapturePage<WorktreeListPage>;
 export type RetainedWorktreeCapture = RetainedCapture<WorktreeSummary>;
+
+export type WorktreeInspectionCaptureMetadata = ListCaptureMetadata & {
+  readonly frame: WorktreeInspectionFrame;
+};
+export type WorktreeInspectionCapturePage = ListCapturePage<WorktreeInspection>;
+export interface RetainedWorktreeInspectionCapture {
+  readonly items: ReadonlyArray<ThreadSummary>;
+  readonly observations: ReadonlyArray<Observation>;
+  readonly frame: WorktreeInspectionFrame;
+}
 export type ThreadGetCaptureMetadata = ListCaptureMetadata & {
   readonly state: CapturedThreadState;
 };
@@ -779,6 +838,22 @@ export interface LocalStoreService {
   readonly findRetainedWorktreeCapture: (
     query: WorktreeListQuery,
   ) => Effect.Effect<RetainedWorktreeCapture | null, LocalStoreError>;
+  readonly captureWorktreeInspectionPage: (input: {
+    readonly query: WorktreeInspectionQuery;
+    readonly items: ReadonlyArray<ThreadSummary>;
+    readonly metadata: WorktreeInspectionCaptureMetadata;
+    readonly limit?: number;
+    readonly maxBytes?: number;
+  }) => Effect.Effect<WorktreeInspectionCapturePage, LocalStoreError>;
+  readonly readWorktreeInspectionPage: (options: {
+    readonly query: WorktreeInspectionQuery;
+    readonly cursor: string;
+    readonly limit?: number;
+    readonly maxBytes?: number;
+  }) => Effect.Effect<WorktreeInspectionCapturePage, LocalStoreError>;
+  readonly findRetainedWorktreeInspectionCapture: (
+    query: WorktreeInspectionQuery,
+  ) => Effect.Effect<RetainedWorktreeInspectionCapture | null, LocalStoreError>;
   readonly captureThreadStatePage: (input: {
     readonly query: ThreadGetCaptureQuery;
     readonly items: ReadonlyArray<PendingRequest>;
@@ -1075,6 +1150,22 @@ export class LocalStore extends Context.Service<LocalStore, LocalStoreService>()
             verifySchemaForOperation,
           );
 
+        const captureWorktreeInspectionPage = (input: {
+          readonly query: WorktreeInspectionQuery;
+          readonly items: ReadonlyArray<ThreadSummary>;
+          readonly metadata: WorktreeInspectionCaptureMetadata;
+          readonly limit?: number;
+          readonly maxBytes?: number;
+        }) =>
+          captureWorktreeInspectionPageInDatabase(
+            sql,
+            crypto,
+            config,
+            databaseId,
+            input,
+            verifySchemaForOperation,
+          );
+
         const readWorktreePage = (options: {
           readonly query: WorktreeListQuery;
           readonly cursor: string;
@@ -1084,6 +1175,22 @@ export class LocalStore extends Context.Service<LocalStore, LocalStoreService>()
 
         const findRetainedWorktreeCapture = (query: WorktreeListQuery) =>
           findRetainedWorktreeCaptureInDatabase(sql, query, verifySchemaForOperation);
+
+        const readWorktreeInspectionPage = (options: {
+          readonly query: WorktreeInspectionQuery;
+          readonly cursor: string;
+          readonly limit?: number;
+          readonly maxBytes?: number;
+        }) =>
+          readWorktreeInspectionPageFromDatabase(
+            sql,
+            databaseId,
+            options,
+            verifySchemaForOperation,
+          );
+
+        const findRetainedWorktreeInspectionCapture = (query: WorktreeInspectionQuery) =>
+          findRetainedWorktreeInspectionCaptureInDatabase(sql, query, verifySchemaForOperation);
 
         const captureThreadStatePage = (input: {
           readonly query: ThreadGetCaptureQuery;
@@ -1256,6 +1363,9 @@ export class LocalStore extends Context.Service<LocalStore, LocalStoreService>()
           captureWorktreePage,
           readWorktreePage,
           findRetainedWorktreeCapture,
+          captureWorktreeInspectionPage,
+          readWorktreeInspectionPage,
+          findRetainedWorktreeInspectionCapture,
           captureThreadStatePage,
           readThreadStatePage,
           findRetainedThreadStateCapture,
@@ -2513,6 +2623,39 @@ const captureWorktreePageInDatabase = (
     verify,
   );
 
+const captureWorktreeInspectionPageInDatabase = (
+  sql: SqlClient.SqlClient,
+  crypto: Crypto.Crypto,
+  config: Required<LocalStoreConfigValue>,
+  databaseId: string,
+  input: {
+    readonly query: WorktreeInspectionQuery;
+    readonly items: ReadonlyArray<ThreadSummary>;
+    readonly metadata: WorktreeInspectionCaptureMetadata;
+    readonly limit?: number;
+    readonly maxBytes?: number;
+  },
+  verify: SchemaVerifier,
+): Effect.Effect<WorktreeInspectionCapturePage, LocalStoreError> =>
+  captureListPageInDatabase(
+    sql,
+    crypto,
+    config,
+    databaseId,
+    {
+      scopeKey: worktreeInspectionScopeKey(input.query),
+      order: WORKTREE_INSPECT_CAPTURE_ORDER,
+      captureKind: "worktree inspection",
+      items: input.items,
+      metadata: input.metadata,
+      stateJson: JSON.stringify(input.metadata.frame),
+      ...(input.limit === undefined ? {} : { limit: input.limit }),
+      ...(input.maxBytes === undefined ? {} : { maxBytes: input.maxBytes }),
+    },
+    worktreeInspectionCaptureCodec(input.query),
+    verify,
+  );
+
 /**
  * A thread-get capture persists the thread-state frame in the capture's
  * state column so every pending-request page is accompanied by the one
@@ -2759,6 +2902,37 @@ const readWorktreePageFromDatabase = (
     verify,
   );
 
+const readWorktreeInspectionPageFromDatabase = (
+  sql: SqlClient.SqlClient,
+  databaseId: string,
+  options: {
+    readonly query: WorktreeInspectionQuery;
+    readonly cursor: string;
+    readonly limit?: number;
+    readonly maxBytes?: number;
+  },
+  verify: SchemaVerifier,
+): Effect.Effect<WorktreeInspectionCapturePage, LocalStoreError> =>
+  readListPageFromDatabase(
+    sql,
+    databaseId,
+    {
+      scopeKey: worktreeInspectionScopeKey(options.query),
+      cursor: options.cursor,
+      ...(options.limit === undefined ? {} : { limit: options.limit }),
+      ...(options.maxBytes === undefined ? {} : { maxBytes: options.maxBytes }),
+    },
+    decodeWorktreeInspectionCursor,
+    (payload) =>
+      payload.databaseId === databaseId &&
+      payload.scope === WORKTREE_INSPECT_CAPTURE_SCOPE &&
+      payload.order === WORKTREE_INSPECT_CAPTURE_ORDER &&
+      worktreeInspectionQueriesEqual(payload.query, options.query),
+    "The worktree inspection cursor does not match this worktree.",
+    worktreeInspectionCaptureCodec(options.query),
+    verify,
+  );
+
 /**
  * Read one pending-request page from a retained thread-state capture. The
  * captured thread-state frame accompanies the page so a cursor continuation
@@ -2811,38 +2985,44 @@ const readThreadStatePageFromDatabase = (
   return retryStorage(effect.pipe(Effect.mapError(toStoreError)));
 };
 
-const findRetainedCaptureInDatabase = <Items>(
+const findRetainedCaptureInDatabase = <Metadata, Items, Retained>(
   sql: SqlClient.SqlClient,
   scopeKey: string,
   order: string,
+  decodeMetadata: (capture: CaptureRow) => Effect.Effect<Metadata, LocalStoreError>,
   decodeItem: (payload: unknown) => Effect.Effect<Items, LocalStoreError>,
+  toRetained: (metadata: Metadata, items: ReadonlyArray<Items>) => Retained,
   verify: SchemaVerifier,
-): Effect.Effect<RetainedCapture<Items> | null, LocalStoreError> =>
+): Effect.Effect<Retained | null, LocalStoreError> =>
   retryStorage(
     Effect.gen(function* () {
       yield* verify();
       const now = yield* Clock.currentTimeMillis;
-      const captures = yield* sql<CaptureRow>`
-        SELECT capture_id, database_id, scope, order_key, expires_at, item_count,
-          failures_json, coverage, limitations_json, observations_json, state_json
-        FROM captures
-        WHERE scope = ${scopeKey}
-          AND order_key = ${order}
-          AND expires_at > ${now}
-        ORDER BY created_at DESC, capture_id DESC
-        LIMIT 1
-      `;
-      const capture = captures[0];
-      if (capture === undefined) return null;
-      const metadata = yield* decodeListCaptureMetadata(capture);
-      const rows = yield* sql<CaptureItemRow>`
-        SELECT position, payload, item_bytes
-        FROM capture_items
-        WHERE capture_id = ${capture.capture_id}
-        ORDER BY position ASC
-      `;
-      const items = yield* Effect.forEach(rows, (row) => decodeItem(row.payload));
-      return { items, observations: metadata.observations } satisfies RetainedCapture<Items>;
+      return yield* sql.withTransaction(
+        Effect.gen(function* () {
+          const captures = yield* sql<CaptureRow>`
+            SELECT capture_id, database_id, scope, order_key, expires_at, item_count,
+              failures_json, coverage, limitations_json, observations_json, state_json
+            FROM captures
+            WHERE scope = ${scopeKey}
+              AND order_key = ${order}
+              AND expires_at > ${now}
+            ORDER BY created_at DESC, capture_id DESC
+            LIMIT 1
+          `;
+          const capture = captures[0];
+          if (capture === undefined) return null;
+          const metadata = yield* decodeMetadata(capture);
+          const rows = yield* sql<CaptureItemRow>`
+            SELECT position, payload, item_bytes
+            FROM capture_items
+            WHERE capture_id = ${capture.capture_id}
+            ORDER BY position ASC
+          `;
+          const items = yield* Effect.forEach(rows, (row) => decodeItem(row.payload));
+          return toRetained(metadata, items);
+        }),
+      );
     }).pipe(Effect.mapError(toStoreError)),
   );
 
@@ -2855,7 +3035,10 @@ const findRetainedProjectCaptureInDatabase = (
     sql,
     projectScopeKey(scope),
     PROJECT_CAPTURE_ORDER,
+    decodeListCaptureMetadata,
     decodeProjectCaptureItem,
+    (metadata, items) =>
+      ({ items, observations: metadata.observations }) satisfies RetainedProjectCapture,
     verify,
   );
 
@@ -2868,7 +3051,10 @@ const findRetainedModelCaptureInDatabase = (
     sql,
     modelScopeKey(query),
     MODEL_CAPTURE_ORDER,
+    decodeListCaptureMetadata,
     decodeModelCaptureItem,
+    (metadata, items) =>
+      ({ items, observations: metadata.observations }) satisfies RetainedModelCapture,
     verify,
   );
 
@@ -2881,7 +3067,10 @@ const findRetainedThreadCaptureInDatabase = (
     sql,
     threadScopeKeyForQuery(query),
     THREAD_CAPTURE_ORDER,
+    decodeListCaptureMetadata,
     decodeThreadCaptureItem,
+    (metadata, items) =>
+      ({ items, observations: metadata.observations }) satisfies RetainedThreadCapture,
     verify,
   );
 
@@ -2894,7 +3083,30 @@ const findRetainedWorktreeCaptureInDatabase = (
     sql,
     worktreeScopeKeyForQuery(query),
     WORKTREE_CAPTURE_ORDER,
+    decodeListCaptureMetadata,
     decodeWorktreeCaptureItem,
+    (metadata, items) =>
+      ({ items, observations: metadata.observations }) satisfies RetainedWorktreeCapture,
+    verify,
+  );
+
+const findRetainedWorktreeInspectionCaptureInDatabase = (
+  sql: SqlClient.SqlClient,
+  query: WorktreeInspectionQuery,
+  verify: SchemaVerifier,
+): Effect.Effect<RetainedWorktreeInspectionCapture | null, LocalStoreError> =>
+  findRetainedCaptureInDatabase(
+    sql,
+    worktreeInspectionScopeKey(query),
+    WORKTREE_INSPECT_CAPTURE_ORDER,
+    decodeWorktreeInspectionCaptureMetadata,
+    decodeThreadCaptureItem,
+    (metadata, items) =>
+      ({
+        items,
+        observations: metadata.observations,
+        frame: metadata.frame,
+      }) satisfies RetainedWorktreeInspectionCapture,
     verify,
   );
 
@@ -2903,45 +3115,19 @@ const findRetainedThreadStateCaptureInDatabase = (
   query: ThreadGetCaptureQuery,
   verify: SchemaVerifier,
 ): Effect.Effect<RetainedThreadGetCapture | null, LocalStoreError> =>
-  retryStorage(
-    Effect.gen(function* () {
-      yield* verify();
-      const now = yield* Clock.currentTimeMillis;
-      // The capture and its items read in one transaction: a concurrent
-      // expiry or capacity eviction cannot delete the capture between the
-      // two queries and leave a retained state with an empty item list.
-      return yield* sql.withTransaction(
-        Effect.gen(function* () {
-          const captures = yield* sql<CaptureRow>`
-            SELECT capture_id, database_id, scope, order_key, expires_at, item_count,
-              failures_json, coverage, limitations_json, observations_json, state_json
-            FROM captures
-            WHERE scope = ${threadGetScopeKey(query)}
-              AND order_key = ${THREAD_GET_CAPTURE_ORDER}
-              AND expires_at > ${now}
-            ORDER BY created_at DESC, capture_id DESC
-            LIMIT 1
-          `;
-          const capture = captures[0];
-          if (capture === undefined) return null;
-          const metadata = yield* decodeThreadGetCaptureMetadata(capture);
-          const rows = yield* sql<CaptureItemRow>`
-            SELECT position, payload, item_bytes
-            FROM capture_items
-            WHERE capture_id = ${capture.capture_id}
-            ORDER BY position ASC
-          `;
-          const items = yield* Effect.forEach(rows, (row) =>
-            decodeThreadGetCaptureItem(row.payload),
-          );
-          return {
-            items,
-            observations: metadata.observations,
-            state: metadata.state,
-          } satisfies RetainedThreadGetCapture;
-        }),
-      );
-    }).pipe(Effect.mapError(toStoreError)),
+  findRetainedCaptureInDatabase(
+    sql,
+    threadGetScopeKey(query),
+    THREAD_GET_CAPTURE_ORDER,
+    decodeThreadGetCaptureMetadata,
+    decodeThreadGetCaptureItem,
+    (metadata, items) =>
+      ({
+        items,
+        observations: metadata.observations,
+        state: metadata.state,
+      }) satisfies RetainedThreadGetCapture,
+    verify,
   );
 
 /**
@@ -3186,46 +3372,24 @@ const findRetainedThreadOutputCaptureInDatabase = (
   query: ThreadOutputCaptureQuery,
   verify: SchemaVerifier,
 ): Effect.Effect<RetainedThreadOutputCapture | null, LocalStoreError> =>
-  retryStorage(
-    Effect.gen(function* () {
-      yield* verify();
-      const now = yield* Clock.currentTimeMillis;
-      // The capture and its items read in one transaction: a concurrent
-      // expiry or capacity eviction cannot delete the capture between the
-      // two queries and leave a retained frame with an empty item list.
-      return yield* sql.withTransaction(
-        Effect.gen(function* () {
-          const captures = yield* sql<CaptureRow>`
-            SELECT capture_id, database_id, scope, order_key, expires_at, item_count,
-              failures_json, coverage, limitations_json, observations_json, state_json
-            FROM captures
-            WHERE scope = ${threadOutputScopeKey(query)}
-              AND order_key = ${THREAD_OUTPUT_CAPTURE_ORDER}
-              AND expires_at > ${now}
-            ORDER BY created_at DESC, capture_id DESC
-            LIMIT 1
-          `;
-          const capture = captures[0];
-          if (capture === undefined) return null;
-          const metadata = yield* decodeThreadOutputCaptureMetadata(capture);
-          const frame = yield* decodeThreadOutputCaptureFrame(capture);
-          const rows = yield* sql<CaptureItemRow>`
-            SELECT position, payload, item_bytes
-            FROM capture_items
-            WHERE capture_id = ${capture.capture_id}
-            ORDER BY position ASC
-          `;
-          const items = yield* Effect.forEach(rows, (row) =>
-            decodeThreadOutputCaptureItem(row.payload),
-          );
-          return {
-            items,
-            observations: metadata.observations,
-            frame,
-          } satisfies RetainedThreadOutputCapture;
-        }),
-      );
-    }).pipe(Effect.mapError(toStoreError)),
+  findRetainedCaptureInDatabase(
+    sql,
+    threadOutputScopeKey(query),
+    THREAD_OUTPUT_CAPTURE_ORDER,
+    (capture) =>
+      Effect.gen(function* () {
+        const metadata = yield* decodeThreadOutputCaptureMetadata(capture);
+        const frame = yield* decodeThreadOutputCaptureFrame(capture);
+        return { metadata, frame };
+      }),
+    decodeThreadOutputCaptureItem,
+    (decoded, items) =>
+      ({
+        items,
+        observations: decoded.metadata.observations,
+        frame: decoded.frame,
+      }) satisfies RetainedThreadOutputCapture,
+    verify,
   );
 
 const publishAndReadFirstPage = (
@@ -3491,6 +3655,23 @@ const worktreeCaptureCodec = (
     serializedByteLength(makeWorktreeListToolSuccess(page, metadata.observations)),
   makeNextCursor: (databaseId, captureId, position) =>
     makeWorktreeCaptureCursor(databaseId, captureId, query, position),
+});
+
+const worktreeInspectionCaptureCodec = (
+  query: WorktreeInspectionQuery,
+): CapturePageCodec<ThreadSummary, WorktreeInspectionCaptureMetadata, WorktreeInspection> => ({
+  order: WORKTREE_INSPECT_CAPTURE_ORDER,
+  cursorKind: "worktree inspection",
+  decodeMetadata: decodeWorktreeInspectionCaptureMetadata,
+  decodeItem: decodeThreadCaptureItem,
+  buildPage: (items, nextCursor, metadata) => ({
+    ...metadata.frame,
+    referencingThreads: makeListPage(items, nextCursor, metadata),
+  }),
+  measureResult: (page, metadata) =>
+    serializedByteLength(makeWorktreeInspectionToolSuccess(page, metadata.observations)),
+  makeNextCursor: (databaseId, captureId, position) =>
+    makeWorktreeInspectionCaptureCursor(databaseId, captureId, query, position),
 });
 
 const threadStateCaptureCodec = (
@@ -3791,38 +3972,59 @@ const decodeWorktreeCaptureItem = (
 ): Effect.Effect<WorktreeSummary, LocalStoreError> =>
   decodeListCaptureItem(payload, WorktreeSummarySchema);
 
+const decodeCaptureStateJson = <Value>(
+  capture: CaptureRow,
+  schema: Schema.ConstraintDecoder<Value>,
+  captureKind: string,
+): Effect.Effect<Value, LocalStoreError> => {
+  const stateJson = typeof capture.state_json === "string" ? capture.state_json : null;
+  if (stateJson === null) {
+    return Effect.fail(
+      new LocalStoreError({
+        kind: "malformed_row",
+        message: `A saved ${captureKind} capture is missing its captured state.`,
+      }),
+    );
+  }
+  return Effect.try({
+    try: () => JSON.parse(stateJson) as unknown,
+    catch: () =>
+      new LocalStoreError({
+        kind: "malformed_row",
+        message: `A saved ${captureKind} capture is not valid JSON.`,
+      }),
+  }).pipe(
+    Effect.flatMap((value) => Schema.decodeUnknownEffect(schema)(value)),
+    Effect.mapError((error) =>
+      error instanceof LocalStoreError
+        ? error
+        : new LocalStoreError({
+            kind: "malformed_row",
+            message: `A saved ${captureKind} capture is malformed.`,
+          }),
+    ),
+  );
+};
+
+const decodeWorktreeInspectionCaptureMetadata = (
+  capture: CaptureRow,
+): Effect.Effect<WorktreeInspectionCaptureMetadata, LocalStoreError> =>
+  Effect.gen(function* () {
+    const base = yield* decodeListCaptureMetadata(capture);
+    const frame = yield* decodeCaptureStateJson(
+      capture,
+      WorktreeInspectionFrameSchema,
+      "worktree inspection",
+    );
+    return { ...base, frame };
+  });
+
 const decodeThreadGetCaptureMetadata = (
   capture: CaptureRow,
 ): Effect.Effect<ThreadGetCaptureMetadata, LocalStoreError> =>
   Effect.gen(function* () {
     const base = yield* decodeListCaptureMetadata(capture);
-    const stateJson = typeof capture.state_json === "string" ? capture.state_json : null;
-    if (stateJson === null) {
-      return yield* Effect.fail(
-        new LocalStoreError({
-          kind: "malformed_row",
-          message: "A saved thread state capture is missing its captured state.",
-        }),
-      );
-    }
-    const state = yield* Effect.try({
-      try: () => JSON.parse(stateJson) as unknown,
-      catch: () =>
-        new LocalStoreError({
-          kind: "malformed_row",
-          message: "A saved thread state capture is not valid JSON.",
-        }),
-    }).pipe(
-      Effect.flatMap((value) => Schema.decodeUnknownEffect(CapturedThreadStateSchema)(value)),
-      Effect.mapError((error) =>
-        error instanceof LocalStoreError
-          ? error
-          : new LocalStoreError({
-              kind: "malformed_row",
-              message: "A saved thread state capture is malformed.",
-            }),
-      ),
-    );
+    const state = yield* decodeCaptureStateJson(capture, CapturedThreadStateSchema, "thread state");
     return { ...base, state };
   });
 
@@ -3838,35 +4040,8 @@ const decodeThreadOutputCaptureMetadata = (
 
 const decodeThreadOutputCaptureFrame = (
   capture: CaptureRow,
-): Effect.Effect<ThreadOutputCaptureFrame, LocalStoreError> => {
-  const stateJson = typeof capture.state_json === "string" ? capture.state_json : null;
-  if (stateJson === null) {
-    return Effect.fail(
-      new LocalStoreError({
-        kind: "malformed_row",
-        message: "A saved thread output capture is missing its captured frame.",
-      }),
-    );
-  }
-  return Effect.try({
-    try: () => JSON.parse(stateJson) as unknown,
-    catch: () =>
-      new LocalStoreError({
-        kind: "malformed_row",
-        message: "A saved thread output capture is not valid JSON.",
-      }),
-  }).pipe(
-    Effect.flatMap((value) => Schema.decodeUnknownEffect(ThreadOutputCaptureFrameSchema)(value)),
-    Effect.mapError((error) =>
-      error instanceof LocalStoreError
-        ? error
-        : new LocalStoreError({
-            kind: "malformed_row",
-            message: "A saved thread output capture is malformed.",
-          }),
-    ),
-  );
-};
+): Effect.Effect<ThreadOutputCaptureFrame, LocalStoreError> =>
+  decodeCaptureStateJson(capture, ThreadOutputCaptureFrameSchema, "thread output");
 
 const decodeThreadOutputCaptureItem = (
   payload: unknown,
@@ -5249,6 +5424,22 @@ const makeWorktreeCaptureCursor = (
     position,
   } satisfies WorktreeCursorPayload);
 
+const makeWorktreeInspectionCaptureCursor = (
+  databaseId: string,
+  captureId: string,
+  query: WorktreeInspectionQuery,
+  position: number,
+): string =>
+  encodeCursor({
+    version: 1,
+    databaseId,
+    captureId,
+    scope: WORKTREE_INSPECT_CAPTURE_SCOPE,
+    order: WORKTREE_INSPECT_CAPTURE_ORDER,
+    query,
+    position,
+  } satisfies WorktreeInspectionCursorPayload);
+
 const makeThreadGetCaptureCursor = (
   databaseId: string,
   captureId: string,
@@ -5304,6 +5495,7 @@ const encodeCursor = (
     | ModelCursorPayload
     | ThreadCursorPayload
     | WorktreeCursorPayload
+    | WorktreeInspectionCursorPayload
     | ThreadGetCursorPayload
     | ThreadOutputCursorPayload,
 ): string => Encoding.encodeBase64Url(JSON.stringify(payload));
@@ -5317,6 +5509,7 @@ const decodeCursorPayload = <Payload>(
     | "model"
     | "thread"
     | "worktree"
+    | "worktree inspection"
     | "thread state"
     | "thread output",
 ): Effect.Effect<Payload, LocalStoreError> => {
@@ -5351,6 +5544,11 @@ const decodeWorktreeCursor = (
   value: string,
 ): Effect.Effect<WorktreeCursorPayload, LocalStoreError> =>
   decodeCursorPayload(value, WorktreeCursorPayloadSchema, "worktree");
+
+const decodeWorktreeInspectionCursor = (
+  value: string,
+): Effect.Effect<WorktreeInspectionCursorPayload, LocalStoreError> =>
+  decodeCursorPayload(value, WorktreeInspectionCursorPayloadSchema, "worktree inspection");
 
 const decodeThreadGetCursor = (
   value: string,

@@ -18,6 +18,11 @@ type JsonRpcMessage = {
     readonly tools?: ReadonlyArray<{
       readonly name: string;
       readonly inputSchema: Record<string, unknown>;
+      readonly annotations?: {
+        readonly readOnlyHint?: boolean;
+        readonly destructiveHint?: boolean;
+        readonly idempotentHint?: boolean;
+      };
     }>;
     readonly structuredContent?: Record<string, unknown>;
     readonly content?: ReadonlyArray<{ readonly type: string; readonly text?: string }>;
@@ -115,6 +120,7 @@ describe("stdio transport", () => {
               "model_list",
               "worktree_list",
               "thread_list",
+              "worktree_inspect",
               "thread_get",
               "approval_respond",
               "thread_output",
@@ -122,6 +128,14 @@ describe("stdio transport", () => {
               "turn_wait",
               "operation_get",
             ]);
+            expect(
+              toolsMessage.result?.tools?.find((tool) => tool.name === "worktree_inspect")
+                ?.annotations,
+            ).toMatchObject({
+              readOnlyHint: false,
+              destructiveHint: false,
+              idempotentHint: false,
+            });
             for (const tool of toolsMessage.result?.tools ?? []) {
               expect(tool.inputSchema).toMatchObject({ allOf: [{ additionalProperties: false }] });
             }
@@ -199,6 +213,25 @@ describe("stdio transport", () => {
             expect(missingTurnWait.result?.structuredContent).toMatchObject({
               result: { kind: "error", error: { code: "registration_not_found" } },
             });
+
+            send(child, {
+              jsonrpc: "2.0",
+              id: 8,
+              method: "tools/call",
+              params: {
+                name: "worktree_inspect",
+                arguments: {
+                  worktree: {
+                    instanceId: "instance-a",
+                    repositoryPath: " /srv/repo",
+                    worktreePath: "/srv/worktrees/a",
+                  },
+                },
+              },
+            });
+            let invalidWorktreePath = await nextMessage();
+            while (invalidWorktreePath.id !== 8) invalidWorktreePath = await nextMessage();
+            expect(invalidWorktreePath.error?.code).toBe(-32602);
           }),
         ({ directory, child }) =>
           Effect.promise(async () => {

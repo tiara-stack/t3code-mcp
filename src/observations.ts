@@ -35,6 +35,9 @@ export class ObservationError extends Data.TaggedError("ObservationError")<{
     | "observation_overflow"
     | "synchronization_timeout"
     | "boundary_missing"
+    | "ambiguous_target"
+    | "uncheckable_target"
+    | "repository_mismatch"
     | "stale_generation"
     | "retention_budget"
     | "subscription_capacity";

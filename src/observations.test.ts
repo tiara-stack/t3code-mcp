@@ -272,6 +272,8 @@ const observationsLayer = (
         discoverProjects: () => Effect.die("not used"),
         discoverModels: () => Effect.die("not used"),
         discoverVcsRefs: () => Effect.die("not used"),
+        readVcsWorktreeStatus: () => Effect.die("not used"),
+        discoverVcsWorktreeRefs: () => Effect.die("not used"),
         openShellStream: (instanceId, options) => {
           seenAfterSequences.push(options?.afterSequence);
           return scripts.openShellStream(instanceId, options);
@@ -445,6 +447,8 @@ describe("Observations coalescing", () => {
               discoverProjects: () => Effect.die("not used"),
               discoverModels: () => Effect.die("not used"),
               discoverVcsRefs: () => Effect.die("not used"),
+              readVcsWorktreeStatus: () => Effect.die("not used"),
+              discoverVcsWorktreeRefs: () => Effect.die("not used"),
               openShellStream: (_instanceId, options) => {
                 streamOpens += 1;
                 seenAfterSequences.push(options?.afterSequence);
@@ -931,6 +935,8 @@ const threadObservationsLayer = (
         discoverProjects: () => Effect.die("not used"),
         discoverModels: () => Effect.die("not used"),
         discoverVcsRefs: () => Effect.die("not used"),
+        readVcsWorktreeStatus: () => Effect.die("not used"),
+        discoverVcsWorktreeRefs: () => Effect.die("not used"),
         openShellStream: () => Stream.die("not used"),
         openThreadStream: (instanceId, threadId, options) => {
           seenThreadReads.push({
@@ -1235,6 +1241,8 @@ describe("InstanceConnections observation capacity", () => {
             inspectCredential: () => Effect.die("not used"),
             listProjects: () => Effect.die("not used"),
             listProviderModels: () => Effect.die("not used"),
+            refreshVcsStatus: () => Effect.die("not used"),
+            listVcsWorktreeRefs: () => Effect.die("not used"),
             subscribeShell: () =>
               Stream.concat(
                 Stream.make(snapshotItem(1, [project("project-a")], [])),
@@ -1327,6 +1335,8 @@ describe("InstanceConnections observation capacity", () => {
           inspectCredential: () => Effect.die("not used"),
           listProjects: () => Effect.die("not used"),
           listProviderModels: () => Effect.die("not used"),
+          refreshVcsStatus: () => Effect.die("not used"),
+          listVcsWorktreeRefs: () => Effect.die("not used"),
           subscribeShell: () =>
             Stream.make(snapshotItem(1, [project("project-a")], []), synchronizedItem),
           subscribeThread: () => Stream.die("not used"),

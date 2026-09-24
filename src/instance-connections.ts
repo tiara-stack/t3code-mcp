@@ -21,6 +21,8 @@ import {
   type StagedPairingToken,
   type T3CodeAdapterService,
   type ThreadStreamItem,
+  type VcsWorktreeRefListing,
+  type VcsWorktreeStatus,
   type VerifiedInstance,
   type CreatedWorktree,
   type WorktreeCreateRequest,
@@ -46,6 +48,14 @@ export interface DiscoveredVcsRefs {
   readonly limitations: ReadonlyArray<string>;
   /** True when unread upstream ref pages remain past the supported read bound. */
   readonly truncated: boolean;
+  readonly observedAt: string;
+}
+
+export interface ObservedVcsWorktreeStatus extends VcsWorktreeStatus {
+  readonly observedAt: string;
+}
+
+export interface DiscoveredVcsWorktreeRefs extends VcsWorktreeRefListing {
   readonly observedAt: string;
 }
 
@@ -102,6 +112,14 @@ export interface InstanceConnectionsService {
     instanceId: string,
     repositoryPath: string,
   ) => Effect.Effect<DiscoveredVcsRefs, LocalStoreError | T3CodeAdapterError>;
+  readonly readVcsWorktreeStatus: (
+    instanceId: string,
+    worktreePath: string,
+  ) => Effect.Effect<ObservedVcsWorktreeStatus, LocalStoreError | T3CodeAdapterError>;
+  readonly discoverVcsWorktreeRefs: (
+    instanceId: string,
+    repositoryPath: string,
+  ) => Effect.Effect<DiscoveredVcsWorktreeRefs, LocalStoreError | T3CodeAdapterError>;
   /**
    * Open a scoped shell observation stream for the current registration
    * revision. The per-instance RPC capacity permit is held until the returned
@@ -283,7 +301,8 @@ export class InstanceConnections extends Context.Service<
                 }),
               );
             }
-            if (registration.credential === null) {
+            const credential = registration.credential;
+            if (credential === null) {
               return yield* Effect.fail(
                 new T3CodeAdapterError({
                   kind: "pairing_required",
@@ -293,7 +312,7 @@ export class InstanceConnections extends Context.Service<
                 }),
               );
             }
-            return registration;
+            return { ...registration, credential };
           });
 
         const discoverProjects = (
@@ -349,6 +368,50 @@ export class InstanceConnections extends Context.Service<
             const listing = yield* withInstanceCapacity(
               instanceId,
               adapter.listVcsRefs({
+                endpoint: connection.endpoint,
+                credential: connection.credential,
+                cwd: repositoryPath,
+              }),
+            );
+            const observedAt = new Date(yield* Clock.currentTimeMillis).toISOString();
+            return { ...listing, observedAt };
+          });
+
+        const readVcsWorktreeStatus = (
+          instanceId: string,
+          worktreePath: string,
+        ): Effect.Effect<ObservedVcsWorktreeStatus, LocalStoreError | T3CodeAdapterError> =>
+          Effect.gen(function* () {
+            yield* requireReadableRegistration(
+              instanceId,
+              "The saved registration requires pairing before worktree status can be read.",
+            );
+            const connection = yield* acquire(instanceId);
+            const status = yield* withInstanceCapacity(
+              instanceId,
+              adapter.refreshVcsStatus({
+                endpoint: connection.endpoint,
+                credential: connection.credential,
+                cwd: worktreePath,
+              }),
+            );
+            const observedAt = new Date(yield* Clock.currentTimeMillis).toISOString();
+            return { ...status, observedAt };
+          });
+
+        const discoverVcsWorktreeRefs = (
+          instanceId: string,
+          repositoryPath: string,
+        ): Effect.Effect<DiscoveredVcsWorktreeRefs, LocalStoreError | T3CodeAdapterError> =>
+          Effect.gen(function* () {
+            yield* requireReadableRegistration(
+              instanceId,
+              "The saved registration requires pairing before worktree references can be read.",
+            );
+            const connection = yield* acquire(instanceId);
+            const listing = yield* withInstanceCapacity(
+              instanceId,
+              adapter.listVcsWorktreeRefs({
                 endpoint: connection.endpoint,
                 credential: connection.credential,
                 cwd: repositoryPath,
@@ -490,25 +553,10 @@ export class InstanceConnections extends Context.Service<
         ): Effect.Effect<InstanceInspection, LocalStoreError | T3CodeAdapterError> =>
           // fallow-ignore-next-line complexity
           Effect.gen(function* () {
-            const registration = yield* store.getRegistration(instanceId);
-            if (registration === null) {
-              return yield* Effect.fail(
-                new LocalStoreError({
-                  kind: "registration_not_found",
-                  message: "The saved registration was not found.",
-                }),
-              );
-            }
-            if (registration.credential === null) {
-              return yield* Effect.fail(
-                new T3CodeAdapterError({
-                  kind: "pairing_required",
-                  message: "The saved registration requires pairing before it can be inspected.",
-                  uncertain: false,
-                  status: null,
-                }),
-              );
-            }
+            const registration = yield* requireReadableRegistration(
+              instanceId,
+              "The saved registration requires pairing before it can be inspected.",
+            );
             const diagnostics = yield* withInstanceCapacity(
               instanceId,
               inspectCredential({
@@ -742,6 +790,8 @@ export class InstanceConnections extends Context.Service<
           discoverModels,
           createWorktree,
           discoverVcsRefs,
+          readVcsWorktreeStatus,
+          discoverVcsWorktreeRefs,
           openShellStream,
           openThreadStream,
           readArchivedShell,

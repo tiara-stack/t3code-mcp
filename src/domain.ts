@@ -757,6 +757,91 @@ export type ThreadListQuery = {
   readonly archived: ThreadArchivedMode;
 };
 
+const worktreeInspectPath = nonEmptyString.check(
+  Schema.makeFilter((value) => value.trim() === value, {
+    message: "expected a trimmed non-empty path",
+  }),
+);
+
+const worktreeInspectReferenceFields = Schema.Struct({
+  instanceId: nonEmptyString,
+  repositoryPath: worktreeInspectPath,
+  worktreePath: worktreeInspectPath,
+});
+
+const unknownWorktreeInspectReferenceField = Schema.String.check(
+  Schema.makeFilter(
+    (key) => key !== "instanceId" && key !== "repositoryPath" && key !== "worktreePath",
+    { message: "unknown worktree_inspect worktree argument" },
+  ),
+);
+
+const worktreeInspectReferenceRuntimeShape = Schema.StructWithRest(worktreeInspectReferenceFields, [
+  Schema.Record(unknownWorktreeInspectReferenceField, Schema.Never),
+]);
+
+const worktreeInspectReferenceJsonShape = Schema.StructWithRest(worktreeInspectReferenceFields, [
+  Schema.Record(Schema.String, Schema.Never),
+]);
+
+const worktreeInspectFields = Schema.Struct({
+  worktree: worktreeInspectReferenceRuntimeShape,
+  cursor: Schema.optionalKey(nonEmptyString),
+  limit: Schema.optionalKey(pageLimit),
+  allowStale: Schema.optionalKey(Schema.Boolean),
+});
+
+const worktreeInspectJsonFields = Schema.Struct({
+  worktree: worktreeInspectReferenceJsonShape,
+  cursor: Schema.optionalKey(nonEmptyString),
+  limit: Schema.optionalKey(pageLimit),
+  allowStale: Schema.optionalKey(Schema.Boolean),
+});
+
+const unknownWorktreeInspectField = Schema.String.check(
+  Schema.makeFilter(
+    (key) => key !== "worktree" && key !== "cursor" && key !== "limit" && key !== "allowStale",
+    { message: "unknown worktree_inspect argument" },
+  ),
+);
+
+const worktreeInspectRuntimeShape = Schema.StructWithRest(worktreeInspectFields, [
+  Schema.Record(unknownWorktreeInspectField, Schema.Never),
+]);
+
+const worktreeInspectJsonShape = Schema.StructWithRest(worktreeInspectJsonFields, [
+  Schema.Record(Schema.String, Schema.Never),
+]);
+
+export const WorktreeInspectInputSchema = Schema.declare<{
+  readonly worktree: WorktreeReference;
+  readonly cursor?: string;
+  readonly limit?: number;
+  readonly allowStale?: boolean;
+}>(
+  (
+    input,
+  ): input is {
+    readonly worktree: WorktreeReference;
+    readonly cursor?: string;
+    readonly limit?: number;
+    readonly allowStale?: boolean;
+  } => Schema.is(worktreeInspectRuntimeShape)(input),
+  {
+    toCodecJson: () =>
+      Schema.link()(worktreeInspectJsonShape, {
+        decode: SchemaGetter.passthrough({ strict: false }),
+        encode: SchemaGetter.passthrough({ strict: false }),
+      } as never),
+  },
+);
+
+export type WorktreeInspectInput = typeof WorktreeInspectInputSchema.Type;
+
+export type WorktreeInspectionQuery = {
+  readonly worktree: WorktreeReference;
+};
+
 /**
  * A thread-get capture binds one direct thread reference; its cursor pages
  * the captured thread's pending requests without mixing snapshots.
@@ -1689,6 +1774,58 @@ export const WorktreeListInputSchema = Schema.declare<{
 
 export type WorktreeListInput = typeof WorktreeListInputSchema.Type;
 
+const WorktreeGuardCheckSchema = Schema.Struct({
+  name: Schema.Literals([
+    "target_identity",
+    "association",
+    "reference_coverage",
+    "inactive_execution",
+    "no_pending_requests",
+    "session_stopped",
+  ]),
+  state: Schema.Literals(["passed", "failed", "unavailable", "not_applicable"]),
+  detail: Schema.String,
+});
+
+export type WorktreeGuardCheck = typeof WorktreeGuardCheckSchema.Type;
+
+const WorktreeInspectionStatusSchema = Schema.Struct({
+  // Older retained worktree captures predate this explicit VCS flag.
+  hasWorkingTreeChanges: Schema.optionalKey(Schema.Boolean),
+  changedFiles: Schema.NullOr(Schema.Natural),
+  stagedFiles: Schema.NullOr(Schema.Natural),
+  untrackedFiles: Schema.NullOr(Schema.Natural),
+  ahead: Schema.NullOr(Schema.Natural),
+  behind: Schema.NullOr(Schema.Natural),
+});
+
+export type WorktreeInspectionStatus = typeof WorktreeInspectionStatusSchema.Type;
+
+export const WorktreeInspectionFrameSchema = Schema.Struct({
+  summary: WorktreeSummarySchema,
+  status: WorktreeInspectionStatusSchema,
+  checks: Schema.Array(WorktreeGuardCheckSchema),
+  discardConsequences: Schema.Struct({
+    deletesWorktreeContents: Schema.Literal(true),
+    retainsBranch: Schema.Literal(true),
+    requiresExplicitSoleThreadForThreadRemoval: Schema.Literal(true),
+    atomicReferenceGuard: Schema.Literal(false),
+  }),
+});
+
+export type WorktreeInspectionFrame = typeof WorktreeInspectionFrameSchema.Type;
+
+const WorktreeInspectionSchema = Schema.Struct({
+  ...WorktreeInspectionFrameSchema.fields,
+  referencingThreads: ThreadListPageSchema,
+});
+
+export type WorktreeInspection = typeof WorktreeInspectionSchema.Type;
+
+export const WorktreeInspectionToolResultSchema = toolResultFields(WorktreeInspectionSchema);
+
+export type WorktreeInspectionToolResult = typeof WorktreeInspectionToolResultSchema.Type;
+
 export const THREAD_SNAPSHOT_TURN_LIMIT = 20;
 export const MAX_ACTIVE_THREAD_SUBSCRIPTIONS_PER_INSTANCE = 32;
 export const MAX_PENDING_REQUEST_QUESTIONS = 32;
@@ -2110,6 +2247,7 @@ export const staleModelReadLimitation = staleProjectReadLimitation;
 export const staleThreadReadLimitation = staleProjectReadLimitation;
 
 export const staleWorktreeReadLimitation = staleProjectReadLimitation;
+const staleWorktreeInspectionReadLimitation = staleProjectReadLimitation;
 
 /**
  * The conditional guarantees reported for a provider/model. The pinned
@@ -2199,6 +2337,29 @@ export const makeWorktreeListToolSuccess = (
       : [],
   ),
 });
+
+export const makeWorktreeInspectionToolSuccess = (
+  value: WorktreeInspection,
+  observations: ReadonlyArray<Observation>,
+): WorktreeInspectionToolResult => {
+  const staleObservation = observations.find((observation) => observation.freshness === "stale");
+  return {
+    result: { kind: "ok" as const, value },
+    observations,
+    warnings:
+      staleObservation === undefined
+        ? []
+        : [
+            {
+              code: "fresh_read_failed",
+              message:
+                staleObservation.limitations.find((limitation) =>
+                  limitation.startsWith("Fresh worktree inspection failed"),
+                ) ?? staleWorktreeInspectionReadLimitation,
+            },
+          ],
+  };
+};
 
 export const staleThreadGetReadLimitation = staleProjectReadLimitation;
 

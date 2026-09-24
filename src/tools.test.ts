@@ -13,7 +13,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { LocalStore, LocalStoreError } from "./local-store";
-import { InstanceConnections, type DiscoveredVcsRefs } from "./instance-connections";
+import {
+  InstanceConnections,
+  type DiscoveredVcsRefs,
+  type DiscoveredVcsWorktreeRefs,
+  type ObservedVcsWorktreeStatus,
+} from "./instance-connections";
 import {
   T3CodeAdapter,
   T3CodeAdapterError,
@@ -57,6 +62,27 @@ const approvalResponseUnavailable = () =>
   });
 
 const failApprovalResponse = () => Effect.fail(approvalResponseUnavailable());
+
+const unsupportedVcsAdapterMethods = {
+  refreshVcsStatus: () =>
+    Effect.fail(
+      new T3CodeAdapterError({
+        kind: "transport",
+        message: "This test adapter does not read VCS status.",
+        uncertain: false,
+        status: null,
+      }),
+    ),
+  listVcsWorktreeRefs: () =>
+    Effect.fail(
+      new T3CodeAdapterError({
+        kind: "transport",
+        message: "This test adapter does not list VCS refs.",
+        uncertain: false,
+        status: null,
+      }),
+    ),
+};
 
 const appLayer = (
   databasePath: string,
@@ -194,6 +220,24 @@ const fakeConnections = (options?: {
           status: null,
         }),
       ),
+    readVcsWorktreeStatus: () =>
+      Effect.fail(
+        new T3CodeAdapterError({
+          kind: "capacity",
+          message: "The test connection does not support VCS status reads.",
+          uncertain: false,
+          status: null,
+        }),
+      ),
+    discoverVcsWorktreeRefs: () =>
+      Effect.fail(
+        new T3CodeAdapterError({
+          kind: "capacity",
+          message: "The test connection does not support VCS ref discovery.",
+          uncertain: false,
+          status: null,
+        }),
+      ),
     discoverVcsRefs: () =>
       Effect.fail(
         new T3CodeAdapterError({
@@ -318,6 +362,7 @@ const fakeAdapterLayer = (
           status: null,
         }),
       ),
+    ...unsupportedVcsAdapterMethods,
   });
 
 const callList = (input: unknown = {}) =>
@@ -1530,6 +1575,8 @@ describe("instance_pair_again", () => {
             status: null,
           }),
         ),
+      readVcsWorktreeStatus: () => Effect.die("not used"),
+      discoverVcsWorktreeRefs: () => Effect.die("not used"),
       openShellStream: () =>
         Stream.fail(
           new T3CodeAdapterError({
@@ -1938,6 +1985,8 @@ describe("instance_pair_again", () => {
                 status: null,
               }),
             ),
+          readVcsWorktreeStatus: () => Effect.die("not used"),
+          discoverVcsWorktreeRefs: () => Effect.die("not used"),
           openShellStream: () =>
             Stream.fail(
               new T3CodeAdapterError({
@@ -2808,6 +2857,7 @@ const projectFixtures = (
           status: null,
         }),
       ),
+    ...unsupportedVcsAdapterMethods,
   });
 
 const seedProjectRegistration = (instanceId: string, endpoint: string, credential?: string) =>
@@ -4045,6 +4095,7 @@ const modelFixtures = (
           status: null,
         }),
       ),
+    ...unsupportedVcsAdapterMethods,
   });
 
 const fixtureProviders = (): ReadonlyArray<DiscoveredProvider> => [
@@ -4634,6 +4685,7 @@ describe("model_list", () => {
                     status: null,
                   }),
                 ),
+              ...unsupportedVcsAdapterMethods,
             }),
           ),
         );
@@ -4932,6 +4984,9 @@ interface ThreadFixtureOptions {
   }) => Effect.Effect<{ readonly sequence: number }, T3CodeAdapterError>;
   approvalResponseBeforeDispatchFailure?: T3CodeAdapterError;
   approvalDispatchRaceSetup?: () => void;
+  vcsStatusFailures?: Readonly<Record<string, T3CodeAdapterError>>;
+  vcsStatuses?: Readonly<Record<string, ObservedVcsWorktreeStatus>>;
+  vcsRefs?: Readonly<Record<string, DiscoveredVcsWorktreeRefs>>;
   readonly seenActive: Array<string>;
   readonly seenArchived: Array<string>;
   readonly seenThreads: Array<string>;
@@ -5026,6 +5081,34 @@ const threadConnections = (options: ThreadFixtureOptions) =>
         );
       }
       return scripted(repositoryPath);
+    },
+    readVcsWorktreeStatus: (instanceId: string, worktreePath: string) => {
+      const failure = options.vcsStatusFailures?.[JSON.stringify([instanceId, worktreePath])];
+      if (failure !== undefined) return Effect.fail(failure);
+      const status = options.vcsStatuses?.[JSON.stringify([instanceId, worktreePath])];
+      return status === undefined
+        ? Effect.fail(
+            new T3CodeAdapterError({
+              kind: "transport",
+              message: `The thread test connection has no VCS status fixture for ${instanceId}.`,
+              uncertain: false,
+              status: null,
+            }),
+          )
+        : Effect.succeed(status);
+    },
+    discoverVcsWorktreeRefs: (instanceId: string, repositoryPath: string) => {
+      const refs = options.vcsRefs?.[JSON.stringify([instanceId, repositoryPath])];
+      return refs === undefined
+        ? Effect.fail(
+            new T3CodeAdapterError({
+              kind: "transport",
+              message: `The thread test connection has no VCS ref fixture for ${instanceId}.`,
+              uncertain: false,
+              status: null,
+            }),
+          )
+        : Effect.succeed(refs);
     },
     openShellStream: (instanceId: string, streamOptions?: { readonly afterSequence?: number }) => {
       options.seenActive.push(instanceId);
@@ -7006,6 +7089,7 @@ const observedThreadFixture = (
     readonly modelSelection: { readonly providerInstanceId: string; readonly model: string };
     readonly runtimeMode: "approval-required" | "auto-accept-edits" | "auto" | "full-access";
     readonly interactionMode: "default" | "plan";
+    readonly branch: string | null;
     readonly worktreePath: string | null;
     readonly latestTurn: {
       readonly turnId: string;
@@ -7077,6 +7161,1514 @@ const detailSnapshotStream = (
     },
     { kind: "synchronized" as const },
   );
+
+describe("worktree_inspect", () => {
+  const hasSingleFreshInspectionFailure = (response: unknown): boolean => {
+    const observations = (
+      response as {
+        readonly observations: ReadonlyArray<{ readonly limitations: ReadonlyArray<string> }>;
+      }
+    ).observations;
+    return (
+      observations.length > 0 &&
+      observations.every(
+        (observation) =>
+          observation.limitations.filter((limitation) =>
+            limitation.startsWith("Fresh worktree inspection failed ("),
+          ).length === 1,
+      )
+    );
+  };
+
+  const inspectionValue = (response: unknown) =>
+    (
+      response as {
+        readonly result: {
+          readonly kind: "ok";
+          readonly value: {
+            readonly summary: { readonly branch: string | null };
+            readonly status: {
+              readonly hasWorkingTreeChanges: boolean;
+              readonly changedFiles: number | null;
+            };
+            readonly checks: ReadonlyArray<{ readonly name: string; readonly state: string }>;
+            readonly referencingThreads: {
+              readonly items: ReadonlyArray<{ readonly thread: { readonly threadId: string } }>;
+              readonly nextCursor: string | null;
+              readonly coverage: string;
+            };
+          };
+        };
+      }
+    ).result.value;
+
+  const expectStaleInspection = (response: unknown): void => {
+    expect(response).toMatchObject({
+      result: {
+        kind: "ok",
+        value: { referencingThreads: { coverage: "partial" } },
+      },
+      warnings: [expect.objectContaining({ code: "fresh_read_failed" })],
+    });
+    expect(inspectionValue(response).checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: "reference_coverage", state: "unavailable" }),
+        expect.objectContaining({ name: "target_identity", state: "unavailable" }),
+      ]),
+    );
+    const observations = (
+      response as {
+        readonly observations: ReadonlyArray<{ readonly freshness: string }>;
+      }
+    ).observations;
+    expect(
+      observations.length > 0 &&
+        observations.every((observation) => observation.freshness === "stale"),
+    ).toBe(true);
+    expect(hasSingleFreshInspectionFailure(response)).toBe(true);
+  };
+
+  it.live("inspects a direct worktree reference with fresh status and thread guards", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/repo",
+          worktreePath: "/srv/worktrees/feature-a",
+        };
+        const at = "2026-09-22T10:00:00.000Z";
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(
+                31,
+                [shellProjectFixture("project-a", worktree.repositoryPath)],
+                [
+                  shellThreadFixture("thread-a", {
+                    worktreePath: worktree.worktreePath,
+                  }),
+                ],
+              ),
+              shellSynchronizedItem,
+            ),
+        };
+        options.archivedShells = {
+          "instance-a": () =>
+            Effect.succeed({
+              snapshotSequence: 32,
+              projects: [shellProjectFixture("project-a", worktree.repositoryPath)],
+              threads: [],
+              observedAt: at,
+            }),
+        };
+        let threadDetailAttempts = 0;
+        options.threadStreams = {
+          "instance-a:thread-a": () => {
+            threadDetailAttempts += 1;
+            return threadDetailAttempts === 1
+              ? Stream.fail(
+                  new T3CodeAdapterError({
+                    kind: "capacity",
+                    message: "The test connection is temporarily at capacity.",
+                    uncertain: false,
+                    status: null,
+                  }),
+                )
+              : detailSnapshotStream(
+                  33,
+                  observedThreadFixture("thread-a", {
+                    projectId: "project-a",
+                    worktreePath: worktree.worktreePath,
+                    session: {
+                      status: "stopped",
+                      activeTurnId: null,
+                      lastError: null,
+                      updatedAt: at,
+                    },
+                  }),
+                );
+          },
+        };
+        options.vcsStatuses = {
+          [JSON.stringify([worktree.instanceId, worktree.worktreePath])]: {
+            isRepo: true,
+            branch: "feature/a",
+            hasWorkingTreeChanges: true,
+            changedFiles: null,
+            stagedFiles: null,
+            untrackedFiles: null,
+            hasUpstream: true,
+            ahead: 3,
+            behind: 1,
+            limitations: ["Staged and untracked counts are not published by this T3Code version."],
+            observedAt: at,
+          },
+        };
+        options.vcsRefs = {
+          [JSON.stringify([worktree.instanceId, worktree.repositoryPath])]: {
+            isRepo: true,
+            refs: [{ branch: "feature/a", worktreePath: worktree.worktreePath }],
+            limitations: [],
+            truncated: false,
+            observedAt: at,
+          },
+        };
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("worktree_inspect", { worktree });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        expect(threadDetailAttempts).toBe(2);
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              summary: { worktree, branch: "feature/a" },
+              status: {
+                hasWorkingTreeChanges: true,
+                changedFiles: null,
+                stagedFiles: null,
+                untrackedFiles: null,
+                ahead: 3,
+                behind: 1,
+              },
+              referencingThreads: {
+                items: [
+                  {
+                    thread: { instanceId: "instance-a", threadId: "thread-a" },
+                    project: { instanceId: "instance-a", projectId: "project-a" },
+                    worktree,
+                  },
+                ],
+                nextCursor: null,
+                coverage: "complete_for_query",
+              },
+              checks: [
+                { name: "target_identity", state: "passed" },
+                { name: "association", state: "passed" },
+                { name: "reference_coverage", state: "passed" },
+                { name: "inactive_execution", state: "passed" },
+                { name: "no_pending_requests", state: "passed" },
+                { name: "session_stopped", state: "passed" },
+              ],
+              discardConsequences: {
+                deletesWorktreeContents: true,
+                retainsBranch: true,
+                requiresExplicitSoleThreadForThreadRemoval: true,
+                atomicReferenceGuard: false,
+              },
+            },
+          },
+          warnings: [],
+        });
+        const firstToolResult = result[0]?.result;
+        if (firstToolResult === undefined) throw new Error("worktree_inspect returned no result");
+        expect(
+          (firstToolResult as { readonly observations: ReadonlyArray<unknown> }).observations,
+        ).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ instanceId: "instance-a", freshness: "fresh" }),
+          ]),
+        );
+        expect(result[0]?.encodedResult).toEqual(result[0]?.result);
+      }),
+    ),
+  );
+
+  it.live("requires pairing before reading remote worktree status", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const worktree = {
+          instanceId: "instance-unpaired",
+          repositoryPath: "/srv/repo",
+          worktreePath: "/srv/worktrees/feature-a",
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration(worktree.instanceId, "https://unpaired.test");
+            return yield* callTool("worktree_inspect", { worktree });
+          }).pipe(
+            Effect.provide(
+              appLayer(
+                databasePath,
+                InstanceConnections.layerWithAdapter(fakeAdapterLayer({ current: null })),
+              ),
+            ),
+          ),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "pairing_required" } },
+        });
+      }),
+    ),
+  );
+
+  it.live("keeps thread pages bound to the complete captured inspection", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/repo",
+          worktreePath: "/srv/worktrees/feature-a",
+        };
+        const at = "2026-09-22T10:00:00.000Z";
+        const status: ObservedVcsWorktreeStatus = {
+          isRepo: true,
+          branch: "feature/a",
+          hasWorkingTreeChanges: false,
+          changedFiles: 0,
+          stagedFiles: null,
+          untrackedFiles: null,
+          hasUpstream: false,
+          ahead: null,
+          behind: null,
+          limitations: ["Staged and untracked counts are not published by this T3Code version."],
+          observedAt: at,
+        };
+        const refs: DiscoveredVcsWorktreeRefs = {
+          isRepo: true,
+          refs: [{ branch: "feature/a", worktreePath: worktree.worktreePath }],
+          limitations: [],
+          truncated: false,
+          observedAt: at,
+        };
+        options.vcsStatuses = {
+          [JSON.stringify([worktree.instanceId, worktree.worktreePath])]: status,
+        };
+        options.vcsRefs = {
+          [JSON.stringify([worktree.instanceId, worktree.repositoryPath])]: refs,
+        };
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(
+                41,
+                [
+                  shellProjectFixture("project-a", worktree.repositoryPath),
+                  shellProjectFixture("project-b", worktree.repositoryPath),
+                ],
+                [
+                  shellThreadFixture("thread-a", { worktreePath: worktree.worktreePath }),
+                  shellThreadFixture("thread-b", {
+                    projectId: "project-b",
+                    worktreePath: worktree.worktreePath,
+                  }),
+                ],
+              ),
+              shellSynchronizedItem,
+            ),
+        };
+        options.archivedShells = {
+          "instance-a": () =>
+            Effect.succeed({
+              snapshotSequence: 42,
+              projects: [
+                shellProjectFixture("project-a", worktree.repositoryPath),
+                shellProjectFixture("project-b", worktree.repositoryPath),
+              ],
+              threads: [],
+              observedAt: at,
+            }),
+        };
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              43,
+              observedThreadFixture("thread-a", {
+                worktreePath: worktree.worktreePath,
+                session: {
+                  status: "stopped",
+                  activeTurnId: null,
+                  lastError: null,
+                  updatedAt: at,
+                },
+              }),
+            ),
+          "instance-a:thread-b": () =>
+            detailSnapshotStream(
+              44,
+              observedThreadFixture("thread-b", {
+                projectId: "project-b",
+                worktreePath: worktree.worktreePath,
+                session: {
+                  status: "stopped",
+                  activeTurnId: null,
+                  lastError: null,
+                  updatedAt: at,
+                },
+              }),
+            ),
+        };
+        const layer = () => appLayer(databasePath, connections);
+
+        const first = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("worktree_inspect", { worktree, limit: 1 });
+          }).pipe(Effect.provide(layer())),
+        );
+        const firstValue = inspectionValue(first[0]?.result);
+        const cursor = firstValue.referencingThreads.nextCursor;
+        expect(firstValue.referencingThreads.items.map((item) => item.thread.threadId)).toEqual([
+          "thread-a",
+        ]);
+        expect(firstValue.referencingThreads.coverage).toBe("complete_for_query");
+        expect(cursor).toEqual(expect.any(String));
+        const readsBeforeContinuation = {
+          active: options.seenActive.length,
+          archived: options.seenArchived.length,
+          details: options.seenThreads.length,
+        };
+
+        const mismatched = yield* Effect.scoped(
+          callTool("worktree_inspect", {
+            worktree: { ...worktree, worktreePath: "/srv/worktrees/other" },
+            cursor,
+            limit: 1,
+          }).pipe(Effect.provide(layer())),
+        );
+        expect(mismatched[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "cursor_mismatch" } },
+        });
+        expect(options.seenActive).toHaveLength(readsBeforeContinuation.active);
+
+        // If a continuation performed a fresh read it would fail. A cursor
+        // continues the inspection captured before these remote changes.
+        options.activeStreams = {};
+        options.archivedShells = {};
+        options.threadStreams = {};
+        options.vcsStatuses = {};
+        options.vcsRefs = {};
+        const second = yield* Effect.scoped(
+          callTool("worktree_inspect", { worktree, cursor, limit: 1 }).pipe(
+            Effect.provide(layer()),
+          ),
+        );
+        const secondValue = inspectionValue(second[0]?.result);
+        expect(secondValue.referencingThreads.items.map((item) => item.thread.threadId)).toEqual([
+          "thread-b",
+        ]);
+        expect(secondValue.referencingThreads.nextCursor).toBeNull();
+        expect(secondValue.summary.branch).toBe("feature/a");
+        expect(secondValue.status.changedFiles).toBe(0);
+        expect(options.seenActive).toHaveLength(readsBeforeContinuation.active);
+        expect(options.seenArchived).toHaveLength(readsBeforeContinuation.archived);
+        expect(options.seenThreads).toHaveLength(readsBeforeContinuation.details);
+
+        const stale = yield* Effect.scoped(
+          callTool("worktree_inspect", { worktree, allowStale: true }).pipe(
+            Effect.provide(layer()),
+          ),
+        );
+        expectStaleInspection(stale[0]?.result);
+
+        const repeatedStale = yield* Effect.scoped(
+          callTool("worktree_inspect", { worktree, allowStale: true }).pipe(
+            Effect.provide(layer()),
+          ),
+        );
+        expectStaleInspection(repeatedStale[0]?.result);
+
+        options.vcsRefs = {
+          [JSON.stringify([worktree.instanceId, worktree.repositoryPath])]: refs,
+        };
+        options.vcsStatusFailures = {
+          [JSON.stringify([worktree.instanceId, worktree.worktreePath])]: new T3CodeAdapterError({
+            kind: "pairing_required",
+            message: "The test pairing was removed before inspection.",
+            uncertain: false,
+            status: null,
+          }),
+        };
+        const pairingRequired = yield* Effect.scoped(
+          callTool("worktree_inspect", { worktree, allowStale: true }).pipe(
+            Effect.provide(layer()),
+          ),
+        );
+        expect(pairingRequired[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "pairing_required" } },
+          observations: [],
+        });
+      }),
+    ),
+  );
+
+  it.live("includes archived UI-created references from another project", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/repo",
+          worktreePath: "/srv/worktrees/ui-checkout",
+        };
+        const at = "2026-09-22T10:00:00.000Z";
+        options.vcsStatuses = {
+          [JSON.stringify([worktree.instanceId, worktree.worktreePath])]: {
+            isRepo: true,
+            branch: "ui/branch",
+            hasWorkingTreeChanges: false,
+            changedFiles: 0,
+            stagedFiles: null,
+            untrackedFiles: null,
+            hasUpstream: false,
+            ahead: null,
+            behind: null,
+            limitations: [],
+            observedAt: at,
+          },
+        };
+        options.vcsRefs = {
+          [JSON.stringify([worktree.instanceId, worktree.repositoryPath])]: {
+            isRepo: true,
+            refs: [{ branch: "ui/branch", worktreePath: worktree.worktreePath }],
+            limitations: [],
+            truncated: false,
+            observedAt: at,
+          },
+        };
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(
+                51,
+                [
+                  shellProjectFixture("project-main", worktree.repositoryPath),
+                  shellProjectFixture("project-ui", worktree.repositoryPath),
+                ],
+                [],
+              ),
+              shellSynchronizedItem,
+            ),
+        };
+        options.archivedShells = {
+          "instance-a": () =>
+            Effect.succeed({
+              snapshotSequence: 52,
+              projects: [shellProjectFixture("project-main", worktree.repositoryPath)],
+              threads: [
+                shellThreadFixture("ui-thread", {
+                  projectId: "project-ui",
+                  archivedAt: at,
+                  worktreePath: worktree.worktreePath,
+                }),
+              ],
+              observedAt: at,
+            }),
+        };
+        options.threadStreams = {
+          "instance-a:ui-thread": () =>
+            detailSnapshotStream(
+              53,
+              observedThreadFixture("ui-thread", {
+                projectId: "project-ui",
+                archivedAt: at,
+                worktreePath: worktree.worktreePath,
+                session: {
+                  status: "stopped",
+                  activeTurnId: null,
+                  lastError: null,
+                  updatedAt: at,
+                },
+              }),
+            ),
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("worktree_inspect", { worktree });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        const value = inspectionValue(result[0]?.result);
+        expect(value.referencingThreads.items).toMatchObject([
+          {
+            thread: { threadId: "ui-thread" },
+            project: { projectId: "project-ui" },
+            archived: true,
+            worktree,
+          },
+        ]);
+        expect(options.seenArchived).toHaveLength(2);
+        expect(options.seenThreads).toEqual(["instance-a:ui-thread"]);
+      }),
+    ),
+  );
+
+  it.live("reports active execution and pending requests in the guard checks", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/repo",
+          worktreePath: "/srv/worktrees/active",
+        };
+        const at = "2026-09-22T10:00:00.000Z";
+        options.vcsStatuses = {
+          [JSON.stringify([worktree.instanceId, worktree.worktreePath])]: {
+            isRepo: true,
+            branch: "feature/active",
+            hasWorkingTreeChanges: false,
+            changedFiles: 0,
+            stagedFiles: null,
+            untrackedFiles: null,
+            hasUpstream: false,
+            ahead: null,
+            behind: null,
+            limitations: [],
+            observedAt: at,
+          },
+        };
+        options.vcsRefs = {
+          [JSON.stringify([worktree.instanceId, worktree.repositoryPath])]: {
+            isRepo: true,
+            refs: [{ branch: "feature/active", worktreePath: worktree.worktreePath }],
+            limitations: [],
+            truncated: false,
+            observedAt: at,
+          },
+        };
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(
+                81,
+                [shellProjectFixture("project-a", worktree.repositoryPath)],
+                [
+                  shellThreadFixture("active-thread", {
+                    worktreePath: worktree.worktreePath,
+                    latestTurnId: "turn-a",
+                  }),
+                ],
+              ),
+              shellSynchronizedItem,
+            ),
+        };
+        options.archivedShells = {
+          "instance-a": () =>
+            Effect.succeed({
+              snapshotSequence: 82,
+              projects: [shellProjectFixture("project-a", worktree.repositoryPath)],
+              threads: [],
+              observedAt: at,
+            }),
+        };
+        options.threadStreams = {
+          "instance-a:active-thread": () =>
+            detailSnapshotStream(
+              83,
+              observedThreadFixture("active-thread", {
+                worktreePath: worktree.worktreePath,
+                latestTurn: { turnId: "turn-a", state: "running" },
+                activities: [
+                  {
+                    activityId: "approval-event",
+                    kind: "approval.requested",
+                    summary: "Approval requested",
+                    payload: {
+                      requestId: "approval-a",
+                      detail: "Allow this command?",
+                      options: [{ decision: "accept", label: "Allow" }],
+                    },
+                    turnId: "turn-a",
+                    createdAt: at,
+                  },
+                ],
+                session: {
+                  status: "running",
+                  activeTurnId: "turn-a",
+                  lastError: null,
+                  updatedAt: at,
+                },
+              }),
+            ),
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("worktree_inspect", { worktree });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        const value = inspectionValue(result[0]?.result);
+        expect(value.checks).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ name: "inactive_execution", state: "failed" }),
+            expect.objectContaining({ name: "no_pending_requests", state: "failed" }),
+            expect.objectContaining({ name: "session_stopped", state: "failed" }),
+          ]),
+        );
+      }),
+    ),
+  );
+
+  it.live("refuses if a thread changes its worktree association during inspection", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/repo",
+          worktreePath: "/srv/worktrees/racing",
+        };
+        const at = "2026-09-22T10:00:00.000Z";
+        options.vcsStatuses = {
+          [JSON.stringify([worktree.instanceId, worktree.worktreePath])]: {
+            isRepo: true,
+            branch: "feature/race",
+            hasWorkingTreeChanges: false,
+            changedFiles: 0,
+            stagedFiles: null,
+            untrackedFiles: null,
+            hasUpstream: false,
+            ahead: null,
+            behind: null,
+            limitations: [],
+            observedAt: at,
+          },
+        };
+        options.vcsRefs = {
+          [JSON.stringify([worktree.instanceId, worktree.repositoryPath])]: {
+            isRepo: true,
+            refs: [{ branch: "feature/race", worktreePath: worktree.worktreePath }],
+            limitations: [],
+            truncated: false,
+            observedAt: at,
+          },
+        };
+        let activeRead = 0;
+        options.activeStreams = {
+          "instance-a": () => {
+            activeRead += 1;
+            const path = activeRead === 1 ? worktree.worktreePath : "/srv/worktrees/replaced";
+            return Stream.make(
+              shellSnapshotItem(
+                61 + activeRead,
+                [shellProjectFixture("project-a", worktree.repositoryPath)],
+                [shellThreadFixture("racing-thread", { worktreePath: path })],
+              ),
+              shellSynchronizedItem,
+            );
+          },
+        };
+        options.archivedShells = {
+          "instance-a": () =>
+            Effect.succeed({
+              snapshotSequence: 70,
+              projects: [shellProjectFixture("project-a", worktree.repositoryPath)],
+              threads: [],
+              observedAt: at,
+            }),
+        };
+        options.threadStreams = {
+          "instance-a:racing-thread": () =>
+            detailSnapshotStream(
+              71,
+              observedThreadFixture("racing-thread", {
+                worktreePath: worktree.worktreePath,
+              }),
+            ),
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("worktree_inspect", { worktree });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "stale_state" } },
+        });
+        expect(activeRead).toBe(2);
+      }),
+    ),
+  );
+
+  it.live("reports persistent thread branch drift as an uncheckable target", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/repo",
+          worktreePath: "/srv/worktrees/branch-drift",
+        };
+        const at = "2026-09-22T10:00:00.000Z";
+        options.vcsStatuses = {
+          [JSON.stringify([worktree.instanceId, worktree.worktreePath])]: {
+            isRepo: true,
+            branch: "feature/live",
+            hasWorkingTreeChanges: false,
+            changedFiles: 0,
+            stagedFiles: null,
+            untrackedFiles: null,
+            hasUpstream: false,
+            ahead: null,
+            behind: null,
+            limitations: [],
+            observedAt: at,
+          },
+        };
+        options.vcsRefs = {
+          [JSON.stringify([worktree.instanceId, worktree.repositoryPath])]: {
+            isRepo: true,
+            refs: [{ branch: "feature/live", worktreePath: worktree.worktreePath }],
+            limitations: [],
+            truncated: false,
+            observedAt: at,
+          },
+        };
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(
+                72,
+                [shellProjectFixture("project-a", worktree.repositoryPath)],
+                [
+                  shellThreadFixture("thread-branch-drift", {
+                    worktreePath: worktree.worktreePath,
+                  }),
+                ],
+              ),
+              shellSynchronizedItem,
+            ),
+        };
+        options.archivedShells = {
+          "instance-a": () =>
+            Effect.succeed({
+              snapshotSequence: 73,
+              projects: [shellProjectFixture("project-a", worktree.repositoryPath)],
+              threads: [],
+              observedAt: at,
+            }),
+        };
+        options.threadStreams = {
+          "instance-a:thread-branch-drift": () =>
+            detailSnapshotStream(
+              74,
+              observedThreadFixture("thread-branch-drift", {
+                branch: "feature/recorded",
+                worktreePath: worktree.worktreePath,
+              }),
+            ),
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("worktree_inspect", { worktree, allowStale: true });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "error",
+            error: {
+              code: "uncheckable_target",
+              retry: "change_request",
+              message: expect.stringContaining('feature/recorded"'),
+            },
+          },
+          observations: [],
+        });
+        expect(options.seenThreads).toEqual(["instance-a:thread-branch-drift"]);
+      }),
+    ),
+  );
+
+  it.live("reports branch changes during inspection as stale state", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/repo",
+          worktreePath: "/srv/worktrees/branch-transition",
+        };
+        const at = "2026-09-22T10:00:00.000Z";
+        const statusKey = JSON.stringify([worktree.instanceId, worktree.worktreePath]);
+        const refsKey = JSON.stringify([worktree.instanceId, worktree.repositoryPath]);
+        options.vcsStatuses = {
+          [statusKey]: {
+            isRepo: true,
+            branch: "feature/before",
+            hasWorkingTreeChanges: false,
+            changedFiles: 0,
+            stagedFiles: null,
+            untrackedFiles: null,
+            hasUpstream: false,
+            ahead: null,
+            behind: null,
+            limitations: [],
+            observedAt: at,
+          },
+        };
+        options.vcsRefs = {
+          [refsKey]: {
+            isRepo: true,
+            refs: [{ branch: "feature/before", worktreePath: worktree.worktreePath }],
+            limitations: [],
+            truncated: false,
+            observedAt: at,
+          },
+        };
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(
+                81,
+                [shellProjectFixture("project-a", worktree.repositoryPath)],
+                [
+                  shellThreadFixture("thread-branch-transition", {
+                    worktreePath: worktree.worktreePath,
+                  }),
+                ],
+              ),
+              shellSynchronizedItem,
+            ),
+        };
+        options.archivedShells = {
+          "instance-a": () =>
+            Effect.succeed({
+              snapshotSequence: 82,
+              projects: [shellProjectFixture("project-a", worktree.repositoryPath)],
+              threads: [],
+              observedAt: at,
+            }),
+        };
+        options.threadStreams = {
+          "instance-a:thread-branch-transition": () => {
+            options.vcsStatuses = {
+              [statusKey]: {
+                isRepo: true,
+                branch: "feature/during",
+                hasWorkingTreeChanges: false,
+                changedFiles: 0,
+                stagedFiles: null,
+                untrackedFiles: null,
+                hasUpstream: false,
+                ahead: null,
+                behind: null,
+                limitations: [],
+                observedAt: at,
+              },
+            };
+            options.vcsRefs = {
+              [refsKey]: {
+                isRepo: true,
+                refs: [{ branch: "feature/during", worktreePath: worktree.worktreePath }],
+                limitations: [],
+                truncated: false,
+                observedAt: at,
+              },
+            };
+            return detailSnapshotStream(
+              83,
+              observedThreadFixture("thread-branch-transition", {
+                branch: "feature/during",
+                worktreePath: worktree.worktreePath,
+              }),
+            );
+          },
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("worktree_inspect", { worktree });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "stale_state", retry: "reconcile_first" } },
+          observations: [],
+        });
+      }),
+    ),
+  );
+
+  it.live("reports page-bounded and unmatched local refs as uncheckable targets", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/repo",
+          worktreePath: "/srv/worktrees/unlisted",
+        };
+        const at = "2026-09-22T10:00:00.000Z";
+        options.vcsStatuses = {
+          [JSON.stringify([worktree.instanceId, worktree.worktreePath])]: {
+            isRepo: true,
+            branch: "feature/unlisted",
+            hasWorkingTreeChanges: false,
+            changedFiles: 0,
+            stagedFiles: null,
+            untrackedFiles: null,
+            hasUpstream: false,
+            ahead: null,
+            behind: null,
+            limitations: [],
+            observedAt: at,
+          },
+        };
+        options.vcsRefs = {
+          [JSON.stringify([worktree.instanceId, worktree.repositoryPath])]: {
+            isRepo: true,
+            refs: [{ branch: "feature/unlisted", worktreePath: worktree.worktreePath }],
+            limitations: [],
+            truncated: false,
+            observedAt: at,
+          },
+        };
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(
+                81,
+                [shellProjectFixture("project-a", worktree.repositoryPath)],
+                [],
+              ),
+              shellSynchronizedItem,
+            ),
+        };
+        options.archivedShells = {
+          "instance-a": () =>
+            Effect.succeed({
+              snapshotSequence: 82,
+              projects: [shellProjectFixture("project-a", worktree.repositoryPath)],
+              threads: [],
+              observedAt: at,
+            }),
+        };
+        const captured = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("worktree_inspect", { worktree });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        expect(captured[0]?.result).toMatchObject({ result: { kind: "ok" } });
+
+        options.vcsRefs = {
+          [JSON.stringify([worktree.instanceId, worktree.repositoryPath])]: {
+            isRepo: true,
+            refs: [],
+            limitations: ["The VCS ref inventory exceeded its page bound."],
+            truncated: true,
+            pageLimitExceeded: true,
+            observedAt: at,
+          },
+        };
+        const result = yield* Effect.scoped(
+          callTool("worktree_inspect", { worktree, allowStale: true }).pipe(
+            Effect.provide(appLayer(databasePath, connections)),
+          ),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "error",
+            error: { code: "uncheckable_target", retry: "change_request" },
+          },
+          observations: [],
+        });
+
+        options.vcsRefs = {
+          [JSON.stringify([worktree.instanceId, worktree.repositoryPath])]: {
+            isRepo: true,
+            refs: [],
+            limitations: [],
+            truncated: false,
+            observedAt: "2026-09-22T10:00:00.000Z",
+          },
+        };
+        const unmatched = yield* Effect.scoped(
+          callTool("worktree_inspect", { worktree, allowStale: true }).pipe(
+            Effect.provide(appLayer(databasePath, connections)),
+          ),
+        );
+        expect(unmatched[0]?.result).toMatchObject({
+          result: {
+            kind: "error",
+            error: { code: "uncheckable_target", retry: "change_request" },
+          },
+          observations: [],
+        });
+      }),
+    ),
+  );
+
+  it.live("refuses a path reported by multiple local refs", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/repo",
+          worktreePath: "/srv/worktrees/ambiguous",
+        };
+        const at = "2026-09-22T10:00:00.000Z";
+        options.vcsStatuses = {
+          [JSON.stringify([worktree.instanceId, worktree.worktreePath])]: {
+            isRepo: true,
+            branch: "feature/a",
+            hasWorkingTreeChanges: false,
+            changedFiles: 0,
+            stagedFiles: null,
+            untrackedFiles: null,
+            hasUpstream: false,
+            ahead: null,
+            behind: null,
+            limitations: [],
+            observedAt: at,
+          },
+        };
+        options.vcsRefs = {
+          [JSON.stringify([worktree.instanceId, worktree.repositoryPath])]: {
+            isRepo: true,
+            refs: [{ branch: "feature/a", worktreePath: worktree.worktreePath }],
+            limitations: [],
+            truncated: false,
+            observedAt: at,
+          },
+        };
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(
+                83,
+                [shellProjectFixture("project-a", worktree.repositoryPath)],
+                [],
+              ),
+              shellSynchronizedItem,
+            ),
+        };
+        options.archivedShells = {
+          "instance-a": () =>
+            Effect.succeed({
+              snapshotSequence: 84,
+              projects: [shellProjectFixture("project-a", worktree.repositoryPath)],
+              threads: [],
+              observedAt: at,
+            }),
+        };
+        const { captured, ambiguous } = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const capturedResult = yield* callTool("worktree_inspect", { worktree });
+            options.vcsRefs = {
+              [JSON.stringify([worktree.instanceId, worktree.repositoryPath])]: {
+                isRepo: true,
+                refs: [
+                  { branch: "feature/a", worktreePath: worktree.worktreePath },
+                  { branch: "feature/b", worktreePath: worktree.worktreePath },
+                ],
+                limitations: [],
+                truncated: false,
+                observedAt: at,
+              },
+            };
+            const ambiguousResult = yield* callTool("worktree_inspect", {
+              worktree,
+              allowStale: true,
+            });
+            return { captured: capturedResult, ambiguous: ambiguousResult };
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        expect(captured[0]?.result).toMatchObject({ result: { kind: "ok" } });
+
+        expect(ambiguous[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "unavailable", retry: "safe_read" } },
+          observations: [],
+        });
+      }),
+    ),
+  );
+
+  it.live("refuses the repository root as a linked worktree target", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/repo",
+          worktreePath: "/srv/repo",
+        };
+        const at = "2026-09-22T10:00:00.000Z";
+        options.vcsStatuses = {
+          [JSON.stringify([worktree.instanceId, worktree.worktreePath])]: {
+            isRepo: true,
+            branch: "main",
+            hasWorkingTreeChanges: false,
+            changedFiles: 0,
+            stagedFiles: null,
+            untrackedFiles: null,
+            hasUpstream: true,
+            ahead: 0,
+            behind: 0,
+            limitations: [],
+            observedAt: at,
+          },
+        };
+        options.vcsRefs = {
+          [JSON.stringify([worktree.instanceId, worktree.repositoryPath])]: {
+            isRepo: true,
+            refs: [{ branch: "main", worktreePath: worktree.repositoryPath }],
+            limitations: [],
+            truncated: false,
+            observedAt: at,
+          },
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("worktree_inspect", { worktree });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "error",
+            error: { code: "uncheckable_target", retry: "change_request" },
+          },
+          observations: [],
+        });
+        expect(options.seenActive).toEqual([]);
+      }),
+    ),
+  );
+
+  it.live("rejects a primary checkout when the repository path is not project-anchored", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/worktrees/linked-checkout",
+          worktreePath: "/srv/repo",
+        };
+        const at = "2026-09-22T10:00:00.000Z";
+        options.vcsStatuses = {
+          [JSON.stringify([worktree.instanceId, worktree.worktreePath])]: {
+            isRepo: true,
+            branch: "main",
+            hasWorkingTreeChanges: false,
+            changedFiles: 0,
+            stagedFiles: null,
+            untrackedFiles: null,
+            hasUpstream: true,
+            ahead: 0,
+            behind: 0,
+            limitations: [],
+            observedAt: at,
+          },
+        };
+        options.vcsRefs = {
+          [JSON.stringify([worktree.instanceId, worktree.repositoryPath])]: {
+            isRepo: true,
+            refs: [{ branch: "main", worktreePath: worktree.worktreePath }],
+            limitations: [],
+            truncated: false,
+            observedAt: at,
+          },
+        };
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(99, [shellProjectFixture("project-a", "/srv/repo")], []),
+              shellSynchronizedItem,
+            ),
+        };
+        options.archivedShells = {
+          "instance-a": () =>
+            Effect.succeed({
+              snapshotSequence: 100,
+              projects: [shellProjectFixture("project-a", "/srv/repo")],
+              threads: [],
+              observedAt: at,
+            }),
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("worktree_inspect", { worktree });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "error",
+            error: { code: "uncheckable_target", retry: "change_request" },
+          },
+          observations: [],
+        });
+      }),
+    ),
+  );
+
+  it.live("reports a thread repository mismatch as an uncheckable target", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/repo",
+          worktreePath: "/srv/worktrees/mismatched-repository",
+        };
+        const at = "2026-09-22T10:00:00.000Z";
+        options.vcsStatuses = {
+          [JSON.stringify([worktree.instanceId, worktree.worktreePath])]: {
+            isRepo: true,
+            branch: "feature/mismatch",
+            hasWorkingTreeChanges: false,
+            changedFiles: 0,
+            stagedFiles: null,
+            untrackedFiles: null,
+            hasUpstream: false,
+            ahead: null,
+            behind: null,
+            limitations: [],
+            observedAt: at,
+          },
+        };
+        options.vcsRefs = {
+          [JSON.stringify([worktree.instanceId, worktree.repositoryPath])]: {
+            isRepo: true,
+            refs: [{ branch: "feature/mismatch", worktreePath: worktree.worktreePath }],
+            limitations: [],
+            truncated: false,
+            observedAt: at,
+          },
+        };
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(
+                93,
+                [shellProjectFixture("project-a", worktree.repositoryPath)],
+                [],
+              ),
+              shellSynchronizedItem,
+            ),
+        };
+        options.archivedShells = {
+          "instance-a": () =>
+            Effect.succeed({
+              snapshotSequence: 94,
+              projects: [shellProjectFixture("project-a", worktree.repositoryPath)],
+              threads: [],
+              observedAt: at,
+            }),
+        };
+        const { captured, associationAmbiguous, result } = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const capturedResult = yield* callTool("worktree_inspect", { worktree });
+            options.activeStreams = {
+              "instance-a": () =>
+                Stream.make(
+                  shellSnapshotItem(
+                    95,
+                    [shellProjectFixture("project-a", worktree.repositoryPath)],
+                    [
+                      shellThreadFixture("thread-ambiguous", {
+                        worktreePath: worktree.worktreePath,
+                      }),
+                    ],
+                  ),
+                  shellSynchronizedItem,
+                ),
+            };
+            options.archivedShells = {
+              "instance-a": () =>
+                Effect.succeed({
+                  snapshotSequence: 96,
+                  projects: [shellProjectFixture("project-a", "/srv/other-repo")],
+                  threads: [],
+                  observedAt: at,
+                }),
+            };
+            const ambiguousAssociationResult = yield* callTool("worktree_inspect", {
+              worktree,
+              allowStale: true,
+            });
+            options.activeStreams = {
+              "instance-a": () =>
+                Stream.make(
+                  shellSnapshotItem(
+                    97,
+                    [shellProjectFixture("project-a", "/srv/other-repo")],
+                    [
+                      shellThreadFixture("thread-mismatch", {
+                        worktreePath: worktree.worktreePath,
+                      }),
+                    ],
+                  ),
+                  shellSynchronizedItem,
+                ),
+            };
+            options.archivedShells = {
+              "instance-a": () =>
+                Effect.succeed({
+                  snapshotSequence: 98,
+                  projects: [],
+                  threads: [],
+                  observedAt: at,
+                }),
+            };
+            const mismatchResult = yield* callTool("worktree_inspect", {
+              worktree,
+              allowStale: true,
+            });
+            return {
+              captured: capturedResult,
+              associationAmbiguous: ambiguousAssociationResult,
+              result: mismatchResult,
+            };
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        expect(captured[0]?.result).toMatchObject({ result: { kind: "ok" } });
+
+        expect(associationAmbiguous[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "unavailable", retry: "safe_read" } },
+          observations: [],
+        });
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "error",
+            error: {
+              code: "uncheckable_target",
+              retry: "change_request",
+              message: expect.stringContaining("/srv/other-repo"),
+            },
+          },
+          observations: [],
+        });
+        expect(options.seenThreads).toEqual([]);
+
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(
+                95,
+                [shellProjectFixture("project-a", worktree.repositoryPath)],
+                [
+                  shellThreadFixture("thread-missing-project", {
+                    projectId: "project-missing",
+                    worktreePath: worktree.worktreePath,
+                  }),
+                ],
+              ),
+              shellSynchronizedItem,
+            ),
+        };
+        options.archivedShells = {
+          "instance-a": () =>
+            Effect.succeed({
+              snapshotSequence: 96,
+              projects: [shellProjectFixture("project-a", worktree.repositoryPath)],
+              threads: [],
+              observedAt: at,
+            }),
+        };
+        const missingProject = yield* Effect.scoped(
+          callTool("worktree_inspect", { worktree }).pipe(
+            Effect.provide(appLayer(databasePath, connections)),
+          ),
+        );
+        expect(missingProject[0]?.result).toMatchObject({
+          result: {
+            kind: "error",
+            error: {
+              code: "unavailable",
+              retry: "safe_read",
+              message: expect.stringMatching(/thread-missing-project.*project-missing/),
+            },
+          },
+        });
+      }),
+    ),
+  );
+
+  it.live("refuses reference inventories above the complete inspection bound", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/repo",
+          worktreePath: "/srv/worktrees/large",
+        };
+        const at = "2026-09-22T10:00:00.000Z";
+        options.vcsStatuses = {
+          [JSON.stringify([worktree.instanceId, worktree.worktreePath])]: {
+            isRepo: true,
+            branch: "feature/large",
+            hasWorkingTreeChanges: false,
+            changedFiles: 0,
+            stagedFiles: null,
+            untrackedFiles: null,
+            hasUpstream: false,
+            ahead: null,
+            behind: null,
+            limitations: [],
+            observedAt: at,
+          },
+        };
+        options.vcsRefs = {
+          [JSON.stringify([worktree.instanceId, worktree.repositoryPath])]: {
+            isRepo: true,
+            refs: [{ branch: "feature/large", worktreePath: worktree.worktreePath }],
+            limitations: [],
+            truncated: false,
+            observedAt: at,
+          },
+        };
+        const referencingThreads = Array.from({ length: 129 }, (_, index) =>
+          shellThreadFixture(`thread-${index}`, { worktreePath: worktree.worktreePath }),
+        );
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(
+                91,
+                [shellProjectFixture("project-a", worktree.repositoryPath)],
+                referencingThreads,
+              ),
+              shellSynchronizedItem,
+            ),
+        };
+        options.archivedShells = {
+          "instance-a": () =>
+            Effect.succeed({
+              snapshotSequence: 92,
+              projects: [shellProjectFixture("project-a", worktree.repositoryPath)],
+              threads: [],
+              observedAt: at,
+            }),
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("worktree_inspect", { worktree, limit: 1 });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "error",
+            error: { code: "uncheckable_target", retry: "change_request" },
+          },
+          observations: [],
+        });
+        expect(options.seenThreads).toEqual([]);
+      }),
+    ),
+  );
+});
 
 const approvalActivity = (
   activityId: string,
