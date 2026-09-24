@@ -6,7 +6,12 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
-import type { ApprovalResponseCommand, InstanceDetails } from "./domain";
+import type {
+  ApprovalResponseCommand,
+  InstanceDetails,
+  InteractionMode,
+  RuntimeMode,
+} from "./domain";
 import { MAX_INSTANCE_RPC_CAPACITY, REVISION_POLL_INTERVAL_MILLIS } from "./domain";
 import { LocalStore, LocalStoreError } from "./local-store";
 import {
@@ -14,6 +19,7 @@ import {
   T3CodeAdapterError,
   type DiscoveredProject,
   type DiscoveredProvider,
+  type DispatchTurnResult,
   type DiscoveredVcsWorktreeRef,
   type PairingExchangeInput,
   type ShellSnapshot,
@@ -72,6 +78,18 @@ export interface InstanceConnection {
   readonly verified: VerifiedInstance;
 }
 
+export interface InstanceDispatchTurnInput {
+  readonly instanceId: string;
+  readonly threadId: string;
+  readonly commandId: string;
+  readonly messageId: string;
+  readonly text: string;
+  readonly runtimeMode: RuntimeMode;
+  readonly interactionMode: InteractionMode;
+  readonly createdAt: string;
+  readonly onDispatchStart: () => void;
+}
+
 export interface InstanceInspection {
   readonly details: InstanceDetails;
   readonly observedAt: string;
@@ -89,6 +107,9 @@ export interface InstanceConnectionsService {
   readonly acquire: (
     instanceId: string,
   ) => Effect.Effect<InstanceConnection, LocalStoreError | T3CodeAdapterError>;
+  readonly dispatchTurn: (
+    input: InstanceDispatchTurnInput,
+  ) => Effect.Effect<DispatchTurnResult, LocalStoreError | T3CodeAdapterError>;
   readonly inspect: (
     instanceId: string,
     allowStale: boolean,
@@ -165,8 +186,23 @@ export class InstanceConnections extends Context.Service<
   InstanceConnectionsService
 >()("t3code-mcp/InstanceConnections") {
   static readonly layerTest = (
-    service: InstanceConnectionsService,
-  ): Layer.Layer<InstanceConnections> => Layer.succeed(InstanceConnections, service);
+    service: Omit<InstanceConnectionsService, "dispatchTurn"> &
+      Partial<Pick<InstanceConnectionsService, "dispatchTurn">>,
+  ): Layer.Layer<InstanceConnections> =>
+    Layer.succeed(InstanceConnections, {
+      ...service,
+      dispatchTurn:
+        service.dispatchTurn ??
+        (() =>
+          Effect.fail(
+            new T3CodeAdapterError({
+              kind: "capacity",
+              message: "The test connection does not support dispatch.",
+              uncertain: false,
+              status: null,
+            }),
+          )),
+    });
 
   static readonly layerWithAdapter = (adapterLayer: Layer.Layer<T3CodeAdapter>) =>
     Layer.effect(
@@ -746,6 +782,27 @@ export class InstanceConnections extends Context.Service<
             yield* ensureWatcher();
             return connection;
           });
+        const dispatchTurn = (input: InstanceDispatchTurnInput) =>
+          Effect.gen(function* () {
+            const connection = yield* acquire(input.instanceId);
+            return yield* withInstanceCapacity(
+              input.instanceId,
+              adapter.dispatchTurn({
+                endpoint: connection.endpoint,
+                credential: connection.credential,
+                expectedEnvironmentId: connection.environmentId,
+                threadId: input.threadId,
+                commandId: input.commandId,
+                messageId: input.messageId,
+                text: input.text,
+                runtimeMode: input.runtimeMode,
+                interactionMode: input.interactionMode,
+                createdAt: input.createdAt,
+                onDispatchStart: input.onDispatchStart,
+              }),
+            );
+          });
+
         const createWorktree = (instanceId: string, input: WorktreeCreateRequest) =>
           Effect.gen(function* () {
             // Preserve the pairing-specific failure before acquire can reuse a cached connection.
@@ -785,6 +842,7 @@ export class InstanceConnections extends Context.Service<
           inspectCredential,
           pair,
           acquire,
+          dispatchTurn,
           inspect,
           discoverProjects,
           discoverModels,

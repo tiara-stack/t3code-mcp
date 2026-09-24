@@ -719,6 +719,8 @@ export type StoredOperation = {
 
 export interface OperationUpdate {
   readonly now: string;
+  /** Reject the update if another process has changed the operation. */
+  readonly expectedRevision?: number;
   /** The minimal nonsecret intent retained after transient dispatch data is dropped. */
   readonly intent?: OperationIntent;
   readonly state?: OperationState;
@@ -4901,6 +4903,28 @@ const updateOperationWithOwnerExpectationInDatabase = (
               }),
             );
           }
+          const revision = Number(row.revision);
+          if (!Number.isSafeInteger(revision) || revision < 0) {
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: "malformed_row",
+                message: "The mutation operation revision is malformed.",
+              }),
+            );
+          }
+          if (
+            update.expectedRevision !== undefined &&
+            (!Number.isSafeInteger(update.expectedRevision) ||
+              update.expectedRevision < 0 ||
+              update.expectedRevision !== revision)
+          ) {
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: "revision_conflict",
+                message: "The mutation operation changed before the update could be applied.",
+              }),
+            );
+          }
           if (
             expectation !== undefined &&
             (row.tool !== "approval_respond" ||
@@ -4935,7 +4959,7 @@ const updateOperationWithOwnerExpectationInDatabase = (
             update.recoverableUntil === undefined ? row.recoverable_until : update.recoverableUntil,
             update.now,
           );
-          yield* sql`
+          const updated = yield* sql<{ revision: unknown }>`
             UPDATE operations SET
               revision = revision + 1,
               state = ${nextState},
@@ -4950,8 +4974,17 @@ const updateOperationWithOwnerExpectationInDatabase = (
               created_json = ${createdJson},
               error_json = ${errorJson},
               recovery = ${update.recovery ?? row.recovery}
-            WHERE request_id = ${requestId}
+            WHERE request_id = ${requestId} AND revision = ${revision}
+            RETURNING revision
           `;
+          if (updated.length === 0) {
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: "revision_conflict",
+                message: "The mutation operation changed before the update could be applied.",
+              }),
+            );
+          }
 
           if (update.stepState !== undefined || update.stepError !== undefined) {
             const stepPosition = update.stepPosition ?? 0;

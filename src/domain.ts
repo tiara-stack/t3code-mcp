@@ -9,6 +9,8 @@ export const MAX_PAGE_LIMIT = 100;
 export const MAX_SERIALIZED_RESULT_BYTES = 128 * 1024;
 const MAX_REQUEST_ID_LENGTH = 128;
 export const MAX_OPERATION_WAIT_MILLIS = 30_000;
+/** The pinned T3Code provider turn-start contract accepts at most 120,000 characters. */
+const MAX_THREAD_SUBMIT_TEXT_CHARS = 120_000;
 /**
  * Dedicated thread waits default to a ten-second budget and accept 0 to
  * 30 seconds; none of these budgets set an execution deadline.
@@ -757,6 +759,11 @@ export type ThreadListQuery = {
   readonly archived: ThreadArchivedMode;
 };
 
+const threadReferenceSchema = Schema.Struct({
+  instanceId: nonEmptyString,
+  threadId: nonEmptyString,
+});
+
 const worktreeInspectPath = nonEmptyString.check(
   Schema.makeFilter((value) => value.trim() === value, {
     message: "expected a trimmed non-empty path",
@@ -850,30 +857,20 @@ export type ThreadGetCaptureQuery = {
   readonly thread: ThreadReference;
 };
 
-const threadGetReferenceRuntimeShape = Schema.StructWithRest(
-  Schema.Struct({
-    instanceId: nonEmptyString,
-    threadId: nonEmptyString,
-  }),
-  [
-    Schema.Record(
-      Schema.String.check(
-        Schema.makeFilter((key) => key !== "instanceId" && key !== "threadId", {
-          message: "unknown thread_get thread argument",
-        }),
-      ),
-      Schema.Never,
+const threadGetReferenceRuntimeShape = Schema.StructWithRest(threadReferenceSchema, [
+  Schema.Record(
+    Schema.String.check(
+      Schema.makeFilter((key) => key !== "instanceId" && key !== "threadId", {
+        message: "unknown thread reference argument",
+      }),
     ),
-  ],
-);
+    Schema.Never,
+  ),
+]);
 
-const threadGetReferenceJsonShape = Schema.StructWithRest(
-  Schema.Struct({
-    instanceId: nonEmptyString,
-    threadId: nonEmptyString,
-  }),
-  [Schema.Record(Schema.String, Schema.Never)],
-);
+const threadGetReferenceJsonShape = Schema.StructWithRest(threadReferenceSchema, [
+  Schema.Record(Schema.String, Schema.Never),
+]);
 
 const threadGetFields = Schema.Struct({
   thread: threadGetReferenceRuntimeShape,
@@ -1320,11 +1317,6 @@ export const ProjectReferenceSchema = projectReferenceSchema;
 
 export type ProjectReference = typeof ProjectReferenceSchema.Type;
 
-const threadReferenceSchema = Schema.Struct({
-  instanceId: nonEmptyString,
-  threadId: nonEmptyString,
-});
-
 const worktreeReferenceSchema = Schema.Struct({
   instanceId: nonEmptyString,
   repositoryPath: nonEmptyString,
@@ -1621,6 +1613,73 @@ export type ModelListToolResult = typeof ModelListToolResultSchema.Type;
 export const ThreadReferenceSchema = threadReferenceSchema;
 
 export type ThreadReference = typeof ThreadReferenceSchema.Type;
+
+const threadSubmitIntent = Schema.Literals(["provider_default", "steer_current"]);
+const threadSubmitContext = Schema.Literals(["thread_default", "require_retained"]);
+
+const threadSubmitFields = Schema.Struct({
+  requestId,
+  thread: threadGetReferenceRuntimeShape,
+  text: Schema.String.check(
+    Schema.isMinLength(1),
+    Schema.isMaxLength(MAX_THREAD_SUBMIT_TEXT_CHARS),
+  ),
+  intent: threadSubmitIntent,
+  context: threadSubmitContext,
+});
+
+const threadSubmitJsonFields = Schema.Struct({
+  requestId,
+  thread: threadGetReferenceJsonShape,
+  text: Schema.String.check(
+    Schema.isMinLength(1),
+    Schema.isMaxLength(MAX_THREAD_SUBMIT_TEXT_CHARS),
+  ),
+  intent: threadSubmitIntent,
+  context: threadSubmitContext,
+});
+
+const threadSubmitFieldNames = new Set(["requestId", "thread", "text", "intent", "context"]);
+const unknownThreadSubmitField = Schema.String.check(
+  Schema.makeFilter((key) => !threadSubmitFieldNames.has(key), {
+    message: "unknown thread_submit argument",
+  }),
+);
+
+const threadSubmitRuntimeShape = Schema.StructWithRest(threadSubmitFields, [
+  Schema.Record(unknownThreadSubmitField, Schema.Never),
+]);
+
+const threadSubmitJsonShape = Schema.StructWithRest(threadSubmitJsonFields, [
+  Schema.Record(Schema.String, Schema.Never),
+]);
+
+export const ThreadSubmitInputSchema = Schema.declare<{
+  readonly requestId: string;
+  readonly thread: ThreadReference;
+  readonly text: string;
+  readonly intent: typeof threadSubmitIntent.Type;
+  readonly context: typeof threadSubmitContext.Type;
+}>(
+  (
+    input,
+  ): input is {
+    readonly requestId: string;
+    readonly thread: ThreadReference;
+    readonly text: string;
+    readonly intent: typeof threadSubmitIntent.Type;
+    readonly context: typeof threadSubmitContext.Type;
+  } => Schema.is(threadSubmitRuntimeShape)(input),
+  {
+    toCodecJson: () =>
+      Schema.link()(threadSubmitJsonShape, {
+        decode: SchemaGetter.passthrough({ strict: false }),
+        encode: SchemaGetter.passthrough({ strict: false }),
+      } as never),
+  },
+);
+
+export type ThreadSubmitInput = typeof ThreadSubmitInputSchema.Type;
 
 // fallow-ignore-next-line unused-export
 export const WorktreeReferenceSchema = worktreeReferenceSchema;

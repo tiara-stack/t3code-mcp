@@ -80,6 +80,7 @@ import {
   WorktreeInspectionToolResultSchema,
   ThreadOutputInputSchema,
   ThreadOutputToolResultSchema,
+  ThreadSubmitInputSchema,
   ThreadWaitInputSchema,
   ThreadWaitToolResultSchema,
   type ThreadWaitToolResult,
@@ -381,6 +382,17 @@ const asRegistrationMutation = <
     .annotate(Tool.OpenWorld, hints.openWorld);
 
 // fallow-ignore-next-line unused-export
+export const ThreadSubmitTool = asRegistrationMutation(
+  Tool.make("thread_submit", {
+    description:
+      "Submit text to an existing thread using its current provider and configuration. The receipt confirms T3Code accepted the turn-start command, not provider execution or when active-thread input will be consumed.",
+    parameters: ThreadSubmitInputSchema,
+    success: OperationToolResultSchema,
+  }),
+  { destructive: true, openWorld: true },
+);
+
+// fallow-ignore-next-line unused-export
 export const InstanceRemoveTool = asRegistrationMutation(
   Tool.make("instance_remove", {
     description: "Remove a saved T3Code registration without changing upstream work.",
@@ -463,6 +475,7 @@ export const ServerToolkit = Toolkit.make(
   ThreadListTool,
   WorktreeInspectTool,
   ThreadGetTool,
+  ThreadSubmitTool,
   ApprovalRespondTool,
   ThreadOutputTool,
   ThreadWaitTool,
@@ -476,6 +489,29 @@ const makeToolFailure = (
   retry: ToolFailure["retry"],
   details: JsonObject = {},
 ) => ({ code, message, retry, details });
+
+const operationServiceFailures = {
+  capacity: {
+    code: "unavailable",
+    retry: "safe_read",
+    details: { action: "retry_later", capacity: MAX_OPERATION_CAPACITY },
+  },
+  unsupported: {
+    code: "unsupported_capability",
+    retry: "change_request",
+    details: {},
+  },
+  stale_approval: {
+    code: "pending_request_not_current",
+    retry: "reconcile_first",
+    details: {},
+  },
+  unsupported_approval_decision: {
+    code: "invalid_argument",
+    retry: "change_request",
+    details: {},
+  },
+} satisfies Record<OperationServiceError["kind"], Pick<ToolFailure, "code" | "retry" | "details">>;
 
 // fallow-ignore-next-line complexity
 const toToolFailure = (
@@ -520,18 +556,8 @@ const toToolFailure = (
     return adapterErrorFailure(error, "read");
   }
   if (error instanceof OperationServiceError) {
-    if (error.kind === "stale_approval") {
-      return makeToolFailure(error.message, "pending_request_not_current", "reconcile_first");
-    }
-    if (error.kind === "unsupported_approval_decision") {
-      return makeToolFailure(error.message, "invalid_argument", "change_request");
-    }
-    return {
-      code: "unavailable" as const,
-      message: error.message,
-      retry: "safe_read" as const,
-      details: { action: "retry_later", capacity: MAX_OPERATION_CAPACITY },
-    };
+    const failure = operationServiceFailures[error.kind];
+    return makeToolFailure(error.message, failure.code, failure.retry, failure.details);
   }
   switch (error.kind) {
     case "invalid_argument":
@@ -4774,6 +4800,11 @@ const serverToolHandlers = ServerToolkit.of({
         }),
       ),
     ),
+  thread_submit: (input) =>
+    Effect.gen(function* () {
+      const operations = yield* Operations;
+      return yield* operationMutationResult(operations.submitThread(input));
+    }),
   approval_respond: (input) =>
     Effect.gen(function* () {
       const operations = yield* Operations;
@@ -4986,6 +5017,7 @@ const operationMutatorTools: ReadonlySet<string> = new Set([
   "instance_update",
   "instance_pair_again",
   "worktree_create",
+  "thread_submit",
   "approval_respond",
 ]);
 

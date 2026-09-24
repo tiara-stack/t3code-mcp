@@ -22,6 +22,7 @@ import {
   type OperationGetInput,
   type OperationGetValue,
   type OperationRecord,
+  type ThreadSubmitInput,
   type PendingRequest,
   type ToolFailure,
   type WorktreeCreateInput,
@@ -31,10 +32,10 @@ import type { OperationIntent, StoredOperation } from "./local-store";
 import { InstanceConnections } from "./instance-connections";
 import { T3CodeAdapterError } from "./t3code-adapter";
 import { adapterErrorFailure } from "./tool-failure";
-import type { ObservationError } from "./observations";
+import { ObservationError, Observations } from "./observations";
 
 export class OperationServiceError extends Data.TaggedError("OperationServiceError")<{
-  readonly kind: "capacity" | "stale_approval" | "unsupported_approval_decision";
+  readonly kind: "capacity" | "stale_approval" | "unsupported_approval_decision" | "unsupported";
   readonly message: string;
 }> {}
 
@@ -52,6 +53,9 @@ export interface OperationsService {
   ) => Effect.Effect<OperationRecord, LocalStoreError | OperationServiceError>;
   readonly updateRegistration: (
     input: InstanceUpdateInput,
+  ) => Effect.Effect<OperationRecord, LocalStoreError | OperationServiceError>;
+  readonly submitThread: (
+    input: ThreadSubmitInput,
   ) => Effect.Effect<OperationRecord, LocalStoreError | OperationServiceError>;
   readonly createWorktree: (
     input: WorktreeCreateInput,
@@ -111,6 +115,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
     Effect.gen(function* () {
       const store = yield* LocalStore;
       const connections = yield* InstanceConnections;
+      const observations = yield* Observations;
       const crypto = yield* Crypto.Crypto;
       const processNonce = yield* crypto.randomUUIDv4.pipe(
         Effect.mapError(
@@ -151,6 +156,87 @@ export class Operations extends Context.Service<Operations, OperationsService>()
         record.state === "failed" ||
         record.state === "partial" ||
         record.state === "outcome_unknown";
+
+      const currentSubmissionRevision = (
+        requestId: string,
+      ): Effect.Effect<number | null, LocalStoreError> =>
+        Effect.gen(function* () {
+          const current = yield* store.getOperation(requestId);
+          if (current === null) {
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: "request_record_unavailable",
+                message: "The mutation operation record is unavailable.",
+              }),
+            );
+          }
+          return terminal(current.record) ? null : current.record.revision;
+        });
+
+      const isPreDispatchRevisionConflict = (
+        error: LocalStoreError | T3CodeAdapterError | ObservationError,
+        dispatchStarted: boolean,
+        accepted: boolean,
+      ): boolean =>
+        !dispatchStarted &&
+        !accepted &&
+        error instanceof LocalStoreError &&
+        error.kind === "revision_conflict";
+
+      type AcceptedSubmissionReceipt = {
+        readonly sequence: number;
+        readonly acceptedAt: string;
+        readonly evidence: Evidence;
+      };
+
+      const persistAcceptedSubmission = (input: {
+        readonly request: ThreadSubmitInput;
+        readonly active: boolean;
+        readonly commandId: string;
+        readonly messageId: string;
+        readonly sequence: number;
+        readonly onAccepted: (receipt: AcceptedSubmissionReceipt) => void;
+      }): Effect.Effect<void, LocalStoreError> =>
+        Effect.gen(function* () {
+          const acceptedAt = yield* nowIso;
+          const acceptedEvidence: Evidence = {
+            kind: "rpc_result",
+            observedAt: acceptedAt,
+            sourceSequence: input.sequence,
+            nativeEventId: null,
+            detail: input.active
+              ? "T3Code accepted and sequenced a new turn-start request for the active thread. This establishes orchestration-level intent, not provider queueing, consumption timing, execution, or prompt-to-turn correlation."
+              : "T3Code accepted the native turn-start command. Provider execution and prompt-to-turn correlation remain unestablished.",
+          };
+          input.onAccepted({
+            sequence: input.sequence,
+            acceptedAt,
+            evidence: acceptedEvidence,
+          });
+          yield* store.updateOperation(input.request.requestId, {
+            now: acceptedAt,
+            state: "completed",
+            dispatch: "accepted",
+            target: input.request.thread,
+            commandId: input.commandId,
+            messageId: input.messageId,
+            correlation: {
+              kind: "unestablished",
+              reason:
+                "T3Code acknowledged the command and message IDs but did not return a turn ID correlated to this submitted message.",
+            },
+            stepPosition: 0,
+            stepState: "succeeded",
+            evidence: [acceptedEvidence],
+            evidenceStepPosition: 0,
+            error: null,
+            recovery: "none",
+            recoverableUntil: new Date(
+              Date.parse(acceptedAt) + OPERATION_DETAIL_RETENTION_MILLIS,
+            ).toISOString(),
+          });
+          yield* signalCompletion(input.request.requestId);
+        });
 
       const operationFailure = (error: LocalStoreError): ToolFailure => {
         switch (error.kind) {
@@ -218,6 +304,54 @@ export class Operations extends Context.Service<Operations, OperationsService>()
               details: {},
             };
         }
+      };
+
+      const submissionAdapterFailures: Record<
+        T3CodeAdapterError["kind"],
+        Pick<ToolFailure, "code" | "retry">
+      > = {
+        invalid_pairing_code: { code: "pairing_failed", retry: "change_request" },
+        pairing_code_used: { code: "pairing_failed", retry: "change_request" },
+        pairing_required: { code: "pairing_required", retry: "change_request" },
+        transport: { code: "unavailable", retry: "safe_read" },
+        timeout: { code: "unavailable", retry: "safe_read" },
+        authorization: { code: "operate_denied", retry: "change_request" },
+        identity_mismatch: { code: "identity_mismatch", retry: "reconcile_first" },
+        identity_conflict: { code: "identity_conflict", retry: "change_request" },
+        incompatible_instance: { code: "incompatible_instance", retry: "change_request" },
+        wire_incompatible: { code: "incompatible_instance", retry: "change_request" },
+        resource_not_found: { code: "resource_not_found", retry: "reconcile_first" },
+        command_rejected: { code: "upstream_failure", retry: "change_request" },
+        upstream_failure: { code: "upstream_failure", retry: "change_request" },
+        capacity: { code: "unavailable", retry: "safe_read" },
+      };
+
+      const submissionFailure = (
+        error: LocalStoreError | T3CodeAdapterError | ObservationError,
+        outcomeUnknown: boolean,
+      ): ToolFailure => {
+        if (error instanceof ObservationError) {
+          return {
+            code: "unavailable",
+            message: "The thread could not be observed before dispatch.",
+            retry: outcomeUnknown ? "reconcile_first" : "safe_read",
+            details: { action: "retry_observation" },
+          };
+        }
+        if (error instanceof LocalStoreError) {
+          const failure = operationFailure(error);
+          return {
+            ...failure,
+            retry: outcomeUnknown ? "reconcile_first" : failure.retry,
+          };
+        }
+        const failure = submissionAdapterFailures[error.kind];
+        return {
+          ...failure,
+          message: error.message,
+          retry: outcomeUnknown ? "reconcile_first" : failure.retry,
+          details: {},
+        };
       };
 
       const pairingFailure = (error: T3CodeAdapterError): ToolFailure =>
@@ -341,6 +475,11 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           : Deferred.succeed(signal, undefined).pipe(Effect.asVoid);
       };
 
+      const ignoreOperationRevisionConflict = (
+        error: LocalStoreError,
+      ): Effect.Effect<void, LocalStoreError> =>
+        error.kind === "revision_conflict" ? Effect.void : Effect.fail(error);
+
       const markOutcomeUnknown = (
         stored: StoredOperation,
         record: OperationRecord,
@@ -350,29 +489,69 @@ export class Operations extends Context.Service<Operations, OperationsService>()
         Effect.gen(function* () {
           if (record.evidence.some((item) => item.detail === detail)) return record;
           const observed = yield* evidence(detail, "adapter_inference");
-          yield* store.updateOperation(stored.record.requestId, {
-            now: observed.observedAt,
-            // Worktree and approval intents are nonsecret recovery identities;
-            // other mutations retain only the instance identity after dispatch.
-            intent:
-              recoveryIntent ??
-              (stored.record.tool === "worktree_create"
-                ? stored.intent
-                : { instanceId: stored.intent.instanceId }),
-            state: "outcome_unknown",
-            dispatch: "unknown",
-            stepPosition: 0,
-            stepState: "outcome_unknown",
-            evidence: [observed],
-            evidenceStepPosition: null,
-            error: {
-              code: "unavailable",
-              message: "The mutation outcome is unknown; reconcile before making a new request.",
-              retry: "reconcile_first",
-              details: {},
-            },
-            recovery: "observe_operation",
-          });
+          yield* store
+            .updateOperation(stored.record.requestId, {
+              now: observed.observedAt,
+              expectedRevision: record.revision,
+              intent:
+                recoveryIntent ??
+                (record.tool === "thread_submit" || record.tool === "worktree_create"
+                  ? stored.intent
+                  : { instanceId: stored.intent.instanceId }),
+              state: "outcome_unknown",
+              dispatch: "unknown",
+              stepPosition: 0,
+              stepState: "outcome_unknown",
+              evidence: [observed],
+              evidenceStepPosition: null,
+              error: {
+                code: "unavailable",
+                message: "The mutation outcome is unknown; reconcile before making a new request.",
+                retry: "reconcile_first",
+                details: {},
+              },
+              recovery: "observe_operation",
+            })
+            .pipe(Effect.catch(ignoreOperationRevisionConflict));
+          yield* signalCompletion(stored.record.requestId);
+          const refreshed = yield* store.getOperation(stored.record.requestId);
+          return refreshed?.record ?? record;
+        });
+
+      const markNotDispatchedFailed = (
+        stored: StoredOperation,
+        record: OperationRecord,
+      ): Effect.Effect<OperationRecord, LocalStoreError> =>
+        Effect.gen(function* () {
+          const observed = yield* evidence(
+            "The owning process stopped before sending the native command; T3Code did not receive this submission.",
+            "adapter_inference",
+          );
+          const failure: ToolFailure = {
+            code: "unavailable",
+            message: "The submission was not sent. Retry it with a new request ID.",
+            retry: "change_request",
+            details: {},
+          };
+          yield* store
+            .updateOperation(stored.record.requestId, {
+              now: observed.observedAt,
+              expectedRevision: record.revision,
+              intent: stored.intent,
+              state: "failed",
+              dispatch: "not_dispatched",
+              stepPosition: 0,
+              stepState: "failed",
+              stepError: failure,
+              evidence: [observed],
+              evidenceStepPosition: null,
+              error: failure,
+              recovery: "new_explicit_request",
+              recoverableUntil: new Date(
+                Date.parse(observed.observedAt) + OPERATION_DETAIL_RETENTION_MILLIS,
+              ).toISOString(),
+            })
+            .pipe(Effect.catch(ignoreOperationRevisionConflict));
           yield* signalCompletion(stored.record.requestId);
           const refreshed = yield* store.getOperation(stored.record.requestId);
           return refreshed?.record ?? record;
@@ -542,6 +721,19 @@ export class Operations extends Context.Service<Operations, OperationsService>()
                 : "A previous process left this re-pairing without confirmed publication evidence; its outcome is unknown, the one-use exchange will not be replayed, and an unfinished staged credential is never published automatically.",
             );
           }
+          if (record.tool === "thread_submit") {
+            if (previousOwner && !previousOwnerStale) return record;
+            if (record.dispatch === "not_dispatched") {
+              return yield* markNotDispatchedFailed(stored, record);
+            }
+            return yield* markOutcomeUnknown(
+              stored,
+              record,
+              previousOwner
+                ? "An earlier process left this dispatched submission unresolved past the observation window. Its outcome is unknown and it was not redispatched."
+                : "The current process has no live dispatch for this submission. Its outcome is unknown and it was not redispatched.",
+            );
+          }
           if (record.tool === "worktree_create") {
             if (previousOwner && !previousOwnerStale) return record;
             return yield* markOutcomeUnknown(
@@ -627,6 +819,33 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           yield* signalCompletion(stored.record.requestId);
           const refreshed = yield* store.getOperation(stored.record.requestId);
           return refreshed?.record ?? record;
+        });
+
+      const findExistingOperation = (
+        requestId: string,
+        fingerprint: string,
+      ): Effect.Effect<OperationRecord | null, LocalStoreError> =>
+        Effect.gen(function* () {
+          const known = yield* store.findRequest(requestId);
+          if (known === null) return null;
+          if (known.fingerprint !== fingerprint) {
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: "request_id_conflict",
+                message: "The request ID was already used for different mutation input.",
+              }),
+            );
+          }
+          const existing = yield* store.getOperation(requestId);
+          if (existing === null) {
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: "request_record_unavailable",
+                message: REQUEST_RECORD_UNAVAILABLE_MESSAGE,
+              }),
+            );
+          }
+          return yield* reconcile(existing);
         });
 
       const readOperation = (
@@ -1375,6 +1594,208 @@ export class Operations extends Context.Service<Operations, OperationsService>()
         );
       };
 
+      const executeSubmit = (input: ThreadSubmitInput): Effect.Effect<void, never> => {
+        let dispatchStarted = false;
+        let acceptedReceipt: AcceptedSubmissionReceipt | null = null;
+        let commandId: string | null = null;
+        let messageId: string | null = null;
+        let intent: OperationIntent | null = null;
+
+        return Effect.gen(function* () {
+          const observed = yield* observations.threadDetail(
+            input.thread.instanceId,
+            input.thread.threadId,
+          );
+          const expectedRevision = yield* currentSubmissionRevision(input.requestId);
+          if (expectedRevision === null) {
+            yield* signalCompletion(input.requestId);
+            return;
+          }
+          const thread = observed.thread;
+          commandId = yield* crypto.randomUUIDv4.pipe(
+            Effect.mapError(
+              () =>
+                new LocalStoreError({
+                  kind: "storage",
+                  message: "The operation supervisor could not create a command identity.",
+                }),
+            ),
+          );
+          messageId = yield* crypto.randomUUIDv4.pipe(
+            Effect.mapError(
+              () =>
+                new LocalStoreError({
+                  kind: "storage",
+                  message: "The operation supervisor could not create a message identity.",
+                }),
+            ),
+          );
+          // Keep the prompt in this live attempt only. The durable intent is
+          // enough to identify what T3Code command was prepared without
+          // retaining prompt text in the operation receipt.
+          intent = {
+            instanceId: input.thread.instanceId,
+            threadId: input.thread.threadId,
+            submissionIntent: input.intent,
+            context: input.context,
+            commandId,
+            messageId,
+            modelSelection: {
+              providerInstanceId: thread.modelSelection.providerInstanceId,
+              model: thread.modelSelection.model,
+              ...(thread.modelSelection.options === undefined
+                ? {}
+                : { options: thread.modelSelection.options }),
+            },
+            runtimeMode: thread.runtimeMode,
+            interactionMode: thread.interactionMode,
+          };
+
+          const active =
+            thread.session?.status === "starting" ||
+            thread.session?.status === "running" ||
+            thread.latestTurn?.state === "running";
+          const observationEvidence: Evidence = {
+            kind: "snapshot",
+            observedAt: observed.observedAt,
+            sourceSequence: observed.snapshotSequence,
+            nativeEventId: null,
+            detail: active
+              ? `The synchronized snapshot showed an active provider session on ${thread.modelSelection.providerInstanceId}/${thread.modelSelection.model}. The snapshot does not establish whether the provider queues input or when it consumes it.`
+              : `The synchronized snapshot showed no active provider session on ${thread.modelSelection.providerInstanceId}/${thread.modelSelection.model}. The snapshot does not establish provider execution.`,
+          };
+          const dispatchMarker = yield* evidence(
+            "The native command and message identities were persisted before dispatch.",
+            "adapter_inference",
+          );
+          yield* store.updateOperation(input.requestId, {
+            now: dispatchMarker.observedAt,
+            expectedRevision,
+            intent,
+            state: "pending",
+            dispatch: "unknown",
+            target: input.thread,
+            commandId,
+            messageId,
+            correlation: {
+              kind: "unestablished",
+              reason:
+                "The native dispatch acknowledgement does not include a turn correlated to this message.",
+            },
+            stepPosition: 0,
+            stepState: "pending",
+            evidence: [observationEvidence, dispatchMarker],
+            evidenceStepPosition: 0,
+            recovery: "observe_operation",
+          });
+          const accepted = yield* connections.dispatchTurn({
+            instanceId: input.thread.instanceId,
+            threadId: input.thread.threadId,
+            commandId,
+            messageId,
+            text: input.text,
+            runtimeMode: thread.runtimeMode,
+            interactionMode: thread.interactionMode,
+            createdAt: dispatchMarker.observedAt,
+            onDispatchStart: () => {
+              dispatchStarted = true;
+            },
+          });
+          yield* persistAcceptedSubmission({
+            request: input,
+            active,
+            commandId,
+            messageId,
+            sequence: accepted.sequence,
+            onAccepted: (receipt) => {
+              acceptedReceipt = receipt;
+            },
+          });
+        }).pipe(
+          Effect.catch((error: LocalStoreError | T3CodeAdapterError | ObservationError) =>
+            nowIso.pipe(
+              // fallow-ignore-next-line complexity
+              Effect.flatMap((now) => {
+                const accepted = acceptedReceipt;
+                if (isPreDispatchRevisionConflict(error, dispatchStarted, accepted !== null)) {
+                  return signalCompletion(input.requestId);
+                }
+                const outcomeUnknown =
+                  accepted === null &&
+                  dispatchStarted &&
+                  (!(error instanceof T3CodeAdapterError) || error.uncertain);
+                const failure = accepted === null ? submissionFailure(error, outcomeUnknown) : null;
+                return store
+                  .updateOperation(input.requestId, {
+                    now,
+                    ...(intent === null ? {} : { intent }),
+                    state:
+                      accepted !== null
+                        ? "completed"
+                        : outcomeUnknown
+                          ? "outcome_unknown"
+                          : "failed",
+                    dispatch:
+                      accepted !== null
+                        ? "accepted"
+                        : dispatchStarted
+                          ? outcomeUnknown
+                            ? "unknown"
+                            : "rejected"
+                          : "not_dispatched",
+                    ...(commandId === null ? {} : { commandId }),
+                    ...(messageId === null ? {} : { messageId }),
+                    target: input.thread,
+                    correlation: {
+                      kind: "unestablished",
+                      reason:
+                        accepted === null
+                          ? "No accepted native response established a turn correlated to this message."
+                          : "T3Code acknowledged the command and message IDs but did not return a turn ID correlated to this submitted message.",
+                    },
+                    stepPosition: 0,
+                    stepState:
+                      accepted !== null
+                        ? "succeeded"
+                        : outcomeUnknown
+                          ? "outcome_unknown"
+                          : "failed",
+                    ...(accepted === null
+                      ? {}
+                      : {
+                          evidence: [{ ...accepted.evidence, sourceSequence: accepted.sequence }],
+                          evidenceStepPosition: 0,
+                        }),
+                    stepError: failure,
+                    error: failure,
+                    recovery:
+                      accepted !== null
+                        ? "none"
+                        : outcomeUnknown
+                          ? "observe_operation"
+                          : "new_explicit_request",
+                    recoverableUntil:
+                      accepted !== null
+                        ? new Date(
+                            Date.parse(accepted.acceptedAt) + OPERATION_DETAIL_RETENTION_MILLIS,
+                          ).toISOString()
+                        : outcomeUnknown
+                          ? null
+                          : new Date(
+                              Date.parse(now) + OPERATION_DETAIL_RETENTION_MILLIS,
+                            ).toISOString(),
+                  })
+                  .pipe(
+                    Effect.andThen(signalCompletion(input.requestId)),
+                    Effect.catch(() => Effect.void),
+                  );
+              }),
+            ),
+          ),
+          Effect.asVoid,
+        );
+      };
+
       type WorktreeCreationReference = NonNullable<OperationRecord["created"]["worktree"]>;
 
       const worktreeCreateFailure = (error: LocalStoreError | T3CodeAdapterError): ToolFailure =>
@@ -1709,6 +2130,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
                   ...(input.target === undefined ? {} : { target: input.target }),
                   ...(input.commandId === undefined ? {} : { commandId: input.commandId }),
                   completionMeans: input.completionMeans,
+                  ...(input.target === undefined ? {} : { target: input.target }),
                   ...(input.steps === undefined ? {} : { steps: input.steps }),
                   ...(input.created === undefined ? {} : { created: input.created }),
                 }),
@@ -1764,27 +2186,8 @@ export class Operations extends Context.Service<Operations, OperationsService>()
       ): Effect.Effect<OperationRecord, LocalStoreError | OperationServiceError> =>
         Effect.gen(function* () {
           const fingerprint = yield* store.fingerprintRequest("instance_pair", input);
-          const known = yield* store.findRequest(input.requestId);
-          if (known !== null) {
-            if (known.fingerprint !== fingerprint) {
-              return yield* Effect.fail(
-                new LocalStoreError({
-                  kind: "request_id_conflict",
-                  message: "The request ID was already used for different mutation input.",
-                }),
-              );
-            }
-            const existing = yield* store.getOperation(input.requestId);
-            if (existing === null) {
-              return yield* Effect.fail(
-                new LocalStoreError({
-                  kind: "request_record_unavailable",
-                  message: REQUEST_RECORD_UNAVAILABLE_MESSAGE,
-                }),
-              );
-            }
-            return yield* reconcile(existing);
-          }
+          const existing = yield* findExistingOperation(input.requestId, fingerprint);
+          if (existing !== null) return existing;
 
           const instanceId = yield* crypto.randomUUIDv4.pipe(
             Effect.mapError(
@@ -1817,27 +2220,8 @@ export class Operations extends Context.Service<Operations, OperationsService>()
       ): Effect.Effect<OperationRecord, LocalStoreError | OperationServiceError> =>
         Effect.gen(function* () {
           const fingerprint = yield* store.fingerprintRequest("instance_pair_again", input);
-          const known = yield* store.findRequest(input.requestId);
-          if (known !== null) {
-            if (known.fingerprint !== fingerprint) {
-              return yield* Effect.fail(
-                new LocalStoreError({
-                  kind: "request_id_conflict",
-                  message: "The request ID was already used for different mutation input.",
-                }),
-              );
-            }
-            const existing = yield* store.getOperation(input.requestId);
-            if (existing === null) {
-              return yield* Effect.fail(
-                new LocalStoreError({
-                  kind: "request_record_unavailable",
-                  message: REQUEST_RECORD_UNAVAILABLE_MESSAGE,
-                }),
-              );
-            }
-            return yield* reconcile(existing);
-          }
+          const existing = yield* findExistingOperation(input.requestId, fingerprint);
+          if (existing !== null) return existing;
 
           return yield* admitAndRun({
             requestId: input.requestId,
@@ -1860,27 +2244,8 @@ export class Operations extends Context.Service<Operations, OperationsService>()
       ): Effect.Effect<OperationRecord, LocalStoreError | OperationServiceError> =>
         Effect.gen(function* () {
           const fingerprint = yield* store.fingerprintRequest("instance_remove", input);
-          const known = yield* store.findRequest(input.requestId);
-          if (known !== null) {
-            if (known.fingerprint !== fingerprint) {
-              return yield* Effect.fail(
-                new LocalStoreError({
-                  kind: "request_id_conflict",
-                  message: "The request ID was already used for different mutation input.",
-                }),
-              );
-            }
-            const existing = yield* store.getOperation(input.requestId);
-            if (existing === null) {
-              return yield* Effect.fail(
-                new LocalStoreError({
-                  kind: "request_record_unavailable",
-                  message: REQUEST_RECORD_UNAVAILABLE_MESSAGE,
-                }),
-              );
-            }
-            return yield* reconcile(existing);
-          }
+          const existing = yield* findExistingOperation(input.requestId, fingerprint);
+          if (existing !== null) return existing;
 
           return yield* admitAndRun({
             requestId: input.requestId,
@@ -1898,27 +2263,8 @@ export class Operations extends Context.Service<Operations, OperationsService>()
         // fallow-ignore-next-line complexity
         Effect.gen(function* () {
           const fingerprint = yield* store.fingerprintRequest("instance_update", input);
-          const known = yield* store.findRequest(input.requestId);
-          if (known !== null) {
-            if (known.fingerprint !== fingerprint) {
-              return yield* Effect.fail(
-                new LocalStoreError({
-                  kind: "request_id_conflict",
-                  message: "The request ID was already used for different mutation input.",
-                }),
-              );
-            }
-            const existing = yield* store.getOperation(input.requestId);
-            if (existing === null) {
-              return yield* Effect.fail(
-                new LocalStoreError({
-                  kind: "request_record_unavailable",
-                  message: REQUEST_RECORD_UNAVAILABLE_MESSAGE,
-                }),
-              );
-            }
-            return yield* reconcile(existing);
-          }
+          const existing = yield* findExistingOperation(input.requestId, fingerprint);
+          if (existing !== null) return existing;
 
           if (input.alias === undefined && input.endpoint === undefined) {
             return yield* Effect.fail(
@@ -1958,32 +2304,48 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           });
         });
 
+      const submitThread = (
+        input: ThreadSubmitInput,
+      ): Effect.Effect<OperationRecord, LocalStoreError | OperationServiceError> =>
+        Effect.gen(function* () {
+          const fingerprint = yield* store.fingerprintRequest("thread_submit", input);
+          const existing = yield* findExistingOperation(input.requestId, fingerprint);
+          if (existing !== null) return existing;
+
+          if (input.intent !== "provider_default" || input.context !== "thread_default") {
+            return yield* Effect.fail(
+              new OperationServiceError({
+                kind: "unsupported",
+                message:
+                  "thread_submit currently supports only provider_default intent with thread_default context.",
+              }),
+            );
+          }
+
+          return yield* admitAndRun({
+            requestId: input.requestId,
+            fingerprint,
+            tool: "thread_submit",
+            intent: {
+              instanceId: input.thread.instanceId,
+              threadId: input.thread.threadId,
+              submissionIntent: input.intent,
+              context: input.context,
+            },
+            completionMeans: "submission_accepted",
+            target: input.thread,
+            steps: ["dispatch_provider_default_turn_start"],
+            execute: executeSubmit(input),
+          });
+        });
+
       const createWorktree = (
         input: WorktreeCreateInput,
       ): Effect.Effect<OperationRecord, LocalStoreError | OperationServiceError> =>
         Effect.gen(function* () {
           const fingerprint = yield* store.fingerprintRequest("worktree_create", input);
-          const known = yield* store.findRequest(input.requestId);
-          if (known !== null) {
-            if (known.fingerprint !== fingerprint) {
-              return yield* Effect.fail(
-                new LocalStoreError({
-                  kind: "request_id_conflict",
-                  message: "The request ID was already used for different mutation input.",
-                }),
-              );
-            }
-            const existing = yield* store.getOperation(input.requestId);
-            if (existing === null) {
-              return yield* Effect.fail(
-                new LocalStoreError({
-                  kind: "request_record_unavailable",
-                  message: REQUEST_RECORD_UNAVAILABLE_MESSAGE,
-                }),
-              );
-            }
-            return yield* reconcile(existing);
-          }
+          const existing = yield* findExistingOperation(input.requestId, fingerprint);
+          if (existing !== null) return existing;
 
           return yield* admitAndRun({
             requestId: input.requestId,
@@ -2000,33 +2362,6 @@ export class Operations extends Context.Service<Operations, OperationsService>()
             steps: ["create_worktree"],
             execute: executeWorktreeCreate(input),
           });
-        });
-
-      const readExistingOperation = (
-        requestId: string,
-        fingerprint: string,
-      ): Effect.Effect<OperationRecord | null, LocalStoreError> =>
-        Effect.gen(function* () {
-          const known = yield* store.findRequest(requestId);
-          if (known === null) return null;
-          if (known.fingerprint !== fingerprint) {
-            return yield* Effect.fail(
-              new LocalStoreError({
-                kind: "request_id_conflict",
-                message: "The request ID was already used for different mutation input.",
-              }),
-            );
-          }
-          const existing = yield* store.getOperation(requestId);
-          if (existing === null) {
-            return yield* Effect.fail(
-              new LocalStoreError({
-                kind: "request_record_unavailable",
-                message: REQUEST_RECORD_UNAVAILABLE_MESSAGE,
-              }),
-            );
-          }
-          return yield* reconcile(existing);
         });
 
       const admitApprovalResponse = (
@@ -2078,7 +2413,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
       > =>
         Effect.gen(function* () {
           const fingerprint = yield* store.fingerprintRequest("approval_respond", input);
-          const existing = yield* readExistingOperation(input.requestId, fingerprint);
+          const existing = yield* findExistingOperation(input.requestId, fingerprint);
           if (existing !== null) return existing;
           yield* validateObservedApproval(input, yield* observeRequest);
           return yield* admitApprovalResponse(input, fingerprint);
@@ -2089,6 +2424,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
         pairInstanceAgain,
         removeRegistration,
         updateRegistration,
+        submitThread,
         createWorktree,
         respondToApproval,
         getOperation: readOperation,

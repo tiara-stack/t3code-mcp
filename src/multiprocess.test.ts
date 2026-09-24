@@ -123,6 +123,7 @@ const startServer = async (databasePath: string): Promise<Server> => {
       "thread_list",
       "worktree_inspect",
       "thread_get",
+      "thread_submit",
       "approval_respond",
       "thread_output",
       "thread_wait",
@@ -326,6 +327,88 @@ describe("shared SQLite worktree inspection captures", () => {
 });
 
 describe("shared SQLite mutation admission", () => {
+  // fallow-ignore-next-line complexity
+  it.live(
+    "deduplicates thread_submit across processes without retaining prompt text",
+    () =>
+      withServers("t3code-mcp-submit-admission-", ({ databasePath, servers }) =>
+        // fallow-ignore-next-line complexity
+        Effect.gen(function* () {
+          yield* seed(databasePath, []);
+          const [left, right] = yield* Effect.promise(() =>
+            Promise.all([startServer(databasePath), startServer(databasePath)]),
+          );
+          servers.add(left);
+          servers.add(right);
+          const prompt = "prompt text that must not survive the live dispatch attempt";
+          const input = {
+            requestId: "shared-submit-request",
+            thread: { instanceId: "missing-instance", threadId: "ui-created-thread" },
+            text: prompt,
+            intent: "provider_default",
+            context: "thread_default",
+          };
+          const concurrent = yield* Effect.promise(() =>
+            Promise.all([
+              call(left, 3, "thread_submit", input),
+              call(right, 3, "thread_submit", input),
+            ]),
+          );
+          expect(concurrent).toHaveLength(2);
+          for (const response of concurrent) {
+            const structured = response.result?.structuredContent as
+              | {
+                  readonly result?: {
+                    readonly kind?: string;
+                    readonly value?: { readonly state?: string };
+                  };
+                }
+              | undefined;
+            expect(structured?.result?.kind).toBe("ok");
+            expect(["admitted", "failed"]).toContain(structured?.result?.value?.state);
+          }
+
+          const conflict = yield* Effect.promise(() =>
+            call(right, 4, "thread_submit", { ...input, text: "different prompt" }),
+          );
+          expect(conflict.result?.structuredContent).toMatchObject({
+            result: { kind: "error", error: { code: "request_id_conflict" } },
+          });
+
+          const lookup = yield* Effect.promise(() =>
+            call(left, 5, "operation_get", {
+              requestId: "shared-submit-request",
+              waitMs: 30_000,
+            }),
+          );
+          expect(lookup.result?.structuredContent).toMatchObject({
+            result: {
+              kind: "ok",
+              value: { operation: { requestId: "shared-submit-request", state: "failed" } },
+            },
+          });
+          expect(JSON.stringify(lookup.result?.structuredContent)).not.toContain(prompt);
+
+          const intentJson = yield* Effect.acquireUseRelease(
+            Effect.sync(() => new DatabaseSync(databasePath)),
+            (database) =>
+              Effect.sync(
+                () =>
+                  (
+                    database
+                      .prepare("SELECT intent_json FROM operations WHERE request_id = ?")
+                      .get("shared-submit-request") as { intent_json: string } | undefined
+                  )?.intent_json,
+              ),
+            (database) => Effect.sync(() => database.close()),
+          );
+          expect(intentJson).toBeDefined();
+          expect(intentJson).not.toContain(prompt);
+        }),
+      ),
+    60000,
+  );
+
   it.live(
     "does not reuse an expired request ID while lookup and admission race across processes",
     () =>

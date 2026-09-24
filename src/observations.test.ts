@@ -1254,9 +1254,9 @@ describe("InstanceConnections observation capacity", () => {
             respondToApproval: () => Effect.die("not used"),
             listVcsRefs: () => Effect.die("not used"),
           };
-          const layer = InstanceConnections.layerWithAdapter(
-            Layer.succeed(T3CodeAdapter, adapter),
-          ).pipe(Layer.provideMerge(LocalStore.layer({ databasePath })));
+          const layer = InstanceConnections.layerWithAdapter(T3CodeAdapter.layerTest(adapter)).pipe(
+            Layer.provideMerge(LocalStore.layer({ databasePath })),
+          );
           yield* Effect.scoped(
             Effect.gen(function* () {
               const store = yield* LocalStore;
@@ -1345,9 +1345,9 @@ describe("InstanceConnections observation capacity", () => {
           respondToApproval: () => Effect.die("not used"),
           listVcsRefs: () => Effect.die("not used"),
         };
-        const layer = InstanceConnections.layerWithAdapter(
-          Layer.succeed(T3CodeAdapter, adapter),
-        ).pipe(Layer.provideMerge(LocalStore.layer({ databasePath })));
+        const layer = InstanceConnections.layerWithAdapter(T3CodeAdapter.layerTest(adapter)).pipe(
+          Layer.provideMerge(LocalStore.layer({ databasePath })),
+        );
         yield* Effect.scoped(
           Effect.gen(function* () {
             const store = yield* LocalStore;

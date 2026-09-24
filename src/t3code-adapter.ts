@@ -30,7 +30,9 @@ import {
   type Authorization,
   type ApprovalResponseCommand,
   type Capability,
+  type InteractionMode,
   type InstanceCapabilityName,
+  type RuntimeMode,
 } from "./domain";
 
 /**
@@ -223,6 +225,10 @@ const ThreadDetailSnapshotWireSchema = Schema.Struct({
 const ThreadDetailEventWireSchema = Schema.Union([
   Schema.Struct({
     sequence: nonNegativeWireInt,
+    type: Schema.Literal("thread.created"),
+  }),
+  Schema.Struct({
+    sequence: nonNegativeWireInt,
     type: Schema.Literal("thread.session-set"),
     payload: Schema.Struct({ session: ThreadSessionWireSchema }),
   }),
@@ -235,6 +241,14 @@ const ThreadDetailEventWireSchema = Schema.Union([
     sequence: nonNegativeWireInt,
     type: Schema.Literal("thread.message-sent"),
     payload: Schema.Struct({ message: ThreadMessageWireSchema }),
+  }),
+  Schema.Struct({
+    sequence: nonNegativeWireInt,
+    type: Schema.Literal("thread.turn-start-requested"),
+  }),
+  Schema.Struct({
+    sequence: nonNegativeWireInt,
+    type: Schema.Literal("thread.meta-updated"),
   }),
   Schema.Struct({
     sequence: nonNegativeWireInt,
@@ -336,6 +350,43 @@ const GetSnapshotErrorWireSchema = Schema.Struct({
   message: Schema.String,
 });
 
+const DispatchCommandErrorWireSchema = Schema.Struct({
+  _tag: Schema.String,
+  message: Schema.String,
+});
+
+const DispatchTurnCommandWireSchema = Schema.Struct({
+  type: Schema.Literal("thread.turn.start"),
+  commandId: trimmedNonEmptyWireString,
+  threadId: trimmedNonEmptyWireString,
+  message: Schema.Struct({
+    messageId: trimmedNonEmptyWireString,
+    role: Schema.Literal("user"),
+    text: Schema.String,
+    attachments: Schema.Array(Schema.Never),
+  }),
+  runtimeMode: Schema.Literals(["approval-required", "auto-accept-edits", "auto", "full-access"]),
+  interactionMode: Schema.Literals(["default", "plan"]),
+  createdAt: Schema.String,
+});
+
+const ApprovalResponseCommandWireSchema = Schema.Struct({
+  type: Schema.Literal("thread.approval.respond"),
+  commandId: trimmedNonEmptyWireString,
+  threadId: trimmedNonEmptyWireString,
+  requestId: trimmedNonEmptyWireString,
+  decision: ApprovalDecisionSchema,
+  createdAt: Schema.String,
+});
+
+const OrchestrationDispatchCommandErrorWireSchema = Schema.Struct({
+  _tag: Schema.Literal("OrchestrationDispatchCommandError"),
+  message: Schema.String,
+  cause: Schema.optionalKey(Schema.Unknown),
+  bootstrapThreadDisposition: Schema.optionalKey(Schema.Literal("deleted")),
+});
+
+const DispatchResultWireSchema = Schema.Struct({ sequence: nonNegativeWireInt });
 const GitCommandErrorWireSchema = Schema.Struct({
   _tag: Schema.Literal("GitCommandError"),
   operation: Schema.String,
@@ -536,6 +587,16 @@ const GetArchivedShellSnapshotRpc = Rpc.make("orchestration.getArchivedShellSnap
   error: Schema.Union([GetSnapshotErrorWireSchema, EnvironmentAuthorizationErrorWireSchema]),
 });
 
+const DispatchCommandRpc = Rpc.make("orchestration.dispatchCommand", {
+  payload: Schema.Union([DispatchTurnCommandWireSchema, ApprovalResponseCommandWireSchema]),
+  success: DispatchResultWireSchema,
+  error: Schema.Union([
+    EnvironmentAuthorizationErrorWireSchema,
+    OrchestrationDispatchCommandErrorWireSchema,
+    DispatchCommandErrorWireSchema,
+  ]),
+});
+
 const SubscribeThreadRpc = Rpc.make("orchestration.subscribeThread", {
   payload: Schema.Struct({
     threadId: trimmedNonEmptyWireString,
@@ -546,33 +607,6 @@ const SubscribeThreadRpc = Rpc.make("orchestration.subscribeThread", {
   success: ThreadStreamItemWireSchema,
   error: Schema.Union([GetSnapshotErrorWireSchema, EnvironmentAuthorizationErrorWireSchema]),
   stream: true,
-});
-
-const ApprovalResponseCommandWireSchema = Schema.Struct({
-  type: Schema.Literal("thread.approval.respond"),
-  commandId: trimmedNonEmptyWireString,
-  threadId: trimmedNonEmptyWireString,
-  requestId: trimmedNonEmptyWireString,
-  decision: ApprovalDecisionSchema,
-  createdAt: Schema.String,
-});
-
-const DispatchCommandResultWireSchema = Schema.Struct({ sequence: nonNegativeWireInt });
-
-const OrchestrationDispatchCommandErrorWireSchema = Schema.Struct({
-  _tag: Schema.Literal("OrchestrationDispatchCommandError"),
-  message: Schema.String,
-  cause: Schema.optionalKey(Schema.Unknown),
-  bootstrapThreadDisposition: Schema.optionalKey(Schema.Literal("deleted")),
-});
-
-const DispatchApprovalResponseRpc = Rpc.make("orchestration.dispatchCommand", {
-  payload: ApprovalResponseCommandWireSchema,
-  success: DispatchCommandResultWireSchema,
-  error: Schema.Union([
-    OrchestrationDispatchCommandErrorWireSchema,
-    EnvironmentAuthorizationErrorWireSchema,
-  ]),
 });
 
 const VcsRefreshStatusRpc = Rpc.make("vcs.refreshStatus", {
@@ -612,8 +646,8 @@ const AdapterRpcGroup = RpcGroup.make(
   VcsCreateWorktreeRpc,
   SubscribeShellRpc,
   GetArchivedShellSnapshotRpc,
+  DispatchCommandRpc,
   SubscribeThreadRpc,
-  DispatchApprovalResponseRpc,
   VcsRefreshStatusRpc,
   VcsListRefsRpc,
 );
@@ -762,9 +796,7 @@ const boundedWebSocket = (websocket: Socket.WebSocketLike): Socket.WebSocketLike
   };
 };
 
-const mapOrchestrationReadError = (message: string) => (error: unknown) => {
-  if (error instanceof T3CodeAdapterError) return error;
-  if (error instanceof RpcClientError.RpcClientError) return error;
+const mapAuthorizationError = (error: unknown): T3CodeAdapterError | null => {
   if (
     Predicate.hasProperty(error, "_tag") &&
     error._tag === "EnvironmentAuthorizationError" &&
@@ -777,6 +809,14 @@ const mapOrchestrationReadError = (message: string) => (error: unknown) => {
       status: null,
     });
   }
+  return null;
+};
+
+const mapOrchestrationReadError = (message: string) => (error: unknown) => {
+  if (error instanceof T3CodeAdapterError) return error;
+  if (error instanceof RpcClientError.RpcClientError) return error;
+  const authorizationError = mapAuthorizationError(error);
+  if (authorizationError !== null) return authorizationError;
   return new T3CodeAdapterError({
     kind: "transport",
     message,
@@ -807,6 +847,50 @@ const mapAuthenticatedChannelError = (error: unknown): T3CodeAdapterError => {
     kind: "wire_incompatible",
     message: "The T3Code authenticated WebSocket RPC contract was rejected.",
     uncertain: false,
+    status: null,
+  });
+};
+
+const mapDispatchCommandError = (error: unknown): T3CodeAdapterError => {
+  if (error instanceof T3CodeAdapterError) return error;
+  const reason = error instanceof RpcClientError.RpcClientError ? error.reason : error;
+  const authorizationError = mapAuthorizationError(reason);
+  if (authorizationError !== null) return authorizationError;
+  if (
+    Predicate.hasProperty(reason, "_tag") &&
+    reason._tag === "OrchestrationDispatchCommandError"
+  ) {
+    return new T3CodeAdapterError({
+      kind: "command_rejected",
+      message: "The T3Code instance rejected the dispatch command.",
+      uncertain: false,
+      status: null,
+    });
+  }
+  if (
+    Predicate.hasProperty(reason, "_tag") &&
+    reason._tag === "OrchestrationCommandInvariantError"
+  ) {
+    return new T3CodeAdapterError({
+      kind: "upstream_failure",
+      message: "T3Code rejected the submission command before accepting it.",
+      uncertain: false,
+      status: null,
+    });
+  }
+  if (error instanceof RpcClientError.RpcClientError) {
+    const mapped = mapAuthenticatedChannelError(error);
+    return new T3CodeAdapterError({
+      kind: mapped.kind,
+      message: mapped.message,
+      uncertain: true,
+      status: mapped.status,
+    });
+  }
+  return new T3CodeAdapterError({
+    kind: "upstream_failure",
+    message: "The T3Code submission outcome could not be established.",
+    uncertain: true,
     status: null,
   });
 };
@@ -1002,6 +1086,24 @@ export class T3CodeAdapterError extends Data.TaggedError("T3CodeAdapterError")<{
 export interface PairingExchangeInput {
   readonly endpoint: string;
   readonly pairingCode: string;
+}
+
+export interface DispatchTurnInput {
+  readonly endpoint: string;
+  readonly credential: string;
+  readonly expectedEnvironmentId: string;
+  readonly threadId: string;
+  readonly commandId: string;
+  readonly messageId: string;
+  readonly text: string;
+  readonly runtimeMode: RuntimeMode;
+  readonly interactionMode: InteractionMode;
+  readonly createdAt: string;
+  readonly onDispatchStart: () => void;
+}
+
+export interface DispatchTurnResult {
+  readonly sequence: number;
 }
 
 export interface WorktreeCreateRequest {
@@ -1261,6 +1363,9 @@ export interface VcsWorktreeRefListing {
 }
 
 export interface T3CodeAdapterService {
+  readonly dispatchTurn: (
+    input: DispatchTurnInput,
+  ) => Effect.Effect<DispatchTurnResult, T3CodeAdapterError>;
   readonly exchangePairingCode: (
     input: PairingExchangeInput,
   ) => Effect.Effect<StagedPairingToken, T3CodeAdapterError>;
@@ -1913,6 +2018,25 @@ const collectVcsRefPages = (options: {
 export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterService>()(
   "t3code-mcp/T3CodeAdapter",
 ) {
+  static readonly layerTest = (
+    service: Omit<T3CodeAdapterService, "dispatchTurn"> &
+      Partial<Pick<T3CodeAdapterService, "dispatchTurn">>,
+  ): Layer.Layer<T3CodeAdapter> =>
+    Layer.succeed(T3CodeAdapter, {
+      ...service,
+      dispatchTurn:
+        service.dispatchTurn ??
+        (() =>
+          Effect.fail(
+            new T3CodeAdapterError({
+              kind: "capacity",
+              message: "The test adapter does not support dispatch.",
+              uncertain: false,
+              status: null,
+            }),
+          )),
+    });
+
   static readonly layer = Layer.effect(
     T3CodeAdapter,
     Effect.gen(function* () {
@@ -2173,7 +2297,7 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
 
       const withRpcChannelBoundaries = <A, R>(
         effect: Effect.Effect<A, unknown, R>,
-        options?: { readonly uncertainOnTimeout?: boolean },
+        options?: { readonly timeoutIsUncertain?: boolean; readonly uncertainOnTimeout?: boolean },
       ): Effect.Effect<A, T3CodeAdapterError, R> =>
         effect.pipe(
           Effect.timeoutOrElse({
@@ -2183,7 +2307,7 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
                 new T3CodeAdapterError({
                   kind: "timeout",
                   message: "The authenticated T3Code RPC request timed out.",
-                  uncertain: options?.uncertainOnTimeout ?? false,
+                  uncertain: options?.timeoutIsUncertain ?? options?.uncertainOnTimeout ?? false,
                   status: null,
                 }),
               ),
@@ -2195,7 +2319,7 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
         endpoint: string,
         credential: string,
         use: (client: AdapterRpcClient) => Effect.Effect<A, unknown>,
-        options?: { readonly uncertainOnTimeout?: boolean },
+        options?: { readonly timeoutIsUncertain?: boolean; readonly uncertainOnTimeout?: boolean },
       ): Effect.Effect<A, T3CodeAdapterError> =>
         withRpcChannelBoundaries(
           Effect.scoped(
@@ -2533,6 +2657,60 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
           }),
         );
 
+      const dispatchTurn = (
+        input: DispatchTurnInput,
+      ): Effect.Effect<DispatchTurnResult, T3CodeAdapterError> =>
+        withCapacity(
+          Effect.gen(function* () {
+            const { descriptor, authorization } = yield* verifyEnvironmentSession(input);
+            if (descriptor.environmentId !== input.expectedEnvironmentId) {
+              return yield* Effect.fail(
+                new T3CodeAdapterError({
+                  kind: "identity_mismatch",
+                  message: "The T3Code environment changed before turn dispatch.",
+                  uncertain: false,
+                  status: null,
+                }),
+              );
+            }
+            if (authorization.operate !== "allowed") {
+              return yield* Effect.fail(
+                new T3CodeAdapterError({
+                  kind: "authorization",
+                  message: "The saved T3Code credential lacks the orchestration operate scope.",
+                  uncertain: false,
+                  status: null,
+                }),
+              );
+            }
+            const command = {
+              type: "thread.turn.start" as const,
+              commandId: input.commandId,
+              threadId: input.threadId,
+              message: {
+                messageId: input.messageId,
+                role: "user" as const,
+                text: input.text,
+                attachments: [],
+              },
+              runtimeMode: input.runtimeMode,
+              interactionMode: input.interactionMode,
+              createdAt: input.createdAt,
+            };
+            return yield* withAuthenticatedRpc(
+              input.endpoint,
+              input.credential,
+              (client) => {
+                input.onDispatchStart();
+                return client["orchestration.dispatchCommand"](command).pipe(
+                  Effect.mapError(mapDispatchCommandError),
+                );
+              },
+              { timeoutIsUncertain: true },
+            );
+          }),
+        );
+
       const refreshVcsStatus = (input: {
         readonly endpoint: string;
         readonly credential: string;
@@ -2691,6 +2869,7 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
         });
 
       return T3CodeAdapter.of({
+        dispatchTurn,
         exchangePairingCode,
         verifyCredential,
         inspectCredential,
