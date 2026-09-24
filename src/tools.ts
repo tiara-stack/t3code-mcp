@@ -79,6 +79,7 @@ import {
   ThreadOutputToolResultSchema,
   ThreadSubmitInputSchema,
   ThreadInterruptInputSchema,
+  ThreadStopSessionInputSchema,
   ThreadWaitInputSchema,
   ThreadWaitToolResultSchema,
   type ThreadWaitToolResult,
@@ -480,6 +481,17 @@ export const OperationGetTool = Tool.make("operation_get", {
   .annotate(Tool.Idempotent, true)
   .annotate(Tool.OpenWorld, false);
 
+// fallow-ignore-next-line unused-export
+export const ThreadStopSessionTool = asRegistrationMutation(
+  Tool.make("thread_stop_session", {
+    description:
+      "Request provider-session shutdown for one thread and wait for an observed stopped-session update tied to the captured session. A command acknowledgement, turn outcome, settlement, or replacement session does not establish shutdown. This does not stop the T3Code instance or establish process-tree termination or work completion.",
+    parameters: ThreadStopSessionInputSchema,
+    success: OperationToolResultSchema,
+  }),
+  { destructive: true, openWorld: true },
+);
+
 export const ServerToolkit = Toolkit.make(
   InstanceListTool,
   InstanceGetTool,
@@ -502,6 +514,7 @@ export const ServerToolkit = Toolkit.make(
   TurnWaitTool,
   InputRespondTool,
   OperationGetTool,
+  ThreadStopSessionTool,
 );
 
 const makeToolFailure = (
@@ -3632,12 +3645,15 @@ const retriableWaitObservationError = (
   return false;
 };
 
-const observationUnavailableWarnings = (message: string) => [
-  { code: "observation_unavailable", message },
-];
+type WaitObservationFailure =
+  | { readonly kind: "propagate" }
+  | { readonly kind: "unavailable" }
+  | { readonly kind: "retry"; readonly pollInterval: number };
 
-type WaitObservationFailure<Value> =
-  | { readonly kind: "unavailable"; readonly value: Value }
+type WaitObservationError = LocalStoreError | T3CodeAdapterError | ObservationError;
+type WaitObservationAttempt<Value, Unavailable> =
+  | { readonly kind: "observed"; readonly value: Value }
+  | { readonly kind: "unavailable"; readonly result: Unavailable }
   | { readonly kind: "retry"; readonly pollInterval: number };
 
 /**
@@ -3646,22 +3662,18 @@ type WaitObservationFailure<Value> =
  * remaining budget and retry, and anything else ends the wait so the caller
  * can report an unavailable observation.
  */
-const classifyWaitObservationFailure = <Value>(options: {
-  readonly failure: LocalStoreError | T3CodeAdapterError | ObservationError;
+const classifyWaitObservationFailure = (options: {
+  readonly failure: WaitObservationError;
   readonly firstEvaluation: boolean;
   readonly deadline: number;
   readonly pollInterval: number;
-  readonly unavailable: (failure: LocalStoreError | T3CodeAdapterError | ObservationError) => Value;
-}): Effect.Effect<
-  WaitObservationFailure<Value>,
-  LocalStoreError | T3CodeAdapterError | ObservationError
-> =>
+}): Effect.Effect<WaitObservationFailure, never> =>
   Effect.gen(function* () {
     const { failure, firstEvaluation, deadline, pollInterval } = options;
-    if (firstEvaluation) return yield* Effect.fail(failure);
+    if (firstEvaluation) return { kind: "propagate" } as const;
     const failedAt = yield* Clock.currentTimeMillis;
     if (!retriableWaitObservationError(failure) || failedAt >= deadline) {
-      return { kind: "unavailable", value: options.unavailable(failure) } as const;
+      return { kind: "unavailable" } as const;
     }
     yield* Effect.sleep(Duration.millis(Math.min(pollInterval, Math.max(0, deadline - failedAt))));
     return {
@@ -3670,34 +3682,84 @@ const classifyWaitObservationFailure = <Value>(options: {
     };
   });
 
-type WaitObservationAttempt<Value> =
-  | { readonly kind: "observed"; readonly detail: SynchronizedThreadDetail }
-  | WaitObservationFailure<Value>;
-
-const observeThreadForWait = <Value>(options: {
-  readonly observations: ObservationsService;
-  readonly instanceId: string;
-  readonly threadId: string;
+const observeForWait = <Value, Unavailable>(options: {
+  readonly observe: Effect.Effect<Value, WaitObservationError>;
   readonly firstEvaluation: boolean;
   readonly deadline: number;
   readonly pollInterval: number;
-  readonly unavailable: (failure: LocalStoreError | T3CodeAdapterError | ObservationError) => Value;
-}): Effect.Effect<
-  WaitObservationAttempt<Value>,
-  LocalStoreError | T3CodeAdapterError | ObservationError
-> =>
+  readonly unavailable: (failure: WaitObservationError) => Unavailable;
+}): Effect.Effect<WaitObservationAttempt<Value, Unavailable>, WaitObservationError> =>
   Effect.gen(function* () {
-    const result = yield* Effect.result(
-      options.observations.threadDetail(options.instanceId, options.threadId),
-    );
-    if (Result.isSuccess(result)) return { kind: "observed", detail: result.success } as const;
-    return yield* classifyWaitObservationFailure({
+    const result = yield* Effect.result(options.observe);
+    if (Result.isSuccess(result)) {
+      return { kind: "observed", value: result.success } as const;
+    }
+    const decision = yield* classifyWaitObservationFailure({
       failure: result.failure,
       firstEvaluation: options.firstEvaluation,
       deadline: options.deadline,
       pollInterval: options.pollInterval,
-      unavailable: options.unavailable,
     });
+    switch (decision.kind) {
+      case "propagate":
+        return yield* Effect.fail(result.failure);
+      case "unavailable":
+        return { kind: "unavailable", result: options.unavailable(result.failure) } as const;
+      case "retry":
+        return { kind: "retry", pollInterval: decision.pollInterval } as const;
+    }
+  });
+
+type WaitPollOutcome<Result, Pending> =
+  | { readonly kind: "result"; readonly result: Result }
+  | { readonly kind: "pending"; readonly pending: Pending };
+
+const runObservedThreadWaitLoop = <Result, Pending>(options: {
+  readonly waitMs: number;
+  readonly observe: () => Effect.Effect<SynchronizedThreadDetail, WaitObservationError>;
+  readonly unavailable: (failure: WaitObservationError) => Result;
+  readonly poll: (
+    detail: SynchronizedThreadDetail,
+  ) => Effect.Effect<WaitPollOutcome<Result, Pending>, WaitObservationError>;
+  readonly timedOut: (pending: Pending) => Result;
+}): Effect.Effect<Result, WaitObservationError> =>
+  Effect.gen(function* () {
+    const startedAt = yield* Clock.currentTimeMillis;
+    const deadline = startedAt + options.waitMs;
+    let firstEvaluation = true;
+    let pollInterval = THREAD_WAIT_POLL_INTERVAL_MILLIS;
+    while (true) {
+      const attempt = yield* observeForWait({
+        observe: options.observe(),
+        firstEvaluation,
+        deadline,
+        pollInterval,
+        unavailable: options.unavailable,
+      });
+      if (attempt.kind === "unavailable") return attempt.result;
+      if (attempt.kind === "retry") {
+        pollInterval = attempt.pollInterval;
+        continue;
+      }
+      const pollAttempt = yield* observeForWait({
+        observe: options.poll(attempt.value),
+        firstEvaluation,
+        deadline,
+        pollInterval,
+        unavailable: options.unavailable,
+      });
+      firstEvaluation = false;
+      if (pollAttempt.kind === "unavailable") return pollAttempt.result;
+      if (pollAttempt.kind === "retry") {
+        pollInterval = pollAttempt.pollInterval;
+        continue;
+      }
+      const outcome = pollAttempt.value;
+      if (outcome.kind === "result") return outcome.result;
+      const next = yield* sleepBeforeNextWaitPoll({ deadline, pollInterval });
+      if (next.elapsed) return options.timedOut(outcome.pending);
+      pollInterval = nextWaitPollInterval(pollInterval);
+    }
   });
 
 /**
@@ -3759,54 +3821,34 @@ const runThreadWait = (
         }
         return lookup;
       });
-    const startedAt = yield* Clock.currentTimeMillis;
-    const deadline = startedAt + waitMs;
-    let firstEvaluation = true;
-    let pollInterval = THREAD_WAIT_POLL_INTERVAL_MILLIS;
-    while (true) {
-      const observation = yield* observeThreadForWait({
-        observations,
-        instanceId,
-        threadId,
-        firstEvaluation,
-        deadline,
-        pollInterval,
-        unavailable: (failure) =>
-          threadWaitObservationResult({
-            condition,
-            observation: "unavailable",
-            state: null,
-            observations: [],
-            warnings: observationUnavailableWarnings(failure.message),
-          }),
-      });
-      if (observation.kind === "unavailable") return observation.value;
-      if (observation.kind === "retry") {
-        pollInterval = observation.pollInterval;
-        continue;
-      }
-      firstEvaluation = false;
-      const project = yield* projectLookupFor(observation.detail);
-      const poll = pollThreadWait({
-        thread,
-        condition,
-        cursor,
-        project,
-        detail: observation.detail,
-      });
-      if (poll.terminal !== null) return poll.terminal;
-      const next = yield* sleepBeforeNextWaitPoll({ deadline, pollInterval });
-      if (next.elapsed) {
-        return threadWaitObservationResult({
+    return yield* runObservedThreadWaitLoop({
+      waitMs,
+      observe: () => observations.threadDetail(instanceId, threadId),
+      unavailable: (failure) =>
+        threadWaitObservationResult({
+          condition,
+          observation: "unavailable",
+          state: null,
+          observations: [],
+          warnings: [{ code: "observation_unavailable", message: failure.message }],
+        }),
+      poll: (detail) =>
+        Effect.gen(function* () {
+          const project = yield* projectLookupFor(detail);
+          const poll = pollThreadWait({ thread, condition, cursor, project, detail });
+          return poll.terminal === null
+            ? ({ kind: "pending", pending: poll } as const)
+            : ({ kind: "result", result: poll.terminal } as const);
+        }),
+      timedOut: (poll) =>
+        threadWaitObservationResult({
           condition,
           observation: "timed_out",
           state: poll.state,
           observations: [poll.observation],
           warnings: [],
-        });
-      }
-      pollInterval = nextWaitPollInterval(pollInterval);
-    }
+        }),
+    });
   });
 
 const TURN_HISTORY_GAP_LIMITATION =
@@ -4099,56 +4141,36 @@ const runTurnWait = (options: {
   readonly turn: TurnReference;
   readonly waitMs: number;
 }): Effect.Effect<TurnWaitToolResult, LocalStoreError | T3CodeAdapterError | ObservationError> =>
-  Effect.gen(function* () {
-    const { store, observations, turn, waitMs } = options;
-    const { instanceId, threadId } = turn;
-    const startedAt = yield* Clock.currentTimeMillis;
-    const deadline = startedAt + waitMs;
-    let firstEvaluation = true;
-    let pollInterval = THREAD_WAIT_POLL_INTERVAL_MILLIS;
-    while (true) {
-      const observation = yield* observeThreadForWait({
-        observations,
-        instanceId,
-        threadId,
-        firstEvaluation,
-        deadline,
-        pollInterval,
-        unavailable: (failure) =>
-          turnWaitResult({
-            turn,
-            observation: "unavailable",
-            evaluation: unknownTurnWaitEvaluation,
-            pendingRequests: [],
-            observations: [],
-            warnings: observationUnavailableWarnings(failure.message),
-          }),
-      });
-      if (observation.kind === "unavailable") return observation.value;
-      if (observation.kind === "retry") {
-        pollInterval = observation.pollInterval;
-        continue;
-      }
-      firstEvaluation = false;
-      const outcome = yield* runTurnWaitPoll({
-        turn,
-        store,
-        detail: observation.detail,
-      });
-      if (outcome.kind === "result") return outcome.result;
-      const next = yield* sleepBeforeNextWaitPoll({ deadline, pollInterval });
-      if (next.elapsed) {
-        return turnWaitResult({
-          turn,
-          observation: "timed_out",
-          evaluation: outcome.poll.evaluation,
-          pendingRequests: outcome.poll.correlated,
-          observations: [outcome.poll.observation],
-          warnings: [],
-        });
-      }
-      pollInterval = nextWaitPollInterval(pollInterval);
-    }
+  runObservedThreadWaitLoop({
+    waitMs: options.waitMs,
+    observe: () =>
+      options.observations.threadDetail(options.turn.instanceId, options.turn.threadId),
+    unavailable: (failure) =>
+      turnWaitResult({
+        turn: options.turn,
+        observation: "unavailable",
+        evaluation: unknownTurnWaitEvaluation,
+        pendingRequests: [],
+        observations: [],
+        warnings: [{ code: "observation_unavailable", message: failure.message }],
+      }),
+    poll: (detail) =>
+      runTurnWaitPoll({ turn: options.turn, store: options.store, detail }).pipe(
+        Effect.map((outcome) =>
+          outcome.kind === "result"
+            ? ({ kind: "result", result: outcome.result } as const)
+            : ({ kind: "pending", pending: outcome.poll } as const),
+        ),
+      ),
+    timedOut: (poll) =>
+      turnWaitResult({
+        turn: options.turn,
+        observation: "timed_out",
+        evaluation: poll.evaluation,
+        pendingRequests: poll.correlated,
+        observations: [poll.observation],
+        warnings: [],
+      }),
   });
 
 const serverToolHandlers = ServerToolkit.of({
@@ -4556,6 +4578,11 @@ const serverToolHandlers = ServerToolkit.of({
       const operations = yield* Operations;
       return yield* operationMutationResult(operations.updateRegistration(input));
     }),
+  thread_stop_session: (input) =>
+    Effect.gen(function* () {
+      const operations = yield* Operations;
+      return yield* operationMutationResult(operations.stopThreadSession(input));
+    }),
   instance_pair: (input) =>
     Effect.gen(function* () {
       const operations = yield* Operations;
@@ -4633,6 +4660,7 @@ const operationMutatorTools: ReadonlySet<string> = new Set([
   "thread_submit",
   "approval_respond",
   "thread_interrupt",
+  "thread_stop_session",
 ]);
 
 // fallow-ignore-next-line complexity

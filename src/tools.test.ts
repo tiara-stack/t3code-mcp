@@ -21,6 +21,7 @@ import {
   type DiscoveredVcsWorktreeRefs,
   type InstanceDispatchTurnInput,
   type ObservedVcsWorktreeStatus,
+  type InstanceConnection,
 } from "./instance-connections";
 import {
   type DispatchTurnInput,
@@ -343,6 +344,15 @@ const fakeAdapterLayer = (
         new T3CodeAdapterError({
           kind: "capacity",
           message: "The test adapter does not support model listing.",
+          uncertain: false,
+          status: null,
+        }),
+      ),
+    stopThreadSession: () =>
+      Effect.fail(
+        new T3CodeAdapterError({
+          kind: "capacity",
+          message: "The test adapter does not support provider-session shutdown.",
           uncertain: false,
           status: null,
         }),
@@ -2898,6 +2908,15 @@ const projectFixtures = (
           status: null,
         }),
       ),
+    stopThreadSession: () =>
+      Effect.fail(
+        new T3CodeAdapterError({
+          kind: "capacity",
+          message: "The project test adapter does not stop sessions.",
+          uncertain: false,
+          status: null,
+        }),
+      ),
     subscribeShell: () =>
       Stream.fail(
         new T3CodeAdapterError({
@@ -4138,6 +4157,7 @@ const modelFixtures = (
       }
       return Effect.succeed({ providers, limitations: [] });
     },
+    stopThreadSession: () => Effect.die("not used"),
     subscribeShell: () =>
       Stream.fail(
         new T3CodeAdapterError({
@@ -4730,6 +4750,7 @@ describe("model_list", () => {
                   }),
                 ),
               listProviderModels: () => Effect.succeed({ providers: [], limitations }),
+              stopThreadSession: () => Effect.die("not used"),
               subscribeShell: () =>
                 Stream.fail(
                   new T3CodeAdapterError({
@@ -5020,6 +5041,18 @@ const shellSnapshotItem = (
 const shellSynchronizedItem: ShellStreamItem = { kind: "synchronized" };
 
 interface ThreadFixtureOptions {
+  acquireDelayMillis?: number;
+  streamSetupDelayMillis?: number;
+  sessionStopCommand?: {
+    readonly commandId: string;
+    readonly createdAt: string;
+  };
+  stopThreadSession?: (input: {
+    readonly instanceId: string;
+    readonly threadId: string;
+    readonly commandId: string;
+    readonly createdAt: string;
+  }) => Effect.Effect<{ readonly sequence: number }, T3CodeAdapterError>;
   activeStreams?: Readonly<
     Record<
       string,
@@ -5081,6 +5114,7 @@ interface ThreadFixtureOptions {
   dispatchTurn?: (
     input: InstanceDispatchTurnInput,
   ) => Effect.Effect<{ readonly sequence: number }, T3CodeAdapterError>;
+  readonly seenAcquires: Array<string>;
   readonly seenVcsRefs: Array<string>;
   readonly interruptCalls: Array<{
     readonly instanceId: string;
@@ -5134,22 +5168,28 @@ const threadConnections = (options: ThreadFixtureOptions) =>
           status: null,
         }),
       ),
-    acquire: (instanceId: string) =>
-      options.acquire === undefined
-        ? Effect.succeed({
-            instanceId,
-            revision: 1,
-            endpoint: `https://${instanceId}.test`,
-            environmentId: `environment-${instanceId}`,
-            credential: "test-token",
-            verified: {
-              environmentId: `environment-${instanceId}`,
-              serverVersion: "0.0.38",
-              scopes: ["orchestration:read", "orchestration:operate"],
-              capabilities: {},
-            },
-          })
-        : options.acquire(instanceId),
+    acquire: (instanceId) => {
+      options.seenAcquires.push(instanceId);
+      const environmentId = `environment-${instanceId}`;
+      const connection = {
+        instanceId,
+        revision: 1,
+        endpoint: `https://${instanceId}.test`,
+        environmentId,
+        credential: "test-token",
+        verified: {
+          environmentId,
+          serverVersion: "0.0.38",
+          scopes: ["orchestration:read", "orchestration:operate"],
+          capabilities: {},
+        },
+      } satisfies InstanceConnection;
+      const acquired = options.acquire ?? (() => Effect.succeed(connection));
+      const result = acquired(instanceId);
+      return options.acquireDelayMillis === undefined
+        ? result
+        : Effect.flatMap(Effect.sleep(Duration.millis(options.acquireDelayMillis)), () => result);
+    },
     dispatchTurn: (input) => {
       if (options.dispatchPreflightFailure !== undefined) {
         return Effect.fail(options.dispatchPreflightFailure);
@@ -5195,6 +5235,19 @@ const threadConnections = (options: ThreadFixtureOptions) =>
           status: null,
         }),
       ),
+    prepareThreadSessionStop: (instanceId) =>
+      Effect.succeed({
+        dispatch: (input) =>
+          options.stopThreadSession?.({ instanceId, ...input }) ??
+          Effect.fail(
+            new T3CodeAdapterError({
+              kind: "capacity",
+              message: "The thread test connection does not stop provider sessions.",
+              uncertain: false,
+              status: null,
+            }),
+          ),
+      }),
     discoverVcsRefs: (instanceId: string, repositoryPath: string) => {
       options.seenVcsRefs.push(`${instanceId}:${repositoryPath}`);
       const scripted = options.vcsRefStreams?.[instanceId];
@@ -5343,6 +5396,7 @@ const emptyThreadFixtures = () => {
     seenActive: [],
     seenArchived: [],
     seenThreads: [],
+    seenAcquires: [],
     seenVcsRefs: [],
     interruptCalls: [],
   };
@@ -14290,6 +14344,7 @@ describe("thread_interrupt", () => {
           message: "The credential verification response had an incompatible wire shape.",
           uncertain: true,
           status: null,
+          requiredScopes: ["orchestration:read"],
         });
         const result = yield* Effect.scoped(
           Effect.gen(function* () {
@@ -14329,7 +14384,11 @@ describe("thread_interrupt", () => {
 
         expect(result).toMatchObject({
           kind: "failure",
-          error: { kind: "incompatible_instance", uncertain: false },
+          error: {
+            kind: "incompatible_instance",
+            uncertain: false,
+            requiredScopes: ["orchestration:read"],
+          },
         });
       }),
     ),
@@ -15703,6 +15762,2667 @@ describe("thread_interrupt", () => {
           },
         });
         expect(ownerFixture.options.interruptCalls).toHaveLength(1);
+      }),
+    ),
+  );
+});
+
+describe("turn_wait", () => {
+  it.effect("meets an already-completed turn immediately with a zero budget", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.threadStreams = {
+          "instance-a:thread-a": () => turnWaitDetail(42, { turnId: "turn-a", state: "completed" }),
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("turn_wait", { turn: turnA, waitMs: 0 });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        const value = result[0]?.result as unknown as TurnWaitToolResultShape;
+        expect(value.result).toMatchObject({
+          kind: "ok",
+          value: {
+            target: turnA,
+            observation: "condition_met",
+            execution: "completed",
+            pendingRequests: [],
+          },
+        });
+        const execution = (
+          value.result as {
+            value: {
+              evidence: ReadonlyArray<{
+                kind: string;
+                sourceSequence: number | null;
+                detail: string;
+              }>;
+            };
+          }
+        ).value;
+        expect(execution.evidence).toMatchObject([
+          { kind: "snapshot", sourceSequence: 42, nativeEventId: null },
+        ]);
+        expect(execution.evidence[0]?.detail).toContain("published the latest turn as completed");
+        expect(value.observations).toMatchObject([
+          { instanceId: "instance-a", freshness: "fresh", sourceSequence: 42 },
+        ]);
+        expect(value.warnings).toEqual([]);
+        expect(result[0]?.encodedResult).toEqual(result[0]?.result);
+      }),
+    ),
+  );
+
+  it.effect("answers from retained evidence after supersession without replacing the target", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(41, [shellProjectFixture("project-a", "/srv/project-a")], []),
+              shellSynchronizedItem,
+            ),
+        };
+        let opens = 0;
+        options.threadStreams = {
+          "instance-a:thread-a": () => {
+            opens += 1;
+            return opens === 1
+              ? turnWaitDetail(10, { turnId: "turn-a", state: "completed" })
+              : turnWaitDetail(20, { turnId: "turn-b", state: "running" });
+          },
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            // The seeding read retains the completed-turn evidence before a
+            // newer turn exists.
+            yield* callTool("thread_get", {
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+            return yield* callTool("turn_wait", { turn: turnA, waitMs: 0 });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        const value = result[0]?.result as unknown as TurnWaitToolResultShape;
+        expect(value.result).toMatchObject({
+          kind: "ok",
+          value: {
+            target: turnA,
+            observation: "condition_met",
+            execution: "completed",
+          },
+        });
+        const outcome = (
+          value.result as { value: { evidence: ReadonlyArray<{ sourceSequence: number | null }> } }
+        ).value;
+        // The outcome came from the retained observation of turn-a, not from
+        // the newer turn-b currently running.
+        expect(outcome.evidence).toMatchObject([{ sourceSequence: 10 }]);
+        expect(value.observations).toMatchObject([
+          {
+            instanceId: "instance-a",
+            freshness: "fresh",
+            coverage: "partial",
+            limitations: [expect.stringMatching(/retained turn evidence/)],
+          },
+        ]);
+      }),
+    ),
+  );
+
+  it.effect("reports running and times out when the turn stays active", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const waitPollOpened = yield* Deferred.make<void>();
+        let opens = 0;
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(41, [shellProjectFixture("project-a", "/srv/project-a")], []),
+              shellSynchronizedItem,
+            ),
+        };
+        options.threadStreams = {
+          "instance-a:thread-a": () => {
+            opens += 1;
+            if (opens === 1) return turnWaitDetail(10, { turnId: "turn-a", state: "running" });
+            return Stream.unwrap(
+              Effect.gen(function* () {
+                if (opens === 2) yield* Deferred.succeed(waitPollOpened, undefined);
+                return Stream.make({ kind: "synchronized" as const });
+              }),
+            );
+          },
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            // The seeding read consumes the first open; the wait's first poll
+            // then resolves the gating deferred without a clock advance.
+            yield* callTool("thread_get", {
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+            const fiber = yield* Effect.forkDetach(
+              callTool("turn_wait", { turn: turnA, waitMs: 250 }),
+            );
+            yield* Deferred.await(waitPollOpened);
+            yield* TestClock.adjust(Duration.millis(150));
+            yield* TestClock.adjust(Duration.millis(150));
+            return yield* Fiber.join(fiber);
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        const value = result[0]?.result as unknown as TurnWaitToolResultShape;
+        expect(value.result).toMatchObject({
+          kind: "ok",
+          value: { target: turnA, observation: "timed_out", execution: "running" },
+        });
+        expect(value.observations).toMatchObject([{ freshness: "fresh" }]);
+      }),
+    ),
+  );
+
+  it.effect("reports a history gap when a newer turn supersedes the target mid-wait", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const waitPollOpened = yield* Deferred.make<void>();
+        const supersedeOpened = yield* Deferred.make<void>();
+        let opens = 0;
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(41, [shellProjectFixture("project-a", "/srv/project-a")], []),
+              shellSynchronizedItem,
+            ),
+        };
+        options.threadStreams = {
+          "instance-a:thread-a": () => {
+            opens += 1;
+            if (opens === 1) return turnWaitDetail(10, { turnId: "turn-a", state: "running" });
+            const stream = turnWaitDetail(20, { turnId: "turn-b", state: "running" });
+            return Stream.unwrap(
+              Effect.gen(function* () {
+                if (opens === 2) yield* Deferred.succeed(waitPollOpened, undefined);
+                if (opens === 3) yield* Deferred.succeed(supersedeOpened, undefined);
+                return stream;
+              }),
+            );
+          },
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            yield* callTool("thread_get", {
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+            const fiber = yield* Effect.forkDetach(
+              callTool("turn_wait", { turn: turnA, waitMs: 10_000 }),
+            );
+            yield* Deferred.await(waitPollOpened);
+            yield* advanceUntilDone(supersedeOpened, 3_000);
+            return yield* Fiber.join(fiber);
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        const value = result[0]?.result as unknown as TurnWaitToolResultShape;
+        expect(value.result).toMatchObject({
+          kind: "ok",
+          value: {
+            target: turnA,
+            observation: "history_gap",
+            execution: "outcome_unknown",
+          },
+        });
+        // Supersession alone never establishes completion; the gap is
+        // reported explicitly so the caller can resynchronize.
+        expect(value.observations).toMatchObject([
+          {
+            freshness: "fresh",
+            sourceSequence: 20,
+            limitations: [expect.stringMatching(/not covered by the current observation/)],
+          },
+        ]);
+      }),
+    ),
+  );
+
+  it.effect("never establishes completion from a projected turn state", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const waitPollOpened = yield* Deferred.make<void>();
+        let opens = 0;
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(41, [shellProjectFixture("project-a", "/srv/project-a")], []),
+              shellSynchronizedItem,
+            ),
+        };
+        options.threadStreams = {
+          "instance-a:thread-a": () => {
+            opens += 1;
+            if (opens === 1) return turnWaitDetail(10, { turnId: "turn-a", state: "running" });
+            return Stream.unwrap(
+              Effect.gen(function* () {
+                if (opens === 2) yield* Deferred.succeed(waitPollOpened, undefined);
+                // A session transition to idle projects the still-running
+                // turn as completed; the projection cannot establish
+                // completion.
+                return Stream.make(
+                  {
+                    kind: "session-set" as const,
+                    sequence: 11,
+                    session: {
+                      status: "idle" as const,
+                      activeTurnId: null,
+                      lastError: null,
+                      updatedAt: "2026-09-22T00:00:01.000Z",
+                    },
+                  },
+                  { kind: "synchronized" as const },
+                );
+              }),
+            );
+          },
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            yield* callTool("thread_get", {
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+            const fiber = yield* Effect.forkDetach(
+              callTool("turn_wait", { turn: turnA, waitMs: 250 }),
+            );
+            yield* Deferred.await(waitPollOpened);
+            yield* TestClock.adjust(Duration.millis(150));
+            yield* TestClock.adjust(Duration.millis(150));
+            return yield* Fiber.join(fiber);
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        const value = result[0]?.result as unknown as TurnWaitToolResultShape;
+        expect(value.result).toMatchObject({
+          kind: "ok",
+          value: { target: turnA, observation: "timed_out", execution: "outcome_unknown" },
+        });
+        const outcome = (value.result as { value: { evidence: ReadonlyArray<{ detail: string }> } })
+          .value;
+        expect(outcome.evidence[0]?.detail).toContain("projected from a session transition");
+      }),
+    ),
+  );
+
+  it.effect("keeps a superseded projected outcome unknown rather than completed", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        let opens = 0;
+        options.threadStreams = {
+          "instance-a:thread-a": () => {
+            opens += 1;
+            if (opens === 1) return turnWaitDetail(10, { turnId: "turn-a", state: "running" });
+            if (opens === 2) {
+              return Stream.make(
+                {
+                  kind: "session-set" as const,
+                  sequence: 11,
+                  session: {
+                    status: "idle" as const,
+                    activeTurnId: null,
+                    lastError: null,
+                    updatedAt: "2026-09-22T00:00:01.000Z",
+                  },
+                },
+                { kind: "synchronized" as const },
+              );
+            }
+            return turnWaitDetail(20, { turnId: "turn-b", state: "running" });
+          },
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            // Observe and retain the projected completion for turn-a before
+            // the newer turn supersedes it.
+            yield* callTool("thread_get", {
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+            yield* callTool("thread_get", {
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+            return yield* callTool("turn_wait", { turn: turnA, waitMs: 0 });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        const value = result[0]?.result as unknown as TurnWaitToolResultShape;
+        expect(value.result).toMatchObject({
+          kind: "ok",
+          value: { target: turnA, observation: "history_gap", execution: "outcome_unknown" },
+        });
+      }),
+    ),
+  );
+
+  it.effect("meets interrupted and failed from supported terminal states", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        let opens = 0;
+        options.threadStreams = {
+          "instance-a:thread-a": () => {
+            opens += 1;
+            if (opens === 1) return turnWaitDetail(10, { turnId: "turn-a", state: "interrupted" });
+            return turnWaitDetail(20, { turnId: "turn-a", state: "error" });
+          },
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const interrupted = yield* callTool("turn_wait", { turn: turnA, waitMs: 0 });
+            const failed = yield* callTool("turn_wait", { turn: turnA, waitMs: 0 });
+            return { interrupted, failed };
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        const interrupted = result.interrupted[0]?.result as unknown as TurnWaitToolResultShape;
+        expect(interrupted.result).toMatchObject({
+          kind: "ok",
+          value: { target: turnA, observation: "condition_met", execution: "interrupted" },
+        });
+        const failed = result.failed[0]?.result as unknown as TurnWaitToolResultShape;
+        expect(failed.result).toMatchObject({
+          kind: "ok",
+          value: { target: turnA, observation: "condition_met", execution: "failed" },
+        });
+      }),
+    ),
+  );
+
+  it.effect("meets awaiting_approval only from a correlated unresolved request", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            turnWaitDetail(42, { turnId: "turn-a", state: "running" }, [
+              approvalActivity("activity-1", "request-1", {
+                options: [{ decision: "accept", label: "Accept" }],
+                turnId: "turn-a",
+              }),
+              // Uncorrelated requests never establish the exact-turn outcome.
+              approvalActivity("activity-2", "request-2", {
+                options: [{ decision: "accept", label: "Accept" }],
+                turnId: null,
+              }),
+            ]),
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("turn_wait", { turn: turnA, waitMs: 0 });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        const value = result[0]?.result as unknown as TurnWaitToolResultShape;
+        expect(value.result).toMatchObject({
+          kind: "ok",
+          value: {
+            target: turnA,
+            observation: "condition_met",
+            execution: "awaiting_approval",
+            pendingRequests: [
+              {
+                activityId: "activity-1",
+                state: "pending",
+                actionable: true,
+                pendingRequestId: "request-1",
+              },
+            ],
+          },
+        });
+        const outcome = (
+          value.result as { value: { evidence: ReadonlyArray<{ nativeEventId: string | null }> } }
+        ).value;
+        expect(outcome.evidence).toMatchObject([{ nativeEventId: "activity-1" }]);
+      }),
+    ),
+  );
+
+  it.effect("never manufactures awaiting from a request whose lifecycle is unknown", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            turnWaitDetail(42, { turnId: "turn-a", state: "running" }, [
+              // Turn-correlated but missing its native request identity: the
+              // lifecycle is unknown, so it cannot establish awaiting.
+              approvalActivity("activity-1", null, { turnId: "turn-a" }),
+            ]),
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("turn_wait", { turn: turnA, waitMs: 0 });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        const value = result[0]?.result as unknown as TurnWaitToolResultShape;
+        expect(value.result).toMatchObject({
+          kind: "ok",
+          value: {
+            target: turnA,
+            observation: "timed_out",
+            execution: "running",
+            pendingRequests: [
+              {
+                activityId: "activity-1",
+                state: "unknown",
+                actionable: false,
+                pendingRequestId: null,
+              },
+            ],
+          },
+        });
+      }),
+    ),
+  );
+
+  it.effect("meets awaiting_input from a correlated unresolved input request", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            turnWaitDetail(42, { turnId: "turn-a", state: "running" }, [
+              inputActivity(
+                "activity-1",
+                "request-1",
+                [
+                  {
+                    id: "q1",
+                    header: "Target",
+                    question: "Which target?",
+                    options: [{ label: "staging", description: "Staging env" }],
+                    multiSelect: false,
+                  },
+                ],
+                { turnId: "turn-a" },
+              ),
+            ]),
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("turn_wait", { turn: turnA, waitMs: 0 });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        const value = result[0]?.result as unknown as TurnWaitToolResultShape;
+        expect(value.result).toMatchObject({
+          kind: "ok",
+          value: {
+            target: turnA,
+            observation: "condition_met",
+            execution: "awaiting_input",
+            pendingRequests: [
+              {
+                activityId: "activity-1",
+                state: "pending",
+                actionable: true,
+                pendingRequestId: "request-1",
+              },
+            ],
+          },
+        });
+      }),
+    ),
+  );
+
+  it.effect("ignores uncorrelated and resolved requests for the exact-turn outcome", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const waitPollOpened = yield* Deferred.make<void>();
+        let opens = 0;
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(41, [shellProjectFixture("project-a", "/srv/project-a")], []),
+              shellSynchronizedItem,
+            ),
+        };
+        options.threadStreams = {
+          "instance-a:thread-a": () => {
+            opens += 1;
+            if (opens === 1) {
+              return turnWaitDetail(10, { turnId: "turn-a", state: "running" }, [
+                // Correlated but already resolved: not awaiting.
+                approvalActivity("activity-1", "request-1", {
+                  options: [{ decision: "accept", label: "Accept" }],
+                  turnId: "turn-a",
+                }),
+                resolvedApprovalActivity("activity-2", "request-1"),
+                // Uncorrelated unresolved requests stay at thread scope.
+                inputActivity("activity-3", "request-3", [
+                  {
+                    id: "q1",
+                    header: "Target",
+                    question: "Which target?",
+                    options: [{ label: "staging", description: "Staging env" }],
+                    multiSelect: false,
+                  },
+                ]),
+              ]);
+            }
+            return Stream.unwrap(
+              Effect.gen(function* () {
+                if (opens === 2) yield* Deferred.succeed(waitPollOpened, undefined);
+                return Stream.make({ kind: "synchronized" as const });
+              }),
+            );
+          },
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            yield* callTool("thread_get", {
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+            const fiber = yield* Effect.forkDetach(
+              callTool("turn_wait", { turn: turnA, waitMs: 250 }),
+            );
+            yield* Deferred.await(waitPollOpened);
+            yield* TestClock.adjust(Duration.millis(150));
+            yield* TestClock.adjust(Duration.millis(150));
+            return yield* Fiber.join(fiber);
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        const value = result[0]?.result as unknown as TurnWaitToolResultShape;
+        expect(value.result).toMatchObject({
+          kind: "ok",
+          value: {
+            target: turnA,
+            observation: "timed_out",
+            execution: "running",
+            pendingRequests: [{ activityId: "activity-1", state: "resolved", actionable: false }],
+          },
+        });
+      }),
+    ),
+  );
+
+  it.effect("meets completion restated by a replacement snapshot", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const waitPollOpened = yield* Deferred.make<void>();
+        const replacementOpened = yield* Deferred.make<void>();
+        let opens = 0;
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(41, [shellProjectFixture("project-a", "/srv/project-a")], []),
+              shellSynchronizedItem,
+            ),
+        };
+        options.threadStreams = {
+          "instance-a:thread-a": () => {
+            opens += 1;
+            if (opens === 1) return turnWaitDetail(10, { turnId: "turn-a", state: "running" });
+            const stream = turnWaitDetail(20, { turnId: "turn-a", state: "completed" });
+            return Stream.unwrap(
+              Effect.gen(function* () {
+                if (opens === 2) yield* Deferred.succeed(waitPollOpened, undefined);
+                if (opens === 3) yield* Deferred.succeed(replacementOpened, undefined);
+                return stream;
+              }),
+            );
+          },
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            yield* callTool("thread_get", {
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+            const fiber = yield* Effect.forkDetach(
+              callTool("turn_wait", { turn: turnA, waitMs: 10_000 }),
+            );
+            yield* Deferred.await(waitPollOpened);
+            yield* advanceUntilDone(replacementOpened, 3_000);
+            return yield* Fiber.join(fiber);
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        const value = result[0]?.result as unknown as TurnWaitToolResultShape;
+        expect(value.result).toMatchObject({
+          kind: "ok",
+          value: { target: turnA, observation: "condition_met", execution: "completed" },
+        });
+        expect(value.observations).toMatchObject([{ freshness: "fresh", sourceSequence: 20 }]);
+      }),
+    ),
+  );
+
+  it.effect("retries a transient mid-wait observation loss and meets completion", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const waitPollOpened = yield* Deferred.make<void>();
+        const failureOpened = yield* Deferred.make<void>();
+        const replayOpened = yield* Deferred.make<void>();
+        let opens = 0;
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(41, [shellProjectFixture("project-a", "/srv/project-a")], []),
+              shellSynchronizedItem,
+            ),
+        };
+        options.threadStreams = {
+          "instance-a:thread-a": () => {
+            opens += 1;
+            if (opens === 1) return turnWaitDetail(10, { turnId: "turn-a", state: "running" });
+            if (opens === 2) {
+              return Stream.unwrap(
+                Effect.gen(function* () {
+                  yield* Deferred.succeed(waitPollOpened, undefined);
+                  return Stream.make({ kind: "synchronized" as const });
+                }),
+              );
+            }
+            if (opens === 3) {
+              return Stream.unwrap(
+                Effect.gen(function* () {
+                  yield* Deferred.succeed(failureOpened, undefined);
+                  return Stream.fail(
+                    new T3CodeAdapterError({
+                      kind: "transport",
+                      message: "The transient test observation failure.",
+                      uncertain: false,
+                      status: null,
+                    }),
+                  );
+                }),
+              );
+            }
+            return Stream.unwrap(
+              Effect.gen(function* () {
+                yield* Deferred.succeed(replayOpened, undefined);
+                return turnWaitDetail(20, { turnId: "turn-a", state: "completed" });
+              }),
+            );
+          },
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            yield* callTool("thread_get", {
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+            const fiber = yield* Effect.forkDetach(
+              callTool("turn_wait", { turn: turnA, waitMs: 10_000 }),
+            );
+            yield* Deferred.await(waitPollOpened);
+            yield* advanceUntilDone(failureOpened, 2_000);
+            yield* advanceUntilDone(replayOpened, 3_000);
+            return yield* Fiber.join(fiber);
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        const value = result[0]?.result as unknown as TurnWaitToolResultShape;
+        expect(value.result).toMatchObject({
+          kind: "ok",
+          value: { target: turnA, observation: "condition_met", execution: "completed" },
+        });
+        expect(value.observations).toMatchObject([{ freshness: "fresh", sourceSequence: 20 }]);
+      }),
+    ),
+  );
+
+  it.effect("ends as unavailable when the registration changes mid-wait", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const waitPollOpened = yield* Deferred.make<void>();
+        const snapshotEmitted = yield* Deferred.make<void>();
+        const gate = yield* Deferred.make<void>();
+        let opens = 0;
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(41, [shellProjectFixture("project-a", "/srv/project-a")], []),
+              shellSynchronizedItem,
+            ),
+        };
+        options.threadStreams = {
+          "instance-a:thread-a": () => {
+            opens += 1;
+            if (opens === 1) return turnWaitDetail(10, { turnId: "turn-a", state: "running" });
+            if (opens === 2) {
+              return Stream.unwrap(
+                Effect.gen(function* () {
+                  yield* Deferred.succeed(waitPollOpened, undefined);
+                  return Stream.make({ kind: "synchronized" as const });
+                }),
+              );
+            }
+            return Stream.concat(
+              Stream.make({
+                kind: "snapshot" as const,
+                snapshot: {
+                  snapshotSequence: 11,
+                  thread: observedThreadFixture("thread-a", {
+                    latestTurn: { turnId: "turn-a", state: "running" },
+                  }),
+                  page: null,
+                },
+              }),
+              Stream.fromEffect(
+                Effect.gen(function* () {
+                  yield* Deferred.succeed(snapshotEmitted, undefined);
+                  yield* Deferred.await(gate);
+                }),
+              ).pipe(Stream.map(() => ({ kind: "synchronized" as const }))),
+            );
+          },
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            yield* callTool("thread_get", {
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+            const fiber = yield* Effect.forkDetach(
+              callTool("turn_wait", { turn: turnA, waitMs: 10_000 }),
+            );
+            yield* Deferred.await(waitPollOpened);
+            yield* advanceUntilDone(snapshotEmitted, 2_000);
+            const store = yield* LocalStore;
+            yield* store.putRegistration({
+              instanceId: "instance-a",
+              alias: "Instance a renamed",
+              endpoint: "https://a.test",
+              environmentId: null,
+              connection: "connected",
+              lastObservedAt: null,
+              credential: "secret-a",
+            });
+            yield* Deferred.succeed(gate, undefined);
+            return yield* Fiber.join(fiber);
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        const value = result[0]?.result as unknown as TurnWaitToolResultShape;
+        expect(value.result).toMatchObject({
+          kind: "ok",
+          value: { target: turnA, observation: "unavailable", execution: "outcome_unknown" },
+        });
+        expect(value.observations).toEqual([]);
+        expect(value.warnings).toMatchObject([
+          { code: "observation_unavailable", message: expect.stringMatching(/changed while/) },
+        ]);
+      }),
+    ),
+  );
+
+  it.effect(
+    "cancellation releases the wait's observation scope without touching upstream work",
+    () =>
+      withDatabasePath((databasePath) =>
+        Effect.gen(function* () {
+          const { options, connections } = emptyThreadFixtures();
+          const waitPollOpened = yield* Deferred.make<void>();
+          const acquired = yield* Deferred.make<void>();
+          const released = yield* Deferred.make<void>();
+          let opens = 0;
+          options.activeStreams = {
+            "instance-a": () =>
+              Stream.make(
+                shellSnapshotItem(41, [shellProjectFixture("project-a", "/srv/project-a")], []),
+                shellSynchronizedItem,
+              ),
+          };
+          options.threadStreams = {
+            "instance-a:thread-a": () => {
+              opens += 1;
+              if (opens === 1) return turnWaitDetail(10, { turnId: "turn-a", state: "running" });
+              if (opens === 2) {
+                return Stream.unwrap(
+                  Effect.gen(function* () {
+                    yield* Deferred.succeed(waitPollOpened, undefined);
+                    return Stream.make({ kind: "synchronized" as const });
+                  }),
+                );
+              }
+              if (opens === 3) {
+                // A synchronization that stays in flight until the wait is
+                // cancelled; its scope must release on interruption.
+                return Stream.unwrap(
+                  Effect.acquireRelease(Deferred.succeed(acquired, undefined), () =>
+                    Deferred.succeed(released, undefined),
+                  ).pipe(
+                    Effect.as(
+                      Stream.concat(
+                        Stream.make({
+                          kind: "snapshot" as const,
+                          snapshot: {
+                            snapshotSequence: 11,
+                            thread: observedThreadFixture("thread-a", {
+                              latestTurn: { turnId: "turn-a", state: "running" },
+                            }),
+                            page: null,
+                          },
+                        }),
+                        Stream.never,
+                      ),
+                    ),
+                  ),
+                );
+              }
+              return turnWaitDetail(12, { turnId: "turn-a", state: "running" });
+            },
+          };
+          yield* Effect.scoped(
+            Effect.gen(function* () {
+              yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+              yield* callTool("thread_get", {
+                thread: { instanceId: "instance-a", threadId: "thread-a" },
+              });
+              const fiber = yield* Effect.forkDetach(
+                callTool("turn_wait", { turn: turnA, waitMs: 30_000 }),
+              );
+              yield* Deferred.await(waitPollOpened);
+              yield* advanceUntilDone(acquired, 3_000);
+              yield* Fiber.interrupt(fiber);
+              yield* Deferred.await(released);
+              const exit = yield* Fiber.await(fiber);
+              expect(Exit.isFailure(exit)).toBe(true);
+              // The thread stays observable for later reads; cancelling the
+              // wait dispatched nothing.
+              const read = yield* callTool("turn_wait", { turn: turnA, waitMs: 0 });
+              const value = read[0]?.result as unknown as TurnWaitToolResultShape;
+              expect(value.result).toMatchObject({ kind: "ok" });
+            }).pipe(Effect.provide(appLayer(databasePath, connections))),
+          );
+        }),
+      ),
+  );
+
+  it.effect("reports a history gap after historical evidence eviction", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(41, [shellProjectFixture("project-a", "/srv/project-a")], []),
+              shellSynchronizedItem,
+            ),
+        };
+        let opens = 0;
+        options.threadStreams = {
+          "instance-a:thread-a": () => {
+            opens += 1;
+            return opens === 1
+              ? turnWaitDetail(10, { turnId: "turn-a", state: "running" })
+              : turnWaitDetail(20, { turnId: "turn-b", state: "running" });
+          },
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* TestClock.setTime(1_000_000);
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            // The first read retains turn-a's evidence at the original
+            // observation time.
+            yield* callTool("thread_get", {
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+            const store = yield* LocalStore;
+            const before = yield* store.findTurnEvidence(turnA);
+            expect(before).toMatchObject({ state: "running", projected: false });
+            yield* TestClock.adjust(Duration.millis(THIRTY_DAYS_MILLIS + 1));
+            // The superseding read retains turn-b's evidence past the
+            // thirty-day window, evicting turn-a's expired row.
+            yield* callTool("thread_get", {
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+            const after = yield* store.findTurnEvidence(turnA);
+            expect(after).toBeNull();
+            return yield* callTool("turn_wait", { turn: turnA, waitMs: 0 });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        const value = result[0]?.result as unknown as TurnWaitToolResultShape;
+        expect(value.result).toMatchObject({
+          kind: "ok",
+          value: { target: turnA, observation: "history_gap", execution: "outcome_unknown" },
+        });
+      }),
+    ),
+  );
+
+  it.effect(
+    "evicts oldest evidence within the budget while pinning unresolved-operation threads",
+    () =>
+      withDatabasePath((databasePath) =>
+        Effect.gen(function* () {
+          const rowBytes = new TextEncoder().encode(
+            JSON.stringify({
+              i: "instance-a",
+              t: "thread-a",
+              u: "turn-1",
+              s: "running",
+              p: false,
+              q: 1,
+              o: "2026-09-22T00:00:00.000Z",
+              d: "The thread detail snapshot published the latest turn as running.",
+            }),
+          ).byteLength;
+          const layer = LocalStore.layer({
+            databasePath,
+            turnEvidenceBudgetBytes: rowBytes * 2 + 1,
+          });
+          yield* Effect.scoped(
+            Effect.gen(function* () {
+              yield* TestClock.setTime(1_000_000);
+              const store = yield* LocalStore;
+              const record = (threadId: string, turnId: string, sequence: number) =>
+                store.recordTurnEvidence({
+                  turn: { instanceId: "instance-a", threadId, turnId },
+                  state: "running",
+                  projected: false,
+                  sourceSequence: sequence,
+                  observedAt: `2026-09-22T00:00:0${sequence}.000Z`,
+                  detail: "The thread detail snapshot published the latest turn as running.",
+                });
+              yield* record("thread-a", "turn-1", 1);
+              yield* record("thread-b", "turn-2", 2);
+              const turnRef = (threadId: string, turnId: string) => ({
+                instanceId: "instance-a",
+                threadId,
+                turnId,
+              });
+
+              // An unresolved operation targeting thread-a pins its evidence.
+              yield* store.admitOperation({
+                requestId: "pinning-request",
+                tool: "thread_interrupt",
+                fingerprint: "fingerprint-pinning",
+                processNonce: "process-pinning",
+                admittedAt: "2026-09-22T00:00:00.000Z",
+                intent: { instanceId: "instance-a", threadId: "thread-a" },
+                completionMeans: "interruption_observed",
+              });
+              yield* store.updateOperation("pinning-request", {
+                now: "2026-09-22T00:00:00.000Z",
+                target: { instanceId: "instance-a", threadId: "thread-a" },
+              });
+
+              // The third row overflows the budget: the oldest unpinned row is
+              // evicted, and the pinned thread-a row stays.
+              yield* record("thread-c", "turn-3", 3);
+              expect(yield* store.findTurnEvidence(turnRef("thread-a", "turn-1"))).not.toBeNull();
+              expect(yield* store.findTurnEvidence(turnRef("thread-b", "turn-2"))).toBeNull();
+              expect(yield* store.findTurnEvidence(turnRef("thread-c", "turn-3"))).not.toBeNull();
+              const pinned = yield* store.getOperation("pinning-request");
+              expect(pinned?.record.target).toEqual({
+                instanceId: "instance-a",
+                threadId: "thread-a",
+              });
+
+              // Resolving the operation removes the pin: the next retained row
+              // evicts thread-a's evidence.
+              yield* store.updateOperation("pinning-request", {
+                now: "2026-09-22T00:00:01.000Z",
+                state: "completed",
+              });
+              yield* record("thread-d", "turn-4", 4);
+              expect(yield* store.findTurnEvidence(turnRef("thread-a", "turn-1"))).toBeNull();
+              expect(yield* store.findTurnEvidence(turnRef("thread-d", "turn-4"))).not.toBeNull();
+            }).pipe(Effect.provide(layer)),
+          );
+        }),
+      ),
+  );
+
+  it.effect("pins evidence by exact turn when an unresolved operation names one", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const rowBytes = new TextEncoder().encode(
+          JSON.stringify({
+            i: "instance-a",
+            t: "thread-a",
+            u: "turn-1",
+            s: "running",
+            p: false,
+            q: 1,
+            o: "2026-09-22T00:00:00.000Z",
+            d: "The thread detail snapshot published the latest turn as running.",
+          }),
+        ).byteLength;
+        const layer = LocalStore.layer({
+          databasePath,
+          turnEvidenceBudgetBytes: rowBytes * 2 + 1,
+        });
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* TestClock.setTime(1_000_000);
+            const store = yield* LocalStore;
+            const record = (threadId: string, turnId: string, sequence: number) =>
+              store.recordTurnEvidence({
+                turn: { instanceId: "instance-a", threadId, turnId },
+                state: "running",
+                projected: false,
+                sourceSequence: sequence,
+                observedAt: `2026-09-22T00:00:0${sequence}.000Z`,
+                detail: "The thread detail snapshot published the latest turn as running.",
+              });
+            const turnRef = (threadId: string, turnId: string) => ({
+              instanceId: "instance-a",
+              threadId,
+              turnId,
+            });
+            yield* record("thread-a", "turn-1", 1);
+            yield* record("thread-a", "turn-2", 2);
+
+            // An unresolved operation correlated to turn-1 pins only that
+            // turn: the other turns of the same thread stay evictable, so a
+            // forgotten outcome_unknown record cannot pin the whole thread
+            // forever.
+            yield* store.admitOperation({
+              requestId: "turn-pinning-request",
+              tool: "thread_interrupt",
+              fingerprint: "fingerprint-turn-pinning",
+              processNonce: "process-turn-pinning",
+              admittedAt: "2026-09-22T00:00:00.000Z",
+              intent: { instanceId: "instance-a", threadId: "thread-a" },
+              completionMeans: "interruption_observed",
+            });
+            yield* store.updateOperation("turn-pinning-request", {
+              now: "2026-09-22T00:00:00.000Z",
+              target: { instanceId: "instance-a", threadId: "thread-a" },
+              correlation: {
+                kind: "established",
+                turn: turnRef("thread-a", "turn-1"),
+                evidence: [],
+              },
+            });
+
+            yield* record("thread-b", "turn-3", 3);
+            expect(yield* store.findTurnEvidence(turnRef("thread-a", "turn-1"))).not.toBeNull();
+            expect(yield* store.findTurnEvidence(turnRef("thread-a", "turn-2"))).toBeNull();
+            expect(yield* store.findTurnEvidence(turnRef("thread-b", "turn-3"))).not.toBeNull();
+          }).pipe(Effect.provide(layer)),
+        );
+      }),
+    ),
+  );
+
+  it.effect("pins nothing thread-wide from an outcome_unknown operation without a turn", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const rowBytes = new TextEncoder().encode(
+          JSON.stringify({
+            i: "instance-a",
+            t: "thread-a",
+            u: "turn-1",
+            s: "running",
+            p: false,
+            q: 1,
+            o: "2026-09-22T00:00:00.000Z",
+            d: "The thread detail snapshot published the latest turn as running.",
+          }),
+        ).byteLength;
+        const layer = LocalStore.layer({
+          databasePath,
+          turnEvidenceBudgetBytes: rowBytes * 2 + 1,
+        });
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* TestClock.setTime(1_000_000);
+            const store = yield* LocalStore;
+            const record = (threadId: string, turnId: string, sequence: number) =>
+              store.recordTurnEvidence({
+                turn: { instanceId: "instance-a", threadId, turnId },
+                state: "running",
+                projected: false,
+                sourceSequence: sequence,
+                observedAt: `2026-09-22T00:00:0${sequence}.000Z`,
+                detail: "The thread detail snapshot published the latest turn as running.",
+              });
+            const turnRef = (threadId: string, turnId: string) => ({
+              instanceId: "instance-a",
+              threadId,
+              turnId,
+            });
+            yield* record("thread-a", "turn-1", 1);
+            yield* record("thread-a", "turn-2", 2);
+
+            // A terminal-to-reconciliation record with a thread-only target
+            // never evaluates thread evidence again, so it pins nothing and
+            // the oldest row stays evictable.
+            yield* store.admitOperation({
+              requestId: "unknown-pinning-request",
+              tool: "thread_interrupt",
+              fingerprint: "fingerprint-unknown-pinning",
+              processNonce: "process-unknown-pinning",
+              admittedAt: "2026-09-22T00:00:00.000Z",
+              intent: { instanceId: "instance-a", threadId: "thread-a" },
+              completionMeans: "interruption_observed",
+            });
+            yield* store.updateOperation("unknown-pinning-request", {
+              now: "2026-09-22T00:00:00.000Z",
+              target: { instanceId: "instance-a", threadId: "thread-a" },
+              state: "outcome_unknown",
+            });
+
+            yield* record("thread-b", "turn-3", 3);
+            expect(yield* store.findTurnEvidence(turnRef("thread-a", "turn-1"))).toBeNull();
+            expect(yield* store.findTurnEvidence(turnRef("thread-a", "turn-2"))).not.toBeNull();
+            expect(
+              yield* store.findTurnEvidence({
+                instanceId: "instance-a",
+                threadId: "thread-b",
+                turnId: "turn-3",
+              }),
+            ).not.toBeNull();
+          }).pipe(Effect.provide(layer)),
+        );
+      }),
+    ),
+  );
+
+  it.effect("never evicts the row its own recording just wrote", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const rowBytes = new TextEncoder().encode(
+          JSON.stringify({
+            i: "instance-a",
+            t: "thread-a",
+            u: "turn-1",
+            s: "running",
+            p: false,
+            q: 1,
+            o: "2026-09-22T00:00:00.000Z",
+            d: "The thread detail snapshot published the latest turn as running.",
+          }),
+        ).byteLength;
+        const layer = LocalStore.layer({
+          databasePath,
+          turnEvidenceBudgetBytes: rowBytes * 2 + 1,
+        });
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* TestClock.setTime(1_000_000);
+            const store = yield* LocalStore;
+            const record = (turnId: string, sequence: number, second: number) =>
+              store.recordTurnEvidence({
+                turn: { instanceId: "instance-a", threadId: "thread-a", turnId },
+                state: "running",
+                projected: false,
+                sourceSequence: sequence,
+                observedAt: `2026-09-22T00:00:${String(second).padStart(2, "0")}.000Z`,
+                detail: "The thread detail snapshot published the latest turn as running.",
+              });
+            const turnRef = (turnId: string) => ({
+              instanceId: "instance-a",
+              threadId: "thread-a",
+              turnId,
+            });
+            yield* record("turn-1", 1, 10);
+            yield* record("turn-2", 2, 20);
+            // A lagging observation arrives with an older observation time:
+            // its own recording must not evict it to make room, so the next
+            // oldest unpinned row goes instead.
+            yield* record("turn-3", 3, 5);
+            expect(yield* store.findTurnEvidence(turnRef("turn-3"))).not.toBeNull();
+            expect(yield* store.findTurnEvidence(turnRef("turn-1"))).toBeNull();
+            expect(yield* store.findTurnEvidence(turnRef("turn-2"))).not.toBeNull();
+          }).pipe(Effect.provide(layer)),
+        );
+      }),
+    ),
+  );
+
+  it.effect("reads retained turn evidence after the database is reopened", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const store = yield* LocalStore;
+            yield* store.recordTurnEvidence({
+              turn: turnA,
+              state: "completed",
+              projected: false,
+              sourceSequence: 42,
+              observedAt: "2026-09-22T00:00:00.000Z",
+              detail: "The thread detail snapshot published the latest turn as completed.",
+            });
+          }).pipe(Effect.provide(LocalStore.layer({ databasePath }))),
+        );
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const store = yield* LocalStore;
+            const record = yield* store.findTurnEvidence(turnA);
+            expect(record).toEqual({
+              turn: turnA,
+              state: "completed",
+              projected: false,
+              sourceSequence: 42,
+              observedAt: "2026-09-22T00:00:00.000Z",
+              detail: "The thread detail snapshot published the latest turn as completed.",
+            });
+          }).pipe(Effect.provide(LocalStore.layer({ databasePath }))),
+        );
+      }),
+    ),
+  );
+
+  it.effect("fails a wait on a missing registration with a typed error", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const result = yield* Effect.scoped(
+          callTool("turn_wait", { turn: turnA, waitMs: 0 }).pipe(
+            Effect.provide(appLayer(databasePath, connections)),
+          ),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "registration_not_found" } },
+        });
+        expect(options.seenThreads).toEqual([]);
+      }),
+    ),
+  );
+
+  it.effect("rejects out-of-range wait budgets and unknown arguments before dispatch", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        for (const input of [
+          { turn: turnA, waitMs: 30_001 },
+          { turn: turnA, unexpected: true },
+        ]) {
+          const exit = yield* Effect.exit(
+            Effect.scoped(
+              callTool("turn_wait", input).pipe(
+                Effect.provide(appLayer(databasePath, connections)),
+              ),
+            ),
+          );
+          expect(Exit.isFailure(exit)).toBe(true);
+          if (Exit.isSuccess(exit)) return;
+          expect(String(exit.cause)).toContain("Invalid parameters for tool 'turn_wait'");
+        }
+        expect(options.seenThreads).toEqual([]);
+      }),
+    ),
+  );
+
+  it.live("observes a live turn outcome across real time", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        let opens = 0;
+        let completed = false;
+        options.threadStreams = {
+          "instance-a:thread-a": () => {
+            opens += 1;
+            if (opens === 1) return turnWaitDetail(10, { turnId: "turn-a", state: "running" });
+            if (!completed) return Stream.make({ kind: "synchronized" as const });
+            return turnWaitDetail(11, { turnId: "turn-a", state: "completed" });
+          },
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const fiber = yield* Effect.forkDetach(
+              callTool("turn_wait", { turn: turnA, waitMs: 2_000 }),
+            );
+            yield* Effect.sleep(Duration.millis(150));
+            completed = true;
+            return yield* Fiber.join(fiber);
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        const value = result[0]?.result as unknown as TurnWaitToolResultShape;
+        expect(value.result).toMatchObject({
+          kind: "ok",
+          value: { target: turnA, observation: "condition_met", execution: "completed" },
+        });
+        expect(value.observations).toMatchObject([{ freshness: "fresh", sourceSequence: 11 }]);
+      }),
+    ),
+  );
+});
+
+describe("thread_stop_session", () => {
+  it.effect("marks connection acquisition errors as definitely not dispatched", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const uncertainAcquisitionError = new T3CodeAdapterError({
+          kind: "wire_incompatible",
+          message: "The credential verification response had an incompatible wire shape.",
+          uncertain: true,
+          status: null,
+          requiredScopes: ["orchestration:read"],
+        });
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const connections = yield* InstanceConnections;
+            return yield* connections.prepareThreadSessionStop("instance-a").pipe(
+              Effect.map(() => ({ kind: "success" as const })),
+              Effect.catchTag("T3CodeAdapterError", (error) =>
+                Effect.succeed({ kind: "failure" as const, error }),
+              ),
+            );
+          }).pipe(
+            Effect.provide(
+              appLayer(
+                databasePath,
+                InstanceConnections.layerWithAdapter(
+                  fakeAdapterLayer(
+                    { current: null },
+                    {},
+                    undefined,
+                    undefined,
+                    undefined,
+                    uncertainAcquisitionError,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+
+        expect(result).toMatchObject({
+          kind: "failure",
+          error: {
+            kind: "incompatible_instance",
+            message: "The credential verification response had an incompatible wire shape.",
+            uncertain: false,
+            status: null,
+            requiredScopes: ["orchestration:read"],
+          },
+        });
+      }),
+    ),
+  );
+
+  it.live("completes only after the matching stop request and stopped-session event", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        let threadReads = 0;
+        let shutdownResumeSequence: number | null = null;
+        options.threadStreams = {
+          "instance-a:thread-a": (streamOptions) => {
+            threadReads += 1;
+            if (threadReads === 1) {
+              return detailSnapshotStream(
+                42,
+                observedThreadFixture("thread-a", {
+                  session: {
+                    status: "ready",
+                    activeTurnId: null,
+                    lastError: null,
+                    updatedAt: "2026-09-23T12:00:00.000Z",
+                  },
+                }),
+              );
+            }
+            if (threadReads === 2) {
+              return Stream.make(
+                {
+                  kind: "session-set" as const,
+                  sequence: 43,
+                  session: {
+                    status: "ready" as const,
+                    activeTurnId: null,
+                    lastError: null,
+                    updatedAt: "2026-09-23T12:00:00.000Z",
+                  },
+                },
+                { kind: "synchronized" as const },
+              );
+            }
+            shutdownResumeSequence = streamOptions?.afterSequence ?? null;
+            const command = options.sessionStopCommand;
+            if (command === undefined) {
+              return Stream.fail(
+                new T3CodeAdapterError({
+                  kind: "transport",
+                  message: "The test stop command was not dispatched.",
+                  uncertain: false,
+                  status: null,
+                }),
+              );
+            }
+            return Stream.make(
+              {
+                kind: "session-stop-requested" as const,
+                sequence: 44,
+                threadId: "thread-a",
+                commandId: command.commandId,
+                createdAt: command.createdAt,
+              },
+              { kind: "detail-event" as const, sequence: 45 },
+              {
+                kind: "session-stop-requested" as const,
+                sequence: 44,
+                threadId: "thread-a",
+                commandId: command.commandId,
+                createdAt: command.createdAt,
+              },
+              {
+                kind: "session-set" as const,
+                sequence: 46,
+                session: {
+                  status: "stopped" as const,
+                  activeTurnId: null,
+                  lastError: null,
+                  updatedAt: command.createdAt,
+                },
+              },
+              { kind: "synchronized" as const },
+            );
+          },
+        };
+        options.stopThreadSession = (input) => {
+          options.sessionStopCommand = input;
+          return Effect.succeed({ sequence: 43 });
+        };
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_stop_session", {
+              requestId: "stop-session-1",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        const value = result[0]?.result as unknown as {
+          readonly result: {
+            readonly kind: "ok";
+            readonly value: {
+              readonly state: string;
+              readonly tool: string;
+              readonly completionMeans: string;
+              readonly dispatch: string;
+              readonly target: unknown;
+              readonly steps: ReadonlyArray<{ readonly name: string; readonly state: string }>;
+            };
+          };
+        };
+        expect(value.result).toMatchObject({
+          kind: "ok",
+          value: {
+            requestId: "stop-session-1",
+            tool: "thread_stop_session",
+            state: "completed",
+            completionMeans: "session_shutdown_observed",
+            dispatch: "accepted",
+            target: { instanceId: "instance-a", threadId: "thread-a" },
+            steps: [
+              { name: "capture_provider_session", state: "succeeded" },
+              { name: "dispatch_provider_session_stop", state: "succeeded" },
+              { name: "observe_provider_session_shutdown", state: "succeeded" },
+            ],
+          },
+        });
+        expect(JSON.stringify(value.result.value)).not.toContain("providerInstanceId");
+        expect(JSON.stringify(value.result.value)).not.toContain("secret-a");
+        expect(shutdownResumeSequence).toBe(43);
+        expect(threadReads).toBe(3);
+      }),
+    ),
+  );
+
+  it.live("does not dispatch when a thread already has no provider session", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        let dispatches = 0;
+        options.threadStreams = {
+          "instance-a:thread-a": () => detailSnapshotStream(42, observedThreadFixture("thread-a")),
+        };
+        options.stopThreadSession = () => {
+          dispatches += 1;
+          return Effect.succeed({ sequence: 43 });
+        };
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_stop_session", {
+              requestId: "stop-session-absent",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "completed",
+              dispatch: "not_dispatched",
+              steps: [
+                { name: "capture_provider_session", state: "succeeded" },
+                { name: "dispatch_provider_session_stop", state: "skipped" },
+                { name: "observe_provider_session_shutdown", state: "already_absent" },
+              ],
+            },
+          },
+        });
+        expect(dispatches).toBe(0);
+      }),
+    ),
+  );
+
+  it.live("treats an already-stopped session as complete without another request", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        let dispatches = 0;
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              42,
+              observedThreadFixture("thread-a", {
+                session: {
+                  status: "stopped",
+                  activeTurnId: null,
+                  lastError: null,
+                  updatedAt: "2026-09-23T12:00:00.000Z",
+                },
+              }),
+            ),
+        };
+        options.stopThreadSession = () => {
+          dispatches += 1;
+          return Effect.succeed({ sequence: 43 });
+        };
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_stop_session", {
+              requestId: "stop-session-already-stopped",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: { state: "completed", dispatch: "not_dispatched" },
+          },
+        });
+        expect(dispatches).toBe(0);
+      }),
+    ),
+  );
+
+  it.live("preserves a skipped dispatch when the captured session changes in preflight", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        let threadReads = 0;
+        let dispatches = 0;
+        options.threadStreams = {
+          "instance-a:thread-a": () => {
+            threadReads += 1;
+            if (threadReads === 1) {
+              return detailSnapshotStream(
+                42,
+                observedThreadFixture("thread-a", {
+                  session: {
+                    status: "ready",
+                    activeTurnId: null,
+                    lastError: null,
+                    updatedAt: "2026-09-23T12:00:00.000Z",
+                  },
+                }),
+              );
+            }
+            return Stream.make(
+              {
+                kind: "session-set" as const,
+                sequence: 43,
+                session: {
+                  status: "ready" as const,
+                  activeTurnId: null,
+                  lastError: null,
+                  updatedAt: "2026-09-23T12:00:05.000Z",
+                },
+              },
+              { kind: "synchronized" as const },
+            );
+          },
+        };
+        options.stopThreadSession = () => {
+          dispatches += 1;
+          return Effect.succeed({ sequence: 44 });
+        };
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_stop_session", {
+              requestId: "stop-session-preflight-change",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "failed",
+              dispatch: "not_dispatched",
+              steps: [
+                { name: "capture_provider_session", state: "succeeded" },
+                { name: "dispatch_provider_session_stop", state: "skipped" },
+                { name: "observe_provider_session_shutdown", state: "failed" },
+              ],
+            },
+          },
+        });
+        expect(dispatches).toBe(0);
+      }),
+    ),
+  );
+
+  it.live("does not mistake a replacement session for the captured session", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        let threadReads = 0;
+        options.threadStreams = {
+          "instance-a:thread-a": () => {
+            threadReads += 1;
+            if (threadReads === 1) {
+              return detailSnapshotStream(
+                42,
+                observedThreadFixture("thread-a", {
+                  session: {
+                    status: "ready",
+                    activeTurnId: null,
+                    lastError: null,
+                    updatedAt: "2026-09-23T12:00:00.000Z",
+                  },
+                }),
+              );
+            }
+            if (threadReads === 2) return Stream.make({ kind: "synchronized" as const });
+            const command = options.sessionStopCommand;
+            if (command === undefined) {
+              return Stream.fail(
+                new T3CodeAdapterError({
+                  kind: "transport",
+                  message: "The test stop command was not dispatched.",
+                  uncertain: false,
+                  status: null,
+                }),
+              );
+            }
+            return Stream.make(
+              {
+                kind: "session-set" as const,
+                sequence: 43,
+                session: {
+                  status: "ready" as const,
+                  activeTurnId: null,
+                  lastError: null,
+                  updatedAt: "2026-09-23T12:00:05.000Z",
+                },
+              },
+              {
+                kind: "session-stop-requested" as const,
+                sequence: 44,
+                threadId: "thread-a",
+                commandId: command.commandId,
+                createdAt: command.createdAt,
+              },
+              {
+                kind: "session-set" as const,
+                sequence: 45,
+                session: {
+                  status: "stopped" as const,
+                  activeTurnId: null,
+                  lastError: null,
+                  updatedAt: command.createdAt,
+                },
+              },
+              { kind: "synchronized" as const },
+            );
+          },
+        };
+        options.stopThreadSession = (input) => {
+          options.sessionStopCommand = input;
+          return Effect.succeed({ sequence: 44 });
+        };
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_stop_session", {
+              requestId: "stop-session-replaced",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "outcome_unknown",
+              dispatch: "accepted",
+              error: { code: "stale_state", retry: "reconcile_first" },
+            },
+          },
+        });
+      }),
+    ),
+  );
+
+  it.live("records an upstream command rejection as a failed operation", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        let threadReads = 0;
+        options.threadStreams = {
+          "instance-a:thread-a": () => {
+            threadReads += 1;
+            if (threadReads === 1) {
+              return detailSnapshotStream(
+                42,
+                observedThreadFixture("thread-a", {
+                  session: {
+                    status: "ready",
+                    activeTurnId: null,
+                    lastError: null,
+                    updatedAt: "2026-09-23T12:00:00.000Z",
+                  },
+                }),
+              );
+            }
+            return Stream.make({ kind: "synchronized" as const });
+          },
+        };
+        options.stopThreadSession = () =>
+          Effect.fail(
+            new T3CodeAdapterError({
+              kind: "command_rejected",
+              message: "T3Code rejected the provider-session stop command.",
+              uncertain: false,
+              status: null,
+            }),
+          );
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_stop_session", {
+              requestId: "stop-session-rejected",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "failed",
+              dispatch: "rejected",
+              error: { code: "upstream_failure" },
+            },
+          },
+        });
+        expect(threadReads).toBe(2);
+      }),
+    ),
+  );
+
+  it.live("marks certain stop transport failures safe to read", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        let threadReads = 0;
+        options.threadStreams = {
+          "instance-a:thread-a": () => {
+            threadReads += 1;
+            return threadReads === 1
+              ? detailSnapshotStream(
+                  42,
+                  observedThreadFixture("thread-a", {
+                    session: {
+                      status: "ready",
+                      activeTurnId: null,
+                      lastError: null,
+                      updatedAt: "2026-09-23T12:00:00.000Z",
+                    },
+                  }),
+                )
+              : Stream.make({ kind: "synchronized" as const });
+          },
+        };
+        options.stopThreadSession = () =>
+          Effect.fail(
+            new T3CodeAdapterError({
+              kind: "transport",
+              message: "The stop channel failed before dispatch.",
+              uncertain: false,
+              status: null,
+            }),
+          );
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_stop_session", {
+              requestId: "stop-session-certain-transport",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "failed",
+              dispatch: "not_dispatched",
+              error: { code: "unavailable", retry: "safe_read", details: {} },
+            },
+          },
+        });
+        expect(threadReads).toBe(2);
+      }),
+    ),
+  );
+
+  it.live("finalizes a persisted dispatch rejection without starting another watch", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const requestId = "stop-session-rejected-before-finalize";
+        const admittedAt = new Date(Date.now() - 120_000).toISOString();
+        const dispatchError = {
+          code: "upstream_failure" as const,
+          message: "T3Code rejected the provider-session stop command.",
+          retry: "change_request" as const,
+          details: {},
+        };
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const store = yield* LocalStore;
+            yield* store.admitOperation({
+              requestId,
+              tool: "thread_stop_session",
+              fingerprint: "stop-session-rejected-before-finalize-fingerprint",
+              processNonce: "previous-process",
+              admittedAt,
+              intent: {
+                instanceId: "instance-a",
+                threadId: "thread-a",
+                sessionStop: {
+                  instanceId: "instance-a",
+                  threadId: "thread-a",
+                  afterSequence: 42,
+                  session: {
+                    providerInstanceId: null,
+                    status: "ready",
+                    activeTurnId: null,
+                    lastError: null,
+                    updatedAt: admittedAt,
+                  },
+                  commandId: "rejected-stop-command",
+                  createdAt: admittedAt,
+                  steps: { capture: 0, dispatch: 1, shutdown: 2 },
+                },
+              },
+              target: { instanceId: "instance-a", threadId: "thread-a" },
+              completionMeans: "session_shutdown_observed",
+              steps: [
+                "capture_provider_session",
+                "dispatch_provider_session_stop",
+                "observe_provider_session_shutdown",
+              ],
+            });
+            yield* store.updateOperation(requestId, {
+              now: admittedAt,
+              state: "pending",
+              dispatch: "rejected",
+              commandId: "rejected-stop-command",
+              stepPosition: 1,
+              stepState: "failed",
+              stepError: dispatchError,
+              error: dispatchError,
+              recovery: "new_explicit_request",
+            });
+            return yield* callTool("operation_get", { requestId });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              operation: {
+                state: "failed",
+                dispatch: "rejected",
+                error: { code: "upstream_failure" },
+              },
+            },
+          },
+        });
+        expect(options.seenThreads).toEqual([]);
+      }),
+    ),
+  );
+
+  it.live("preserves a persisted pre-dispatch error when recovering an uncaptured stop", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const requestId = "stop-session-uncaptured-pre-dispatch-error";
+        const admittedAt = new Date(Date.now() - 120_000).toISOString();
+        const dispatchError = {
+          code: "operate_denied" as const,
+          message: "The instance denied session control before dispatch.",
+          retry: "change_request" as const,
+          details: {},
+        };
+        const stepError = {
+          code: "unavailable" as const,
+          message: "A less specific dispatch error was persisted on the step.",
+          retry: "reconcile_first" as const,
+          details: {},
+        };
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const store = yield* LocalStore;
+            yield* store.admitOperation({
+              requestId,
+              tool: "thread_stop_session",
+              fingerprint: "stop-session-uncaptured-pre-dispatch-fingerprint",
+              processNonce: "previous-process",
+              admittedAt,
+              intent: { instanceId: "instance-a", threadId: "thread-a" },
+              target: { instanceId: "instance-a", threadId: "thread-a" },
+              completionMeans: "session_shutdown_observed",
+              steps: [
+                "capture_provider_session",
+                "dispatch_provider_session_stop",
+                "observe_provider_session_shutdown",
+              ],
+            });
+            yield* store.updateOperation(requestId, {
+              now: admittedAt,
+              state: "pending",
+              dispatch: "not_dispatched",
+              stepPosition: 1,
+              stepState: "failed",
+              stepError,
+              error: dispatchError,
+              recovery: "new_explicit_request",
+            });
+            return yield* callTool("operation_get", { requestId });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              operation: {
+                state: "failed",
+                dispatch: "not_dispatched",
+                error: {
+                  code: "operate_denied",
+                  message: "The instance denied session control before dispatch.",
+                },
+              },
+            },
+          },
+        });
+        expect(options.seenThreads).toEqual([]);
+      }),
+    ),
+  );
+
+  it.live("does not rewrite an unknown receipt for repeated same-code history gaps", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        let threadReads = 0;
+        let historyGapSequence = 43;
+        options.threadStreams = {
+          "instance-a:thread-a": () => {
+            threadReads += 1;
+            if (threadReads === 1) {
+              return detailSnapshotStream(
+                42,
+                observedThreadFixture("thread-a", {
+                  session: {
+                    status: "ready",
+                    activeTurnId: null,
+                    lastError: null,
+                    updatedAt: "2026-09-23T12:00:00.000Z",
+                  },
+                }),
+              );
+            }
+            if (threadReads === 2) return Stream.make({ kind: "synchronized" as const });
+            return Stream.make(
+              {
+                kind: "snapshot" as const,
+                snapshot: {
+                  snapshotSequence: historyGapSequence,
+                  thread: observedThreadFixture("thread-a", {
+                    session: {
+                      status: "ready",
+                      activeTurnId: null,
+                      lastError: null,
+                      updatedAt: "2026-09-23T12:00:00.000Z",
+                    },
+                  }),
+                  page: null,
+                },
+              },
+              { kind: "synchronized" as const },
+            );
+          },
+        };
+        options.stopThreadSession = (input) => {
+          options.sessionStopCommand = input;
+          return Effect.succeed({ sequence: 43 });
+        };
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const first = yield* callTool("thread_stop_session", {
+              requestId: "stop-session-history-gap-repeat",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+            const store = yield* LocalStore;
+            const before = yield* store.getOperation("stop-session-history-gap-repeat");
+            historyGapSequence = 44;
+            const repeated = yield* callTool("operation_get", {
+              requestId: "stop-session-history-gap-repeat",
+            });
+            const after = yield* store.getOperation("stop-session-history-gap-repeat");
+            return { first, repeated, before, after };
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result.first[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "outcome_unknown",
+              dispatch: "accepted",
+              completionMeans: "session_shutdown_observed",
+              error: { code: "unavailable", retry: "reconcile_first" },
+            },
+          },
+        });
+        expect(result.repeated[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              operation: {
+                state: "outcome_unknown",
+                dispatch: "accepted",
+                error: { code: "unavailable", retry: "reconcile_first" },
+              },
+            },
+          },
+        });
+        expect(result.after?.record.revision).toBe(result.before?.record.revision);
+        expect(result.after?.record.evidence).toEqual(result.before?.record.evidence);
+      }),
+    ),
+  );
+
+  it.live("recovers a lost command reply from matching shutdown evidence", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        let threadReads = 0;
+        options.threadStreams = {
+          "instance-a:thread-a": () => {
+            threadReads += 1;
+            if (threadReads === 1) {
+              return detailSnapshotStream(
+                42,
+                observedThreadFixture("thread-a", {
+                  session: {
+                    status: "ready",
+                    activeTurnId: null,
+                    lastError: null,
+                    updatedAt: "2026-09-23T12:00:00.000Z",
+                  },
+                }),
+              );
+            }
+            if (threadReads === 2) return Stream.make({ kind: "synchronized" as const });
+            const command = options.sessionStopCommand;
+            if (command === undefined) {
+              return Stream.fail(
+                new T3CodeAdapterError({
+                  kind: "transport",
+                  message: "The test stop command was not dispatched.",
+                  uncertain: false,
+                  status: null,
+                }),
+              );
+            }
+            return Stream.make(
+              {
+                kind: "session-stop-requested" as const,
+                sequence: 43,
+                threadId: "thread-a",
+                commandId: command.commandId,
+                createdAt: command.createdAt,
+              },
+              {
+                kind: "session-set" as const,
+                sequence: 44,
+                session: {
+                  status: "stopped" as const,
+                  activeTurnId: null,
+                  lastError: null,
+                  updatedAt: command.createdAt,
+                },
+              },
+              { kind: "synchronized" as const },
+            );
+          },
+        };
+        options.stopThreadSession = (input) => {
+          options.sessionStopCommand = input;
+          return Effect.fail(
+            new T3CodeAdapterError({
+              kind: "transport",
+              message: "The dispatch reply was lost.",
+              uncertain: true,
+              status: null,
+            }),
+          );
+        };
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_stop_session", {
+              requestId: "stop-session-lost-reply",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "completed",
+              dispatch: "accepted",
+              completionMeans: "session_shutdown_observed",
+              steps: [
+                { state: "succeeded" },
+                { state: "succeeded", error: null },
+                { state: "succeeded", error: null },
+              ],
+            },
+          },
+        });
+      }),
+    ),
+  );
+
+  it.live("uses matching shutdown evidence after a wire-incompatible reply", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        let threadReads = 0;
+        options.threadStreams = {
+          "instance-a:thread-a": () => {
+            threadReads += 1;
+            if (threadReads === 1) {
+              return detailSnapshotStream(
+                42,
+                observedThreadFixture("thread-a", {
+                  session: {
+                    status: "ready",
+                    activeTurnId: null,
+                    lastError: null,
+                    updatedAt: "2026-09-23T12:00:00.000Z",
+                  },
+                }),
+              );
+            }
+            if (threadReads === 2) return Stream.make({ kind: "synchronized" as const });
+            const command = options.sessionStopCommand;
+            if (command === undefined) {
+              return Stream.fail(
+                new T3CodeAdapterError({
+                  kind: "transport",
+                  message: "The test stop command was not dispatched.",
+                  uncertain: false,
+                  status: null,
+                }),
+              );
+            }
+            return Stream.make(
+              {
+                kind: "session-stop-requested" as const,
+                sequence: 43,
+                threadId: "thread-a",
+                commandId: command.commandId,
+                createdAt: command.createdAt,
+              },
+              {
+                kind: "session-set" as const,
+                sequence: 44,
+                session: {
+                  status: "stopped" as const,
+                  activeTurnId: null,
+                  lastError: null,
+                  updatedAt: command.createdAt,
+                },
+              },
+              { kind: "synchronized" as const },
+            );
+          },
+        };
+        options.stopThreadSession = (input) => {
+          options.sessionStopCommand = input;
+          return Effect.fail(
+            new T3CodeAdapterError({
+              kind: "wire_incompatible",
+              message: "The stop command response did not match the pinned wire schema.",
+              uncertain: true,
+              status: null,
+            }),
+          );
+        };
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_stop_session", {
+              requestId: "stop-session-wire-mismatch",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: { state: "completed", dispatch: "accepted" },
+          },
+        });
+      }),
+    ),
+  );
+
+  it.live("throttles repeated recovery watches for an unknown stop", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        let threadReads = 0;
+        let dispatches = 0;
+        let readsAtDispatch = 0;
+        options.threadStreams = {
+          "instance-a:thread-a": () => {
+            threadReads += 1;
+            if (threadReads === 1) {
+              return detailSnapshotStream(
+                42,
+                observedThreadFixture("thread-a", {
+                  session: {
+                    status: "ready",
+                    activeTurnId: null,
+                    lastError: null,
+                    updatedAt: "2026-09-23T12:00:00.000Z",
+                  },
+                }),
+              );
+            }
+            return Stream.make({ kind: "synchronized" as const });
+          },
+        };
+        options.stopThreadSession = (input) => {
+          dispatches += 1;
+          readsAtDispatch = threadReads;
+          options.sessionStopCommand = input;
+          return Effect.succeed({ sequence: 43 });
+        };
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const first = yield* callTool("thread_stop_session", {
+              requestId: "stop-session-recovery-throttle",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+            const readsAfterDispatch = threadReads;
+            const recovered = yield* callTool("operation_get", {
+              requestId: "stop-session-recovery-throttle",
+            });
+            const readsAfterRecovery = threadReads;
+            const repeated = yield* callTool("operation_get", {
+              requestId: "stop-session-recovery-throttle",
+            });
+            return {
+              first,
+              recovered,
+              repeated,
+              readsAtDispatch,
+              readsAfterDispatch,
+              readsAfterRecovery,
+            };
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result.first[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "outcome_unknown",
+              dispatch: "accepted",
+              error: { code: "unavailable", retry: "reconcile_first" },
+            },
+          },
+        });
+        for (const response of [result.recovered, result.repeated]) {
+          expect(response[0]?.result).toMatchObject({
+            result: {
+              kind: "ok",
+              value: {
+                operation: {
+                  state: "outcome_unknown",
+                  dispatch: "accepted",
+                  error: { code: "unavailable", retry: "reconcile_first" },
+                },
+              },
+            },
+          });
+        }
+        expect(result.readsAfterDispatch).toBeGreaterThan(result.readsAtDispatch);
+        expect(result.readsAfterRecovery).toBeGreaterThan(result.readsAfterDispatch);
+        expect(threadReads).toBe(result.readsAfterRecovery);
+        expect(dispatches).toBe(1);
+      }),
+    ),
+  );
+
+  it.live("recovers a later authoritative shutdown from operation_get", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        let threadReads = 0;
+        let dispatches = 0;
+        let publishLateEvidence = false;
+        options.threadStreams = {
+          "instance-a:thread-a": () => {
+            threadReads += 1;
+            if (threadReads === 1) {
+              return detailSnapshotStream(
+                42,
+                observedThreadFixture("thread-a", {
+                  session: {
+                    status: "ready",
+                    activeTurnId: null,
+                    lastError: null,
+                    updatedAt: "2026-09-23T12:00:00.000Z",
+                  },
+                }),
+              );
+            }
+            if (threadReads === 2) return Stream.make({ kind: "synchronized" as const });
+            const command = options.sessionStopCommand;
+            if (threadReads === 3) return Stream.make({ kind: "synchronized" as const });
+            if (command === undefined) {
+              return Stream.fail(
+                new T3CodeAdapterError({
+                  kind: "transport",
+                  message: "The test stop command was not dispatched.",
+                  uncertain: false,
+                  status: null,
+                }),
+              );
+            }
+            if (!publishLateEvidence) {
+              return Stream.make({ kind: "synchronized" as const });
+            }
+            const shutdownEvents = Stream.make(
+              {
+                kind: "session-stop-requested" as const,
+                sequence: 43,
+                threadId: "thread-a",
+                commandId: command.commandId,
+                createdAt: command.createdAt,
+              },
+              {
+                kind: "session-set" as const,
+                sequence: 44,
+                session: {
+                  status: "stopped" as const,
+                  activeTurnId: null,
+                  lastError: null,
+                  updatedAt: command.createdAt,
+                },
+              },
+              { kind: "synchronized" as const },
+            );
+            return options.streamSetupDelayMillis === undefined
+              ? shutdownEvents
+              : Stream.fromEffect(
+                  Effect.sleep(Duration.millis(options.streamSetupDelayMillis)),
+                ).pipe(Stream.flatMap(() => shutdownEvents));
+          },
+        };
+        options.stopThreadSession = (input) => {
+          dispatches += 1;
+          options.sessionStopCommand = input;
+          return Effect.succeed({ sequence: 43 });
+        };
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const first = yield* callTool("thread_stop_session", {
+              requestId: "stop-session-late-evidence",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+            publishLateEvidence = true;
+            options.acquireDelayMillis = 1_100;
+            options.streamSetupDelayMillis = 1_100;
+            const recovered = yield* callTool("operation_get", {
+              requestId: "stop-session-late-evidence",
+            });
+            return { first, recovered };
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result.first[0]?.result).toMatchObject({
+          result: { kind: "ok", value: { state: "outcome_unknown", dispatch: "accepted" } },
+        });
+        expect(result.recovered[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: { operation: { state: "completed", dispatch: "accepted" } },
+          },
+        });
+        expect(options.seenAcquires).toContain("instance-a");
+        expect(dispatches).toBe(1);
+      }),
+    ),
+  );
+
+  it.live("continues the admitted shutdown after the tool caller cancels", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const dispatchStarted = yield* Deferred.make<void>();
+        const watcherStarted = yield* Deferred.make<void>();
+        const publishShutdown = yield* Deferred.make<void>();
+        let threadReads = 0;
+        options.threadStreams = {
+          "instance-a:thread-a": () => {
+            threadReads += 1;
+            if (threadReads === 1) {
+              return detailSnapshotStream(
+                42,
+                observedThreadFixture("thread-a", {
+                  session: {
+                    status: "ready",
+                    activeTurnId: null,
+                    lastError: null,
+                    updatedAt: "2026-09-23T12:00:00.000Z",
+                  },
+                }),
+              );
+            }
+            if (threadReads === 2) return Stream.make({ kind: "synchronized" as const });
+            const command = options.sessionStopCommand;
+            if (command === undefined) {
+              return Stream.fail(
+                new T3CodeAdapterError({
+                  kind: "transport",
+                  message: "The test stop command was not dispatched.",
+                  uncertain: false,
+                  status: null,
+                }),
+              );
+            }
+            return Stream.fromEffect(Deferred.succeed(watcherStarted, undefined)).pipe(
+              Stream.flatMap(() =>
+                Stream.fromEffect(Deferred.await(publishShutdown)).pipe(
+                  Stream.flatMap(() =>
+                    Stream.make(
+                      {
+                        kind: "session-stop-requested" as const,
+                        sequence: 43,
+                        threadId: "thread-a",
+                        commandId: command.commandId,
+                        createdAt: command.createdAt,
+                      },
+                      {
+                        kind: "session-set" as const,
+                        sequence: 44,
+                        session: {
+                          status: "stopped" as const,
+                          activeTurnId: null,
+                          lastError: null,
+                          updatedAt: command.createdAt,
+                        },
+                      },
+                      { kind: "synchronized" as const },
+                    ),
+                  ),
+                ),
+              ),
+            );
+          },
+        };
+        options.stopThreadSession = (input) => {
+          options.sessionStopCommand = input;
+          return Deferred.succeed(dispatchStarted, undefined).pipe(Effect.as({ sequence: 43 }));
+        };
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const caller = yield* Effect.forkScoped(
+              callTool("thread_stop_session", {
+                requestId: "stop-session-cancelled",
+                thread: { instanceId: "instance-a", threadId: "thread-a" },
+              }),
+            );
+            yield* Deferred.await(dispatchStarted);
+            yield* Deferred.await(watcherStarted);
+            yield* Fiber.interrupt(caller);
+            yield* Deferred.succeed(publishShutdown, undefined);
+            return yield* callTool("operation_get", {
+              requestId: "stop-session-cancelled",
+              waitMs: 5_000,
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: { operation: { state: "completed", dispatch: "accepted" } },
+          },
+        });
+      }),
+    ),
+  );
+
+  it.live("rejects unknown arguments before admission", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const exit = yield* Effect.exit(
+          Effect.scoped(
+            callTool("thread_stop_session", {
+              requestId: "stop-session-invalid",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+              unexpected: true,
+            }).pipe(Effect.provide(appLayer(databasePath, fakeConnections()))),
+          ),
+        );
+
+        expect(Exit.isFailure(exit)).toBe(true);
+        if (Exit.isSuccess(exit)) throw new Error("Expected the unknown top-level field to fail.");
+        expect(String(exit.cause)).toContain("Invalid parameters for tool 'thread_stop_session'");
+
+        const nestedExit = yield* Effect.exit(
+          Effect.scoped(
+            callTool("thread_stop_session", {
+              requestId: "stop-session-invalid-nested",
+              thread: { instanceId: "instance-a", threadId: "thread-a", unexpected: true },
+            }).pipe(Effect.provide(appLayer(databasePath, fakeConnections()))),
+          ),
+        );
+        expect(Exit.isFailure(nestedExit)).toBe(true);
+        if (Exit.isSuccess(nestedExit)) {
+          throw new Error("Expected the unknown nested thread field to fail.");
+        }
+        expect(String(nestedExit.cause)).toContain(
+          "Invalid parameters for tool 'thread_stop_session'",
+        );
       }),
     ),
   );

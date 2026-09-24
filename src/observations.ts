@@ -13,6 +13,7 @@ import {
   MAX_ACTIVE_THREAD_SUBSCRIPTIONS_PER_INSTANCE,
   MAX_INSTANCE_OBSERVATION_QUEUE_BYTES,
   MAX_RETAINED_OBSERVATION_BYTES,
+  MAX_THREAD_WAIT_MILLIS,
   SYNCHRONIZATION_BOUND_MILLIS,
   THREAD_SNAPSHOT_TURN_LIMIT,
   serializedByteLength,
@@ -67,6 +68,29 @@ export interface SynchronizedThreadDetail {
    */
   readonly snapshotReset: boolean;
   readonly observedAt: string;
+}
+
+export type ThreadSessionShutdownObservation =
+  | {
+      readonly kind: "observed";
+      readonly requestSequence: number;
+      readonly shutdownSequence: number;
+    }
+  | {
+      readonly kind: "session_changed";
+      readonly sourceSequence: number;
+      readonly requestSequence: number | null;
+    }
+  | { readonly kind: "history_gap"; readonly sourceSequence: number }
+  | { readonly kind: "timed_out" };
+
+export interface ThreadSessionShutdownTarget {
+  readonly instanceId: string;
+  readonly threadId: string;
+  readonly afterSequence: number;
+  readonly commandId: string;
+  readonly createdAt: string;
+  readonly session: NonNullable<ObservedThreadDetail["session"]>;
 }
 
 export type ObservationServiceError = LocalStoreError | T3CodeAdapterError | ObservationError;
@@ -256,6 +280,8 @@ const applyThreadEvent = (staging: ThreadDetailStaging, item: OrderedStagingItem
       staging.thread = { ...staging.thread, activities };
       break;
     }
+    case "session-stop-requested":
+      break;
     case "message-sent": {
       // A message event replaces any retained row with the same native
       // identity (streaming updates re-send the message) and appends the
@@ -482,6 +508,278 @@ const boundaryMissingError = new ObservationError({
   message: "The observation stream ended before its synchronized boundary.",
 });
 
+interface ThreadSessionShutdownCursor {
+  lastSequence: number;
+  requestSequence: number | null;
+}
+
+interface ThreadSessionShutdownStreamState {
+  readonly cursor: ThreadSessionShutdownCursor;
+  synchronized: boolean;
+  bufferedBytes: number;
+  buffered: Array<ThreadStreamItem>;
+}
+
+const threadSessionShutdownGap = (sourceSequence: number) => ({
+  kind: "history_gap" as const,
+  sourceSequence,
+});
+
+const threadSessionShutdownChanged = (sourceSequence: number, requestSequence: number | null) => ({
+  kind: "session_changed" as const,
+  sourceSequence,
+  requestSequence,
+});
+
+export const observedSessionsMatch = (
+  current: ObservedThreadDetail["session"],
+  expected: ObservedThreadDetail["session"],
+): boolean =>
+  current !== null &&
+  expected !== null &&
+  (current.providerInstanceId ?? null) === (expected.providerInstanceId ?? null) &&
+  current.status === expected.status &&
+  current.activeTurnId === expected.activeTurnId &&
+  current.lastError === expected.lastError &&
+  current.updatedAt === expected.updatedAt;
+
+const sessionMatchesThreadSessionStopTarget = (
+  current: ObservedThreadDetail["session"],
+  target: ThreadSessionShutdownTarget,
+): boolean => observedSessionsMatch(current, target.session);
+
+const sessionWasStoppedByThreadSessionRequest = (
+  session: NonNullable<ObservedThreadDetail["session"]>,
+  target: ThreadSessionShutdownTarget,
+): boolean =>
+  session.status === "stopped" &&
+  session.activeTurnId === null &&
+  session.updatedAt === target.createdAt &&
+  (session.providerInstanceId ?? null) === (target.session.providerInstanceId ?? null);
+
+const currentThreadSessionShutdownSnapshot = (
+  item: Extract<ThreadStreamItem, { readonly kind: "snapshot" }>,
+  target: ThreadSessionShutdownTarget,
+): ThreadSessionShutdownObservation | null => {
+  if (item.snapshot.snapshotSequence !== target.afterSequence) {
+    return threadSessionShutdownGap(item.snapshot.snapshotSequence);
+  }
+  return sessionMatchesThreadSessionStopTarget(item.snapshot.thread.session, target)
+    ? null
+    : threadSessionShutdownGap(item.snapshot.snapshotSequence);
+};
+
+type ThreadSessionSequencePosition =
+  | { readonly kind: "skip" }
+  | { readonly kind: "advanced" }
+  | { readonly kind: "gap"; readonly sourceSequence: number };
+
+const advanceThreadSessionShutdownCursor = (
+  cursor: ThreadSessionShutdownCursor,
+  sequence: number,
+): ThreadSessionSequencePosition => {
+  if (sequence <= cursor.lastSequence) return { kind: "skip" };
+  cursor.lastSequence = sequence;
+  return { kind: "advanced" };
+};
+
+const advanceThreadSessionShutdownItem = (
+  cursor: ThreadSessionShutdownCursor,
+  sequence: number,
+): ThreadSessionSequencePosition => advanceThreadSessionShutdownCursor(cursor, sequence);
+
+const threadSessionShutdownPositionFailure = (
+  position: ThreadSessionSequencePosition,
+): ThreadSessionShutdownObservation | null =>
+  position.kind === "gap" ? threadSessionShutdownGap(position.sourceSequence) : null;
+
+const processThreadSessionSequence = (
+  cursor: ThreadSessionShutdownCursor,
+  sequence: number,
+  process: () => ThreadSessionShutdownObservation | null,
+): ThreadSessionShutdownObservation | null => {
+  const position = advanceThreadSessionShutdownItem(cursor, sequence);
+  if (position.kind === "skip") return null;
+  const failure = threadSessionShutdownPositionFailure(position);
+  return failure ?? process();
+};
+
+const processThreadSessionStopRequested = (
+  item: Extract<ThreadStreamItem, { readonly kind: "session-stop-requested" }>,
+  target: ThreadSessionShutdownTarget,
+  cursor: ThreadSessionShutdownCursor,
+): ThreadSessionShutdownObservation | null =>
+  processThreadSessionSequence(cursor, item.sequence, () => {
+    if (item.threadId !== target.threadId) return threadSessionShutdownGap(item.sequence);
+    if (item.commandId !== target.commandId) {
+      return threadSessionShutdownChanged(item.sequence, cursor.requestSequence);
+    }
+    if (item.createdAt !== target.createdAt) return threadSessionShutdownGap(item.sequence);
+    cursor.requestSequence ??= item.sequence;
+    return null;
+  });
+
+const processThreadSessionSet = (
+  item: Extract<ThreadStreamItem, { readonly kind: "session-set" }>,
+  target: ThreadSessionShutdownTarget,
+  cursor: ThreadSessionShutdownCursor,
+): ThreadSessionShutdownObservation | null =>
+  processThreadSessionSequence(cursor, item.sequence, () => {
+    if (cursor.requestSequence === null || item.sequence <= cursor.requestSequence) {
+      return threadSessionShutdownChanged(item.sequence, cursor.requestSequence);
+    }
+    return sessionWasStoppedByThreadSessionRequest(item.session, target)
+      ? {
+          kind: "observed",
+          requestSequence: cursor.requestSequence,
+          shutdownSequence: item.sequence,
+        }
+      : threadSessionShutdownChanged(item.sequence, cursor.requestSequence);
+  });
+
+const processThreadSessionShutdownItem = (
+  item: ThreadStreamItem,
+  target: ThreadSessionShutdownTarget,
+  cursor: ThreadSessionShutdownCursor,
+): ThreadSessionShutdownObservation | null => {
+  switch (item.kind) {
+    case "synchronized":
+      return null;
+    case "snapshot":
+      return currentThreadSessionShutdownSnapshot(item, target);
+    case "session-stop-requested":
+      return processThreadSessionStopRequested(item, target, cursor);
+    case "session-set":
+      return processThreadSessionSet(item, target, cursor);
+    default: {
+      const position = advanceThreadSessionShutdownItem(cursor, item.sequence);
+      return position.kind === "skip" ? null : threadSessionShutdownPositionFailure(position);
+    }
+  }
+};
+
+const sequenceOfThreadStreamItem = (item: ThreadStreamItem): number | null =>
+  item.kind === "synchronized"
+    ? null
+    : item.kind === "snapshot"
+      ? item.snapshot.snapshotSequence
+      : item.sequence;
+
+const processBufferedThreadSessionShutdown = (
+  state: ThreadSessionShutdownStreamState,
+  target: ThreadSessionShutdownTarget,
+): ThreadSessionShutdownObservation | null => {
+  state.buffered.sort(
+    (left, right) =>
+      (sequenceOfThreadStreamItem(left) ?? -1) - (sequenceOfThreadStreamItem(right) ?? -1),
+  );
+  for (const item of state.buffered) {
+    const result = processThreadSessionShutdownItem(item, target, state.cursor);
+    if (result !== null) return result;
+  }
+  state.buffered = [];
+  state.bufferedBytes = 0;
+  return null;
+};
+
+const bufferThreadSessionShutdownItem = (
+  state: ThreadSessionShutdownStreamState,
+  item: ThreadStreamItem,
+  target: ThreadSessionShutdownTarget,
+  bufferBudgetBytes: number,
+): ThreadSessionShutdownObservation | null => {
+  if (item.kind !== "synchronized") {
+    state.buffered.push(item);
+    state.bufferedBytes += serializedByteLength(item);
+    return state.bufferedBytes > bufferBudgetBytes
+      ? threadSessionShutdownGap(state.cursor.lastSequence)
+      : null;
+  }
+  state.synchronized = true;
+  return processBufferedThreadSessionShutdown(state, target);
+};
+
+const processThreadSessionShutdownChunk = (
+  state: ThreadSessionShutdownStreamState,
+  items: ReadonlyArray<ThreadStreamItem>,
+  target: ThreadSessionShutdownTarget,
+  bufferBudgetBytes: number,
+): ThreadSessionShutdownObservation | null => {
+  for (const item of items) {
+    const result = state.synchronized
+      ? processThreadSessionShutdownItem(item, target, state.cursor)
+      : bufferThreadSessionShutdownItem(state, item, target, bufferBudgetBytes);
+    if (result !== null) return result;
+  }
+  return null;
+};
+
+const collectThreadSessionShutdownObservation = (
+  stream: Stream.Stream<ThreadStreamItem, ObservationServiceError>,
+  target: ThreadSessionShutdownTarget,
+  waitMs: number,
+): Effect.Effect<ThreadSessionShutdownObservation, ObservationServiceError> =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const pull = yield* Stream.toPull(stream);
+      const state: ThreadSessionShutdownStreamState = {
+        cursor: {
+          lastSequence: target.afterSequence,
+          requestSequence: null,
+        },
+        synchronized: false,
+        bufferedBytes: 0,
+        buffered: [],
+      };
+      const pullChunk = () => Pull.catchDone(pull, () => Effect.succeed(null));
+      // Pull once before starting the observation budget. This lets the
+      // connection, authenticated channel, and subscription setup finish;
+      // the bounded window then applies only to replay/live evidence.
+      const firstPull = yield* pullChunk().pipe(
+        Effect.map((items) => ({ status: "received" as const, items })),
+        Effect.timeoutOrElse({
+          duration: Duration.millis(SYNCHRONIZATION_BOUND_MILLIS),
+          orElse: () => Effect.succeed({ status: "setup_timeout" as const }),
+        }),
+      );
+      if (firstPull.status === "setup_timeout") {
+        return { kind: "timed_out" } as const;
+      }
+      const firstChunk = firstPull.items;
+      if (firstChunk === null) return yield* Effect.fail(boundaryMissingError);
+      const firstResult = processThreadSessionShutdownChunk(
+        state,
+        firstChunk,
+        target,
+        MAX_INSTANCE_OBSERVATION_QUEUE_BYTES,
+      );
+      if (firstResult !== null) return firstResult;
+
+      return yield* Effect.gen(function* () {
+        while (true) {
+          const items = yield* pullChunk();
+          if (items === null) {
+            return state.synchronized
+              ? ({ kind: "timed_out" } as const)
+              : yield* Effect.fail(boundaryMissingError);
+          }
+          const result = processThreadSessionShutdownChunk(
+            state,
+            items,
+            target,
+            MAX_INSTANCE_OBSERVATION_QUEUE_BYTES,
+          );
+          if (result !== null) return result;
+        }
+      }).pipe(
+        Effect.timeoutOrElse({
+          duration: Duration.millis(Math.min(waitMs, MAX_THREAD_WAIT_MILLIS)),
+          orElse: () => Effect.succeed({ kind: "timed_out" as const }),
+        }),
+      );
+    }),
+  );
+
 const shellSynchronizationEngine: StreamSynchronizationEngine<
   ShellStaging,
   ShellStreamItem,
@@ -702,6 +1000,16 @@ export interface ObservationsService {
     instanceId: string,
     threadId: string,
   ) => Effect.Effect<SynchronizedThreadDetail, ObservationServiceError>;
+  /**
+   * Observe one accepted thread.session.stop command and its following
+   * stopped-session update from an ordered replay beginning at the captured
+   * session watermark. An intervening session update or replay gap cannot
+   * satisfy the stop request.
+   */
+  readonly watchThreadSessionShutdown: (
+    target: ThreadSessionShutdownTarget,
+    waitMs: number,
+  ) => Effect.Effect<ThreadSessionShutdownObservation, ObservationServiceError>;
 }
 interface RetainedObservation<Value> {
   readonly value: Value;
@@ -801,6 +1109,32 @@ export class Observations extends Context.Service<Observations, ObservationsServ
         InflightSync<SynchronizedThreadDetail, ObservationServiceError>
       >();
       const activeThreadSubscriptions = new Map<string, number>();
+      const reserveThreadSubscription = (instanceId: string) =>
+        Effect.gen(function* () {
+          const acquired = yield* Effect.acquireRelease(
+            Effect.sync(() => {
+              const active = activeThreadSubscriptions.get(instanceId) ?? 0;
+              if (active >= MAX_ACTIVE_THREAD_SUBSCRIPTIONS_PER_INSTANCE) return false;
+              activeThreadSubscriptions.set(instanceId, active + 1);
+              return true;
+            }),
+            (released) =>
+              Effect.sync(() => {
+                if (!released) return;
+                const remaining = (activeThreadSubscriptions.get(instanceId) ?? 1) - 1;
+                if (remaining > 0) activeThreadSubscriptions.set(instanceId, remaining);
+                else activeThreadSubscriptions.delete(instanceId);
+              }),
+          );
+          if (!acquired) {
+            return yield* Effect.fail(
+              new ObservationError({
+                kind: "subscription_capacity",
+                message: `The instance already has ${MAX_ACTIVE_THREAD_SUBSCRIPTIONS_PER_INSTANCE} active thread subscriptions.`,
+              }),
+            );
+          }
+        });
 
       /**
        * One reader of a shared in-flight synchronization leaves: decrement the
@@ -965,29 +1299,7 @@ export class Observations extends Context.Service<Observations, ObservationsServ
         // overflow, and closure.
         Effect.scoped(
           Effect.gen(function* () {
-            const acquired = yield* Effect.acquireRelease(
-              Effect.sync(() => {
-                const active = activeThreadSubscriptions.get(instanceId) ?? 0;
-                if (active >= MAX_ACTIVE_THREAD_SUBSCRIPTIONS_PER_INSTANCE) return false;
-                activeThreadSubscriptions.set(instanceId, active + 1);
-                return true;
-              }),
-              (released) =>
-                Effect.sync(() => {
-                  if (!released) return;
-                  const remaining = (activeThreadSubscriptions.get(instanceId) ?? 1) - 1;
-                  if (remaining > 0) activeThreadSubscriptions.set(instanceId, remaining);
-                  else activeThreadSubscriptions.delete(instanceId);
-                }),
-            );
-            if (!acquired) {
-              return yield* Effect.fail(
-                new ObservationError({
-                  kind: "subscription_capacity",
-                  message: `The instance already has ${MAX_ACTIVE_THREAD_SUBSCRIPTIONS_PER_INSTANCE} active thread subscriptions.`,
-                }),
-              );
-            }
+            yield* reserveThreadSubscription(instanceId);
             const last = retained.lastPublished<SynchronizedThreadDetail>(
               threadRetentionKey(instanceId, threadId),
             );
@@ -1131,6 +1443,56 @@ export class Observations extends Context.Service<Observations, ObservationsServ
           return yield* Fiber.join(entry.fiber);
         });
 
+      const consumeThreadSessionShutdown = (
+        target: ThreadSessionShutdownTarget,
+        waitMs: number,
+      ): Effect.Effect<ThreadSessionShutdownObservation, ObservationServiceError> =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            yield* reserveThreadSubscription(target.instanceId);
+            return yield* collectThreadSessionShutdownObservation(
+              connections.openThreadStream(target.instanceId, target.threadId, {
+                afterSequence: target.afterSequence,
+                turnLimit: THREAD_SNAPSHOT_TURN_LIMIT,
+              }),
+              target,
+              waitMs,
+            );
+          }),
+        );
+
+      const watchThreadSessionShutdown = (
+        target: ThreadSessionShutdownTarget,
+        waitMs: number,
+      ): Effect.Effect<ThreadSessionShutdownObservation, ObservationServiceError> =>
+        Effect.gen(function* () {
+          const before = yield* store.getRegistration(target.instanceId);
+          if (before === null) {
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: "registration_not_found",
+                message: "The saved registration was not found.",
+              }),
+            );
+          }
+          // Verify the saved connection before starting the short replay
+          // budget. openThreadStream uses this cached connection and its
+          // authenticated channel setup is completed by the first pull.
+          yield* connections.acquire(target.instanceId);
+          const observation = yield* consumeThreadSessionShutdown(target, waitMs);
+          const after = yield* store.getRegistration(target.instanceId);
+          if (after === null || after.revision !== before.revision) {
+            return yield* Effect.fail(
+              new ObservationError({
+                kind: "stale_generation",
+                message:
+                  "The saved registration changed while provider-session shutdown was being observed.",
+              }),
+            );
+          }
+          return observation;
+        });
+
       const archivedShell = (
         instanceId: string,
       ): Effect.Effect<SynchronizedShell, LocalStoreError | T3CodeAdapterError> =>
@@ -1144,7 +1506,12 @@ export class Observations extends Context.Service<Observations, ObservationsServ
           } satisfies SynchronizedShell;
         });
 
-      return Observations.of({ activeShell, archivedShell, threadDetail });
+      return Observations.of({
+        activeShell,
+        archivedShell,
+        threadDetail,
+        watchThreadSessionShutdown,
+      });
     }),
   );
 }

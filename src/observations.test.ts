@@ -9,14 +9,15 @@ import * as TestClock from "effect/testing/TestClock";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { LocalStore } from "./local-store";
-import { InstanceConnections } from "./instance-connections";
+import { LocalStore, LocalStoreError } from "./local-store";
+import { InstanceConnections, type InstanceConnection } from "./instance-connections";
 import {
   ObservationError,
   Observations,
   synchronizeShellStream,
   synchronizeThreadStream,
   type SynchronizedShell,
+  type ThreadSessionShutdownTarget,
 } from "./observations";
 import * as Result from "effect/Result";
 import {
@@ -907,6 +908,9 @@ describe("synchronizeThreadStream", () => {
 });
 
 interface ThreadScripts {
+  readonly acquire?: (
+    instanceId: string,
+  ) => Effect.Effect<InstanceConnection, LocalStoreError | T3CodeAdapterError>;
   readonly openThreadStream: (
     instanceId: string,
     threadId: string,
@@ -930,7 +934,7 @@ const threadObservationsLayer = (
         verifyCredential: () => Effect.die("not used"),
         inspectCredential: () => Effect.die("not used"),
         pair: () => Effect.die("not used"),
-        acquire: () => Effect.die("not used"),
+        acquire: (instanceId) => scripts.acquire?.(instanceId) ?? Effect.die("not used"),
         inspect: () => Effect.die("not used"),
         discoverProjects: () => Effect.die("not used"),
         discoverModels: () => Effect.die("not used"),
@@ -954,6 +958,65 @@ const threadObservationsLayer = (
     ),
     Layer.provideMerge(LocalStore.layer({ databasePath })),
   );
+
+describe("Thread session shutdown observation", () => {
+  it.effect("returns timed_out when the stream closes after synchronization", () =>
+    withDatabasePath((databasePath) => {
+      let streamOpens = 0;
+      const target: ThreadSessionShutdownTarget = {
+        instanceId: "instance-a",
+        threadId: "thread-a",
+        afterSequence: 7,
+        commandId: "stop-command-a",
+        createdAt: "2026-09-23T12:00:00.000Z",
+        session: {
+          providerInstanceId: "provider-a",
+          status: "ready",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: "2026-09-23T11:59:00.000Z",
+        },
+      };
+      const layer = threadObservationsLayer(
+        databasePath,
+        {
+          acquire: (instanceId) =>
+            Effect.succeed({
+              instanceId,
+              revision: 1,
+              endpoint: "https://a.test",
+              environmentId: "env-a",
+              credential: "secret-a",
+              verified: {
+                environmentId: "env-a",
+                serverVersion: "0.0.38",
+                scopes: [],
+                capabilities: {},
+              },
+            }),
+          openThreadStream: () => {
+            streamOpens += 1;
+            return streamOpens === 1 ? Stream.make(threadSynchronizedItem) : Stream.empty;
+          },
+        },
+        [],
+      );
+      return Effect.scoped(
+        Effect.gen(function* () {
+          yield* seedRegistration;
+          const observations = yield* Observations;
+          const result = yield* observations.watchThreadSessionShutdown(target, 1_000);
+          expect(result).toEqual({ kind: "timed_out" });
+          const boundaryError = yield* Effect.flip(
+            observations.watchThreadSessionShutdown(target, 1_000),
+          );
+          expect(boundaryError).toBeInstanceOf(ObservationError);
+          expect((boundaryError as ObservationError).kind).toBe("boundary_missing");
+        }).pipe(Effect.provide(layer)),
+      );
+    }),
+  );
+});
 
 describe("Observations thread detail", () => {
   it.effect("requests the 20-turn window and resumes from the published watermark", () =>
@@ -1243,6 +1306,7 @@ describe("InstanceConnections observation capacity", () => {
             listProviderModels: () => Effect.die("not used"),
             refreshVcsStatus: () => Effect.die("not used"),
             listVcsWorktreeRefs: () => Effect.die("not used"),
+            stopThreadSession: () => Effect.die("not used"),
             subscribeShell: () =>
               Stream.concat(
                 Stream.make(snapshotItem(1, [project("project-a")], [])),
@@ -1339,6 +1403,7 @@ describe("InstanceConnections observation capacity", () => {
           listProviderModels: () => Effect.die("not used"),
           refreshVcsStatus: () => Effect.die("not used"),
           listVcsWorktreeRefs: () => Effect.die("not used"),
+          stopThreadSession: () => Effect.die("not used"),
           subscribeShell: () =>
             Stream.make(snapshotItem(1, [project("project-a")], []), synchronizedItem),
           subscribeThread: () => Stream.die("not used"),

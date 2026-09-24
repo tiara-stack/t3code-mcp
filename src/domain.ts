@@ -16,7 +16,6 @@ const MAX_THREAD_SUBMIT_TEXT_CHARS = 120_000;
  * 30 seconds; none of these budgets set an execution deadline.
  */
 export const DEFAULT_THREAD_WAIT_MILLIS = 10_000;
-// fallow-ignore-next-line unused-export
 export const MAX_THREAD_WAIT_MILLIS = 30_000;
 /**
  * Retained compact turn evidence expires thirty days after it was observed,
@@ -857,36 +856,38 @@ export type ThreadGetCaptureQuery = {
   readonly thread: ThreadReference;
 };
 
-const threadGetReferenceRuntimeShape = Schema.StructWithRest(threadReferenceSchema, [
-  Schema.Record(
-    Schema.String.check(
-      Schema.makeFilter((key) => key !== "instanceId" && key !== "threadId", {
-        message: "unknown thread reference argument",
-      }),
-    ),
-    Schema.Never,
-  ),
-]);
+const threadReferenceRuntimeShape = (unknownFieldMessage: string) =>
+  Schema.StructWithRest(
+    Schema.Struct({
+      instanceId: nonEmptyString,
+      threadId: nonEmptyString,
+    }),
+    [
+      Schema.Record(
+        Schema.String.check(
+          Schema.makeFilter((key) => key !== "instanceId" && key !== "threadId", {
+            message: unknownFieldMessage,
+          }),
+        ),
+        Schema.Never,
+      ),
+    ],
+  );
+
+const threadGetReferenceRuntimeShape = threadReferenceRuntimeShape(
+  "unknown thread_get thread argument",
+);
 
 const threadGetReferenceJsonShape = Schema.StructWithRest(threadReferenceSchema, [
   Schema.Record(Schema.String, Schema.Never),
 ]);
 
-const threadInterruptReferenceRuntimeShape = Schema.StructWithRest(
-  Schema.Struct({
-    instanceId: nonEmptyString,
-    threadId: nonEmptyString,
-  }),
-  [
-    Schema.Record(
-      Schema.String.check(
-        Schema.makeFilter((key) => key !== "instanceId" && key !== "threadId", {
-          message: "unknown thread_interrupt thread argument",
-        }),
-      ),
-      Schema.Never,
-    ),
-  ],
+const threadInterruptReferenceRuntimeShape = threadReferenceRuntimeShape(
+  "unknown thread_interrupt thread argument",
+);
+
+const threadStopSessionReferenceRuntimeShape = threadReferenceRuntimeShape(
+  "unknown thread_stop_session thread argument",
 );
 
 const threadGetFields = Schema.Struct({
@@ -949,6 +950,52 @@ export const ThreadGetInputSchema = Schema.declare<{
 );
 
 export type ThreadGetInput = typeof ThreadGetInputSchema.Type;
+
+const threadStopSessionFields = Schema.Struct({
+  requestId,
+  thread: threadStopSessionReferenceRuntimeShape,
+});
+
+const threadStopSessionJsonFields = Schema.Struct({
+  requestId,
+  thread: threadGetReferenceJsonShape,
+});
+
+const unknownThreadStopSessionField = Schema.String.check(
+  Schema.makeFilter((key) => key !== "requestId" && key !== "thread", {
+    message: "unknown thread_stop_session argument",
+  }),
+);
+
+const threadStopSessionRuntimeShape = Schema.StructWithRest(threadStopSessionFields, [
+  Schema.Record(unknownThreadStopSessionField, Schema.Never),
+]);
+
+const threadStopSessionJsonShape = Schema.StructWithRest(threadStopSessionJsonFields, [
+  Schema.Record(Schema.String, Schema.Never),
+]);
+
+/**
+ * A provider-session shutdown request names a direct thread reference and
+ * durable mutation request ID. Provider-native session identities remain
+ * internal to the adapter and recovery record.
+ */
+export const ThreadStopSessionInputSchema = Schema.declare<{
+  readonly requestId: string;
+  readonly thread: ThreadReference;
+}>(
+  (input): input is { readonly requestId: string; readonly thread: ThreadReference } =>
+    Schema.is(threadStopSessionRuntimeShape)(input),
+  {
+    toCodecJson: () =>
+      Schema.link()(threadStopSessionJsonShape, {
+        decode: SchemaGetter.passthrough({ strict: false }),
+        encode: SchemaGetter.passthrough({ strict: false }),
+      } as never),
+  },
+);
+
+export type ThreadStopSessionInput = typeof ThreadStopSessionInputSchema.Type;
 
 const outputByteBudget = Schema.Int.check(
   Schema.isBetween({ minimum: THREAD_OUTPUT_MIN_MAX_BYTES, maximum: THREAD_OUTPUT_MAX_MAX_BYTES }),

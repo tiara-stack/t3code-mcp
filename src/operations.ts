@@ -8,9 +8,12 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Match from "effect/Match";
+import * as Result from "effect/Result";
+import * as Schema from "effect/Schema";
 import {
   MAX_OPERATION_CAPACITY,
   MAX_OPERATION_WAIT_MILLIS,
+  MAX_THREAD_WAIT_MILLIS,
   LIVE_EFFECT_OBSERVATION_MILLIS,
   OPERATION_DETAIL_RETENTION_MILLIS,
   STAGED_PAIRING_RETENTION_MILLIS,
@@ -27,21 +30,137 @@ import {
   type ThreadSubmitInput,
   type PendingRequest,
   type ThreadInterruptInput,
+  type ThreadStopSessionInput,
   type ToolFailure,
   type WorktreeCreateInput,
 } from "./domain";
 import { LocalStore, LocalStoreError, REQUEST_RECORD_UNAVAILABLE_MESSAGE } from "./local-store";
-import type { OperationIntent, OperationUpdate, StoredOperation } from "./local-store";
+import type {
+  OperationCompareAndUpdateInput,
+  OperationIntent,
+  OperationUpdate,
+  StoredOperation,
+} from "./local-store";
 import { InstanceConnections } from "./instance-connections";
 import {
   ObservationError,
   Observations,
+  observedSessionsMatch,
   type ObservationServiceError,
   type SynchronizedThreadDetail,
+  type ThreadSessionShutdownObservation,
+  type ThreadSessionShutdownTarget,
 } from "./observations";
 import { T3CodeAdapterError, type T3CodeAdapterErrorKind } from "./t3code-adapter";
 import { validateObservedInputResponse } from "./pending-requests";
 import { adapterErrorFailure } from "./tool-failure";
+
+const ThreadSessionStopRecoverySchema = Schema.Struct({
+  instanceId: Schema.NonEmptyString,
+  threadId: Schema.NonEmptyString,
+  afterSequence: Schema.Natural,
+  session: Schema.Struct({
+    providerInstanceId: Schema.NullOr(Schema.NonEmptyString),
+    status: Schema.Literals([
+      "idle",
+      "starting",
+      "running",
+      "ready",
+      "interrupted",
+      "stopped",
+      "error",
+    ]),
+    activeTurnId: Schema.NullOr(Schema.String),
+    lastError: Schema.NullOr(Schema.String),
+    updatedAt: Schema.String,
+  }),
+  commandId: Schema.NonEmptyString,
+  createdAt: Schema.String,
+  steps: Schema.Struct({
+    capture: Schema.Natural,
+    dispatch: Schema.Natural,
+    shutdown: Schema.Natural,
+  }),
+});
+
+type ThreadSessionStopRecovery = typeof ThreadSessionStopRecoverySchema.Type;
+
+type ThreadSessionStopSteps = {
+  readonly capture: number;
+  readonly dispatch: number;
+  readonly shutdown: number;
+};
+
+const THREAD_SESSION_STOP_STEPS: ThreadSessionStopSteps = {
+  capture: 0,
+  dispatch: 1,
+  shutdown: 2,
+};
+
+type ThreadSessionStopOperationInput = {
+  readonly requestId: string;
+  readonly thread: ThreadStopSessionInput["thread"];
+  readonly steps: ThreadSessionStopSteps;
+};
+
+type ThreadSessionStopStepOutcome =
+  | { readonly kind: "already_stopped" }
+  | { readonly kind: "observed" }
+  | { readonly kind: "not_dispatched"; readonly error: ToolFailure }
+  | { readonly kind: "outcome_unknown"; readonly error: ToolFailure };
+
+const shouldFinalizeThreadSessionStopRecovery = (
+  record: OperationRecord,
+  outcome: ThreadSessionStopStepOutcome,
+  ownerAbandoned: boolean,
+): boolean =>
+  outcome.kind !== "outcome_unknown" || (record.state !== "outcome_unknown" && ownerAbandoned);
+
+const threadSessionStopWriteConflictFailure: ToolFailure = {
+  code: "stale_state",
+  message: "The admitted operation changed while provider-session evidence was being persisted.",
+  retry: "reconcile_first",
+  details: { action: "observe_operation" },
+};
+
+const threadSessionStopOwnerAbandoned = (
+  previousOwner: boolean,
+  previousOwnerStale: boolean,
+): boolean => !previousOwner || previousOwnerStale;
+
+const threadSessionStopCanFinalize = (
+  record: OperationRecord,
+  outcome: ThreadSessionStopStepOutcome,
+): boolean =>
+  record.state !== "completed" &&
+  record.state !== "failed" &&
+  record.state !== "partial" &&
+  (record.state !== "outcome_unknown" ||
+    outcome.kind === "observed" ||
+    outcome.kind === "already_stopped");
+
+type ThreadSessionStopObservationFailure = {
+  readonly error: ToolFailure;
+  readonly detail: string;
+  readonly evidenceKind: Evidence["kind"];
+  readonly sourceSequence: number | null;
+  readonly commandId: string | null;
+  readonly dispatchAccepted: boolean;
+};
+
+type ThreadSessionStopPersistenceAttempt =
+  | { readonly kind: "retry" }
+  | { readonly kind: "done"; readonly outcome: ThreadSessionStopStepOutcome };
+
+type ThreadSessionStopDispatchPreparation =
+  | { readonly kind: "retry" }
+  | { readonly kind: "done"; readonly outcome: ThreadSessionStopStepOutcome }
+  | { readonly kind: "ready"; readonly stored: StoredOperation };
+
+const threadSessionStopRecovery = (intent: OperationIntent): ThreadSessionStopRecovery | null => {
+  const decoded = Schema.decodeUnknownResult(ThreadSessionStopRecoverySchema)(intent.sessionStop);
+  return Result.isSuccess(decoded) ? decoded.success : null;
+};
 
 export class OperationServiceError extends Data.TaggedError("OperationServiceError")<{
   readonly kind: "capacity" | "stale_approval" | "unsupported_approval_decision" | "unsupported";
@@ -146,6 +265,9 @@ export interface OperationsService {
   readonly interruptThread: (
     input: ThreadInterruptInput,
   ) => Effect.Effect<OperationRecord, LocalStoreError | OperationServiceError>;
+  readonly stopThreadSession: (
+    input: ThreadStopSessionInput,
+  ) => Effect.Effect<OperationRecord, LocalStoreError | OperationServiceError>;
   readonly getOperation: (
     input: OperationGetInput,
   ) => Effect.Effect<OperationGetValue, LocalStoreError>;
@@ -203,6 +325,26 @@ export class Operations extends Context.Service<Operations, OperationsService>()
         ),
       );
       const activeRequests = new Map<string, number>();
+      const threadSessionStopRecoveryLastAttemptAt = new Map<string, number>();
+      const reserveThreadSessionStopRecoveryObservation = (
+        requestId: string,
+        attemptAt: number,
+      ): boolean => {
+        for (const [previousRequestId, lastAttemptAt] of threadSessionStopRecoveryLastAttemptAt) {
+          if (attemptAt - lastAttemptAt >= LIVE_EFFECT_OBSERVATION_MILLIS) {
+            threadSessionStopRecoveryLastAttemptAt.delete(previousRequestId);
+          }
+        }
+        const lastAttemptAt = threadSessionStopRecoveryLastAttemptAt.get(requestId);
+        if (
+          lastAttemptAt !== undefined &&
+          attemptAt - lastAttemptAt < LIVE_EFFECT_OBSERVATION_MILLIS
+        ) {
+          return false;
+        }
+        threadSessionStopRecoveryLastAttemptAt.set(requestId, attemptAt);
+        return true;
+      };
       let activeCapacity = 0;
       const completionSignals = new Map<string, Deferred.Deferred<void, never>>();
 
@@ -563,6 +705,21 @@ export class Operations extends Context.Service<Operations, OperationsService>()
         return forceReconcileFirst ? { ...failure, retry: "reconcile_first" } : failure;
       };
 
+      const threadSessionStopFailure = (
+        error: LocalStoreError | T3CodeAdapterError | ObservationError,
+      ): ToolFailure => {
+        if (error instanceof LocalStoreError) return operationFailure(error);
+        if (error instanceof ObservationError) {
+          return {
+            code: error.kind === "stale_generation" ? "stale_state" : "unavailable",
+            message: error.message,
+            retry: "reconcile_first",
+            details: { action: "observe_operation" },
+          };
+        }
+        return adapterErrorFailure(error, "thread_stop");
+      };
+
       const evidence = (
         detail: string,
         kind: Evidence["kind"] = "local_registration",
@@ -640,6 +797,851 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           const refreshed = yield* store.getOperation(stored.record.requestId);
           return refreshed?.record ?? record;
         });
+
+      const evidenceAt = (
+        detail: string,
+        kind: Evidence["kind"],
+        sourceSequence: number | null = null,
+        nativeEventId: string | null = null,
+      ): Effect.Effect<Evidence, never> =>
+        nowIso.pipe(
+          Effect.map((observedAt) => ({
+            kind,
+            observedAt,
+            sourceSequence,
+            nativeEventId,
+            detail,
+          })),
+        );
+
+      const threadSessionStopRejectedDispatchOutcome = (
+        current: StoredOperation,
+        recovery: ThreadSessionStopRecovery,
+      ): ThreadSessionStopStepOutcome | null => {
+        if (
+          current.record.dispatch !== "rejected" &&
+          current.record.dispatch !== "not_dispatched"
+        ) {
+          return null;
+        }
+        const dispatchStep = current.record.steps[recovery.steps.dispatch];
+        return {
+          kind: "not_dispatched",
+          error: dispatchStep?.error ??
+            current.record.error ?? {
+              code: "unavailable",
+              message: "T3Code did not accept the provider-session stop command.",
+              retry: "reconcile_first",
+              details: {},
+            },
+        };
+      };
+
+      const threadSessionStopStoredFailureOutcome = (
+        current: StoredOperation,
+      ): ThreadSessionStopStepOutcome | null => {
+        if (current.record.state !== "failed" && current.record.state !== "partial") return null;
+        return {
+          kind: "not_dispatched",
+          error: current.record.error ?? {
+            code: "unavailable",
+            message: "The terminal operation receipt cannot be reconciled.",
+            retry: "reconcile_first",
+            details: {},
+          },
+        };
+      };
+
+      const terminalThreadSessionStopOutcome = (
+        current: StoredOperation,
+        recovery: ThreadSessionStopRecovery,
+      ): ThreadSessionStopStepOutcome | null => {
+        const step = current.record.steps[recovery.steps.shutdown];
+        if (current.record.state === "completed" || step?.state === "succeeded") {
+          return { kind: "observed" };
+        }
+        if (step?.state === "already_absent") return { kind: "already_stopped" };
+        return (
+          threadSessionStopRejectedDispatchOutcome(current, recovery) ??
+          threadSessionStopStoredFailureOutcome(current)
+        );
+      };
+
+      const threadSessionStopObservationFailure = (input: {
+        readonly current: StoredOperation;
+        readonly recovery: ThreadSessionStopRecovery;
+        readonly observation: ThreadSessionShutdownObservation | null;
+        readonly failure: LocalStoreError | T3CodeAdapterError | ObservationError | null;
+      }): ThreadSessionStopObservationFailure => {
+        const { current, recovery, observation, failure } = input;
+        if (failure !== null) {
+          return {
+            error: threadSessionStopFailure(failure),
+            detail: "The session shutdown observer failed; the command will not be replayed.",
+            evidenceKind: "adapter_inference",
+            sourceSequence: null,
+            commandId: null,
+            dispatchAccepted: current.record.dispatch === "accepted",
+          };
+        }
+        if (observation?.kind === "session_changed") {
+          return {
+            error: {
+              code: "stale_state",
+              message:
+                "The thread's provider session changed before the captured session shutdown could be confirmed.",
+              retry: "reconcile_first",
+              details: {},
+            },
+            detail:
+              "A session update intervened before shutdown evidence could be tied to the captured session.",
+            evidenceKind: "event",
+            sourceSequence: observation.sourceSequence,
+            commandId: observation.requestSequence === null ? null : recovery.commandId,
+            dispatchAccepted:
+              current.record.dispatch === "accepted" || observation.requestSequence !== null,
+          };
+        }
+        if (observation?.kind === "history_gap") {
+          return {
+            error: {
+              code: "unavailable",
+              message: "The session shutdown event history could not be continuously established.",
+              retry: "reconcile_first",
+              details: { action: "observe_thread" },
+            },
+            detail:
+              "The thread observation restarted from a snapshot, so the stop request cannot be correlated to this session.",
+            evidenceKind: "event",
+            sourceSequence: observation.sourceSequence,
+            commandId: null,
+            dispatchAccepted: current.record.dispatch === "accepted",
+          };
+        }
+        return {
+          error: {
+            code: "unavailable",
+            message:
+              "The provider-session shutdown was not observed before the operation wait ended.",
+            retry: "reconcile_first",
+            details: { action: "observe_thread" },
+          },
+          detail:
+            "The session shutdown was not observed before the operation wait ended; the command will not be replayed.",
+          evidenceKind: "adapter_inference",
+          sourceSequence: null,
+          commandId: null,
+          dispatchAccepted: current.record.dispatch === "accepted",
+        };
+      };
+
+      const repeatedUnknownThreadSessionStopOutcome = (
+        latest: StoredOperation,
+        recovery: ThreadSessionStopRecovery,
+        failure: ThreadSessionStopObservationFailure,
+        uncertain: Evidence,
+      ): ThreadSessionStopStepOutcome | null => {
+        const shutdownStep = latest.record.steps[recovery.steps.shutdown];
+        const existingError = latest.record.error ?? shutdownStep?.error;
+        if (
+          latest.record.state === "outcome_unknown" &&
+          shutdownStep?.state === "outcome_unknown" &&
+          existingError?.code === failure.error.code
+        ) {
+          return { kind: "outcome_unknown", error: existingError };
+        }
+        const duplicate = latest.record.evidence.some(
+          (item) =>
+            item.detail === uncertain.detail &&
+            item.sourceSequence === uncertain.sourceSequence &&
+            item.nativeEventId === uncertain.nativeEventId,
+        );
+        return duplicate ? { kind: "outcome_unknown", error: failure.error } : null;
+      };
+
+      const prepareObservedThreadSessionStopDispatch = (
+        requestId: string,
+        recovery: ThreadSessionStopRecovery,
+        requested: Evidence,
+      ): Effect.Effect<ThreadSessionStopDispatchPreparation, LocalStoreError> =>
+        Effect.gen(function* () {
+          const latest = yield* store.getOperation(requestId);
+          if (latest === null) {
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: "request_record_unavailable",
+                message: REQUEST_RECORD_UNAVAILABLE_MESSAGE,
+              }),
+            );
+          }
+          const existing = terminalThreadSessionStopOutcome(latest, recovery);
+          if (existing !== null) return { kind: "done", outcome: existing } as const;
+
+          const dispatchStep = latest.record.steps[recovery.steps.dispatch];
+          if (latest.record.dispatch === "accepted" && dispatchStep?.state === "succeeded") {
+            return { kind: "ready", stored: latest } as const;
+          }
+
+          const updated = yield* store.compareAndUpdateOperation(requestId, {
+            now: requested.observedAt,
+            expectedRevision: latest.record.revision,
+            dispatch: "accepted",
+            commandId: recovery.commandId,
+            stepPosition: recovery.steps.dispatch,
+            stepState: "succeeded",
+            stepError: null,
+            evidence: [requested],
+            evidenceStepPosition: recovery.steps.dispatch,
+          });
+          if (!updated) return { kind: "retry" } as const;
+          const refreshed = yield* store.getOperation(requestId);
+          if (refreshed === null) {
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: "request_record_unavailable",
+                message: REQUEST_RECORD_UNAVAILABLE_MESSAGE,
+              }),
+            );
+          }
+          const terminal = terminalThreadSessionStopOutcome(refreshed, recovery);
+          return terminal === null
+            ? ({ kind: "ready", stored: refreshed } as const)
+            : ({ kind: "done", outcome: terminal } as const);
+        });
+
+      const writeObservedThreadSessionStop = (
+        requestId: string,
+        recovery: ThreadSessionStopRecovery,
+        requested: Evidence,
+        stopped: Evidence,
+      ): Effect.Effect<ThreadSessionStopPersistenceAttempt, LocalStoreError> =>
+        Effect.gen(function* () {
+          const prepared = yield* prepareObservedThreadSessionStopDispatch(
+            requestId,
+            recovery,
+            requested,
+          );
+          if (prepared.kind !== "ready") return prepared;
+          const updated = yield* store.compareAndUpdateOperation(requestId, {
+            now: stopped.observedAt,
+            expectedRevision: prepared.stored.record.revision,
+            dispatch: "accepted",
+            commandId: recovery.commandId,
+            stepPosition: recovery.steps.shutdown,
+            stepState: "succeeded",
+            stepError: null,
+            evidence: [stopped],
+            evidenceStepPosition: recovery.steps.shutdown,
+          });
+          return updated
+            ? ({ kind: "done", outcome: { kind: "observed" } } as const)
+            : ({ kind: "retry" } as const);
+        });
+
+      const persistObservedThreadSessionStop = (
+        requestId: string,
+        recovery: ThreadSessionStopRecovery,
+        requestSequence: number,
+        shutdownSequence: number,
+      ): Effect.Effect<ThreadSessionStopStepOutcome, LocalStoreError> =>
+        Effect.gen(function* () {
+          const requested = yield* evidenceAt(
+            "T3Code replayed the matching provider-session stop request.",
+            "event",
+            requestSequence,
+            recovery.commandId,
+          );
+          const stopped = yield* evidenceAt(
+            "T3Code published the captured provider session as stopped after the matching stop request.",
+            "event",
+            shutdownSequence,
+          );
+          let attempts = 0;
+          while (attempts < 4) {
+            const result = yield* writeObservedThreadSessionStop(
+              requestId,
+              recovery,
+              requested,
+              stopped,
+            );
+            if (result.kind === "done") return result.outcome;
+            attempts += 1;
+          }
+          return {
+            kind: "outcome_unknown",
+            error: threadSessionStopWriteConflictFailure,
+          } as const;
+        });
+
+      const writeUnknownThreadSessionStop = (
+        requestId: string,
+        recovery: ThreadSessionStopRecovery,
+        failure: ThreadSessionStopObservationFailure,
+        uncertain: Evidence,
+      ): Effect.Effect<ThreadSessionStopPersistenceAttempt, LocalStoreError> =>
+        Effect.gen(function* () {
+          const latest = yield* store.getOperation(requestId);
+          if (latest === null) {
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: "request_record_unavailable",
+                message: REQUEST_RECORD_UNAVAILABLE_MESSAGE,
+              }),
+            );
+          }
+          const existing = terminalThreadSessionStopOutcome(latest, recovery);
+          if (existing !== null) return { kind: "done", outcome: existing } as const;
+          const repeated = repeatedUnknownThreadSessionStopOutcome(
+            latest,
+            recovery,
+            failure,
+            uncertain,
+          );
+          if (repeated !== null) return { kind: "done", outcome: repeated } as const;
+          const dispatchAccepted =
+            failure.dispatchAccepted || latest.record.dispatch === "accepted";
+          const updated = yield* store.compareAndUpdateOperation(requestId, {
+            now: uncertain.observedAt,
+            expectedRevision: latest.record.revision,
+            dispatch: dispatchAccepted ? "accepted" : "unknown",
+            ...(dispatchAccepted ? { commandId: recovery.commandId } : {}),
+            stepPosition: recovery.steps.shutdown,
+            stepState: "outcome_unknown",
+            stepError: failure.error,
+            evidence: [uncertain],
+            evidenceStepPosition: recovery.steps.shutdown,
+            error: failure.error,
+            recovery: "observe_thread",
+          });
+          return updated
+            ? ({
+                kind: "done",
+                outcome: { kind: "outcome_unknown", error: failure.error },
+              } as const)
+            : ({ kind: "retry" } as const);
+        });
+
+      const persistUnknownThreadSessionStop = (
+        requestId: string,
+        recovery: ThreadSessionStopRecovery,
+        failure: ThreadSessionStopObservationFailure,
+      ): Effect.Effect<ThreadSessionStopStepOutcome, LocalStoreError> =>
+        Effect.gen(function* () {
+          const uncertain = yield* evidenceAt(
+            failure.detail,
+            failure.evidenceKind,
+            failure.sourceSequence,
+            failure.commandId,
+          );
+          let attempts = 0;
+          while (attempts < 4) {
+            const result = yield* writeUnknownThreadSessionStop(
+              requestId,
+              recovery,
+              failure,
+              uncertain,
+            );
+            if (result.kind === "done") return result.outcome;
+            attempts += 1;
+          }
+          return { kind: "outcome_unknown", error: failure.error } as const;
+        });
+
+      const updateThreadSessionStopFromObservation = (
+        requestId: string,
+        recovery: ThreadSessionStopRecovery,
+        waitMs: number,
+      ): Effect.Effect<ThreadSessionStopStepOutcome, LocalStoreError> =>
+        Effect.gen(function* () {
+          const current = yield* store.getOperation(requestId);
+          if (current === null) {
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: "request_record_unavailable",
+                message: REQUEST_RECORD_UNAVAILABLE_MESSAGE,
+              }),
+            );
+          }
+          const existing = terminalThreadSessionStopOutcome(current, recovery);
+          if (existing !== null) return existing;
+
+          const target: ThreadSessionShutdownTarget = {
+            instanceId: recovery.instanceId,
+            threadId: recovery.threadId,
+            afterSequence: recovery.afterSequence,
+            commandId: recovery.commandId,
+            createdAt: recovery.createdAt,
+            session: recovery.session,
+          };
+          const observed = yield* Effect.result(
+            observations.watchThreadSessionShutdown(target, waitMs),
+          );
+          if (Result.isSuccess(observed) && observed.success.kind === "observed") {
+            return yield* persistObservedThreadSessionStop(
+              requestId,
+              recovery,
+              observed.success.requestSequence,
+              observed.success.shutdownSequence,
+            );
+          }
+
+          const observation = Result.isSuccess(observed) ? observed.success : null;
+          const watchFailure = threadSessionStopObservationFailure({
+            current,
+            recovery,
+            observation,
+            failure: Result.isFailure(observed) ? observed.failure : null,
+          });
+          return yield* persistUnknownThreadSessionStop(requestId, recovery, watchFailure);
+        });
+
+      /**
+       * Stop and observe a captured provider session inside the caller's
+       * admitted operation. Guarded cleanup uses this same path with its own
+       * step positions, so it never creates a second MCP mutation receipt.
+       */
+      const stopThreadSessionForOperation = (input: {
+        readonly requestId: string;
+        readonly thread: ThreadStopSessionInput["thread"];
+        readonly steps: ThreadSessionStopSteps;
+        readonly waitMs: number;
+      }): Effect.Effect<
+        ThreadSessionStopStepOutcome,
+        LocalStoreError | T3CodeAdapterError | ObservationError
+      > =>
+        // fallow-ignore-next-line complexity
+        Effect.gen(function* () {
+          const existing = yield* store.getOperation(input.requestId);
+          if (existing === null) {
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: "request_record_unavailable",
+                message: REQUEST_RECORD_UNAVAILABLE_MESSAGE,
+              }),
+            );
+          }
+          const saved = threadSessionStopRecovery(existing.intent);
+          if (saved !== null) {
+            if (
+              saved.instanceId !== input.thread.instanceId ||
+              saved.threadId !== input.thread.threadId ||
+              saved.steps.capture !== input.steps.capture ||
+              saved.steps.dispatch !== input.steps.dispatch ||
+              saved.steps.shutdown !== input.steps.shutdown
+            ) {
+              return {
+                kind: "outcome_unknown",
+                error: {
+                  code: "stale_state",
+                  message:
+                    "The admitted operation contains a different provider-session stop target.",
+                  retry: "reconcile_first",
+                  details: {},
+                },
+              } as const;
+            }
+            const shutdownStep = existing.record.steps[saved.steps.shutdown];
+            if (shutdownStep?.state === "succeeded") return { kind: "observed" } as const;
+            if (shutdownStep?.state === "already_absent") {
+              return { kind: "already_stopped" } as const;
+            }
+            return yield* updateThreadSessionStopFromObservation(
+              input.requestId,
+              saved,
+              input.waitMs,
+            );
+          }
+
+          const baseline = yield* observations.threadDetail(
+            input.thread.instanceId,
+            input.thread.threadId,
+          );
+          const session = baseline.thread.session;
+          const captured = yield* evidenceAt(
+            `T3Code reported the provider session as ${session?.status ?? "absent"} before shutdown was requested.`,
+            "snapshot",
+            baseline.snapshotSequence,
+          );
+          const captureUpdated = yield* store.compareAndUpdateOperation(input.requestId, {
+            now: captured.observedAt,
+            expectedRevision: existing.record.revision,
+            onlyIfNonterminal: true,
+            state: "pending",
+            target: input.thread,
+            stepPosition: input.steps.capture,
+            stepState: "succeeded",
+            evidence: [captured],
+            evidenceStepPosition: input.steps.capture,
+          });
+          if (!captureUpdated) {
+            return {
+              kind: "not_dispatched",
+              error: threadSessionStopWriteConflictFailure,
+            } as const;
+          }
+
+          if (session === null || session.status === "stopped") {
+            const alreadyStopped = yield* evidenceAt(
+              session === null
+                ? "The fresh thread snapshot showed no provider session to stop."
+                : "The fresh thread snapshot showed that the provider session was already stopped.",
+              "snapshot",
+              baseline.snapshotSequence,
+            );
+            yield* store.updateOperation(input.requestId, {
+              now: alreadyStopped.observedAt,
+              target: input.thread,
+              stepPosition: input.steps.dispatch,
+              stepState: "skipped",
+              evidence: [alreadyStopped],
+              evidenceStepPosition: input.steps.dispatch,
+            });
+            yield* store.updateOperation(input.requestId, {
+              now: alreadyStopped.observedAt,
+              stepPosition: input.steps.shutdown,
+              stepState: "already_absent",
+              evidence: [alreadyStopped],
+              evidenceStepPosition: input.steps.shutdown,
+            });
+            return { kind: "already_stopped" } as const;
+          }
+
+          const preflight = yield* observations.threadDetail(
+            input.thread.instanceId,
+            input.thread.threadId,
+          );
+          if (
+            preflight.snapshotReset ||
+            preflight.snapshotSequence < baseline.snapshotSequence ||
+            !observedSessionsMatch(session, preflight.thread.session)
+          ) {
+            const failure: ToolFailure = {
+              code: "stale_state",
+              message:
+                "The provider session changed after it was captured; no stop command was sent.",
+              retry: "reconcile_first",
+              details: {},
+            };
+            const changed = yield* evidenceAt(
+              "A fresh preflight did not confirm the captured session identity; shutdown was not dispatched.",
+              "adapter_inference",
+              preflight.snapshotSequence,
+            );
+            yield* store.updateOperation(input.requestId, {
+              now: changed.observedAt,
+              target: input.thread,
+              stepPosition: input.steps.dispatch,
+              stepState: "skipped",
+              evidence: [changed],
+              evidenceStepPosition: input.steps.dispatch,
+            });
+            yield* store.updateOperation(input.requestId, {
+              now: changed.observedAt,
+              stepPosition: input.steps.shutdown,
+              stepState: "failed",
+              stepError: failure,
+              evidence: [changed],
+              evidenceStepPosition: input.steps.shutdown,
+              error: failure,
+              recovery: "observe_thread",
+            });
+            return { kind: "not_dispatched", error: failure } as const;
+          }
+
+          // Pairing, identity, and connection setup finish before the durable
+          // dispatch marker. The prepared dispatcher keeps credentials inside
+          // InstanceConnections and avoids a second acquisition after the marker.
+          const preparedStop = yield* connections.prepareThreadSessionStop(input.thread.instanceId);
+
+          const commandId = yield* crypto.randomUUIDv4.pipe(
+            Effect.mapError(
+              () =>
+                new LocalStoreError({
+                  kind: "storage",
+                  message:
+                    "The operation supervisor could not create a provider-session command identity.",
+                }),
+            ),
+          );
+          const createdAt = yield* nowIso;
+          const recovery: ThreadSessionStopRecovery = {
+            instanceId: input.thread.instanceId,
+            threadId: input.thread.threadId,
+            afterSequence: preflight.snapshotSequence,
+            session: {
+              providerInstanceId: session.providerInstanceId ?? null,
+              status: session.status,
+              activeTurnId: session.activeTurnId,
+              lastError: session.lastError,
+              updatedAt: session.updatedAt,
+            },
+            commandId,
+            createdAt,
+            steps: input.steps,
+          };
+          const currentForIntent = yield* store.getOperation(input.requestId);
+          if (currentForIntent === null) {
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: "request_record_unavailable",
+                message: REQUEST_RECORD_UNAVAILABLE_MESSAGE,
+              }),
+            );
+          }
+          const dispatchStarted = yield* evidenceAt(
+            "The provider-session command identity and captured session evidence were persisted before dispatch; this command will not be replayed.",
+            "adapter_inference",
+            baseline.snapshotSequence,
+            commandId,
+          );
+          const intentUpdated = yield* store.compareAndUpdateOperation(input.requestId, {
+            now: dispatchStarted.observedAt,
+            expectedRevision: currentForIntent.record.revision,
+            onlyIfNonterminal: true,
+            intent: { ...currentForIntent.intent, sessionStop: recovery },
+            target: input.thread,
+            state: "pending",
+            dispatch: "unknown",
+            commandId,
+            stepPosition: input.steps.dispatch,
+            stepState: "pending",
+            evidence: [dispatchStarted],
+            evidenceStepPosition: input.steps.dispatch,
+            recovery: "observe_operation",
+          });
+          if (!intentUpdated) {
+            return {
+              kind: "not_dispatched",
+              error: threadSessionStopWriteConflictFailure,
+            } as const;
+          }
+
+          const dispatch = yield* Effect.result(
+            preparedStop.dispatch({
+              threadId: input.thread.threadId,
+              commandId,
+              createdAt,
+            }),
+          );
+          if (Result.isFailure(dispatch)) {
+            const error = dispatch.failure;
+            const mayHaveDispatched = error instanceof T3CodeAdapterError && error.uncertain;
+            const mappedFailure = threadSessionStopFailure(error);
+            const failure = mayHaveDispatched
+              ? { ...mappedFailure, retry: "reconcile_first" as const }
+              : mappedFailure;
+            const failedDispatch = yield* evidenceAt(
+              mayHaveDispatched
+                ? "The provider-session command reply was lost or unavailable; the command will not be replayed."
+                : `T3Code did not accept the provider-session stop command: ${failure.message}`,
+              mayHaveDispatched ? "adapter_inference" : "rpc_result",
+              null,
+              commandId,
+            );
+            yield* store.updateOperation(input.requestId, {
+              now: failedDispatch.observedAt,
+              dispatch: mayHaveDispatched
+                ? "unknown"
+                : error instanceof T3CodeAdapterError && error.kind === "command_rejected"
+                  ? "rejected"
+                  : "not_dispatched",
+              stepPosition: input.steps.dispatch,
+              stepState: mayHaveDispatched ? "outcome_unknown" : "failed",
+              stepError: failure,
+              evidence: [failedDispatch],
+              evidenceStepPosition: input.steps.dispatch,
+              error: failure,
+              recovery: mayHaveDispatched ? "observe_thread" : "new_explicit_request",
+            });
+            if (!mayHaveDispatched) {
+              return { kind: "not_dispatched", error: failure } as const;
+            }
+            return yield* updateThreadSessionStopFromObservation(
+              input.requestId,
+              recovery,
+              input.waitMs,
+            );
+          }
+
+          const accepted = yield* evidenceAt(
+            "T3Code accepted the provider-session stop command; shutdown still requires a matching session update.",
+            "rpc_result",
+            dispatch.success.sequence,
+            commandId,
+          );
+          yield* store.updateOperation(input.requestId, {
+            now: accepted.observedAt,
+            dispatch: "accepted",
+            commandId,
+            stepPosition: input.steps.dispatch,
+            stepState: "succeeded",
+            stepError: null,
+            evidence: [accepted],
+            evidenceStepPosition: input.steps.dispatch,
+          });
+          return yield* updateThreadSessionStopFromObservation(
+            input.requestId,
+            recovery,
+            input.waitMs,
+          );
+        });
+
+      const threadSessionStopCompletedUpdate = (
+        input: ThreadSessionStopOperationInput,
+        current: StoredOperation,
+        now: string,
+        dispatch: "accepted" | "not_dispatched",
+        stepState: "succeeded" | "already_absent",
+      ): OperationCompareAndUpdateInput => ({
+        now,
+        expectedRevision: current.record.revision,
+        target: input.thread,
+        state: "completed",
+        dispatch,
+        stepPosition: input.steps.shutdown,
+        stepState,
+        stepError: null,
+        error: null,
+        recovery: "none",
+        recoverableUntil: new Date(
+          Date.parse(now) + OPERATION_DETAIL_RETENTION_MILLIS,
+        ).toISOString(),
+      });
+
+      const threadSessionStopFailedUpdate = (
+        input: ThreadSessionStopOperationInput,
+        current: StoredOperation,
+        now: string,
+        error: ToolFailure,
+      ): OperationCompareAndUpdateInput => ({
+        now,
+        expectedRevision: current.record.revision,
+        target: input.thread,
+        state: "failed",
+        dispatch: current.record.dispatch === "rejected" ? "rejected" : "not_dispatched",
+        ...(current.record.steps[input.steps.dispatch]?.state === "skipped"
+          ? {}
+          : {
+              stepPosition: input.steps.dispatch,
+              stepState: "failed" as const,
+              stepError: error,
+            }),
+        error,
+        recovery: error.code === "stale_state" ? "observe_thread" : "new_explicit_request",
+        recoverableUntil: new Date(
+          Date.parse(now) + OPERATION_DETAIL_RETENTION_MILLIS,
+        ).toISOString(),
+      });
+
+      const threadSessionStopUnknownUpdate = (
+        input: ThreadSessionStopOperationInput,
+        current: StoredOperation,
+        now: string,
+        error: ToolFailure,
+      ): OperationCompareAndUpdateInput => ({
+        now,
+        expectedRevision: current.record.revision,
+        target: input.thread,
+        state: "outcome_unknown",
+        dispatch: current.record.dispatch === "accepted" ? "accepted" : "unknown",
+        stepPosition: input.steps.shutdown,
+        stepState: "outcome_unknown",
+        stepError: error,
+        error,
+        recovery: "observe_thread",
+        recoverableUntil: null,
+      });
+
+      const threadSessionStopFinalUpdate = (
+        input: ThreadSessionStopOperationInput,
+        current: StoredOperation,
+        outcome: ThreadSessionStopStepOutcome,
+        now: string,
+      ): OperationCompareAndUpdateInput => {
+        switch (outcome.kind) {
+          case "already_stopped":
+            return threadSessionStopCompletedUpdate(
+              input,
+              current,
+              now,
+              "not_dispatched",
+              "already_absent",
+            );
+          case "observed":
+            return threadSessionStopCompletedUpdate(input, current, now, "accepted", "succeeded");
+          case "not_dispatched":
+            return threadSessionStopFailedUpdate(input, current, now, outcome.error);
+          case "outcome_unknown":
+            return threadSessionStopUnknownUpdate(input, current, now, outcome.error);
+        }
+      };
+
+      const finishThreadSessionStop = (
+        input: ThreadSessionStopOperationInput,
+        outcome: ThreadSessionStopStepOutcome,
+      ): Effect.Effect<void, LocalStoreError> =>
+        Effect.gen(function* () {
+          let attempts = 0;
+          while (attempts < 4) {
+            const current = yield* store.getOperation(input.requestId);
+            if (current === null) return;
+            if (!threadSessionStopCanFinalize(current.record, outcome)) return;
+            const now = yield* nowIso;
+            const updated = yield* store.compareAndUpdateOperation(
+              input.requestId,
+              threadSessionStopFinalUpdate(input, current, outcome, now),
+            );
+            if (updated) {
+              yield* signalCompletion(input.requestId);
+              return;
+            }
+            attempts += 1;
+          }
+        });
+
+      const executeThreadSessionStop = (
+        input: ThreadStopSessionInput,
+      ): Effect.Effect<void, never> => {
+        const operation = stopThreadSessionForOperation({
+          requestId: input.requestId,
+          thread: input.thread,
+          steps: THREAD_SESSION_STOP_STEPS,
+          waitMs: MAX_THREAD_WAIT_MILLIS,
+        }).pipe(
+          Effect.flatMap((outcome) =>
+            finishThreadSessionStop(
+              {
+                requestId: input.requestId,
+                thread: input.thread,
+                steps: THREAD_SESSION_STOP_STEPS,
+              },
+              outcome,
+            ),
+          ),
+        );
+        return operation.pipe(
+          Effect.catch((error: LocalStoreError | T3CodeAdapterError | ObservationError) =>
+            Effect.gen(function* () {
+              const current = yield* store.getOperation(input.requestId);
+              if (current === null) return;
+              const failure = threadSessionStopFailure(error);
+              const dispatchMayHaveOccurred =
+                current.record.dispatch === "accepted" || current.record.dispatch === "unknown";
+              yield* finishThreadSessionStop(
+                {
+                  requestId: input.requestId,
+                  thread: input.thread,
+                  steps: THREAD_SESSION_STOP_STEPS,
+                },
+                dispatchMayHaveOccurred
+                  ? { kind: "outcome_unknown", error: failure }
+                  : { kind: "not_dispatched", error: failure },
+              );
+            }).pipe(Effect.catch(() => Effect.void)),
+          ),
+          Effect.asVoid,
+        );
+      };
 
       const markOtherOutcomeUnknown = (
         stored: StoredOperation,
@@ -869,6 +1871,185 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           return refreshed?.record ?? record;
         });
 
+      const threadSessionStopOperationInput = (
+        stored: StoredOperation,
+        record: OperationRecord,
+      ): ThreadSessionStopOperationInput | null => {
+        const threadId = stored.intent.threadId;
+        return typeof threadId === "string"
+          ? {
+              requestId: record.requestId,
+              thread: { instanceId: stored.intent.instanceId, threadId },
+              steps: THREAD_SESSION_STOP_STEPS,
+            }
+          : null;
+      };
+
+      const uncapturedThreadSessionStopOutcome = (
+        record: OperationRecord,
+        steps: ThreadSessionStopSteps,
+      ): ThreadSessionStopStepOutcome => {
+        if (record.steps[steps.shutdown]?.state === "already_absent") {
+          return { kind: "already_stopped" };
+        }
+        if (record.dispatch === "rejected") {
+          return {
+            kind: "not_dispatched",
+            error: record.steps[steps.dispatch]?.error ?? {
+              code: "upstream_failure",
+              message: "T3Code rejected the provider-session stop command.",
+              retry: "change_request",
+              details: {},
+            },
+          };
+        }
+        return {
+          kind: "not_dispatched",
+          error: record.error ??
+            record.steps[steps.dispatch]?.error ?? {
+              code: "unavailable",
+              message:
+                "The owning process stopped before it dispatched the provider-session command; no command was replayed.",
+              retry: "reconcile_first",
+              details: {},
+            },
+        };
+      };
+
+      const finishUncapturedThreadSessionStop = (
+        operationInput: ThreadSessionStopOperationInput,
+        record: OperationRecord,
+      ): Effect.Effect<OperationRecord, LocalStoreError> =>
+        Effect.gen(function* () {
+          const outcome = uncapturedThreadSessionStopOutcome(record, operationInput.steps);
+          yield* finishThreadSessionStop(operationInput, outcome);
+          const refreshed = yield* store.getOperation(record.requestId);
+          return refreshed?.record ?? record;
+        });
+
+      const reconcileUncapturedThreadSessionStop = (
+        stored: StoredOperation,
+        record: OperationRecord,
+        previousOwner: boolean,
+        previousOwnerStale: boolean,
+      ): Effect.Effect<OperationRecord, LocalStoreError> =>
+        Effect.gen(function* () {
+          if (
+            record.state === "outcome_unknown" ||
+            !threadSessionStopOwnerAbandoned(previousOwner, previousOwnerStale)
+          ) {
+            return record;
+          }
+          const operationInput = threadSessionStopOperationInput(stored, record);
+          if (
+            operationInput !== null &&
+            (record.dispatch === "not_dispatched" || record.dispatch === "rejected")
+          ) {
+            return yield* finishUncapturedThreadSessionStop(operationInput, record);
+          }
+          return yield* markOutcomeUnknown(
+            stored,
+            record,
+            "A previous process stopped before it captured a provider session; the command was not replayed.",
+          );
+        });
+
+      const claimThreadSessionStopRecoveryObservation = (
+        record: OperationRecord,
+      ): Effect.Effect<
+        | { readonly kind: "claimed" }
+        | { readonly kind: "rate_limited"; readonly record: OperationRecord },
+        LocalStoreError
+      > =>
+        Effect.gen(function* () {
+          const attemptAt = yield* Clock.currentTimeMillis;
+          const claimed = yield* Effect.sync(() =>
+            reserveThreadSessionStopRecoveryObservation(record.requestId, attemptAt),
+          );
+          if (claimed) return { kind: "claimed" } as const;
+          const current = yield* store.getOperation(record.requestId);
+          return { kind: "rate_limited", record: current?.record ?? record } as const;
+        });
+
+      const threadSessionStopReceiptIsFinal = (state: OperationRecord["state"]): boolean =>
+        state === "completed" || state === "failed" || state === "partial";
+
+      const finalizeThreadSessionStopRecovery = (input: {
+        readonly record: OperationRecord;
+        readonly recovery: ThreadSessionStopRecovery;
+        readonly ownerAbandoned: boolean;
+        readonly outcome: ThreadSessionStopStepOutcome;
+      }): Effect.Effect<OperationRecord, LocalStoreError> =>
+        Effect.gen(function* () {
+          const { record, recovery, ownerAbandoned, outcome } = input;
+          const operationInput: ThreadSessionStopOperationInput = {
+            requestId: record.requestId,
+            thread: { instanceId: recovery.instanceId, threadId: recovery.threadId },
+            steps: recovery.steps,
+          };
+          if (shouldFinalizeThreadSessionStopRecovery(record, outcome, ownerAbandoned)) {
+            yield* finishThreadSessionStop(operationInput, outcome);
+          }
+          const refreshed = yield* store.getOperation(record.requestId);
+          const current = refreshed?.record ?? record;
+          if (threadSessionStopReceiptIsFinal(current.state)) {
+            threadSessionStopRecoveryLastAttemptAt.delete(record.requestId);
+          }
+          return current;
+        });
+
+      const reconcileCapturedThreadSessionStop = (
+        stored: StoredOperation,
+        record: OperationRecord,
+        recovery: ThreadSessionStopRecovery,
+        previousOwner: boolean,
+        previousOwnerStale: boolean,
+      ): Effect.Effect<OperationRecord, LocalStoreError> =>
+        Effect.gen(function* () {
+          const ownerAbandoned = threadSessionStopOwnerAbandoned(previousOwner, previousOwnerStale);
+          if (!ownerAbandoned && record.state !== "outcome_unknown") {
+            return record;
+          }
+          const claim = yield* claimThreadSessionStopRecoveryObservation(record);
+          if (claim.kind === "rate_limited") return claim.record;
+          const outcome = yield* updateThreadSessionStopFromObservation(
+            record.requestId,
+            recovery,
+            Math.min(1_000, MAX_THREAD_WAIT_MILLIS),
+          );
+          return yield* finalizeThreadSessionStopRecovery({
+            record,
+            recovery,
+            ownerAbandoned,
+            outcome,
+          });
+        });
+
+      const reconcileThreadSessionStop = (
+        stored: StoredOperation,
+        previousOwner: boolean,
+        previousOwnerStale: boolean,
+      ): Effect.Effect<OperationRecord, LocalStoreError> => {
+        const record = stored.record;
+        if (
+          record.state === "completed" ||
+          record.state === "failed" ||
+          record.state === "partial"
+        ) {
+          return Effect.succeed(record);
+        }
+        const recovery = threadSessionStopRecovery(stored.intent);
+        return recovery === null
+          ? reconcileUncapturedThreadSessionStop(stored, record, previousOwner, previousOwnerStale)
+          : reconcileCapturedThreadSessionStop(
+              stored,
+              record,
+              recovery,
+              previousOwner,
+              previousOwnerStale,
+            );
+      };
+
       const reconcile = (
         stored: StoredOperation,
       ): Effect.Effect<OperationRecord, LocalStoreError> =>
@@ -976,6 +2157,9 @@ export class Operations extends Context.Service<Operations, OperationsService>()
             }
             const refreshed = yield* store.getOperation(record.requestId);
             return refreshed?.record ?? record;
+          }
+          if (record.tool === "thread_stop_session") {
+            return yield* reconcileThreadSessionStop(stored, previousOwner, previousOwnerStale);
           }
           if (terminal(record)) return record;
           if (record.tool === "instance_pair") {
@@ -3118,6 +4302,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
                   Effect.ensuring(
                     Effect.gen(function* () {
                       yield* release(input.requestId);
+                      yield* signalCompletion(input.requestId);
                       completionSignals.delete(input.requestId);
                     }),
                   ),
@@ -3135,6 +4320,19 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           );
 
           if (!admitted.execute) return admitted.operation;
+          if (input.tool === "thread_stop_session") {
+            const signal = completionSignals.get(input.requestId);
+            if (signal !== undefined) {
+              yield* Deferred.await(signal).pipe(
+                Effect.timeoutOrElse({
+                  duration: Duration.millis(MAX_OPERATION_WAIT_MILLIS),
+                  orElse: () => Effect.void,
+                }),
+              );
+            }
+            const stored = yield* store.getOperation(input.requestId);
+            return stored?.record ?? admitted.operation;
+          }
           const deadline = (yield* Clock.currentTimeMillis) + MAX_OPERATION_WAIT_MILLIS;
           let current = yield* readOperation({
             requestId: input.requestId,
@@ -3793,6 +4991,30 @@ export class Operations extends Context.Service<Operations, OperationsService>()
             execute: executeThreadInterrupt(input, commandId),
           });
         });
+      const stopThreadSession = (
+        input: ThreadStopSessionInput,
+      ): Effect.Effect<OperationRecord, LocalStoreError | OperationServiceError> =>
+        Effect.gen(function* () {
+          const fingerprint = yield* store.fingerprintRequest("thread_stop_session", input);
+          const existing = yield* findExistingOperation(input.requestId, fingerprint);
+          if (existing !== null) return existing;
+
+          return yield* admitAndRun({
+            requestId: input.requestId,
+            fingerprint,
+            tool: "thread_stop_session",
+            intent: { instanceId: input.thread.instanceId, threadId: input.thread.threadId },
+            target: input.thread,
+            completionMeans: "session_shutdown_observed",
+            steps: [
+              "capture_provider_session",
+              "dispatch_provider_session_stop",
+              "observe_provider_session_shutdown",
+            ],
+            execute: executeThreadSessionStop(input),
+          });
+        });
+
       return Operations.of({
         pairInstance,
         pairInstanceAgain,
@@ -3803,6 +5025,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
         createWorktree,
         respondToApproval,
         interruptThread,
+        stopThreadSession,
         getOperation: readOperation,
       });
     }),

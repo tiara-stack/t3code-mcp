@@ -4,7 +4,7 @@ import { T3CodeAdapterError, type T3CodeAdapterErrorKind } from "./t3code-adapte
 type AdapterFailureMapping = Pick<ToolFailure, "code" | "retry" | "details"> & {
   readonly message?: string;
 };
-type AdapterFailureContext = "read" | "pairing" | "worktree" | "approval";
+type AdapterFailureContext = "read" | "pairing" | "worktree" | "approval" | "thread_stop";
 type AdapterFailurePolicy =
   | AdapterFailureMapping
   | ((error: T3CodeAdapterError) => AdapterFailureMapping);
@@ -16,12 +16,6 @@ const reconcileFirstUnavailable: AdapterFailureMapping = {
 };
 
 const sharedAdapterFailures = {
-  command_rejected: {
-    code: "pending_request_not_current",
-    message: "The approval request changed before T3Code accepted the response.",
-    retry: "reconcile_first",
-    details: {},
-  },
   invalid_pairing_code: {
     code: "pairing_failed",
     retry: "change_request",
@@ -82,6 +76,11 @@ const sharedAdapterFailures = {
     retry: "reconcile_first",
     details: {},
   },
+  command_rejected: {
+    code: "upstream_failure",
+    retry: "change_request",
+    details: {},
+  },
   capacity: {
     code: "unavailable",
     retry: "safe_read",
@@ -129,6 +128,12 @@ const worktreeOverrides = {
 } satisfies Partial<Record<T3CodeAdapterErrorKind, AdapterFailurePolicy>>;
 
 const approvalOverrides = {
+  command_rejected: {
+    code: "pending_request_not_current",
+    message: "The approval request changed before T3Code accepted the response.",
+    retry: "reconcile_first",
+    details: {},
+  },
   transport: {
     code: "unavailable",
     message: "The approval response was not dispatched; submit a new explicit request.",
@@ -153,11 +158,48 @@ const approvalOverrides = {
   },
 } satisfies Partial<Record<T3CodeAdapterErrorKind, AdapterFailurePolicy>>;
 
+const threadStopUncertainFailure: AdapterFailureMapping = {
+  code: "unavailable",
+  retry: "reconcile_first",
+  details: { action: "observe_operation" },
+};
+
+const threadStopTransportFailure = (error: T3CodeAdapterError): AdapterFailureMapping =>
+  error.uncertain
+    ? threadStopUncertainFailure
+    : { code: "unavailable", retry: "safe_read", details: {} };
+
+const threadStopOverrides = {
+  invalid_pairing_code: {
+    code: "pairing_failed",
+    retry: "change_request",
+    details: { reason: "invalid_pairing_code" },
+  },
+  pairing_code_used: {
+    code: "pairing_failed",
+    retry: "change_request",
+    details: { reason: "pairing_code_used" },
+  },
+  transport: threadStopTransportFailure,
+  timeout: threadStopTransportFailure,
+  authorization: {
+    code: "operate_denied",
+    retry: "change_request",
+    details: {},
+  },
+  capacity: {
+    code: "unavailable",
+    retry: "safe_read",
+    details: { action: "retry_later" },
+  },
+} satisfies Partial<Record<T3CodeAdapterErrorKind, AdapterFailurePolicy>>;
+
 const adapterFailureMappings = {
   read: sharedAdapterFailures,
   pairing: { ...sharedAdapterFailures, ...pairingOverrides },
   worktree: { ...sharedAdapterFailures, ...worktreeOverrides },
   approval: { ...sharedAdapterFailures, ...approvalOverrides },
+  thread_stop: { ...sharedAdapterFailures, ...threadStopOverrides },
 } satisfies Record<AdapterFailureContext, Record<T3CodeAdapterErrorKind, AdapterFailurePolicy>>;
 
 export const adapterErrorFailure = (

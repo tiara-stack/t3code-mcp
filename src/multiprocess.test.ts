@@ -14,6 +14,8 @@ const tsxCliPath = createRequire(import.meta.url).resolve("tsx/cli");
 
 type JsonRpcMessage = {
   readonly id?: number;
+  readonly stage?: string;
+  readonly operation?: unknown;
   readonly result?: {
     readonly tools?: ReadonlyArray<{ readonly name: string }>;
     readonly isError?: boolean;
@@ -132,12 +134,42 @@ const startServer = async (databasePath: string): Promise<Server> => {
       "turn_wait",
       "input_respond",
       "operation_get",
+      "thread_stop_session",
     ]);
     return server;
   } catch (error) {
     await stopServer(server);
     throw error;
   }
+};
+
+const startSessionStopWorker = async (
+  databasePath: string,
+  mode: "start" | "recover",
+  requestId: string,
+  recovery?: { readonly commandId: string; readonly createdAt: string },
+): Promise<Server> => {
+  const child = spawn(
+    process.execPath,
+    [tsxCliPath, "scripts/multiprocess-session-stop-worker.ts"],
+    {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        T3CODE_MCP_DATABASE_PATH: databasePath,
+        T3CODE_MCP_SESSION_STOP_MODE: mode,
+        T3CODE_MCP_SESSION_STOP_REQUEST_ID: requestId,
+        ...(recovery === undefined
+          ? {}
+          : {
+              T3CODE_MCP_SESSION_STOP_COMMAND_ID: recovery.commandId,
+              T3CODE_MCP_SESSION_STOP_CREATED_AT: recovery.createdAt,
+            }),
+      },
+      stdio: ["ignore", "pipe", "inherit"],
+    },
+  );
+  return { child, next: waitForMessage(child) };
 };
 
 const stopServer = async (server: Server) => {
@@ -196,6 +228,23 @@ const expireResolvedOperation = (databasePath: string, requestId: string) => {
     database.close();
   }
 };
+
+const agePendingOperation = (databasePath: string, requestId: string) =>
+  Effect.acquireUseRelease(
+    Effect.sync(() => new DatabaseSync(databasePath)),
+    (database) =>
+      Effect.sync(() => {
+        const timestamp = new Date(Date.now() - 120_000).toISOString();
+        database.exec("PRAGMA busy_timeout = 5000");
+        const result = database
+          .prepare("UPDATE operations SET updated_at = ? WHERE request_id = ?")
+          .run(timestamp, requestId);
+        if (Number(result.changes) !== 1) {
+          throw new Error(`Could not age pending operation ${requestId}`);
+        }
+      }),
+    (database) => Effect.sync(() => database.close()),
+  );
 
 const withServers = <A, E, R>(
   prefix: string,
@@ -808,6 +857,7 @@ describe("shared SQLite mutation admission", () => {
     () =>
       withServers("t3code-mcp-input-response-admission-", ({ databasePath, servers }) =>
         Effect.gen(function* () {
+          yield* seed(databasePath, []);
           const [left, right] = yield* Effect.promise(() =>
             Promise.all([startServer(databasePath), startServer(databasePath)]),
           );
@@ -910,6 +960,89 @@ describe("shared SQLite mutation admission", () => {
           const list = yield* Effect.promise(() => call(second, 4, "instance_list", {}));
           expect(list.result?.structuredContent).toMatchObject({
             result: { kind: "ok", value: { items: [] } },
+          });
+        }),
+      ),
+    60000,
+  );
+
+  it.live(
+    "recovers observed provider-session shutdown evidence after the owning OS process dies",
+    () =>
+      withServers("t3code-mcp-session-stop-recovery-", ({ databasePath, servers }) =>
+        Effect.gen(function* () {
+          const requestId = "session-stop-process-death";
+          yield* seed(databasePath, [{ instanceId: "instance-a" }]);
+
+          const first = yield* Effect.promise(() =>
+            startSessionStopWorker(databasePath, "start", requestId),
+          );
+          servers.add(first);
+          expect((yield* Effect.promise(() => first.next())).stage).toBe("dispatched");
+          expect((yield* Effect.promise(() => first.next())).stage).toBe("watching");
+
+          const intent = yield* Effect.acquireUseRelease(
+            Effect.sync(() => new DatabaseSync(databasePath)),
+            (database) =>
+              Effect.sync(() => {
+                const row = database
+                  .prepare(
+                    "SELECT intent_json, target_json, dispatch, state FROM operations WHERE request_id = ?",
+                  )
+                  .get(requestId) as
+                  | {
+                      intent_json: string;
+                      target_json: string | null;
+                      dispatch: string;
+                      state: string;
+                    }
+                  | undefined;
+                expect(row).toMatchObject({ dispatch: "accepted", state: "pending" });
+                expect(JSON.parse(row?.target_json ?? "null")).toEqual({
+                  instanceId: "instance-a",
+                  threadId: "thread-a",
+                });
+                return JSON.parse(row?.intent_json ?? "{}") as {
+                  sessionStop?: { commandId?: string; createdAt?: string };
+                };
+              }),
+            (database) => Effect.sync(() => database.close()),
+          );
+
+          const recovery = intent.sessionStop;
+          const commandId = recovery?.commandId;
+          const createdAt = recovery?.createdAt;
+          expect(commandId).toEqual(expect.any(String));
+          expect(createdAt).toEqual(expect.any(String));
+          if (commandId === undefined || createdAt === undefined) {
+            throw new Error("The admitted operation did not persist session-stop recovery data");
+          }
+          const exited = new Promise<void>((resolve) => first.child.once("exit", () => resolve()));
+          first.child.kill("SIGKILL");
+          yield* Effect.promise(() => exited);
+          servers.delete(first);
+          yield* agePendingOperation(databasePath, requestId);
+
+          const second = yield* Effect.promise(() =>
+            startSessionStopWorker(databasePath, "recover", requestId, {
+              commandId,
+              createdAt,
+            }),
+          );
+          servers.add(second);
+          const recovered = yield* Effect.promise(() => second.next());
+          expect(recovered.stage).toBe("result");
+          expect(recovered.operation).toMatchObject({
+            result: {
+              kind: "ok",
+              value: {
+                operation: {
+                  state: "completed",
+                  dispatch: "accepted",
+                  completionMeans: "session_shutdown_observed",
+                },
+              },
+            },
           });
         }),
       ),

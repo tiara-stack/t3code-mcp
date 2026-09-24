@@ -37,6 +37,15 @@ import {
 
 export type VerifiedPairing = StagedPairingToken & VerifiedInstance;
 
+const certainConnectionAcquisitionError = (error: T3CodeAdapterError): T3CodeAdapterError =>
+  new T3CodeAdapterError({
+    kind: error.kind === "wire_incompatible" ? "incompatible_instance" : error.kind,
+    message: error.message,
+    uncertain: false,
+    status: error.status,
+    ...(error.requiredScopes === undefined ? {} : { requiredScopes: error.requiredScopes }),
+  });
+
 export interface DiscoveredProjects {
   readonly snapshotSequence: number;
   readonly projects: ReadonlyArray<DiscoveredProject>;
@@ -90,6 +99,13 @@ export interface InstanceDispatchTurnInput {
   readonly createdAt: string;
   readonly onDispatchStart: () => void;
 }
+export type PreparedThreadSessionStop = {
+  readonly dispatch: (input: {
+    readonly threadId: string;
+    readonly commandId: string;
+    readonly createdAt: string;
+  }) => Effect.Effect<{ readonly sequence: number }, T3CodeAdapterError>;
+};
 
 export interface InstanceInspection {
   readonly details: InstanceDetails;
@@ -125,6 +141,9 @@ export interface InstanceConnectionsService {
     instanceId: string,
     input: WorktreeCreateRequest,
   ) => Effect.Effect<CreatedWorktree, LocalStoreError | T3CodeAdapterError>;
+  readonly prepareThreadSessionStop: (
+    instanceId: string,
+  ) => Effect.Effect<PreparedThreadSessionStop, LocalStoreError | T3CodeAdapterError>;
   /**
    * Read the VCS refs for one repository path on the target instance, keeping
    * only refs that report a worktree checkout. A missing registration or an
@@ -203,10 +222,13 @@ export class InstanceConnections extends Context.Service<
   static readonly layerTest = (
     service: Omit<
       InstanceConnectionsService,
-      "respondToInput" | "dispatchTurn" | "interruptThread"
+      "respondToInput" | "dispatchTurn" | "interruptThread" | "prepareThreadSessionStop"
     > &
       Partial<
-        Pick<InstanceConnectionsService, "respondToInput" | "dispatchTurn" | "interruptThread">
+        Pick<
+          InstanceConnectionsService,
+          "respondToInput" | "dispatchTurn" | "interruptThread" | "prepareThreadSessionStop"
+        >
       >,
   ): Layer.Layer<InstanceConnections> =>
     Layer.succeed(InstanceConnections, {
@@ -244,6 +266,20 @@ export class InstanceConnections extends Context.Service<
               status: null,
             }),
           )),
+      prepareThreadSessionStop:
+        service.prepareThreadSessionStop ??
+        (() =>
+          Effect.succeed({
+            dispatch: () =>
+              Effect.fail(
+                new T3CodeAdapterError({
+                  kind: "capacity",
+                  message: "The test connection does not support provider-session shutdown.",
+                  uncertain: false,
+                  status: null,
+                }),
+              ),
+          })),
     });
 
   static readonly layerWithAdapter = (adapterLayer: Layer.Layer<T3CodeAdapter>) =>
@@ -433,6 +469,34 @@ export class InstanceConnections extends Context.Service<
             return { ...listing, observedAt };
           });
 
+        const prepareThreadSessionStop = (
+          instanceId: string,
+        ): Effect.Effect<PreparedThreadSessionStop, LocalStoreError | T3CodeAdapterError> =>
+          Effect.gen(function* () {
+            yield* requireReadableRegistration(
+              instanceId,
+              "The saved registration requires pairing before sessions can be stopped.",
+            );
+            const connection = yield* acquire(instanceId).pipe(
+              Effect.catchTag("T3CodeAdapterError", (error) =>
+                Effect.fail(certainConnectionAcquisitionError(error)),
+              ),
+            );
+            return {
+              dispatch: (input) =>
+                withInstanceCapacity(
+                  instanceId,
+                  adapter.stopThreadSession({
+                    endpoint: connection.endpoint,
+                    credential: connection.credential,
+                    threadId: input.threadId,
+                    commandId: input.commandId,
+                    createdAt: input.createdAt,
+                  }),
+                ),
+            } satisfies PreparedThreadSessionStop;
+          });
+
         const discoverVcsRefs = (
           instanceId: string,
           repositoryPath: string,
@@ -528,14 +592,7 @@ export class InstanceConnections extends Context.Service<
             }
             const connection = yield* acquire(input.instanceId).pipe(
               Effect.catchTag("T3CodeAdapterError", (error) =>
-                Effect.fail(
-                  new T3CodeAdapterError({
-                    kind: error.kind === "wire_incompatible" ? "incompatible_instance" : error.kind,
-                    message: error.message,
-                    uncertain: false,
-                    status: error.status,
-                  }),
-                ),
+                Effect.fail(certainConnectionAcquisitionError(error)),
               ),
             );
             return yield* withInstanceCapacity(
@@ -965,6 +1022,7 @@ export class InstanceConnections extends Context.Service<
           discoverProjects,
           discoverModels,
           createWorktree,
+          prepareThreadSessionStop,
           discoverVcsRefs,
           readVcsWorktreeStatus,
           discoverVcsWorktreeRefs,

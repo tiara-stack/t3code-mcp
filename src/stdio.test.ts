@@ -130,6 +130,7 @@ describe("stdio transport", () => {
               "turn_wait",
               "input_respond",
               "operation_get",
+              "thread_stop_session",
             ]);
             expect(
               toolsMessage.result?.tools?.find((tool) => tool.name === "worktree_inspect")

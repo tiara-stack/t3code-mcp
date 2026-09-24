@@ -152,6 +152,7 @@ const isoDateTimeWireString = Schema.String.check(
  * decoders drop the rest, including attachments and streaming state.
  */
 const ThreadSessionWireSchema = Schema.Struct({
+  providerInstanceId: Schema.optionalKey(Schema.NullOr(trimmedNonEmptyWireString)),
   status: Schema.Literals([
     "idle",
     "starting",
@@ -248,6 +249,15 @@ const ThreadDetailEventWireSchema = Schema.Union([
     sequence: nonNegativeWireInt,
     type: Schema.Literal("thread.session-set"),
     payload: Schema.Struct({ session: ThreadSessionWireSchema }),
+  }),
+  Schema.Struct({
+    sequence: nonNegativeWireInt,
+    commandId: Schema.NullOr(trimmedNonEmptyWireString),
+    type: Schema.Literal("thread.session-stop-requested"),
+    payload: Schema.Struct({
+      threadId: trimmedNonEmptyWireString,
+      createdAt: Schema.String,
+    }),
   }),
   Schema.Struct({
     sequence: nonNegativeWireInt,
@@ -362,6 +372,13 @@ const ServerSettingsErrorWireSchema = Schema.Struct({
   _tag: Schema.Literal("ServerSettingsError"),
 });
 
+const OrchestrationCommandInvariantErrorWireSchema = Schema.Struct({
+  _tag: Schema.Literal("OrchestrationCommandInvariantError"),
+  commandType: Schema.String,
+  detail: Schema.String,
+  cause: Schema.optionalKey(Schema.Unknown),
+});
+
 const GetSnapshotErrorWireSchema = Schema.Struct({
   _tag: Schema.Literal("OrchestrationGetSnapshotError"),
   message: Schema.String,
@@ -400,13 +417,6 @@ const OrchestrationDispatchCommandErrorWireSchema = Schema.Struct({
   message: Schema.String,
   cause: Schema.optionalKey(Schema.Unknown),
   bootstrapThreadDisposition: Schema.optionalKey(Schema.Literal("deleted")),
-});
-
-const OrchestrationCommandInvariantErrorWireSchema = Schema.Struct({
-  _tag: Schema.Literal("OrchestrationCommandInvariantError"),
-  commandType: Schema.String,
-  detail: Schema.String,
-  cause: Schema.optionalKey(Schema.Unknown),
 });
 
 const ThreadInterruptCommandWireSchema = Schema.Struct({
@@ -626,12 +636,20 @@ const InputResponseCommandWireSchema = Schema.Struct({
   createdAt: trimmedNonEmptyWireString,
 });
 
+const ThreadSessionStopCommandWireSchema = Schema.Struct({
+  type: Schema.Literal("thread.session.stop"),
+  commandId: trimmedNonEmptyWireString,
+  threadId: trimmedNonEmptyWireString,
+  createdAt: Schema.String,
+});
+
 const DispatchCommandRpc = Rpc.make("orchestration.dispatchCommand", {
   payload: Schema.Union([
     InputResponseCommandWireSchema,
     DispatchTurnCommandWireSchema,
     ApprovalResponseCommandWireSchema,
     ThreadInterruptCommandWireSchema,
+    ThreadSessionStopCommandWireSchema,
   ]),
   success: DispatchResultWireSchema,
   error: Schema.Union([
@@ -1323,6 +1341,7 @@ export type ObservedSessionStatus =
   | "error";
 
 export interface ObservedThreadSession {
+  readonly providerInstanceId?: string | null;
   readonly status: ObservedSessionStatus;
   readonly activeTurnId: string | null;
   readonly lastError: string | null;
@@ -1371,6 +1390,13 @@ export type ThreadStreamItem =
       readonly kind: "session-set";
       readonly sequence: number;
       readonly session: ObservedThreadSession;
+    }
+  | {
+      readonly kind: "session-stop-requested";
+      readonly sequence: number;
+      readonly threadId: string;
+      readonly commandId: string | null;
+      readonly createdAt: string;
     }
   | {
       readonly kind: "activity-appended";
@@ -1527,6 +1553,13 @@ export interface T3CodeAdapterService {
     readonly cwd: string;
   }) => Effect.Effect<VcsWorktreeRefListing, T3CodeAdapterError>;
   readonly interruptThread: (input: {
+    readonly endpoint: string;
+    readonly credential: string;
+    readonly threadId: string;
+    readonly commandId: string;
+    readonly createdAt: string;
+  }) => Effect.Effect<{ readonly sequence: number }, T3CodeAdapterError>;
+  readonly stopThreadSession: (input: {
     readonly endpoint: string;
     readonly credential: string;
     readonly threadId: string;
@@ -1951,6 +1984,7 @@ const observedThreadMessageFromEvent = (
 const observedThreadSessionFromWire = (
   session: typeof ThreadSessionWireSchema.Type,
 ): ObservedThreadSession => ({
+  providerInstanceId: session.providerInstanceId ?? null,
   status: session.status,
   activeTurnId: session.activeTurnId,
   lastError: session.lastError,
@@ -2016,6 +2050,14 @@ const threadStreamItemFromWire = (
             kind: "session-set",
             sequence: item.event.sequence,
             session: observedThreadSessionFromWire(item.event.payload.session),
+          };
+        case "thread.session-stop-requested":
+          return {
+            kind: "session-stop-requested",
+            sequence: item.event.sequence,
+            threadId: item.event.payload.threadId,
+            commandId: item.event.commandId,
+            createdAt: item.event.payload.createdAt,
           };
         case "thread.activity-appended":
           return {
@@ -2454,7 +2496,11 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
 
       const withRpcChannelBoundaries = <A, R>(
         effect: Effect.Effect<A, unknown, R>,
-        options?: { readonly timeoutIsUncertain?: boolean; readonly uncertainOnTimeout?: boolean },
+        options?: {
+          readonly timeoutIsUncertain?: boolean;
+          readonly uncertainOnTimeout?: boolean;
+          readonly uncertainOnWireIncompatible?: boolean;
+        },
       ): Effect.Effect<A, T3CodeAdapterError, R> =>
         effect.pipe(
           Effect.timeoutOrElse({
@@ -2469,25 +2515,39 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
                 }),
               ),
           }),
-          Effect.mapError((error: unknown) => mapAuthenticatedChannelError(error)),
+          Effect.mapError((error: unknown) => {
+            const mapped = mapAuthenticatedChannelError(error);
+            return options?.uncertainOnWireIncompatible && mapped.kind === "wire_incompatible"
+              ? new T3CodeAdapterError({
+                  kind: mapped.kind,
+                  message: mapped.message,
+                  uncertain: true,
+                  status: mapped.status,
+                })
+              : mapped;
+          }),
         );
 
       const withAuthenticatedRpc = <A>(
         endpoint: string,
         credential: string,
         use: (client: AdapterRpcClient) => Effect.Effect<A, unknown>,
-        options?: { readonly timeoutIsUncertain?: boolean; readonly uncertainOnTimeout?: boolean },
+        options?: {
+          readonly timeoutIsUncertain?: boolean;
+          readonly uncertainOnTimeout?: boolean;
+          readonly uncertainOnWireIncompatible?: boolean;
+        },
       ): Effect.Effect<A, T3CodeAdapterError> =>
-        withRpcChannelBoundaries(
-          Effect.scoped(
-            Effect.flatMap(authenticatedRpcChannel(endpoint, credential), (protocolLayer) =>
+        Effect.flatMap(authenticatedRpcChannel(endpoint, credential), (protocolLayer) =>
+          withRpcChannelBoundaries(
+            Effect.scoped(
               Effect.gen(function* () {
                 const client = yield* RpcClient.make(AdapterRpcGroup);
                 return yield* use(client);
               }).pipe(Effect.provide(protocolLayer)),
             ),
+            options,
           ),
-          options,
         );
 
       const verifyEnvironmentSession = (input: {
@@ -3066,6 +3126,59 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
               : Effect.succeed(result.response),
         );
 
+      const stopThreadSession = (input: {
+        readonly endpoint: string;
+        readonly credential: string;
+        readonly threadId: string;
+        readonly commandId: string;
+        readonly createdAt: string;
+      }): Effect.Effect<{ readonly sequence: number }, T3CodeAdapterError> =>
+        withCapacity(
+          withAuthenticatedRpc(
+            input.endpoint,
+            input.credential,
+            (client) =>
+              client["orchestration.dispatchCommand"]({
+                type: "thread.session.stop",
+                commandId: input.commandId,
+                threadId: input.threadId,
+                createdAt: input.createdAt,
+              }).pipe(
+                Effect.catchTag("EnvironmentAuthorizationError", (error) =>
+                  Effect.fail(
+                    new T3CodeAdapterError({
+                      kind: "authorization",
+                      message: `The T3Code credential lacks the required ${"requiredScope" in error ? String(error.requiredScope) : "operate"} scope.`,
+                      uncertain: false,
+                      status: null,
+                    }),
+                  ),
+                ),
+                Effect.catchTag("OrchestrationDispatchCommandError", (error) =>
+                  Effect.fail(
+                    new T3CodeAdapterError({
+                      kind: "command_rejected",
+                      message: `The T3Code instance rejected the provider-session stop command: ${error.message}`,
+                      uncertain: false,
+                      status: null,
+                    }),
+                  ),
+                ),
+                Effect.catchTag("OrchestrationCommandInvariantError", (error) =>
+                  Effect.fail(
+                    new T3CodeAdapterError({
+                      kind: "command_rejected",
+                      message: `The T3Code instance rejected the provider-session stop command: ${"detail" in error ? String(error.detail) : error.message}`,
+                      uncertain: false,
+                      status: null,
+                    }),
+                  ),
+                ),
+              ),
+            { uncertainOnTimeout: true, uncertainOnWireIncompatible: true },
+          ),
+        );
+
       const verifyCredential = (input: {
         readonly endpoint: string;
         readonly credential: string;
@@ -3110,6 +3223,7 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
         refreshVcsStatus,
         listVcsWorktreeRefs,
         interruptThread,
+        stopThreadSession,
         subscribeShell,
         subscribeThread,
         getArchivedShellSnapshot,

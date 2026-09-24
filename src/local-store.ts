@@ -4709,7 +4709,7 @@ const discardPairingInDatabase = (
   retryStorage(
     Effect.gen(function* () {
       yield* verify();
-      yield* sql.withTransaction(
+      return yield* sql.withTransaction(
         sql`DELETE FROM staged_pairings WHERE instance_id = ${instanceId}`,
       );
     }).pipe(Effect.mapError(toStoreError)),
@@ -4764,6 +4764,74 @@ const operationAdmissionMetadata = (input: OperationAdmissionInput) => {
   };
 };
 
+const insertOperationAdmissionInTransaction = (
+  sql: SqlClient.SqlClient,
+  input: OperationAdmissionInput,
+  admission: ReturnType<typeof operationAdmissionMetadata>,
+): Effect.Effect<StoredOperation, LocalStoreError> =>
+  Effect.gen(function* () {
+    const initialRecord: OperationRecord = {
+      requestId: input.requestId,
+      tool: input.tool,
+      revision: 0,
+      state: "admitted",
+      admittedAt: input.admittedAt,
+      updatedAt: input.admittedAt,
+      recoverableUntil: null,
+      target: admission.target,
+      completionMeans: input.completionMeans,
+      dispatch: "not_dispatched",
+      commandId: admission.commandId,
+      messageId: null,
+      correlation: null,
+      created: input.created ?? {},
+      steps: (input.steps ?? ["remove_registration"]).map((name) => ({
+        name,
+        state: "not_started" as const,
+        evidence: [],
+        error: null,
+      })),
+      evidence: [],
+      error: null,
+      recovery: "observe_operation",
+    };
+    const targetJson = admission.targetJson;
+
+    yield* sql`
+      INSERT INTO request_keys (request_id, tool, fingerprint, process_nonce, admitted_at)
+      VALUES (
+        ${input.requestId}, ${input.tool}, ${input.fingerprint},
+        ${input.processNonce}, ${input.admittedAt}
+      )
+    `;
+    yield* sql`
+      INSERT INTO operations (
+        request_id, tool, revision, state, admitted_at, updated_at,
+        recoverable_until, intent_json, target_json, completion_means, dispatch,
+        command_id, message_id, correlation_json, created_json, error_json,
+        recovery, owner_process_nonce
+      ) VALUES (
+        ${input.requestId}, ${input.tool}, 0, 'admitted', ${input.admittedAt},
+        ${input.admittedAt}, NULL, ${JSON.stringify(input.intent)}, ${targetJson},
+        ${input.completionMeans}, 'not_dispatched', ${admission.commandId}, NULL, NULL,
+        ${JSON.stringify(input.created ?? {})}, NULL,
+        'observe_operation', ${input.processNonce}
+      )
+    `;
+    yield* Effect.forEach(
+      input.steps ?? ["remove_registration"],
+      (name, position) =>
+        sql`
+        INSERT INTO operation_steps (request_id, position, name, state, error_json)
+        VALUES (${input.requestId}, ${position}, ${name}, 'not_started', NULL)
+      `,
+    );
+    return {
+      record: initialRecord,
+      intent: input.intent,
+      ownerProcessNonce: input.processNonce,
+    };
+  }).pipe(Effect.mapError(toStoreError));
 const admitOperationInDatabase = (
   sql: SqlClient.SqlClient,
   input: OperationAdmissionInput,
@@ -4806,69 +4874,9 @@ const admitOperationInDatabase = (
             return { kind: "existing" as const, operation: existing };
           }
 
-          const initialRecord: OperationRecord = {
-            requestId: input.requestId,
-            tool: input.tool,
-            revision: 0,
-            state: "admitted",
-            admittedAt: input.admittedAt,
-            updatedAt: input.admittedAt,
-            recoverableUntil: null,
-            target: admission.target,
-            completionMeans: input.completionMeans,
-            dispatch: "not_dispatched",
-            commandId: admission.commandId,
-            messageId: null,
-            correlation: null,
-            created: input.created ?? {},
-            steps: (input.steps ?? ["remove_registration"]).map((name) => ({
-              name,
-              state: "not_started" as const,
-              evidence: [],
-              error: null,
-            })),
-            evidence: [],
-            error: null,
-            recovery: "observe_operation",
-          };
-
-          yield* sql`
-            INSERT INTO request_keys (request_id, tool, fingerprint, process_nonce, admitted_at)
-            VALUES (
-              ${input.requestId}, ${input.tool}, ${input.fingerprint},
-              ${input.processNonce}, ${input.admittedAt}
-            )
-          `;
-          yield* sql`
-            INSERT INTO operations (
-              request_id, tool, revision, state, admitted_at, updated_at,
-              recoverable_until, intent_json, target_json, completion_means, dispatch,
-              command_id, message_id, correlation_json, created_json, error_json,
-              recovery, owner_process_nonce
-            ) VALUES (
-              ${input.requestId}, ${input.tool}, 0, 'admitted', ${input.admittedAt},
-              ${input.admittedAt}, NULL, ${JSON.stringify(input.intent)},
-              ${admission.targetJson},
-              ${input.completionMeans}, 'not_dispatched', ${admission.commandId}, NULL, NULL,
-              ${JSON.stringify(input.created ?? {})}, NULL,
-              'observe_operation', ${input.processNonce}
-            )
-          `;
-          yield* Effect.forEach(
-            input.steps ?? ["remove_registration"],
-            (name, position) =>
-              sql`
-              INSERT INTO operation_steps (request_id, position, name, state, error_json)
-              VALUES (${input.requestId}, ${position}, ${name}, 'not_started', NULL)
-            `,
-          );
           return {
             kind: "inserted" as const,
-            operation: {
-              record: initialRecord,
-              intent: input.intent,
-              ownerProcessNonce: input.processNonce,
-            },
+            operation: yield* insertOperationAdmissionInTransaction(sql, input, admission),
           };
         }),
       );
