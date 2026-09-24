@@ -128,6 +128,7 @@ describe("stdio transport", () => {
               "thread_output",
               "thread_wait",
               "turn_wait",
+              "input_respond",
               "operation_get",
             ]);
             expect(

@@ -23,22 +23,19 @@ import {
   InstancePairAgainInputSchema,
   InstancePairInputSchema,
   InstanceUpdateInputSchema,
+  InputRespondInputSchema,
   WorktreeCreateInputSchema,
   DEFAULT_THREAD_WAIT_MILLIS,
   MAX_ACTIVE_THREAD_SUBSCRIPTIONS_PER_INSTANCE,
   MAX_OPERATION_CAPACITY,
-  MAX_PENDING_REQUEST_OPTIONS,
-  MAX_PENDING_REQUEST_QUESTIONS,
   MAX_TOTAL_RPC_CAPACITY,
   THREAD_OUTPUT_PART_LIMIT_BYTES,
   THREAD_SNAPSHOT_TURN_LIMIT,
-  type ApprovalDecision,
   type CapturedThreadState,
   type Evidence,
   type OperationRecord,
   type OutputChunkItem,
   type PendingRequest,
-  type PendingRequestForm,
   type ThreadCondition,
   type ThreadConfiguration,
   type ThreadGetCaptureQuery,
@@ -149,9 +146,9 @@ import {
 import {
   T3CodeAdapterError,
   type DiscoveredModelSelection,
-  type ObservedThreadActivity,
   type ObservedThreadDetail,
 } from "./t3code-adapter";
+import { pendingRequestsFromActivities } from "./pending-requests";
 import { adapterErrorFailure } from "./tool-failure";
 
 const withToolHints = <
@@ -436,6 +433,16 @@ export const InstancePairAgainTool = asRegistrationMutation(
 );
 
 // fallow-ignore-next-line unused-export
+export const InputRespondTool = asRegistrationMutation(
+  Tool.make("input_respond", {
+    description:
+      "Respond to one currently observed native input request with answers validated against its current form.",
+    parameters: InputRespondInputSchema,
+    success: OperationToolResultSchema,
+  }),
+  { destructive: false, openWorld: true },
+);
+
 export const WorktreeCreateTool = Tool.make("worktree_create", {
   description:
     "Create a worktree on one T3Code instance. Reusing its request ID reads the original creation receipt and never repeats the VCS operation.",
@@ -493,6 +500,7 @@ export const ServerToolkit = Toolkit.make(
   ThreadOutputTool,
   ThreadWaitTool,
   TurnWaitTool,
+  InputRespondTool,
   OperationGetTool,
 );
 
@@ -2478,7 +2486,11 @@ const inspectWorktreeThread = (options: {
     });
     const execution = threadExecutionState(worktree.instanceId, detail);
     const session = threadSessionStateOf(detail);
-    const pendingRequests = pendingRequestsFromActivities(summary.thread, detail.thread.activities);
+    const pendingRequests = pendingRequestsFromActivities(
+      summary.thread,
+      detail.thread.activities,
+      detail.limitedHistory,
+    );
     const observation: Observation = {
       instanceId: worktree.instanceId,
       observedAt: detail.observedAt,
@@ -2829,430 +2841,6 @@ const threadSnapshotEvidence = (detail: SynchronizedThreadDetail, note: string):
     detail: note,
   },
 ];
-
-const approvalDecisions: ReadonlyArray<ApprovalDecision> = [
-  "accept",
-  "acceptForSession",
-  "acceptAlways",
-  "decline",
-  "cancel",
-];
-
-interface DecodedApprovalOption {
-  readonly decision: ApprovalDecision;
-  readonly label: string;
-}
-
-/**
- * T3 Code 0.0.38's web client renders these choices when an approval event
- * omits provider options. Keep this fallback limited to request types the
- * pinned runtime classifies, so an unknown form never becomes actionable.
- */
-const defaultApprovalOptions: ReadonlyArray<DecodedApprovalOption> = [
-  { decision: "cancel", label: "Cancel" },
-  { decision: "decline", label: "Decline" },
-  { decision: "acceptForSession", label: "Always allow this session" },
-  { decision: "accept", label: "Approve" },
-];
-
-const defaultApprovalRequestKinds: Readonly<Record<string, string>> = {
-  command_execution_approval: "command",
-  exec_command_approval: "command",
-  file_read_approval: "file-read",
-  file_change_approval: "file-change",
-  apply_patch_approval: "file-change",
-  mcp_elicitation_approval: "mcp-elicitation",
-};
-
-const defaultApprovalOptionsForPayload = (
-  payload: Record<string, unknown>,
-): ReadonlyArray<DecodedApprovalOption> | null => {
-  const requestType = payload.requestType;
-  if (typeof requestType !== "string" || !Object.hasOwn(defaultApprovalRequestKinds, requestType)) {
-    return null;
-  }
-  const expectedRequestKind = defaultApprovalRequestKinds[requestType];
-  return typeof expectedRequestKind === "string" && expectedRequestKind === payload.requestKind
-    ? defaultApprovalOptions
-    : null;
-};
-
-const decodeApprovalOption = (element: unknown): DecodedApprovalOption | null => {
-  if (typeof element !== "object" || element === null) return null;
-  const candidate = element as Record<string, unknown>;
-  if (
-    typeof candidate.decision !== "string" ||
-    !approvalDecisions.includes(candidate.decision as ApprovalDecision) ||
-    typeof candidate.label !== "string" ||
-    candidate.label.length === 0
-  ) {
-    return null;
-  }
-  return { decision: candidate.decision as ApprovalDecision, label: candidate.label };
-};
-
-const decodeApprovalOptions = (
-  payload: Record<string, unknown>,
-): ReadonlyArray<DecodedApprovalOption> | null => {
-  if (payload.options === undefined) return defaultApprovalOptionsForPayload(payload);
-  if (!Array.isArray(payload.options)) return null;
-  // A request with no offered decisions cannot be answered; an oversized
-  // list exceeds the bounded-form limit. Both stay unactionable.
-  if (payload.options.length === 0 || payload.options.length > MAX_PENDING_REQUEST_OPTIONS) {
-    return null;
-  }
-  const options: Array<DecodedApprovalOption> = [];
-  for (const element of payload.options) {
-    const option = decodeApprovalOption(element);
-    if (option === null) return null;
-    options.push(option);
-  }
-  return options;
-};
-
-interface DecodedInputQuestion {
-  readonly id: string;
-  readonly header: string;
-  readonly question: string;
-  readonly options: ReadonlyArray<{ readonly label: string; readonly description: string }>;
-  readonly multiSelect: boolean;
-}
-
-const decodeInputQuestionOption = (
-  rawOption: unknown,
-): { readonly label: string; readonly description: string } | null => {
-  if (typeof rawOption !== "object" || rawOption === null) return null;
-  const option = rawOption as Record<string, unknown>;
-  if (typeof option.label !== "string" || typeof option.description !== "string") return null;
-  return { label: option.label, description: option.description };
-};
-
-const decodeQuestionIdentity = (
-  candidate: Record<string, unknown>,
-): { readonly id: string; readonly header: string; readonly question: string } | null => {
-  if (
-    typeof candidate.id !== "string" ||
-    candidate.id.length === 0 ||
-    typeof candidate.header !== "string" ||
-    typeof candidate.question !== "string"
-  ) {
-    return null;
-  }
-  return { id: candidate.id, header: candidate.header, question: candidate.question };
-};
-
-const decodeInputQuestion = (element: unknown): DecodedInputQuestion | null => {
-  if (typeof element !== "object" || element === null) return null;
-  const candidate = element as Record<string, unknown>;
-  const identity = decodeQuestionIdentity(candidate);
-  if (identity === null) return null;
-  const rawOptions = Array.isArray(candidate.options) ? candidate.options : [];
-  if (rawOptions.length > MAX_PENDING_REQUEST_OPTIONS) return null;
-  const options: Array<{ label: string; description: string }> = [];
-  for (const rawOption of rawOptions) {
-    const option = decodeInputQuestionOption(rawOption);
-    if (option === null) return null;
-    options.push(option);
-  }
-  return {
-    ...identity,
-    options,
-    multiSelect: candidate.multiSelect === true,
-  };
-};
-
-const decodeInputQuestions = (
-  payload: Record<string, unknown>,
-): ReadonlyArray<DecodedInputQuestion> | null => {
-  if (!Array.isArray(payload.questions)) return null;
-  if (payload.questions.length > MAX_PENDING_REQUEST_QUESTIONS) return null;
-  const questions: Array<DecodedInputQuestion> = [];
-  for (const element of payload.questions) {
-    const question = decodeInputQuestion(element);
-    if (question === null) return null;
-    questions.push(question);
-  }
-  return questions;
-};
-
-/**
- * Build the bounded JSON Schema describing the answers an actionable input
- * request accepts. Multi-select questions accept arrays of offered labels;
- * single-select questions accept one offered label; questions without
- * options accept free text.
- */
-const inputResponseSchema = (
-  questions: ReadonlyArray<DecodedInputQuestion>,
-): Record<string, unknown> => ({
-  type: "object",
-  properties: Object.fromEntries(
-    questions.map((question) => {
-      const labels = question.options.map((option) => option.label);
-      const value =
-        labels.length === 0
-          ? { type: "string" }
-          : question.multiSelect
-            ? { type: "array", items: { enum: labels }, minItems: 1, uniqueItems: true }
-            : { type: "string", enum: labels };
-      return [question.id, value];
-    }),
-  ),
-  required: questions.map((question) => question.id),
-  additionalProperties: false,
-});
-
-const activityPayloadRecord = (activity: ObservedThreadActivity): Record<string, unknown> =>
-  typeof activity.payload === "object" && activity.payload !== null
-    ? (activity.payload as Record<string, unknown>)
-    : {};
-
-const MISSING_REQUEST_ID_REASON =
-  "The native request ID is missing; the request cannot be answered.";
-const RESOLVED_REQUEST_REASON = "The request is already resolved.";
-const UNKNOWN_REQUEST_LIFECYCLE_REASON =
-  "The thread history is incomplete, so the request lifecycle cannot be established.";
-const UNREPRESENTABLE_APPROVAL_REASON = "The offered approval decisions could not be represented.";
-const UNREPRESENTABLE_INPUT_REASON = "The input form could not be represented.";
-
-interface PendingRequestContext {
-  readonly thread: ThreadState["summary"]["thread"];
-  readonly resolvedRequestIds: ReadonlySet<string>;
-  readonly historyLimited: boolean;
-}
-
-const collectResolvedRequestIds = (
-  activities: ReadonlyArray<ObservedThreadActivity>,
-): ReadonlySet<string> => {
-  const resolvedRequestIds = new Set<string>();
-  for (const activity of activities) {
-    if (activity.kind !== "approval.resolved" && activity.kind !== "user-input.resolved") {
-      continue;
-    }
-    const requestId = activityPayloadRecord(activity).requestId;
-    if (typeof requestId === "string" && requestId.length > 0) resolvedRequestIds.add(requestId);
-  }
-  return resolvedRequestIds;
-};
-
-const pendingRequestBase = (context: PendingRequestContext, activity: ObservedThreadActivity) => ({
-  activityId: activity.activityId,
-  thread: context.thread,
-  turn:
-    activity.turnId === null
-      ? null
-      : {
-          instanceId: context.thread.instanceId,
-          threadId: context.thread.threadId,
-          turnId: activity.turnId,
-        },
-});
-
-type ActionableForm = Extract<PendingRequestForm, { readonly kind: "approval" | "input" }>;
-
-interface RepresentableForm {
-  readonly actionable: true;
-  readonly form: ActionableForm;
-}
-
-interface UnrepresentableForm {
-  readonly actionable: false;
-  readonly form: PendingRequestForm;
-  readonly unavailableReason: string;
-}
-
-const pendingRequestWithLifecycle = (options: {
-  readonly context: PendingRequestContext;
-  readonly base: ReturnType<typeof pendingRequestBase>;
-  readonly requestId: string;
-  readonly representable: RepresentableForm | UnrepresentableForm;
-}): PendingRequest => {
-  const { context, base, requestId, representable } = options;
-  const resolved = context.resolvedRequestIds.has(requestId);
-  const lifecycleKnown = !context.historyLimited || base.turn !== null;
-  const state = resolved ? "resolved" : lifecycleKnown ? "pending" : "unknown";
-  if (!representable.actionable) {
-    return {
-      ...base,
-      state,
-      actionable: false,
-      pendingRequestId: requestId,
-      unavailableReason:
-        state === "unknown" ? UNKNOWN_REQUEST_LIFECYCLE_REASON : representable.unavailableReason,
-      form: representable.form,
-    };
-  }
-  if (state === "resolved") {
-    return {
-      ...base,
-      state,
-      actionable: false,
-      pendingRequestId: requestId,
-      unavailableReason: RESOLVED_REQUEST_REASON,
-      form: representable.form,
-    };
-  }
-  if (state === "unknown") {
-    return {
-      ...base,
-      state,
-      actionable: false,
-      pendingRequestId: requestId,
-      unavailableReason: UNKNOWN_REQUEST_LIFECYCLE_REASON,
-      form: representable.form,
-    };
-  }
-  return {
-    ...base,
-    state,
-    actionable: true,
-    pendingRequestId: requestId,
-    unavailableReason: null,
-    form: representable.form,
-  };
-};
-
-const approvalPendingRequest = (
-  context: PendingRequestContext,
-  activity: ObservedThreadActivity,
-  requestId: string,
-): PendingRequest => {
-  const payload = activityPayloadRecord(activity);
-  const options = decodeApprovalOptions(payload);
-  const representable: RepresentableForm | UnrepresentableForm =
-    options === null
-      ? {
-          actionable: false,
-          form: { kind: "unavailable", requestKind: "approval" },
-          unavailableReason: UNREPRESENTABLE_APPROVAL_REASON,
-        }
-      : {
-          actionable: true,
-          form: {
-            kind: "approval" as const,
-            detail: typeof payload.detail === "string" ? payload.detail : activity.kind,
-            choices: options.map((option) => ({
-              decision: option.decision,
-              label: option.label,
-            })),
-          },
-        };
-  return pendingRequestWithLifecycle({
-    context,
-    base: pendingRequestBase(context, activity),
-    requestId,
-    representable,
-  });
-};
-
-const inputPendingRequest = (
-  context: PendingRequestContext,
-  activity: ObservedThreadActivity,
-  requestId: string,
-): PendingRequest => {
-  const questions = decodeInputQuestions(activityPayloadRecord(activity));
-  const representable: RepresentableForm | UnrepresentableForm =
-    questions === null
-      ? {
-          actionable: false,
-          form: { kind: "unavailable", requestKind: "input" },
-          unavailableReason: UNREPRESENTABLE_INPUT_REASON,
-        }
-      : {
-          actionable: true,
-          form: {
-            kind: "input" as const,
-            questions: questions.map((question) => ({
-              id: question.id,
-              header: question.header,
-              question: question.question,
-              options: question.options.map((option) => ({
-                label: option.label,
-                description: option.description,
-              })),
-              multiSelect: question.multiSelect,
-            })),
-            responseSchema: inputResponseSchema(questions),
-          },
-        };
-  return pendingRequestWithLifecycle({
-    context,
-    base: pendingRequestBase(context, activity),
-    requestId,
-    representable,
-  });
-};
-
-const compareActivities = (left: ObservedThreadActivity, right: ObservedThreadActivity): number =>
-  left.createdAt.localeCompare(right.createdAt) || left.activityId.localeCompare(right.activityId);
-
-const isRequestActivity = (activity: ObservedThreadActivity): boolean =>
-  activity.kind === "approval.requested" || activity.kind === "user-input.requested";
-
-const requestedPendingRequest = (
-  context: PendingRequestContext,
-  activity: ObservedThreadActivity,
-  requestId: string | null,
-): PendingRequest =>
-  requestId === null
-    ? uncorrelatedPendingRequest(context, activity)
-    : activity.kind === "approval.requested"
-      ? approvalPendingRequest(context, activity, requestId)
-      : inputPendingRequest(context, activity, requestId);
-
-/**
- * Derive the observed pending-request page from a thread's retained
- * activities. Approval and user-input requests keep their native identity
- * when available, their offered form when representable within the bounds,
- * their lifecycle, and their nullable turn correlation; requests without a
- * native ID stay visible at thread scope but unactionable, and a lifecycle
- * that cannot be established is never reported as resolved.
- */
-const pendingRequestsFromActivities = (
-  thread: ThreadState["summary"]["thread"],
-  activities: ReadonlyArray<ObservedThreadActivity>,
-  historyLimited = false,
-): ReadonlyArray<PendingRequest> => {
-  const requested = activities.filter(isRequestActivity).slice().sort(compareActivities);
-  const context: PendingRequestContext = {
-    thread,
-    resolvedRequestIds: collectResolvedRequestIds(activities),
-    historyLimited,
-  };
-  // The pinned snapshot keeps the latest requested row per native request
-  // ID; deduplicate from the newest row backwards so the same rule holds
-  // when live events or replay deliver more than one requested row.
-  const seenRequestIds = new Set<string>();
-  const requests: Array<PendingRequest> = [];
-  for (const activity of requested.slice().reverse()) {
-    const payload = activityPayloadRecord(activity);
-    const requestId = typeof payload.requestId === "string" ? payload.requestId : null;
-    if (requestId !== null && seenRequestIds.has(requestId)) continue;
-    if (requestId !== null) seenRequestIds.add(requestId);
-    requests.push(requestedPendingRequest(context, activity, requestId));
-  }
-  requests.reverse();
-  return requests;
-};
-
-/**
- * A request observed without its native identity stays visible at thread
- * scope but can never be answered, and its lifecycle stays unknown rather
- * than resolved.
- */
-const uncorrelatedPendingRequest = (
-  context: PendingRequestContext,
-  activity: ObservedThreadActivity,
-): PendingRequest => ({
-  ...pendingRequestBase(context, activity),
-  state: "unknown",
-  actionable: false,
-  pendingRequestId: null,
-  unavailableReason: MISSING_REQUEST_ID_REASON,
-  form: {
-    kind: "unavailable",
-    requestKind: activity.kind === "approval.requested" ? "approval" : "input",
-  },
-});
 
 const threadConfigurationFromDetail = (detail: ObservedThreadDetail): ThreadConfiguration => ({
   model: {
@@ -4983,6 +4571,11 @@ const serverToolHandlers = ServerToolkit.of({
       const operations = yield* Operations;
       return yield* operationMutationResult(operations.createWorktree(input));
     }),
+  input_respond: (input) =>
+    Effect.gen(function* () {
+      const operations = yield* Operations;
+      return yield* operationMutationResult(operations.respondToInput(input));
+    }),
   operation_get: (input) =>
     Effect.gen(function* () {
       const operations = yield* Operations;
@@ -5016,9 +4609,13 @@ const serverToolHandlers = ServerToolkit.of({
     ),
 });
 
-export const serverToolkitLayer = ServerToolkit.toLayer(serverToolHandlers).pipe(
-  Layer.provideMerge(Operations.layer.pipe(Layer.provide(NodeCrypto.layer))),
+const operationsLayer = Operations.layer.pipe(
   Layer.provideMerge(Observations.layer),
+  Layer.provide(NodeCrypto.layer),
+);
+
+export const serverToolkitLayer = ServerToolkit.toLayer(serverToolHandlers).pipe(
+  Layer.provideMerge(operationsLayer),
 );
 
 const toStructuredContent = (value: unknown): Schema.JsonObject | undefined =>
@@ -5031,6 +4628,7 @@ const operationMutatorTools: ReadonlySet<string> = new Set([
   "instance_pair",
   "instance_update",
   "instance_pair_again",
+  "input_respond",
   "worktree_create",
   "thread_submit",
   "approval_respond",

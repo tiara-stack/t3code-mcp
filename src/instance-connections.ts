@@ -8,6 +8,7 @@ import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import type {
   ApprovalResponseCommand,
+  InputRespondAnswers,
   InstanceDetails,
   InteractionMode,
   RuntimeMode,
@@ -172,6 +173,14 @@ export interface InstanceConnectionsService {
   readonly readArchivedShell: (
     instanceId: string,
   ) => Effect.Effect<ObservedShellSnapshot, LocalStoreError | T3CodeAdapterError>;
+  readonly respondToInput: (input: {
+    readonly instanceId: string;
+    readonly commandId: string;
+    readonly createdAt: string;
+    readonly threadId: string;
+    readonly requestId: string;
+    readonly answers: InputRespondAnswers;
+  }) => Effect.Effect<{ readonly sequence: number }, LocalStoreError | T3CodeAdapterError>;
   readonly respondToApproval: <E>(
     input: ApprovalResponseCommand & {
       readonly instanceId: string;
@@ -192,11 +201,27 @@ export class InstanceConnections extends Context.Service<
   InstanceConnectionsService
 >()("t3code-mcp/InstanceConnections") {
   static readonly layerTest = (
-    service: Omit<InstanceConnectionsService, "dispatchTurn" | "interruptThread"> &
-      Partial<Pick<InstanceConnectionsService, "dispatchTurn" | "interruptThread">>,
+    service: Omit<
+      InstanceConnectionsService,
+      "respondToInput" | "dispatchTurn" | "interruptThread"
+    > &
+      Partial<
+        Pick<InstanceConnectionsService, "respondToInput" | "dispatchTurn" | "interruptThread">
+      >,
   ): Layer.Layer<InstanceConnections> =>
     Layer.succeed(InstanceConnections, {
       ...service,
+      respondToInput:
+        service.respondToInput ??
+        (() =>
+          Effect.fail(
+            new T3CodeAdapterError({
+              kind: "capacity",
+              message: "The test connection does not support input responses.",
+              uncertain: false,
+              status: null,
+            }),
+          )),
       dispatchTurn:
         service.dispatchTurn ??
         (() =>
@@ -625,6 +650,31 @@ export class InstanceConnections extends Context.Service<
             return { ...snapshot, observedAt };
           });
 
+        const respondToInput = (input: {
+          readonly instanceId: string;
+          readonly commandId: string;
+          readonly createdAt: string;
+          readonly threadId: string;
+          readonly requestId: string;
+          readonly answers: InputRespondAnswers;
+        }) =>
+          Effect.gen(function* () {
+            const connection = yield* acquire(input.instanceId);
+            return yield* withInstanceCapacity(
+              input.instanceId,
+              adapter.respondToInput({
+                endpoint: connection.endpoint,
+                credential: connection.credential,
+                environmentId: connection.environmentId,
+                commandId: input.commandId,
+                createdAt: input.createdAt,
+                threadId: input.threadId,
+                requestId: input.requestId,
+                answers: input.answers,
+              }),
+            );
+          });
+
         const respondToApproval = <E>(
           input: ApprovalResponseCommand & {
             readonly instanceId: string;
@@ -922,6 +972,7 @@ export class InstanceConnections extends Context.Service<
           openShellStream,
           openThreadStream,
           readArchivedShell,
+          respondToInput,
           respondToApproval,
           invalidate,
         });

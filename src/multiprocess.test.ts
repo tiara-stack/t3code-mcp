@@ -130,6 +130,7 @@ const startServer = async (databasePath: string): Promise<Server> => {
       "thread_output",
       "thread_wait",
       "turn_wait",
+      "input_respond",
       "operation_get",
     ]);
     return server;
@@ -803,6 +804,76 @@ describe("shared SQLite mutation admission", () => {
   );
 
   it.live(
+    "recovers input response admission across processes without replaying or accepting conflicting answers",
+    () =>
+      withServers("t3code-mcp-input-response-admission-", ({ databasePath, servers }) =>
+        Effect.gen(function* () {
+          const [left, right] = yield* Effect.promise(() =>
+            Promise.all([startServer(databasePath), startServer(databasePath)]),
+          );
+          servers.add(left);
+          servers.add(right);
+          const input = {
+            requestId: "shared-input-response",
+            pendingRequest: {
+              instanceId: "not-registered",
+              threadId: "ui-created-thread",
+              pendingRequestId: "native-input-1",
+            },
+            answers: { destination: "staging" },
+          };
+          const responses = yield* Effect.promise(() =>
+            Promise.all([
+              call(left, 3, "input_respond", input),
+              call(right, 3, "input_respond", input),
+            ]),
+          );
+          for (const response of responses) {
+            expect(response.result?.structuredContent).toMatchObject({
+              result: {
+                kind: "ok",
+                value: {
+                  requestId: input.requestId,
+                  tool: "input_respond",
+                  target: { instanceId: "not-registered", threadId: "ui-created-thread" },
+                },
+              },
+            });
+          }
+
+          const conflicting = yield* Effect.promise(() =>
+            call(right, 4, "input_respond", {
+              ...input,
+              answers: { destination: "production" },
+            }),
+          );
+          expect(conflicting.result?.structuredContent).toMatchObject({
+            result: { kind: "error", error: { code: "request_id_conflict" } },
+          });
+
+          const lookup = yield* Effect.promise(() =>
+            call(left, 5, "operation_get", { requestId: input.requestId }),
+          );
+          expect(lookup.result?.structuredContent).toMatchObject({
+            result: {
+              kind: "ok",
+              value: {
+                operation: {
+                  requestId: input.requestId,
+                  tool: "input_respond",
+                  state: "failed",
+                  dispatch: "not_dispatched",
+                  target: { instanceId: "not-registered", threadId: "ui-created-thread" },
+                },
+              },
+            },
+          });
+        }),
+      ),
+    60000,
+  );
+
+  it.live(
     "recovers a completed receipt after the originating process exits",
     () =>
       withServers("t3code-mcp-recovery-", ({ databasePath, servers }) =>
@@ -1198,7 +1269,7 @@ describe("shared SQLite mutation admission", () => {
                 stepState: "pending",
                 recovery: "observe_operation",
               });
-              const wrongOwnerClaim = yield* store.compareAndSetApprovalDispatch(
+              const wrongOwnerClaim = yield* store.compareAndSetOperationDispatch(
                 inputs[0]!.requestId,
                 "different-process-owner",
                 "pending",
@@ -1222,13 +1293,13 @@ describe("shared SQLite mutation admission", () => {
           const reconciledClaims = yield* Effect.scoped(
             Effect.gen(function* () {
               const store = yield* LocalStore;
-              const notDispatchedClaim = yield* store.compareAndSetApprovalDispatch(
+              const notDispatchedClaim = yield* store.compareAndSetOperationDispatch(
                 inputs[0]!.requestId,
                 "approval-stale-test-owner",
                 "pending",
                 dispatchUpdate,
               );
-              const unknownClaim = yield* store.compareAndSetApprovalDispatch(
+              const unknownClaim = yield* store.compareAndSetOperationDispatch(
                 inputs[1]!.requestId,
                 "approval-stale-test-owner",
                 "pending",

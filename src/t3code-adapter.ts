@@ -30,6 +30,7 @@ import {
   type Authorization,
   type ApprovalResponseCommand,
   type Capability,
+  type InputRespondAnswers,
   type InteractionMode,
   type InstanceCapabilityName,
   type RuntimeMode,
@@ -193,6 +194,14 @@ const ThreadMessageWireSchema = Schema.Struct({
   createdAt: Schema.String,
 });
 
+/** The pinned message-sent event is flat, while snapshot messages use `id`. */
+const ThreadMessageSentPayloadWireSchema = Schema.Struct({
+  messageId: trimmedNonEmptyWireString,
+  text: Schema.String,
+  turnId: Schema.NullOr(trimmedNonEmptyWireString),
+  createdAt: Schema.String,
+});
+
 const ThreadDetailWireSchema = Schema.Struct({
   id: trimmedNonEmptyWireString,
   projectId: trimmedNonEmptyWireString,
@@ -248,7 +257,7 @@ const ThreadDetailEventWireSchema = Schema.Union([
   Schema.Struct({
     sequence: nonNegativeWireInt,
     type: Schema.Literal("thread.message-sent"),
-    payload: Schema.Struct({ message: ThreadMessageWireSchema }),
+    payload: ThreadMessageSentPayloadWireSchema,
   }),
   Schema.Struct({
     sequence: nonNegativeWireInt,
@@ -386,7 +395,6 @@ const ApprovalResponseCommandWireSchema = Schema.Struct({
   decision: ApprovalDecisionSchema,
   createdAt: Schema.String,
 });
-
 const OrchestrationDispatchCommandErrorWireSchema = Schema.Struct({
   _tag: Schema.Literal("OrchestrationDispatchCommandError"),
   message: Schema.String,
@@ -609,8 +617,18 @@ const GetArchivedShellSnapshotRpc = Rpc.make("orchestration.getArchivedShellSnap
   error: Schema.Union([GetSnapshotErrorWireSchema, EnvironmentAuthorizationErrorWireSchema]),
 });
 
+const InputResponseCommandWireSchema = Schema.Struct({
+  type: Schema.Literal("thread.user-input.respond"),
+  commandId: trimmedNonEmptyWireString,
+  threadId: trimmedNonEmptyWireString,
+  requestId: trimmedNonEmptyWireString,
+  answers: Schema.Record(Schema.String, Schema.Union([Schema.String, Schema.Array(Schema.String)])),
+  createdAt: trimmedNonEmptyWireString,
+});
+
 const DispatchCommandRpc = Rpc.make("orchestration.dispatchCommand", {
   payload: Schema.Union([
+    InputResponseCommandWireSchema,
     DispatchTurnCommandWireSchema,
     ApprovalResponseCommandWireSchema,
     ThreadInterruptCommandWireSchema,
@@ -635,7 +653,6 @@ const SubscribeThreadRpc = Rpc.make("orchestration.subscribeThread", {
   error: Schema.Union([GetSnapshotErrorWireSchema, EnvironmentAuthorizationErrorWireSchema]),
   stream: true,
 });
-
 const VcsRefreshStatusRpc = Rpc.make("vcs.refreshStatus", {
   payload: Schema.Struct({ cwd: trimmedNonEmptyWireString }),
   success: VcsWorktreeStatusWireSchema,
@@ -834,6 +851,7 @@ const mapAuthorizationError = (error: unknown): T3CodeAdapterError | null => {
       message: `The T3Code credential lacks the required ${String(error.requiredScope)} scope.`,
       uncertain: false,
       status: null,
+      requiredScopes: [String(error.requiredScope)],
     });
   }
   return null;
@@ -849,6 +867,48 @@ const mapOrchestrationReadError = (message: string) => (error: unknown) => {
     message,
     uncertain: false,
     status: null,
+  });
+};
+
+export const mapOrchestrationDispatchCommandError = (
+  error: unknown,
+): T3CodeAdapterError | RpcClientError.RpcClientError => {
+  if (
+    Predicate.hasProperty(error, "_tag") &&
+    error._tag === "OrchestrationDispatchCommandError" &&
+    Predicate.hasProperty(error, "message") &&
+    typeof error.message === "string"
+  ) {
+    return new T3CodeAdapterError({
+      kind: "command_rejected",
+      message: error.message,
+      uncertain: false,
+      status: null,
+    });
+  }
+  if (Predicate.hasProperty(error, "_tag") && error._tag === "OrchestrationCommandInvariantError") {
+    return new T3CodeAdapterError({
+      kind: "command_rejected",
+      message: "T3Code rejected the native command because it violated a server invariant.",
+      uncertain: false,
+      status: null,
+    });
+  }
+  return mapOrchestrationReadError("The T3Code input response command was unavailable.")(error);
+};
+
+const inputResponseDispatchFailure = (
+  error: T3CodeAdapterError,
+  dispatchCommandStarted: boolean,
+): T3CodeAdapterError => {
+  const uncertain =
+    dispatchCommandStarted && error.kind !== "command_rejected" && error.kind !== "authorization";
+  if (error.uncertain === uncertain) return error;
+  return new T3CodeAdapterError({
+    kind: error.kind,
+    message: error.message,
+    uncertain,
+    status: error.status,
   });
 };
 
@@ -1490,6 +1550,16 @@ export interface T3CodeAdapterService {
     readonly endpoint: string;
     readonly credential: string;
   }) => Effect.Effect<ShellSnapshot, T3CodeAdapterError>;
+  readonly respondToInput: (input: {
+    readonly endpoint: string;
+    readonly credential: string;
+    readonly environmentId: string;
+    readonly commandId: string;
+    readonly createdAt: string;
+    readonly threadId: string;
+    readonly requestId: string;
+    readonly answers: InputRespondAnswers;
+  }) => Effect.Effect<{ readonly sequence: number }, T3CodeAdapterError>;
   readonly createWorktree: (
     input: { readonly endpoint: string; readonly credential: string } & WorktreeCreateRequest,
   ) => Effect.Effect<CreatedWorktree, T3CodeAdapterError>;
@@ -1869,6 +1939,15 @@ const observedThreadMessageFromWire = (
   createdAt: message.createdAt,
 });
 
+const observedThreadMessageFromEvent = (
+  message: typeof ThreadMessageSentPayloadWireSchema.Type,
+): ObservedThreadMessage => ({
+  messageId: message.messageId,
+  text: message.text,
+  turnId: message.turnId,
+  createdAt: message.createdAt,
+});
+
 const observedThreadSessionFromWire = (
   session: typeof ThreadSessionWireSchema.Type,
 ): ObservedThreadSession => ({
@@ -1948,7 +2027,7 @@ const threadStreamItemFromWire = (
           return {
             kind: "message-sent",
             sequence: item.event.sequence,
-            message: observedThreadMessageFromWire(item.event.payload.message),
+            message: observedThreadMessageFromEvent(item.event.payload),
           };
         default:
           return { kind: "detail-event", sequence: item.event.sequence };
@@ -2716,6 +2795,59 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
           ),
         );
 
+      const respondToInput = (input: {
+        readonly endpoint: string;
+        readonly credential: string;
+        readonly environmentId: string;
+        readonly commandId: string;
+        readonly createdAt: string;
+        readonly threadId: string;
+        readonly requestId: string;
+        readonly answers: InputRespondAnswers;
+      }): Effect.Effect<{ readonly sequence: number }, T3CodeAdapterError> =>
+        withCapacity(
+          Effect.gen(function* () {
+            const { descriptor, authorization } = yield* verifyEnvironmentSession(input);
+            if (descriptor.environmentId !== input.environmentId) {
+              return yield* Effect.fail(
+                new T3CodeAdapterError({
+                  kind: "identity_mismatch",
+                  message: "The T3Code endpoint now identifies a different environment.",
+                  uncertain: false,
+                  status: null,
+                }),
+              );
+            }
+            if (authorization.operate !== "allowed") {
+              return yield* Effect.fail(
+                new T3CodeAdapterError({
+                  kind: "authorization",
+                  message: "The saved T3Code credential lacks the orchestration operate scope.",
+                  uncertain: false,
+                  status: null,
+                }),
+              );
+            }
+            let dispatchCommandStarted = false;
+            const response = withAuthenticatedRpc(input.endpoint, input.credential, (client) => {
+              dispatchCommandStarted = true;
+              return client["orchestration.dispatchCommand"]({
+                type: "thread.user-input.respond",
+                commandId: input.commandId,
+                threadId: input.threadId,
+                requestId: input.requestId,
+                answers: input.answers,
+                createdAt: input.createdAt,
+              }).pipe(Effect.mapError(mapOrchestrationDispatchCommandError));
+            }).pipe(
+              Effect.mapError((error) =>
+                inputResponseDispatchFailure(error, dispatchCommandStarted),
+              ),
+            );
+            return yield* response;
+          }),
+        );
+
       const loadProviderModels = (input: {
         readonly endpoint: string;
         readonly credential: string;
@@ -2981,6 +3113,7 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
         subscribeShell,
         subscribeThread,
         getArchivedShellSnapshot,
+        respondToInput,
         createWorktree,
         respondToApproval,
         listVcsRefs,

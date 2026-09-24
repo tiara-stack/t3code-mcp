@@ -16,6 +16,7 @@ import {
   STAGED_PAIRING_RETENTION_MILLIS,
   type ApprovalRespondInput,
   type Evidence,
+  type InputRespondInput,
   type InstancePairAgainInput,
   type InstancePairInput,
   type InstanceRemoveInput,
@@ -30,11 +31,17 @@ import {
   type WorktreeCreateInput,
 } from "./domain";
 import { LocalStore, LocalStoreError, REQUEST_RECORD_UNAVAILABLE_MESSAGE } from "./local-store";
-import type { OperationIntent, StoredOperation } from "./local-store";
+import type { OperationIntent, OperationUpdate, StoredOperation } from "./local-store";
 import { InstanceConnections } from "./instance-connections";
+import {
+  ObservationError,
+  Observations,
+  type ObservationServiceError,
+  type SynchronizedThreadDetail,
+} from "./observations";
 import { T3CodeAdapterError, type T3CodeAdapterErrorKind } from "./t3code-adapter";
+import { validateObservedInputResponse } from "./pending-requests";
 import { adapterErrorFailure } from "./tool-failure";
-import { ObservationError, Observations, type SynchronizedThreadDetail } from "./observations";
 
 export class OperationServiceError extends Data.TaggedError("OperationServiceError")<{
   readonly kind: "capacity" | "stale_approval" | "unsupported_approval_decision" | "unsupported";
@@ -42,6 +49,22 @@ export class OperationServiceError extends Data.TaggedError("OperationServiceErr
 }> {}
 
 class ApprovalDispatchClaimLost extends Data.TaggedError("ApprovalDispatchClaimLost")<{}> {}
+
+const inputResponseAuthorizationFailure = (error: T3CodeAdapterError): ToolFailure => {
+  const requiredScopes = error.requiredScopes ?? [];
+  const readDenied =
+    requiredScopes.includes("orchestration:read") &&
+    !requiredScopes.includes("orchestration:operate");
+  return {
+    code: readDenied ? "read_denied" : "operate_denied",
+    message: error.message,
+    retry: "change_request",
+    details:
+      requiredScopes.length === 0
+        ? { action: "check_operate_scope" }
+        : { requiredScopes: [...requiredScopes] },
+  };
+};
 
 const threadInterruptAdapterFailure: Record<
   T3CodeAdapterErrorKind,
@@ -100,6 +123,9 @@ export interface OperationsService {
   ) => Effect.Effect<OperationRecord, LocalStoreError | OperationServiceError>;
   readonly updateRegistration: (
     input: InstanceUpdateInput,
+  ) => Effect.Effect<OperationRecord, LocalStoreError | OperationServiceError>;
+  readonly respondToInput: (
+    input: InputRespondInput,
   ) => Effect.Effect<OperationRecord, LocalStoreError | OperationServiceError>;
   readonly submitThread: (
     input: ThreadSubmitInput,
@@ -558,7 +584,64 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           : Deferred.succeed(signal, undefined).pipe(Effect.asVoid);
       };
 
-      const markOutcomeUnknown = (
+      const compareAndSetInputResponseOutcome = (
+        stored: StoredOperation,
+        record: OperationRecord,
+        update: OperationUpdate,
+      ): Effect.Effect<boolean, LocalStoreError> =>
+        Effect.gen(function* () {
+          if (record.state !== "admitted" && record.state !== "pending") return false;
+          const expectedDispatch =
+            record.dispatch === "not_dispatched" || record.dispatch === "unknown"
+              ? record.dispatch
+              : null;
+          if (expectedDispatch === null) return false;
+          return yield* store.compareAndSetOperationDispatch(
+            stored.record.requestId,
+            stored.ownerProcessNonce,
+            record.state,
+            update,
+            expectedDispatch,
+          );
+        });
+
+      const markInputResponseOutcomeUnknown = (
+        stored: StoredOperation,
+        record: OperationRecord,
+        detail: string,
+      ): Effect.Effect<OperationRecord, LocalStoreError> =>
+        Effect.gen(function* () {
+          if (record.evidence.some((item) => item.detail === detail)) return record;
+          const observed = yield* evidence(detail, "adapter_inference");
+          const update: OperationUpdate = {
+            now: observed.observedAt,
+            intent: stored.intent,
+            state: "outcome_unknown",
+            dispatch: "unknown",
+            stepPosition: 1,
+            stepState: "outcome_unknown",
+            evidence: [observed],
+            evidenceStepPosition: null,
+            error: {
+              code: "unavailable",
+              message: "The mutation outcome is unknown; reconcile before making a new request.",
+              retry: "reconcile_first",
+              details: {},
+            },
+            recovery: "observe_operation",
+          };
+          const claimed = yield* compareAndSetInputResponseOutcome(stored, record, update);
+          if (!claimed) {
+            yield* signalCompletion(stored.record.requestId);
+            const refreshed = yield* store.getOperation(stored.record.requestId);
+            return refreshed?.record ?? record;
+          }
+          yield* signalCompletion(stored.record.requestId);
+          const refreshed = yield* store.getOperation(stored.record.requestId);
+          return refreshed?.record ?? record;
+        });
+
+      const markOtherOutcomeUnknown = (
         stored: StoredOperation,
         record: OperationRecord,
         detail: string,
@@ -637,6 +720,64 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           return refreshed?.record ?? record;
         });
 
+      const markOutcomeUnknown = (
+        stored: StoredOperation,
+        record: OperationRecord,
+        detail: string,
+        recoveryIntent?: OperationIntent,
+      ): Effect.Effect<OperationRecord, LocalStoreError> =>
+        stored.record.tool === "input_respond"
+          ? markInputResponseOutcomeUnknown(stored, record, detail)
+          : markOtherOutcomeUnknown(stored, record, detail, recoveryIntent);
+
+      const markInputResponseNotDispatched = (
+        stored: StoredOperation,
+        record: OperationRecord,
+      ): Effect.Effect<OperationRecord, LocalStoreError> =>
+        Effect.gen(function* () {
+          if (record.state !== "admitted" && record.state !== "pending") return record;
+          const detail =
+            "The previous process stopped before dispatching the native input response; no response was sent.";
+          if (record.evidence.some((item) => item.detail === detail)) return record;
+          const observed = yield* evidence(detail, "adapter_inference");
+          const failure: ToolFailure = {
+            code: "unavailable",
+            message:
+              "The input response was not dispatched. Submit a new explicit request; this operation will not be replayed.",
+            retry: "change_request",
+            details: {},
+          };
+          const claimed = yield* store.compareAndSetOperationDispatch(
+            stored.record.requestId,
+            stored.ownerProcessNonce,
+            record.state,
+            {
+              now: observed.observedAt,
+              state: "failed",
+              dispatch: "not_dispatched",
+              stepPosition: 0,
+              stepState: "failed",
+              stepError: failure,
+              evidence: [observed],
+              evidenceStepPosition: 0,
+              error: failure,
+              recovery: "new_explicit_request",
+              recoverableUntil: new Date(
+                Date.parse(observed.observedAt) + OPERATION_DETAIL_RETENTION_MILLIS,
+              ).toISOString(),
+            },
+            "not_dispatched",
+          );
+          if (!claimed) {
+            yield* signalCompletion(stored.record.requestId);
+            const refreshed = yield* store.getOperation(stored.record.requestId);
+            return refreshed?.record ?? record;
+          }
+          yield* signalCompletion(stored.record.requestId);
+          const refreshed = yield* store.getOperation(stored.record.requestId);
+          return refreshed?.record ?? record;
+        });
+
       const markApprovalNotDispatched = (
         stored: StoredOperation,
         record: OperationRecord,
@@ -654,7 +795,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
             retry: "change_request",
             details: {},
           };
-          const claimed = yield* store.compareAndSetApprovalDispatch(
+          const claimed = yield* store.compareAndSetOperationDispatch(
             stored.record.requestId,
             stored.ownerProcessNonce,
             record.state,
@@ -698,7 +839,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
             retry: "reconcile_first",
             details: {},
           };
-          const claimed = yield* store.compareAndSetApprovalDispatch(
+          const claimed = yield* store.compareAndSetOperationDispatch(
             stored.record.requestId,
             stored.ownerProcessNonce,
             "pending",
@@ -896,6 +1037,17 @@ export class Operations extends Context.Service<Operations, OperationsService>()
                 : "A previous process left this re-pairing without confirmed publication evidence; its outcome is unknown, the one-use exchange will not be replayed, and an unfinished staged credential is never published automatically.",
             );
           }
+          if (record.tool === "input_respond") {
+            if (previousOwner && !previousOwnerStale) return record;
+            if (!previousOwner && record.dispatch === "not_dispatched") {
+              return yield* markInputResponseNotDispatched(stored, record);
+            }
+            return yield* markOutcomeUnknown(
+              stored,
+              record,
+              "A previous process left this input response without a confirmed command receipt; it is unknown and will not be redispatched.",
+            );
+          }
           if (record.tool === "thread_submit") {
             if (previousOwner && !previousOwnerStale) return record;
             if (record.dispatch === "not_dispatched") {
@@ -996,9 +1148,32 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           return refreshed?.record ?? record;
         });
 
+      const ensureInputResponseTarget = (
+        stored: StoredOperation,
+        target: OperationRecord["target"] | undefined,
+      ): Effect.Effect<StoredOperation, LocalStoreError> =>
+        target === undefined ||
+        stored.record.tool !== "input_respond" ||
+        stored.record.target !== null
+          ? Effect.succeed(stored)
+          : Effect.gen(function* () {
+              yield* store.updateOperation(stored.record.requestId, { now: yield* nowIso, target });
+              const refreshed = yield* store.getOperation(stored.record.requestId);
+              if (refreshed === null) {
+                return yield* Effect.fail(
+                  new LocalStoreError({
+                    kind: "request_record_unavailable",
+                    message: REQUEST_RECORD_UNAVAILABLE_MESSAGE,
+                  }),
+                );
+              }
+              return refreshed;
+            });
+
       const findExistingOperation = (
         requestId: string,
         fingerprint: string,
+        target?: OperationRecord["target"],
       ): Effect.Effect<OperationRecord | null, LocalStoreError> =>
         Effect.gen(function* () {
           const known = yield* store.findRequest(requestId);
@@ -1020,7 +1195,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
               }),
             );
           }
-          return yield* reconcile(existing);
+          return yield* ensureInputResponseTarget(existing, target).pipe(Effect.flatMap(reconcile));
         });
 
       const readOperation = (
@@ -2765,7 +2940,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
             "The approval response and its native request identity were durably admitted for this process.",
             "adapter_inference",
           );
-          const claimed = yield* store.compareAndSetApprovalDispatch(
+          const claimed = yield* store.compareAndSetOperationDispatch(
             input.requestId,
             processNonce,
             "admitted",
@@ -2794,7 +2969,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
             createdAt,
             onDispatch: Effect.gen(function* () {
               const dispatchAt = yield* nowIso;
-              const claimed = yield* store.compareAndSetApprovalDispatch(
+              const claimed = yield* store.compareAndSetOperationDispatch(
                 input.requestId,
                 processNonce,
                 "pending",
@@ -2923,16 +3098,16 @@ export class Operations extends Context.Service<Operations, OperationsService>()
                   ...(input.target === undefined ? {} : { target: input.target }),
                   ...(input.commandId === undefined ? {} : { commandId: input.commandId }),
                   completionMeans: input.completionMeans,
-                  ...(input.target === undefined ? {} : { target: input.target }),
                   ...(input.steps === undefined ? {} : { steps: input.steps }),
                   ...(input.created === undefined ? {} : { created: input.created }),
                 }),
               );
               if (result.kind === "existing") {
+                const existing = yield* ensureInputResponseTarget(result.operation, input.target);
                 yield* release(input.requestId);
                 reserved = false;
                 return {
-                  operation: yield* restore(reconcile(result.operation)),
+                  operation: yield* restore(reconcile(existing)),
                   execute: false,
                 };
               }
@@ -2976,6 +3151,350 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           return current.operation;
         });
 
+      const inputResponseTarget = (input: InputRespondInput) => ({
+        instanceId: input.pendingRequest.instanceId,
+        threadId: input.pendingRequest.threadId,
+      });
+
+      const inputResponseIntent = (input: InputRespondInput) => ({
+        ...inputResponseTarget(input),
+        pendingRequestId: input.pendingRequest.pendingRequestId,
+      });
+
+      const writeInputResponseFailure = (
+        input: InputRespondInput,
+        failure: ToolFailure,
+        options: {
+          readonly expectedState: "admitted" | "pending";
+          readonly expectedDispatch: "not_dispatched" | "unknown";
+          readonly state: "failed" | "outcome_unknown";
+          readonly dispatch: OperationRecord["dispatch"];
+          readonly stepPosition: number;
+          readonly stepState: "failed" | "outcome_unknown";
+          readonly recovery: OperationRecord["recovery"];
+        },
+      ): Effect.Effect<void, never> =>
+        nowIso.pipe(
+          Effect.flatMap((now) =>
+            store
+              .compareAndSetOperationDispatch(
+                input.requestId,
+                processNonce,
+                options.expectedState,
+                {
+                  now,
+                  intent: inputResponseIntent(input),
+                  state: options.state,
+                  dispatch: options.dispatch,
+                  target: inputResponseTarget(input),
+                  stepPosition: options.stepPosition,
+                  stepState: options.stepState,
+                  stepError: failure,
+                  error: failure,
+                  recovery: options.recovery,
+                  recoverableUntil:
+                    options.state === "failed"
+                      ? new Date(Date.parse(now) + OPERATION_DETAIL_RETENTION_MILLIS).toISOString()
+                      : null,
+                },
+                options.expectedDispatch,
+              )
+              .pipe(Effect.asVoid),
+          ),
+          Effect.catch(() => Effect.void),
+          Effect.andThen(signalCompletion(input.requestId)),
+          Effect.asVoid,
+        );
+
+      const isUncertainInputResponseAdapterError = (error: T3CodeAdapterError): boolean =>
+        error.kind !== "command_rejected" && error.uncertain;
+
+      const inputResponseToolFailure = (
+        error: ObservationServiceError | ObservationError,
+        uncertain: boolean,
+      ): ToolFailure => {
+        if (error instanceof LocalStoreError) return operationFailure(error);
+        if (error instanceof T3CodeAdapterError) {
+          if (uncertain) {
+            return {
+              code: "unavailable",
+              message: error.message,
+              retry: "reconcile_first",
+              details: {},
+            };
+          }
+          switch (error.kind) {
+            case "authorization":
+              return inputResponseAuthorizationFailure(error);
+            case "pairing_required":
+              return {
+                code: "pairing_required",
+                message: error.message,
+                retry: "change_request",
+                details: { action: "pair_instance" },
+              };
+            case "command_rejected":
+              return {
+                code: "upstream_failure",
+                message: error.message,
+                retry: "reconcile_first",
+                details: {},
+              };
+            default:
+              return pairingFailure(error);
+          }
+        }
+        return {
+          code: "unavailable",
+          message: error.message,
+          retry: "reconcile_first",
+          details: {},
+        };
+      };
+
+      const inputResponseFailureDispatch = (
+        error: ObservationServiceError | ObservationError,
+        dispatchStarted: boolean,
+        uncertain: boolean,
+      ): OperationRecord["dispatch"] => {
+        if (uncertain) return "unknown";
+        if (
+          dispatchStarted &&
+          error instanceof T3CodeAdapterError &&
+          error.kind === "command_rejected"
+        ) {
+          return "rejected";
+        }
+        return "not_dispatched";
+      };
+
+      const inputResponseFailureRecovery = (
+        error: ObservationServiceError | ObservationError,
+        uncertain: boolean,
+      ): OperationRecord["recovery"] => {
+        if (uncertain) return "observe_operation";
+        if (error instanceof ObservationError) return "observe_thread";
+        if (error instanceof T3CodeAdapterError && error.kind === "command_rejected") {
+          return "observe_thread";
+        }
+        return "new_explicit_request";
+      };
+
+      const inputResponseFailureDisposition = (
+        error: ObservationServiceError | ObservationError,
+        dispatchStarted: boolean,
+      ) => {
+        const uncertain =
+          dispatchStarted &&
+          error instanceof T3CodeAdapterError &&
+          isUncertainInputResponseAdapterError(error);
+        const state = uncertain ? ("outcome_unknown" as const) : ("failed" as const);
+        return {
+          state,
+          dispatch: inputResponseFailureDispatch(error, dispatchStarted, uncertain),
+          stepPosition: dispatchStarted ? 1 : 0,
+          stepState: uncertain ? ("outcome_unknown" as const) : ("failed" as const),
+          recovery: inputResponseFailureRecovery(error, uncertain),
+        };
+      };
+
+      const inputResponseFailure = (
+        input: InputRespondInput,
+        error: ObservationServiceError | ObservationError,
+        dispatchStarted: boolean,
+        expectedState: "admitted" | "pending",
+      ): Effect.Effect<void, never> => {
+        const disposition = inputResponseFailureDisposition(error, dispatchStarted);
+        return writeInputResponseFailure(
+          input,
+          inputResponseToolFailure(error, disposition.state === "outcome_unknown"),
+          {
+            ...disposition,
+            expectedState,
+            expectedDispatch: dispatchStarted ? "unknown" : "not_dispatched",
+          },
+        );
+      };
+
+      const finishAcceptedInputResponse = (
+        input: InputRespondInput,
+        accepted: { readonly commandId: string; readonly sequence: number },
+      ): Effect.Effect<void, LocalStoreError> =>
+        Effect.gen(function* () {
+          const receipt = yield* evidence(
+            `T3Code accepted the native input response command at sequence ${accepted.sequence}; provider consumption and resolution remain separately observed.`,
+            "rpc_result",
+          );
+          yield* store.updateOperation(input.requestId, {
+            now: receipt.observedAt,
+            intent: inputResponseIntent(input),
+            state: "completed",
+            dispatch: "accepted",
+            target: inputResponseTarget(input),
+            commandId: accepted.commandId,
+            stepPosition: 1,
+            stepState: "succeeded",
+            evidence: [receipt],
+            evidenceStepPosition: 1,
+            error: null,
+            recovery: "none",
+            recoverableUntil: new Date(
+              Date.parse(receipt.observedAt) + OPERATION_DETAIL_RETENTION_MILLIS,
+            ).toISOString(),
+          });
+          yield* signalCompletion(input.requestId);
+        });
+
+      const executeInputResponse = (input: InputRespondInput): Effect.Effect<void, never> => {
+        let dispatchStarted = false;
+        let expectedState: "admitted" | "pending" = "admitted";
+        let acceptedResponse: { readonly commandId: string; readonly sequence: number } | null =
+          null;
+        const thread = inputResponseTarget(input);
+        return Effect.gen(function* () {
+          const admitted = yield* evidence(
+            "Input response admission was committed; the current form will be checked before dispatch.",
+            "adapter_inference",
+          );
+          const claimedAdmission = yield* store.compareAndSetOperationDispatch(
+            input.requestId,
+            processNonce,
+            "admitted",
+            {
+              now: admitted.observedAt,
+              intent: inputResponseIntent(input),
+              state: "pending",
+              dispatch: "not_dispatched",
+              target: thread,
+              stepPosition: 0,
+              stepState: "pending",
+              evidence: [admitted],
+              evidenceStepPosition: 0,
+              recovery: "observe_thread",
+            },
+            "not_dispatched",
+          );
+          if (!claimedAdmission) {
+            yield* signalCompletion(input.requestId);
+            return;
+          }
+          expectedState = "pending";
+
+          const detail = yield* observations.threadDetail(thread.instanceId, thread.threadId);
+          const validation = validateObservedInputResponse({
+            thread,
+            activities: detail.thread.activities,
+            pendingRequestId: input.pendingRequest.pendingRequestId,
+            answers: input.answers,
+            historyLimited: detail.limitedHistory,
+          });
+          if (validation.kind === "invalid") {
+            const failure: ToolFailure = {
+              code: validation.code,
+              message: validation.message,
+              retry: validation.code === "invalid_argument" ? "change_request" : "reconcile_first",
+              details: {},
+            };
+            yield* writeInputResponseFailure(input, failure, {
+              expectedState: "pending",
+              expectedDispatch: "not_dispatched",
+              state: "failed",
+              dispatch: "not_dispatched",
+              stepPosition: 0,
+              stepState: "failed",
+              recovery:
+                validation.code === "invalid_argument" ? "new_explicit_request" : "observe_thread",
+            });
+            return;
+          }
+
+          yield* connections.acquire(thread.instanceId);
+          const validated = yield* evidence(
+            "Fresh synchronized thread evidence confirms this exact unresolved input form and its answers.",
+            "snapshot",
+          );
+          const claimedValidation = yield* store.compareAndSetOperationDispatch(
+            input.requestId,
+            processNonce,
+            "pending",
+            {
+              now: validated.observedAt,
+              intent: inputResponseIntent(input),
+              target: thread,
+              stepPosition: 0,
+              stepState: "succeeded",
+              evidence: [validated],
+              evidenceStepPosition: 0,
+              recovery: "observe_operation",
+            },
+            "not_dispatched",
+          );
+          if (!claimedValidation) {
+            yield* signalCompletion(input.requestId);
+            return;
+          }
+
+          const commandId = yield* crypto.randomUUIDv4.pipe(
+            Effect.mapError(
+              () =>
+                new LocalStoreError({
+                  kind: "storage",
+                  message: "The input response command could not be assigned a native identity.",
+                }),
+            ),
+          );
+          const createdAt = yield* nowIso;
+          const dispatchEvidence = yield* evidence(
+            "The native input response command identity and dispatch marker were saved before dispatch.",
+            "adapter_inference",
+          );
+          const claimedDispatch = yield* store.compareAndSetOperationDispatch(
+            input.requestId,
+            processNonce,
+            "pending",
+            {
+              now: dispatchEvidence.observedAt,
+              intent: inputResponseIntent(input),
+              state: "pending",
+              dispatch: "unknown",
+              target: thread,
+              commandId,
+              stepPosition: 1,
+              stepState: "pending",
+              evidence: [dispatchEvidence],
+              evidenceStepPosition: 1,
+              recovery: "observe_operation",
+            },
+            "not_dispatched",
+          );
+          if (!claimedDispatch) {
+            yield* signalCompletion(input.requestId);
+            return;
+          }
+          dispatchStarted = true;
+
+          const accepted = yield* connections.respondToInput({
+            ...thread,
+            commandId,
+            createdAt,
+            requestId: input.pendingRequest.pendingRequestId,
+            answers: validation.answers,
+          });
+          acceptedResponse = { commandId, sequence: accepted.sequence };
+          yield* finishAcceptedInputResponse(input, acceptedResponse);
+        }).pipe(
+          Effect.catch((error: ObservationServiceError | ObservationError) => {
+            if (acceptedResponse !== null) {
+              return finishAcceptedInputResponse(input, acceptedResponse).pipe(
+                Effect.catch(() => signalCompletion(input.requestId)),
+              );
+            }
+            return inputResponseFailure(input, error, dispatchStarted, expectedState);
+          }),
+          Effect.asVoid,
+        );
+      };
+
       // fallow-ignore-next-line complexity
       const pairInstance = (
         input: InstancePairInput,
@@ -2983,6 +3502,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
         Effect.gen(function* () {
           const fingerprint = yield* store.fingerprintRequest("instance_pair", input);
           const existing = yield* findExistingOperation(input.requestId, fingerprint);
+
           if (existing !== null) return existing;
 
           const instanceId = yield* crypto.randomUUIDv4.pipe(
@@ -3017,6 +3537,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
         Effect.gen(function* () {
           const fingerprint = yield* store.fingerprintRequest("instance_pair_again", input);
           const existing = yield* findExistingOperation(input.requestId, fingerprint);
+
           if (existing !== null) return existing;
 
           return yield* admitAndRun({
@@ -3041,6 +3562,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
         Effect.gen(function* () {
           const fingerprint = yield* store.fingerprintRequest("instance_remove", input);
           const existing = yield* findExistingOperation(input.requestId, fingerprint);
+
           if (existing !== null) return existing;
 
           return yield* admitAndRun({
@@ -3060,6 +3582,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
         Effect.gen(function* () {
           const fingerprint = yield* store.fingerprintRequest("instance_update", input);
           const existing = yield* findExistingOperation(input.requestId, fingerprint);
+
           if (existing !== null) return existing;
 
           if (input.alias === undefined && input.endpoint === undefined) {
@@ -3097,6 +3620,30 @@ export class Operations extends Context.Service<Operations, OperationsService>()
               ? ["verify_endpoint_environment", "publish_registration_update"]
               : ["update_registration"],
             execute: executeUpdate(input, endpointChange ? (input.endpoint ?? null) : null),
+          });
+        });
+
+      const respondToInput = (
+        input: InputRespondInput,
+      ): Effect.Effect<OperationRecord, LocalStoreError | OperationServiceError> =>
+        Effect.gen(function* () {
+          const fingerprint = yield* store.fingerprintRequest("input_respond", input);
+          const existing = yield* findExistingOperation(
+            input.requestId,
+            fingerprint,
+            inputResponseTarget(input),
+          );
+          if (existing !== null) return existing;
+
+          return yield* admitAndRun({
+            requestId: input.requestId,
+            fingerprint,
+            tool: "input_respond",
+            intent: inputResponseIntent(input),
+            target: inputResponseTarget(input),
+            completionMeans: "response_accepted",
+            steps: ["validate_current_input_request", "dispatch_input_response"],
+            execute: executeInputResponse(input),
           });
         });
 
@@ -3141,6 +3688,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
         Effect.gen(function* () {
           const fingerprint = yield* store.fingerprintRequest("worktree_create", input);
           const existing = yield* findExistingOperation(input.requestId, fingerprint);
+
           if (existing !== null) return existing;
 
           return yield* admitAndRun({
@@ -3210,6 +3758,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
         Effect.gen(function* () {
           const fingerprint = yield* store.fingerprintRequest("approval_respond", input);
           const existing = yield* findExistingOperation(input.requestId, fingerprint);
+
           if (existing !== null) return existing;
           yield* validateObservedApproval(input, yield* observeRequest);
           return yield* admitApprovalResponse(input, fingerprint);
@@ -3249,6 +3798,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
         pairInstanceAgain,
         removeRegistration,
         updateRegistration,
+        respondToInput,
         submitThread,
         createWorktree,
         respondToApproval,

@@ -17,6 +17,7 @@ import { LocalStore, LocalStoreError } from "./local-store";
 import {
   InstanceConnections,
   type DiscoveredVcsRefs,
+  type InstanceConnectionsService,
   type DiscoveredVcsWorktreeRefs,
   type InstanceDispatchTurnInput,
   type ObservedVcsWorktreeStatus,
@@ -374,6 +375,7 @@ const fakeAdapterLayer = (
           status: null,
         }),
       ),
+    respondToInput: () => Effect.die("not used"),
     ...unsupportedVcsAdapterMethods,
     createWorktree,
     respondToApproval: failApprovalResponse,
@@ -2924,6 +2926,7 @@ const projectFixtures = (
           status: null,
         }),
       ),
+    respondToInput: () => Effect.die("not used"),
     createWorktree: () => Effect.die("not used"),
     respondToApproval: failApprovalResponse,
     listVcsRefs: () =>
@@ -4163,6 +4166,7 @@ const modelFixtures = (
           status: null,
         }),
       ),
+    respondToInput: () => Effect.die("not used"),
     createWorktree: () => Effect.die("not used"),
     respondToApproval: failApprovalResponse,
     listVcsRefs: () =>
@@ -4754,6 +4758,7 @@ describe("model_list", () => {
                     status: null,
                   }),
                 ),
+              respondToInput: () => Effect.die("not used"),
               createWorktree: () => Effect.die("not used"),
               respondToApproval: failApprovalResponse,
               listVcsRefs: () =>
@@ -5054,6 +5059,8 @@ interface ThreadFixtureOptions {
       ) => Effect.Effect<DiscoveredVcsRefs, LocalStoreError | T3CodeAdapterError>
     >
   >;
+  respondToInput?: InstanceConnectionsService["respondToInput"];
+  acquire?: InstanceConnectionsService["acquire"];
   approvalResponse?: (input: {
     readonly instanceId: string;
     readonly threadId: string;
@@ -5127,15 +5134,22 @@ const threadConnections = (options: ThreadFixtureOptions) =>
           status: null,
         }),
       ),
-    acquire: () =>
-      Effect.fail(
-        new T3CodeAdapterError({
-          kind: "capacity",
-          message: "The thread test connection does not acquire.",
-          uncertain: false,
-          status: null,
-        }),
-      ),
+    acquire: (instanceId: string) =>
+      options.acquire === undefined
+        ? Effect.succeed({
+            instanceId,
+            revision: 1,
+            endpoint: `https://${instanceId}.test`,
+            environmentId: `environment-${instanceId}`,
+            credential: "test-token",
+            verified: {
+              environmentId: `environment-${instanceId}`,
+              serverVersion: "0.0.38",
+              scopes: ["orchestration:read", "orchestration:operate"],
+              capabilities: {},
+            },
+          })
+        : options.acquire(instanceId),
     dispatchTurn: (input) => {
       if (options.dispatchPreflightFailure !== undefined) {
         return Effect.fail(options.dispatchPreflightFailure);
@@ -5287,6 +5301,17 @@ const threadConnections = (options: ThreadFixtureOptions) =>
       }
       return scripted();
     },
+    respondToInput: (input) =>
+      options.respondToInput === undefined
+        ? Effect.fail(
+            new T3CodeAdapterError({
+              kind: "capacity",
+              message: "The thread test connection does not respond to input requests.",
+              uncertain: false,
+              status: null,
+            }),
+          )
+        : options.respondToInput(input),
     createWorktree: () => Effect.die("not used"),
     respondToApproval: <E>(
       input: ApprovalResponseCommand & {
@@ -9899,6 +9924,1137 @@ type ThreadOutputToolResultShape = {
   }>;
   readonly warnings: ReadonlyArray<{ readonly code: string }>;
 };
+
+describe("input_respond", () => {
+  const expectRejectedInputResponseToInspectThread = (result: unknown) =>
+    expect(result).toMatchObject({
+      result: {
+        kind: "ok",
+        value: {
+          dispatch: "rejected",
+          recovery: "observe_thread",
+          error: { code: "upstream_failure", retry: "reconcile_first" },
+        },
+      },
+    });
+
+  it("is exposed through the public server toolkit", () => {
+    expect(Object.keys(ServerToolkit.tools)).toContain("input_respond");
+  });
+
+  it.live("validates a free-text, single-select, and multi-select form before accepting once", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const dispatched: Array<Parameters<InstanceConnectionsService["respondToInput"]>[0]> = [];
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              42,
+              observedThreadFixture("thread-a", {
+                activities: [
+                  inputActivity("activity-1", "request-1", [
+                    {
+                      id: "environment",
+                      header: "Environment",
+                      question: "Where should this run?",
+                      options: [
+                        { label: "staging", description: "Shared test environment" },
+                        { label: "production", description: "Live environment" },
+                      ],
+                      multiSelect: false,
+                    },
+                    {
+                      id: "checks",
+                      header: "Checks",
+                      question: "Which checks should run?",
+                      options: [
+                        { label: "unit", description: "Unit tests" },
+                        { label: "integration", description: "Integration tests" },
+                      ],
+                      multiSelect: true,
+                    },
+                    {
+                      id: "notes",
+                      header: "Notes",
+                      question: "Any extra context?",
+                      options: [],
+                      multiSelect: false,
+                    },
+                  ]),
+                ],
+              }),
+            ),
+        };
+        options.respondToInput = (input) =>
+          Effect.sync(() => dispatched.push(input)).pipe(Effect.as({ sequence: 81 }));
+        const input = {
+          requestId: "mutation-input-1",
+          pendingRequest: {
+            instanceId: "instance-a",
+            threadId: "thread-a",
+            pendingRequestId: "request-1",
+          },
+          answers: {
+            environment: "staging",
+            checks: ["unit", "integration"],
+            notes: "Run after the deployment window.",
+          },
+        };
+
+        const { first, duplicate, conflict } = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const first = yield* callTool("input_respond", input);
+            const duplicate = yield* callTool("input_respond", input);
+            const conflict = yield* callTool("input_respond", {
+              ...input,
+              answers: { ...input.answers, notes: "Changed answer" },
+            });
+            return { first, duplicate, conflict };
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(first[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              tool: "input_respond",
+              state: "completed",
+              completionMeans: "response_accepted",
+              dispatch: "accepted",
+              target: { instanceId: "instance-a", threadId: "thread-a" },
+              correlation: null,
+              steps: [
+                { name: "validate_current_input_request", state: "succeeded" },
+                { name: "dispatch_input_response", state: "succeeded" },
+              ],
+              error: null,
+            },
+          },
+          observations: [{ instanceId: "instance-a", freshness: "fresh" }],
+        });
+        expect(duplicate[0]?.result).toMatchObject({
+          result: { kind: "ok", value: { requestId: "mutation-input-1", state: "completed" } },
+        });
+        expect(conflict[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "request_id_conflict" } },
+        });
+        expect(dispatched).toHaveLength(1);
+        expect(dispatched[0]).toMatchObject({
+          instanceId: "instance-a",
+          threadId: "thread-a",
+          requestId: "request-1",
+          answers: input.answers,
+        });
+        expect(dispatched[0]?.commandId).toEqual(expect.any(String));
+      }),
+    ),
+  );
+
+  it.live("rejects missing fields, unknown fields, and values outside offered choices", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        let dispatched = 0;
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              42,
+              observedThreadFixture("thread-a", {
+                activities: [
+                  inputActivity("activity-select", "request-select", [
+                    {
+                      id: "environment",
+                      header: "Environment",
+                      question: "Where should this run?",
+                      options: [
+                        { label: "staging", description: "Shared test environment" },
+                        { label: "production", description: "Live environment" },
+                      ],
+                      multiSelect: false,
+                    },
+                  ]),
+                  inputActivity("activity-multi", "request-multi", [
+                    {
+                      id: "checks",
+                      header: "Checks",
+                      question: "Which checks should run?",
+                      options: [
+                        { label: "unit", description: "Unit tests" },
+                        { label: "integration", description: "Integration tests" },
+                      ],
+                      multiSelect: true,
+                    },
+                  ]),
+                ],
+              }),
+            ),
+        };
+        options.respondToInput = () =>
+          Effect.sync(() => (dispatched += 1)).pipe(Effect.as({ sequence: 82 }));
+        const invalidInputs = [
+          {
+            requestId: "invalid-unknown-field",
+            pendingRequestId: "request-select",
+            answers: { environment: "staging", extra: "forwarded?" },
+          },
+          {
+            requestId: "invalid-required-field",
+            pendingRequestId: "request-select",
+            answers: {},
+          },
+          {
+            requestId: "invalid-offered-choice",
+            pendingRequestId: "request-select",
+            answers: { environment: "qa" },
+          },
+          {
+            requestId: "invalid-single-select-type",
+            pendingRequestId: "request-select",
+            answers: { environment: ["staging"] },
+          },
+          {
+            requestId: "invalid-multiselect-choice",
+            pendingRequestId: "request-multi",
+            answers: { checks: ["unit", "unknown"] },
+          },
+          {
+            requestId: "invalid-multiselect-duplicate",
+            pendingRequestId: "request-multi",
+            answers: { checks: ["unit", "unit"] },
+          },
+        ];
+
+        const results = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* Effect.forEach(invalidInputs, (invalid, index) =>
+              callTool("input_respond", {
+                requestId: invalid.requestId,
+                pendingRequest: {
+                  instanceId: "instance-a",
+                  threadId: "thread-a",
+                  pendingRequestId: invalid.pendingRequestId,
+                },
+                answers: invalid.answers,
+              }).pipe(Effect.map((result) => ({ index, result }))),
+            );
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        for (const { result } of results) {
+          expect(result[0]?.result).toMatchObject({
+            result: {
+              kind: "ok",
+              value: {
+                state: "failed",
+                dispatch: "not_dispatched",
+                error: { code: "invalid_argument" },
+              },
+            },
+          });
+        }
+        expect(dispatched).toBe(0);
+        expect(JSON.stringify(results)).not.toContain("forwarded?");
+      }),
+    ),
+  );
+
+  it.live("rejects stale, resolved, missing-ID, and unrepresentable forms before dispatch", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        let dispatched = 0;
+        const questions = [
+          {
+            id: "answer",
+            header: "Answer",
+            question: "Provide an answer.",
+            options: [],
+            multiSelect: false,
+          },
+        ];
+        options.threadStreams = {
+          "instance-a:thread-race": () =>
+            Stream.make(
+              {
+                kind: "snapshot" as const,
+                snapshot: {
+                  snapshotSequence: 42,
+                  thread: observedThreadFixture("thread-race", {
+                    activities: [inputActivity("activity-race", "request-race", questions)],
+                  }),
+                  page: null,
+                },
+              },
+              {
+                kind: "activity-appended" as const,
+                sequence: 43,
+                activity: {
+                  activityId: "activity-resolved-elsewhere",
+                  kind: "user-input.resolved",
+                  summary: "Resolved in another T3Code client",
+                  payload: { requestId: "request-race" },
+                  turnId: null,
+                  createdAt: "2026-09-22T00:00:02.000Z",
+                },
+              },
+              { kind: "synchronized" as const },
+            ),
+          "instance-a:thread-empty": () =>
+            detailSnapshotStream(44, observedThreadFixture("thread-empty")),
+          "instance-a:thread-unusable": () =>
+            detailSnapshotStream(
+              45,
+              observedThreadFixture("thread-unusable", {
+                activities: [
+                  inputActivity("activity-no-id", null, questions),
+                  inputActivity("activity-bad-schema", "request-bad-schema", [
+                    { ...questions[0], unexpected: true },
+                  ]),
+                ],
+              }),
+            ),
+          "instance-a:thread-oversized": () =>
+            detailSnapshotStream(
+              46,
+              observedThreadFixture("thread-oversized", {
+                activities: [
+                  inputActivity("activity-large", "request-large", [
+                    {
+                      ...questions[0],
+                      header: "x".repeat(33 * 1024),
+                    },
+                  ]),
+                ],
+              }),
+            ),
+        };
+        options.respondToInput = () =>
+          Effect.sync(() => (dispatched += 1)).pipe(Effect.as({ sequence: 83 }));
+        const invalidRequests = [
+          {
+            requestId: "external-resolution-race",
+            threadId: "thread-race",
+            pendingRequestId: "request-race",
+            message: "already resolved",
+          },
+          {
+            requestId: "stale-input-request",
+            threadId: "thread-empty",
+            pendingRequestId: "request-stale",
+            message: "stale or absent",
+          },
+          {
+            requestId: "missing-native-request-id",
+            threadId: "thread-unusable",
+            pendingRequestId: "request-without-native-id",
+            message: "stale or absent",
+          },
+          {
+            requestId: "unrepresentable-input-form",
+            threadId: "thread-unusable",
+            pendingRequestId: "request-bad-schema",
+            message: "could not be represented",
+          },
+          {
+            requestId: "oversized-input-form",
+            threadId: "thread-oversized",
+            pendingRequestId: "request-large",
+            message: "could not be represented",
+          },
+        ];
+
+        const results = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* Effect.forEach(invalidRequests, (invalid) =>
+              callTool("input_respond", {
+                requestId: invalid.requestId,
+                pendingRequest: {
+                  instanceId: "instance-a",
+                  threadId: invalid.threadId,
+                  pendingRequestId: invalid.pendingRequestId,
+                },
+                answers: { answer: "value" },
+              }),
+            );
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(results[0]?.[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "failed",
+              dispatch: "not_dispatched",
+              error: {
+                code: "pending_request_not_current",
+                message: "The request is already resolved.",
+              },
+            },
+          },
+        });
+        for (let index = 1; index < invalidRequests.length; index += 1) {
+          expect(results[index]?.[0]?.result).toMatchObject({
+            result: {
+              kind: "ok",
+              value: {
+                state: "failed",
+                dispatch: "not_dispatched",
+                error: { code: "pending_request_not_current" },
+              },
+            },
+          });
+          expect(JSON.stringify(results[index]?.[0]?.result)).toContain(
+            invalidRequests[index]?.message,
+          );
+        }
+        expect(dispatched).toBe(0);
+      }),
+    ),
+  );
+
+  it.live("keeps accepted and unknown responses recoverable without dispatch replay", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        let dispatched = 0;
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              42,
+              observedThreadFixture("thread-a", {
+                activities: [
+                  inputActivity("activity-1", "request-1", [
+                    {
+                      id: "answer",
+                      header: "Answer",
+                      question: "Provide an answer.",
+                      options: [],
+                      multiSelect: false,
+                    },
+                  ]),
+                ],
+              }),
+            ),
+        };
+        options.respondToInput = () =>
+          Effect.sync(() => (dispatched += 1)).pipe(
+            Effect.andThen(
+              Effect.fail(
+                new T3CodeAdapterError({
+                  kind: "transport",
+                  message: "The input response acknowledgement was lost.",
+                  uncertain: true,
+                  status: null,
+                }),
+              ),
+            ),
+          );
+        const input = {
+          requestId: "mutation-unknown-input",
+          pendingRequest: {
+            instanceId: "instance-a",
+            threadId: "thread-a",
+            pendingRequestId: "request-1",
+          },
+          answers: { answer: "Do not replay." },
+        };
+        const { first, retry, lookup } = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const first = yield* callTool("input_respond", input);
+            const retry = yield* callTool("input_respond", input);
+            const lookup = yield* callTool("operation_get", {
+              requestId: input.requestId,
+            });
+            return { first, retry, lookup };
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        expect(first[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "outcome_unknown",
+              dispatch: "unknown",
+              error: { code: "unavailable", retry: "reconcile_first" },
+            },
+          },
+        });
+        expect(retry[0]?.result).toMatchObject({
+          result: { kind: "ok", value: { state: "outcome_unknown" } },
+        });
+        expect(lookup[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: { operation: { requestId: input.requestId, state: "outcome_unknown" } },
+          },
+        });
+        expect(dispatched).toBe(1);
+      }),
+    ),
+  );
+
+  it.live("maps definite adapter failures and preserves ambiguous dispatch outcomes", () =>
+    withDatabasePath((databasePath) =>
+      // fallow-ignore-next-line complexity
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const cases = [
+          {
+            mutationRequestId: "mutation-auth-denied",
+            pendingRequestId: "request-auth-denied",
+            state: "failed",
+            dispatch: "not_dispatched",
+            code: "operate_denied",
+          },
+          {
+            mutationRequestId: "mutation-pairing-required",
+            pendingRequestId: "request-pairing-required",
+            state: "failed",
+            dispatch: "not_dispatched",
+            code: "pairing_required",
+          },
+          {
+            mutationRequestId: "mutation-wire-pre-send",
+            pendingRequestId: "request-wire-pre-send",
+            state: "failed",
+            dispatch: "not_dispatched",
+            code: "incompatible_instance",
+          },
+          {
+            mutationRequestId: "mutation-wire-unknown",
+            pendingRequestId: "request-wire-unknown",
+            state: "outcome_unknown",
+            dispatch: "unknown",
+            code: "unavailable",
+          },
+          {
+            mutationRequestId: "mutation-timeout-pre-send",
+            pendingRequestId: "request-timeout-pre-send",
+            state: "failed",
+            dispatch: "not_dispatched",
+            code: "unavailable",
+          },
+          {
+            mutationRequestId: "mutation-timeout-unknown",
+            pendingRequestId: "request-timeout-unknown",
+            state: "outcome_unknown",
+            dispatch: "unknown",
+            code: "unavailable",
+          },
+          {
+            mutationRequestId: "mutation-explicit-unknown",
+            pendingRequestId: "request-explicit-unknown",
+            state: "outcome_unknown",
+            dispatch: "unknown",
+            code: "unavailable",
+          },
+          {
+            mutationRequestId: "mutation-command-rejected",
+            pendingRequestId: "request-command-rejected",
+            state: "failed",
+            dispatch: "rejected",
+            code: "upstream_failure",
+          },
+          {
+            mutationRequestId: "mutation-auth-read-denied",
+            pendingRequestId: "request-auth-read-denied",
+            state: "failed",
+            dispatch: "not_dispatched",
+            code: "read_denied",
+          },
+          {
+            mutationRequestId: "mutation-auth-operate-denied",
+            pendingRequestId: "request-auth-operate-denied",
+            state: "failed",
+            dispatch: "not_dispatched",
+            code: "operate_denied",
+          },
+          {
+            mutationRequestId: "mutation-local-store-before-dispatch",
+            pendingRequestId: "request-local-store-before-dispatch",
+            state: "failed",
+            dispatch: "not_dispatched",
+            code: "unavailable",
+          },
+        ];
+        const errorByRequestId = new Map<string, LocalStoreError | T3CodeAdapterError>([
+          [
+            "request-auth-denied",
+            new T3CodeAdapterError({
+              kind: "authorization",
+              message: "The saved credential lacks input-response authorization.",
+              uncertain: false,
+              status: null,
+            }),
+          ],
+          [
+            "request-auth-read-denied",
+            new T3CodeAdapterError({
+              kind: "authorization",
+              message: "The saved credential lacks the orchestration:read scope.",
+              uncertain: false,
+              status: null,
+              requiredScopes: ["orchestration:read"],
+            }),
+          ],
+          [
+            "request-auth-operate-denied",
+            new T3CodeAdapterError({
+              kind: "authorization",
+              message: "The saved credential lacks the orchestration:operate scope.",
+              uncertain: false,
+              status: null,
+              requiredScopes: ["orchestration:operate"],
+            }),
+          ],
+          [
+            "request-local-store-before-dispatch",
+            new LocalStoreError({
+              kind: "storage",
+              message: "The connection record could not be read before the RPC call.",
+            }),
+          ],
+          [
+            "request-pairing-required",
+            new T3CodeAdapterError({
+              kind: "pairing_required",
+              message: "The instance needs pairing before input responses.",
+              uncertain: false,
+              status: null,
+            }),
+          ],
+          [
+            "request-wire-pre-send",
+            new T3CodeAdapterError({
+              kind: "wire_incompatible",
+              message: "The authenticated channel failed before command dispatch.",
+              uncertain: false,
+              status: null,
+            }),
+          ],
+          [
+            "request-wire-unknown",
+            new T3CodeAdapterError({
+              kind: "wire_incompatible",
+              message: "The RPC response could not be decoded after dispatch.",
+              uncertain: true,
+              status: null,
+            }),
+          ],
+          [
+            "request-timeout-pre-send",
+            new T3CodeAdapterError({
+              kind: "timeout",
+              message: "The channel connection timed out before command dispatch.",
+              uncertain: false,
+              status: null,
+            }),
+          ],
+          [
+            "request-timeout-unknown",
+            new T3CodeAdapterError({
+              kind: "timeout",
+              message: "The command acknowledgement timed out after dispatch.",
+              uncertain: true,
+              status: null,
+            }),
+          ],
+          [
+            "request-explicit-unknown",
+            new T3CodeAdapterError({
+              kind: "authorization",
+              message: "The adapter reported an uncertain authorization failure.",
+              uncertain: true,
+              status: null,
+            }),
+          ],
+          [
+            "request-command-rejected",
+            new T3CodeAdapterError({
+              kind: "command_rejected",
+              message: "T3Code rejected the input response command.",
+              uncertain: false,
+              status: null,
+            }),
+          ],
+        ]);
+        const dispatched: Array<string> = [];
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              42,
+              observedThreadFixture("thread-a", {
+                activities: cases.map((entry, index) =>
+                  inputActivity(`activity-${index}`, entry.pendingRequestId, [
+                    {
+                      id: "answer",
+                      header: "Answer",
+                      question: "Provide an answer.",
+                      options: [],
+                      multiSelect: false,
+                    },
+                  ]),
+                ),
+              }),
+            ),
+        };
+        options.respondToInput = (input) => {
+          dispatched.push(input.requestId);
+          const error = errorByRequestId.get(input.requestId);
+          return error === undefined ? Effect.succeed({ sequence: 85 }) : Effect.fail(error);
+        };
+
+        const results = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* Effect.forEach(cases, (entry) =>
+              callTool("input_respond", {
+                requestId: entry.mutationRequestId,
+                pendingRequest: {
+                  instanceId: "instance-a",
+                  threadId: "thread-a",
+                  pendingRequestId: entry.pendingRequestId,
+                },
+                answers: { answer: "value" },
+              }),
+            );
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        for (const [index, entry] of cases.entries()) {
+          expect(results[index]?.[0]?.result).toMatchObject({
+            result: {
+              kind: "ok",
+              value: {
+                state: entry.state,
+                dispatch: entry.dispatch,
+                error: { code: entry.code },
+              },
+            },
+          });
+        }
+        expect(results[1]?.[0]?.result).toMatchObject({
+          result: { kind: "ok", value: { error: { details: { action: "pair_instance" } } } },
+        });
+        expect(results[3]?.[0]?.result).toMatchObject({
+          result: { kind: "ok", value: { error: { retry: "reconcile_first" } } },
+        });
+        expectRejectedInputResponseToInspectThread(results[7]?.[0]?.result);
+        expect(results[0]?.[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              error: { code: "operate_denied", details: { action: "check_operate_scope" } },
+            },
+          },
+        });
+        expect(results[8]?.[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              error: { code: "read_denied", details: { requiredScopes: ["orchestration:read"] } },
+            },
+          },
+        });
+        expect(results[9]?.[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              error: {
+                code: "operate_denied",
+                details: { requiredScopes: ["orchestration:operate"] },
+              },
+            },
+          },
+        });
+        expect(results[10]?.[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              recovery: "new_explicit_request",
+              error: { retry: "reconcile_first" },
+            },
+          },
+        });
+        expect(dispatched).toHaveLength(cases.length);
+      }),
+    ),
+  );
+
+  it.effect("keeps stale previous-owner input responses outcome unknown", () => {
+    const startedAt = 12_000_000;
+    return withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const responses = [
+          {
+            requestId: "stale-input-not-dispatched",
+            dispatch: "not_dispatched" as const,
+            stepPosition: 0,
+            recovery: "observe_thread" as const,
+          },
+          {
+            requestId: "stale-input-unknown",
+            dispatch: "unknown" as const,
+            stepPosition: 1,
+            recovery: "observe_operation" as const,
+          },
+        ];
+        yield* TestClock.setTime(startedAt);
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const store = yield* LocalStore;
+            for (const response of responses) {
+              yield* store.admitOperation({
+                requestId: response.requestId,
+                tool: "input_respond",
+                fingerprint: response.requestId,
+                processNonce: "previous-process",
+                admittedAt: new Date(startedAt).toISOString(),
+                intent: {
+                  instanceId: "instance-a",
+                  threadId: "thread-a",
+                  pendingRequestId: "native-request",
+                },
+                completionMeans: "response_accepted",
+                steps: ["validate_current_input_request", "dispatch_input_response"],
+              });
+              yield* store.updateOperation(response.requestId, {
+                now: new Date(startedAt).toISOString(),
+                state: "pending",
+                dispatch: response.dispatch,
+                target: { instanceId: "instance-a", threadId: "thread-a" },
+                stepPosition: response.stepPosition,
+                stepState: "pending",
+                recovery: response.recovery,
+              });
+            }
+          }).pipe(Effect.provide(LocalStore.layer({ databasePath }))),
+        );
+        yield* TestClock.adjust(Duration.millis(LIVE_EFFECT_OBSERVATION_MILLIS + 1));
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            const notDispatched = yield* callTool("operation_get", {
+              requestId: "stale-input-not-dispatched",
+            });
+            const uncertain = yield* callTool("operation_get", {
+              requestId: "stale-input-unknown",
+            });
+            return { notDispatched, uncertain };
+          }).pipe(Effect.provide(appLayer(databasePath))),
+        );
+
+        expect(result.notDispatched[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              operation: {
+                state: "outcome_unknown",
+                dispatch: "unknown",
+                recovery: "observe_operation",
+                steps: [{ state: "pending" }, { state: "outcome_unknown" }],
+                error: { code: "unavailable", retry: "reconcile_first" },
+              },
+            },
+          },
+        });
+        expect(result.uncertain[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              operation: {
+                state: "outcome_unknown",
+                dispatch: "unknown",
+                steps: [{}, { state: "outcome_unknown" }],
+                error: { code: "unavailable", retry: "reconcile_first" },
+              },
+            },
+          },
+        });
+      }),
+    );
+  });
+
+  it.effect("fails an orphaned same-process input response that never dispatched", () => {
+    const startedAt = 13_000_000;
+    return withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(startedAt);
+        const { connections } = emptyThreadFixtures();
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            const store = yield* LocalStore;
+            yield* seedProjectRegistration("instance-owner", "https://owner.test", "secret-owner");
+            yield* callTool("instance_remove", {
+              requestId: "same-process-owner-probe",
+              instanceId: "instance-owner",
+            });
+            const ownerProbe = yield* store.getOperation("same-process-owner-probe");
+            if (ownerProbe === null) return yield* Effect.die("owner probe was not persisted");
+
+            yield* store.admitOperation({
+              requestId: "same-process-input-not-dispatched",
+              tool: "input_respond",
+              fingerprint: "same-process-fingerprint",
+              processNonce: ownerProbe.ownerProcessNonce,
+              admittedAt: new Date(startedAt).toISOString(),
+              intent: {
+                instanceId: "instance-owner",
+                threadId: "thread-owner",
+                pendingRequestId: "native-owner-request",
+              },
+              completionMeans: "response_accepted",
+              steps: ["validate_current_input_request", "dispatch_input_response"],
+            });
+            yield* store.updateOperation("same-process-input-not-dispatched", {
+              now: new Date(startedAt).toISOString(),
+              state: "pending",
+              dispatch: "not_dispatched",
+              target: { instanceId: "instance-owner", threadId: "thread-owner" },
+              stepPosition: 0,
+              stepState: "pending",
+              recovery: "observe_thread",
+            });
+
+            return yield* callTool("operation_get", {
+              requestId: "same-process-input-not-dispatched",
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              operation: {
+                state: "failed",
+                dispatch: "not_dispatched",
+                recovery: "new_explicit_request",
+                steps: [{ state: "failed" }, { state: "not_started" }],
+                error: { code: "unavailable", retry: "change_request" },
+              },
+            },
+          },
+        });
+      }),
+    );
+  });
+
+  it.live(
+    "does not dispatch input after the operation becomes unknown before the command marker",
+    () =>
+      withDatabasePath((databasePath) =>
+        Effect.gen(function* () {
+          const first = emptyThreadFixtures();
+          const second = emptyThreadFixtures();
+          const acquireStarted = yield* Deferred.make<void>();
+          const finishAcquire = yield* Deferred.make<void>();
+          let dispatched = 0;
+          first.options.threadStreams = {
+            "instance-a:thread-a": () =>
+              detailSnapshotStream(
+                42,
+                observedThreadFixture("thread-a", {
+                  activities: [
+                    inputActivity("activity-1", "request-1", [
+                      {
+                        id: "answer",
+                        header: "Answer",
+                        question: "Provide an answer.",
+                        options: [],
+                        multiSelect: false,
+                      },
+                    ]),
+                  ],
+                }),
+              ),
+          };
+          first.options.acquire = (instanceId) =>
+            Deferred.succeed(acquireStarted, undefined).pipe(
+              Effect.andThen(Deferred.await(finishAcquire)),
+              Effect.as({
+                instanceId,
+                revision: 1,
+                endpoint: `https://${instanceId}.test`,
+                environmentId: `environment-${instanceId}`,
+                credential: "test-token",
+                verified: {
+                  environmentId: `environment-${instanceId}`,
+                  serverVersion: "0.0.38",
+                  scopes: ["orchestration:read", "orchestration:operate"],
+                  capabilities: {},
+                },
+              }),
+            );
+          first.options.respondToInput = () =>
+            Effect.sync(() => (dispatched += 1)).pipe(Effect.as({ sequence: 86 }));
+          const input = {
+            requestId: "stale-input-dispatch-race",
+            pendingRequest: {
+              instanceId: "instance-a",
+              threadId: "thread-a",
+              pendingRequestId: "request-1",
+            },
+            answers: { answer: "Do not dispatch after reconciliation." },
+          };
+
+          const result = yield* Effect.scoped(
+            Effect.gen(function* () {
+              const store = yield* LocalStore;
+              yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+              const original = yield* Effect.forkChild(callTool("input_respond", input));
+              const stage = yield* Effect.race(
+                Deferred.await(acquireStarted).pipe(Effect.as("acquire" as const)),
+                Fiber.join(original).pipe(Effect.as("completed" as const)),
+              );
+              if (stage !== "acquire") {
+                return yield* Effect.die("input response completed before the dispatch gate");
+              }
+              const stored = yield* store.getOperation(input.requestId);
+              if (stored === null)
+                return yield* Effect.die("input response admission was not persisted");
+              const staleAt = new Date(
+                (yield* Clock.currentTimeMillis) - LIVE_EFFECT_OBSERVATION_MILLIS - 1,
+              ).toISOString();
+              yield* store.updateOperation(input.requestId, { now: staleAt });
+
+              const reconciled = yield* callTool("operation_get", {
+                requestId: input.requestId,
+              }).pipe(Effect.provide(Layer.fresh(appLayer(databasePath, second.connections))));
+              yield* Deferred.succeed(finishAcquire, undefined);
+              const originalResult = yield* Fiber.join(original);
+              return { reconciled, originalResult };
+            }).pipe(Effect.provide(appLayer(databasePath, first.connections))),
+          );
+
+          expect(result.reconciled[0]?.result).toMatchObject({
+            result: {
+              kind: "ok",
+              value: {
+                operation: { state: "outcome_unknown", dispatch: "unknown" },
+              },
+            },
+          });
+          expect(result.originalResult[0]?.result).toMatchObject({
+            result: {
+              kind: "ok",
+              value: { state: "outcome_unknown", dispatch: "unknown" },
+            },
+          });
+          expect(dispatched).toBe(0);
+        }),
+      ),
+  );
+
+  it.live("continues an admitted response after the caller cancels its wait", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const started = yield* Deferred.make<void>();
+        const gate = yield* Deferred.make<{ readonly sequence: number }>();
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              42,
+              observedThreadFixture("thread-a", {
+                activities: [
+                  inputActivity("activity-1", "request-1", [
+                    {
+                      id: "answer",
+                      header: "Answer",
+                      question: "Provide an answer.",
+                      options: [],
+                      multiSelect: false,
+                    },
+                  ]),
+                ],
+              }),
+            ),
+        };
+        options.respondToInput = () =>
+          Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(gate)));
+        const input = {
+          requestId: "mutation-cancelled-wait",
+          pendingRequest: {
+            instanceId: "instance-a",
+            threadId: "thread-a",
+            pendingRequestId: "request-1",
+          },
+          answers: { answer: "Keep dispatching." },
+        };
+
+        const lookup = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const caller = yield* Effect.forkChild(callTool("input_respond", input));
+            yield* Deferred.await(started);
+            yield* Fiber.interrupt(caller);
+            yield* Deferred.succeed(gate, { sequence: 84 });
+            return yield* callTool("operation_get", {
+              requestId: input.requestId,
+              waitMs: 2_000,
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        expect(lookup[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: { operation: { requestId: input.requestId, state: "completed" } },
+          },
+        });
+      }),
+    ),
+  );
+
+  it.live("rejects unknown argument fields and non-string answer values at the tool boundary", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { connections } = emptyThreadFixtures();
+        const exits = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const unknown = yield* Effect.exit(
+              callTool("input_respond", {
+                requestId: "strict-input-args",
+                pendingRequest: {
+                  instanceId: "instance-a",
+                  threadId: "thread-a",
+                  pendingRequestId: "request-1",
+                  extra: true,
+                },
+                answers: { answer: "value" },
+              }),
+            );
+            const wrongType = yield* Effect.exit(
+              callTool("input_respond", {
+                requestId: "strict-input-answer-type",
+                pendingRequest: {
+                  instanceId: "instance-a",
+                  threadId: "thread-a",
+                  pendingRequestId: "request-1",
+                },
+                answers: { answer: 1 },
+              }),
+            );
+            return { unknown, wrongType };
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        expect(Exit.isFailure(exits.unknown)).toBe(true);
+        expect(Exit.isFailure(exits.wrongType)).toBe(true);
+        if (Exit.isSuccess(exits.unknown) || Exit.isSuccess(exits.wrongType)) return;
+        expect(String(exits.unknown.cause)).toContain(
+          "Invalid parameters for tool 'input_respond'",
+        );
+        expect(String(exits.wrongType.cause)).toContain(
+          "Invalid parameters for tool 'input_respond'",
+        );
+      }),
+    ),
+  );
+});
 
 describe("thread_output", () => {
   it.live("serves the latest retained messages and activities first with native identities", () =>

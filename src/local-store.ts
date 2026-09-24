@@ -940,7 +940,7 @@ export interface LocalStoreService {
     requestId: string,
     update: OperationUpdate,
   ) => Effect.Effect<void, LocalStoreError>;
-  readonly compareAndSetApprovalDispatch: (
+  readonly compareAndSetOperationDispatch: (
     requestId: string,
     ownerProcessNonce: string,
     expectedState: "admitted" | "pending",
@@ -1346,14 +1346,14 @@ export class LocalStore extends Context.Service<LocalStore, LocalStoreService>()
             verifySchemaForOperation,
           );
 
-        const compareAndSetApprovalDispatch = (
+        const compareAndSetOperationDispatch = (
           requestId: string,
           ownerProcessNonce: string,
           expectedState: "admitted" | "pending",
           update: OperationUpdate,
           expectedDispatch?: "not_dispatched" | "unknown",
         ) =>
-          compareAndSetApprovalDispatchInDatabase(
+          compareAndSetOperationDispatchInDatabase(
             sql,
             requestId,
             ownerProcessNonce,
@@ -1413,7 +1413,7 @@ export class LocalStore extends Context.Service<LocalStore, LocalStoreService>()
           admitOperation,
           getOperation,
           updateOperation,
-          compareAndSetApprovalDispatch,
+          compareAndSetOperationDispatch,
           compareAndUpdateOperation,
           inspectRegistration,
           removeRegistration,
@@ -4948,8 +4948,7 @@ const updateOperationWithOwnerExpectationInDatabase = (
           }
           if (
             expectation !== undefined &&
-            (row.tool !== "approval_respond" ||
-              row.owner_process_nonce !== expectation.ownerProcessNonce ||
+            (row.owner_process_nonce !== expectation.ownerProcessNonce ||
               row.state !== expectation.state ||
               row.dispatch !== (expectation.dispatch ?? "not_dispatched"))
           ) {
@@ -5072,7 +5071,7 @@ const updateOperationInDatabase = (
 ): Effect.Effect<void, LocalStoreError> =>
   updateOperationWithOwnerExpectationInDatabase(sql, requestId, update, verify).pipe(Effect.asVoid);
 
-const compareAndSetApprovalDispatchInDatabase = (
+const compareAndSetOperationDispatchInDatabase = (
   sql: SqlClient.SqlClient,
   requestId: string,
   ownerProcessNonce: string,

@@ -1952,6 +1952,8 @@ export const THREAD_SNAPSHOT_TURN_LIMIT = 20;
 export const MAX_ACTIVE_THREAD_SUBSCRIPTIONS_PER_INSTANCE = 32;
 export const MAX_PENDING_REQUEST_QUESTIONS = 32;
 export const MAX_PENDING_REQUEST_OPTIONS = 64;
+export const MAX_PENDING_REQUEST_FORM_BYTES = 32 * 1024;
+export const MAX_PENDING_INPUT_ANSWERS_BYTES = 64 * 1024;
 
 /**
  * The windowed thread snapshot always requests the pinned server's supported
@@ -2162,6 +2164,83 @@ export const PendingRequestPageSchema = Schema.Struct({
 });
 
 export type PendingRequestPage = typeof PendingRequestPageSchema.Type;
+
+export type InputRespondAnswers = Readonly<Record<string, string | ReadonlyArray<string>>>;
+
+export type InputRespondInput = {
+  readonly requestId: string;
+  readonly pendingRequest: ThreadReference & { readonly pendingRequestId: string };
+  readonly answers: InputRespondAnswers;
+};
+
+const inputRespondAnswerValueSchema = Schema.Union([Schema.String, Schema.Array(Schema.String)]);
+
+const inputRespondPendingRequestFields = Schema.Struct({
+  instanceId: nonEmptyString,
+  threadId: nonEmptyString,
+  pendingRequestId: nonEmptyString,
+});
+
+const inputRespondPendingRequestRuntimeShape = Schema.StructWithRest(
+  inputRespondPendingRequestFields,
+  [
+    Schema.Record(
+      Schema.String.check(
+        Schema.makeFilter(
+          (key) => key !== "instanceId" && key !== "threadId" && key !== "pendingRequestId",
+          { message: "unknown input_respond pendingRequest argument" },
+        ),
+      ),
+      Schema.Never,
+    ),
+  ],
+);
+
+const inputRespondPendingRequestJsonShape = Schema.StructWithRest(
+  inputRespondPendingRequestFields,
+  [Schema.Record(Schema.String, Schema.Never)],
+);
+
+const inputRespondFields = Schema.Struct({
+  requestId,
+  pendingRequest: inputRespondPendingRequestRuntimeShape,
+  answers: Schema.Record(Schema.String, inputRespondAnswerValueSchema),
+});
+
+const inputRespondJsonFields = Schema.Struct({
+  requestId,
+  pendingRequest: inputRespondPendingRequestJsonShape,
+  answers: Schema.Record(Schema.String, inputRespondAnswerValueSchema),
+});
+
+const unknownInputRespondField = Schema.String.check(
+  Schema.makeFilter((key) => key !== "requestId" && key !== "pendingRequest" && key !== "answers", {
+    message: "unknown input_respond argument",
+  }),
+);
+
+const inputRespondRuntimeShape = Schema.StructWithRest(inputRespondFields, [
+  Schema.Record(unknownInputRespondField, Schema.Never),
+]);
+
+const inputRespondJsonShape = Schema.StructWithRest(inputRespondJsonFields, [
+  Schema.Record(Schema.String, Schema.Never),
+]);
+
+type InputRespondJson = typeof inputRespondJsonShape.Type;
+
+export const InputRespondInputSchema = Schema.declare<InputRespondInput>(
+  (input): input is InputRespondInput =>
+    Schema.is(inputRespondRuntimeShape)(input) &&
+    serializedByteLength(input.answers) <= MAX_PENDING_INPUT_ANSWERS_BYTES,
+  {
+    toCodecJson: () =>
+      Schema.link<InputRespondInput>()(inputRespondJsonShape, {
+        decode: SchemaGetter.passthrough<InputRespondInput, InputRespondJson>({ strict: false }),
+        encode: SchemaGetter.passthrough<InputRespondJson, InputRespondInput>({ strict: false }),
+      }),
+  },
+);
 
 // fallow-ignore-next-line unused-export
 export const ThreadExecutionStateSchema = Schema.Struct({
