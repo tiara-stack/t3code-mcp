@@ -1,4 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
+import * as Clock from "effect/Clock";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -42,6 +43,16 @@ import { ServerToolkit, serverToolkitLayer } from "./tools";
 
 const THIRTY_DAYS_MILLIS = 30 * 24 * 60 * 60 * 1000;
 const TWENTY_FOUR_HOURS_MILLIS = 24 * 60 * 60 * 1000;
+
+const unsupportedThreadInterrupt = () =>
+  Effect.fail(
+    new T3CodeAdapterError({
+      kind: "capacity",
+      message: "This test adapter does not dispatch thread interruptions.",
+      uncertain: false,
+      status: null,
+    }),
+  );
 
 const makeDatabasePath = () => {
   const directory = mkdtempSync(join(tmpdir(), "t3code-mcp-tools-"));
@@ -299,11 +310,15 @@ const fakeAdapterLayer = (
   dispatchTurn?: (
     input: DispatchTurnInput,
   ) => Effect.Effect<DispatchTurnResult, T3CodeAdapterError>,
+  verificationFailure?: T3CodeAdapterError,
 ) =>
   T3CodeAdapter.layerTest({
     exchangePairingCode: () =>
       Effect.succeed({ credential: "secret-token", expiresAtMillis: null }),
-    verifyCredential,
+    verifyCredential: (input) =>
+      verificationFailure === undefined
+        ? verifyCredential(input)
+        : Effect.fail(verificationFailure),
     inspectCredential: ({ endpoint }: { readonly endpoint: string }) =>
       failure.current === null
         ? Effect.succeed({
@@ -349,6 +364,7 @@ const fakeAdapterLayer = (
           status: null,
         }),
       ),
+    interruptThread: unsupportedThreadInterrupt,
     getArchivedShellSnapshot: () =>
       Effect.fail(
         new T3CodeAdapterError({
@@ -2898,6 +2914,7 @@ const projectFixtures = (
           status: null,
         }),
       ),
+    interruptThread: unsupportedThreadInterrupt,
     getArchivedShellSnapshot: () =>
       Effect.fail(
         new T3CodeAdapterError({
@@ -4136,6 +4153,7 @@ const modelFixtures = (
           status: null,
         }),
       ),
+    interruptThread: unsupportedThreadInterrupt,
     getArchivedShellSnapshot: () =>
       Effect.fail(
         new T3CodeAdapterError({
@@ -4726,6 +4744,7 @@ describe("model_list", () => {
                     status: null,
                   }),
                 ),
+              interruptThread: unsupportedThreadInterrupt,
               getArchivedShellSnapshot: () =>
                 Effect.fail(
                   new T3CodeAdapterError({
@@ -5056,6 +5075,18 @@ interface ThreadFixtureOptions {
     input: InstanceDispatchTurnInput,
   ) => Effect.Effect<{ readonly sequence: number }, T3CodeAdapterError>;
   readonly seenVcsRefs: Array<string>;
+  readonly interruptCalls: Array<{
+    readonly instanceId: string;
+    readonly threadId: string;
+    readonly commandId: string;
+    readonly createdAt: string;
+  }>;
+  interruptThread?: (input: {
+    readonly instanceId: string;
+    readonly threadId: string;
+    readonly commandId: string;
+    readonly createdAt: string;
+  }) => Effect.Effect<{ readonly sequence: number }, LocalStoreError | T3CodeAdapterError>;
 }
 
 const threadConnections = (options: ThreadFixtureOptions) =>
@@ -5193,6 +5224,19 @@ const threadConnections = (options: ThreadFixtureOptions) =>
           )
         : Effect.succeed(refs);
     },
+    interruptThread: (input) => {
+      options.interruptCalls.push(input);
+      return options.interruptThread === undefined
+        ? Effect.fail(
+            new T3CodeAdapterError({
+              kind: "capacity",
+              message: "The thread test connection does not dispatch interruptions.",
+              uncertain: false,
+              status: null,
+            }),
+          )
+        : options.interruptThread(input);
+    },
     openShellStream: (instanceId: string, streamOptions?: { readonly afterSequence?: number }) => {
       options.seenActive.push(instanceId);
       const scripted = options.activeStreams?.[instanceId];
@@ -5275,6 +5319,7 @@ const emptyThreadFixtures = () => {
     seenArchived: [],
     seenThreads: [],
     seenVcsRefs: [],
+    interruptCalls: [],
   };
   return {
     options,
@@ -11963,8 +12008,8 @@ describe("thread_submit", () => {
             const store = yield* LocalStore;
             return LocalStore.of({
               ...store,
-              updateOperation: (requestId, update) => {
-                if (!reconciled && update.expectedRevision !== undefined) {
+              compareAndUpdateOperation: (requestId, update) => {
+                if (!reconciled) {
                   reconciled = true;
                   const failure = {
                     code: "unavailable" as const,
@@ -11983,9 +12028,9 @@ describe("thread_submit", () => {
                       error: failure,
                       recovery: "new_explicit_request",
                     })
-                    .pipe(Effect.andThen(store.updateOperation(requestId, update)));
+                    .pipe(Effect.andThen(store.compareAndUpdateOperation(requestId, update)));
                 }
-                return store.updateOperation(requestId, update);
+                return store.compareAndUpdateOperation(requestId, update);
               },
             });
           }),
@@ -12071,8 +12116,8 @@ describe("thread_submit", () => {
                 const store = yield* LocalStore;
                 return LocalStore.of({
                   ...store,
-                  updateOperation: (requestId, update) => {
-                    if (!newerResultWritten && update.expectedRevision !== undefined) {
+                  compareAndUpdateOperation: (requestId, update) => {
+                    if (!newerResultWritten) {
                       newerResultWritten = true;
                       const accepted: Evidence = {
                         kind: "rpc_result",
@@ -12093,9 +12138,9 @@ describe("thread_submit", () => {
                           error: null,
                           recovery: "none",
                         })
-                        .pipe(Effect.andThen(store.updateOperation(requestId, update)));
+                        .pipe(Effect.andThen(store.compareAndUpdateOperation(requestId, update)));
                     }
-                    return store.updateOperation(requestId, update);
+                    return store.compareAndUpdateOperation(requestId, update);
                   },
                 });
               }),
@@ -13079,6 +13124,1433 @@ const turnWaitDetail = (
       }>,
     }),
   );
+
+describe("thread_interrupt", () => {
+  it.effect("marks connection acquisition errors as definitely not dispatched", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const uncertainAcquisitionError = new T3CodeAdapterError({
+          kind: "wire_incompatible",
+          message: "The credential verification response had an incompatible wire shape.",
+          uncertain: true,
+          status: null,
+        });
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const connections = yield* InstanceConnections;
+            return yield* connections
+              .interruptThread({
+                instanceId: "instance-a",
+                threadId: "thread-a",
+                commandId: "interrupt-acquire-command",
+                createdAt: "2026-09-23T00:00:00.000Z",
+              })
+              .pipe(
+                Effect.map((receipt) => ({ kind: "success" as const, receipt })),
+                Effect.catchTag("T3CodeAdapterError", (error) =>
+                  Effect.succeed({ kind: "failure" as const, error }),
+                ),
+              );
+          }).pipe(
+            Effect.provide(
+              appLayer(
+                databasePath,
+                InstanceConnections.layerWithAdapter(
+                  fakeAdapterLayer(
+                    { current: null },
+                    {},
+                    undefined,
+                    undefined,
+                    undefined,
+                    uncertainAcquisitionError,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+
+        expect(result).toMatchObject({
+          kind: "failure",
+          error: { kind: "incompatible_instance", uncertain: false },
+        });
+      }),
+    ),
+  );
+
+  it.live(
+    "records the accepted command and completes after the same turn is observed interrupted",
+    () =>
+      withDatabasePath((databasePath) =>
+        Effect.gen(function* () {
+          const { options, connections } = emptyThreadFixtures();
+          let state: "running" | "interrupted" = "running";
+          let sequence = 11;
+          options.threadStreams = {
+            "instance-a:thread-a": () =>
+              detailSnapshotStream(
+                sequence,
+                observedThreadFixture("thread-a", {
+                  latestTurn: { turnId: "turn-a", state },
+                  session: {
+                    status: state === "running" ? "running" : "stopped",
+                    activeTurnId: state === "running" ? "turn-a" : null,
+                    lastError: null,
+                    updatedAt: "2026-09-23T00:00:00.000Z",
+                  },
+                }),
+              ),
+          };
+          options.interruptThread = () => {
+            state = "interrupted";
+            sequence = 13;
+            return Effect.succeed({ sequence: 12 });
+          };
+
+          const result = yield* Effect.scoped(
+            Effect.gen(function* () {
+              yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+              const fenced = yield* Effect.exit(
+                callTool("thread_interrupt", {
+                  requestId: "interrupt-fenced",
+                  thread: { instanceId: "instance-a", threadId: "thread-a" },
+                  turnId: "turn-a",
+                }),
+              );
+              const unknownThreadArgument = yield* Effect.exit(
+                callTool("thread_interrupt", {
+                  requestId: "interrupt-unknown-thread-argument",
+                  thread: {
+                    instanceId: "instance-a",
+                    threadId: "thread-a",
+                    unexpected: true,
+                  },
+                }),
+              );
+              const interrupted = yield* callTool("thread_interrupt", {
+                requestId: "interrupt-a",
+                thread: { instanceId: "instance-a", threadId: "thread-a" },
+              });
+              const recovered = yield* callTool("operation_get", { requestId: "interrupt-a" });
+              return { fenced, unknownThreadArgument, interrupted, recovered };
+            }).pipe(Effect.provide(appLayer(databasePath, connections))),
+          );
+
+          if (Exit.isSuccess(result.fenced)) {
+            throw new Error("thread_interrupt accepted a turn fence");
+          }
+          expect(String(result.fenced.cause)).toContain(
+            "Invalid parameters for tool 'thread_interrupt'",
+          );
+          if (Exit.isSuccess(result.unknownThreadArgument)) {
+            throw new Error("thread_interrupt accepted an unknown nested thread argument");
+          }
+          expect(String(result.unknownThreadArgument.cause)).toContain(
+            "Invalid parameters for tool 'thread_interrupt'",
+          );
+          expect(result.interrupted[0]?.result).toMatchObject({
+            result: {
+              kind: "ok",
+              value: {
+                tool: "thread_interrupt",
+                state: "completed",
+                dispatch: "accepted",
+                completionMeans: "interruption_observed",
+                target: { instanceId: "instance-a", threadId: "thread-a" },
+                steps: [
+                  { name: "dispatch_thread_interrupt", state: "succeeded" },
+                  { name: "observe_interruption_effect", state: "succeeded" },
+                ],
+              },
+            },
+          });
+          expect(result.interrupted[0]?.result).toMatchObject({
+            result: {
+              value: {
+                evidence: expect.arrayContaining([
+                  expect.objectContaining({
+                    detail: expect.stringContaining("provider_session_status=stopped"),
+                  }),
+                ]),
+              },
+            },
+          });
+          expect(options.interruptCalls).toHaveLength(1);
+          expect(options.interruptCalls[0]).toMatchObject({
+            instanceId: "instance-a",
+            threadId: "thread-a",
+            commandId: expect.any(String),
+          });
+          expect("turnId" in (options.interruptCalls[0] ?? {})).toBe(false);
+          expect(result.recovered[0]?.result).toMatchObject({
+            result: { kind: "ok", value: { operation: { state: "completed" } } },
+          });
+        }),
+      ),
+  );
+
+  it.live("leaves a turn that ended before dispatch unknown even when the session is idle", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        let sequence = 11;
+        let detailCalls = 0;
+        options.threadStreams = {
+          "instance-a:thread-a": () => {
+            detailCalls += 1;
+            return detailSnapshotStream(
+              sequence,
+              observedThreadFixture("thread-a", {
+                latestTurn: { turnId: "turn-a", state: "completed" },
+                session: {
+                  status: "idle",
+                  activeTurnId: null,
+                  lastError: null,
+                  updatedAt: "2026-09-23T00:00:00.000Z",
+                },
+              }),
+            );
+          },
+        };
+        options.interruptThread = () => {
+          sequence = 13;
+          return Effect.succeed({ sequence: 12 });
+        };
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const input = {
+              requestId: "interrupt-ended",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            };
+            const initial = yield* callTool("thread_interrupt", input);
+            const detailCallsBeforeRecovery = detailCalls;
+            const recovered = yield* callTool("thread_interrupt", input);
+            return { initial, recovered, detailCallsBeforeRecovery };
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result.initial[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "outcome_unknown",
+              dispatch: "accepted",
+              error: { code: "unavailable", retry: "reconcile_first" },
+            },
+          },
+        });
+        expect(result.recovered[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "outcome_unknown",
+              dispatch: "accepted",
+            },
+          },
+        });
+        expect(detailCalls).toBe(result.detailCallsBeforeRecovery);
+        expect(options.interruptCalls).toHaveLength(1);
+      }),
+    ),
+  );
+
+  it.live("does not reobserve a baseline turn that already ended without interruption", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        let turnState: "running" | "completed" | "interrupted" = "running";
+        let sequence = 11;
+        let detailCalls = 0;
+        options.threadStreams = {
+          "instance-a:thread-a": () => {
+            detailCalls += 1;
+            return detailSnapshotStream(
+              sequence,
+              observedThreadFixture("thread-a", {
+                latestTurn: { turnId: "turn-a", state: turnState },
+              }),
+            );
+          },
+        };
+        options.interruptThread = () => {
+          turnState = "completed";
+          sequence = 13;
+          return Effect.succeed({ sequence: 12 });
+        };
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const initial = yield* callTool("thread_interrupt", {
+              requestId: "interrupt-ended-baseline",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+            const observedBeforeRecovery = detailCalls;
+            turnState = "interrupted";
+            sequence = 14;
+            const recovered = yield* callTool("operation_get", {
+              requestId: "interrupt-ended-baseline",
+            });
+            return { initial, observedBeforeRecovery, recovered };
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result.initial[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "outcome_unknown",
+              evidence: expect.arrayContaining([
+                expect.objectContaining({
+                  detail: expect.stringContaining("ended without supported interruption evidence"),
+                }),
+              ]),
+            },
+          },
+        });
+        expect(result.recovered[0]?.result).toMatchObject({
+          result: { kind: "ok", value: { operation: { state: "outcome_unknown" } } },
+        });
+        expect(detailCalls).toBe(result.observedBeforeRecovery);
+      }),
+    ),
+  );
+
+  it.effect("persists baseline-ended evidence during stale interrupt reconciliation", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        let turnState: "completed" | "interrupted" = "completed";
+        let sequence = 14;
+        let detailCalls = 0;
+        options.threadStreams = {
+          "instance-a:thread-a": () => {
+            detailCalls += 1;
+            return detailSnapshotStream(
+              sequence,
+              observedThreadFixture("thread-a", {
+                latestTurn: { turnId: "turn-a", state: turnState },
+              }),
+            );
+          },
+        };
+        const input = {
+          requestId: "interrupt-baseline-ended-after-restart",
+          thread: { instanceId: "instance-a", threadId: "thread-a" },
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const store = yield* LocalStore;
+            const now = yield* Clock.currentTimeMillis;
+            const acceptedAt = new Date(now - 60_001).toISOString();
+            const intent = {
+              instanceId: input.thread.instanceId,
+              threadId: input.thread.threadId,
+              baselineSequence: 10,
+              baselineTurnId: "turn-a",
+              baselineTurnState: "running",
+              baselineTurnProjected: false,
+            };
+            const fingerprint = yield* store.fingerprintRequest("thread_interrupt", input);
+            yield* store.admitOperation({
+              requestId: input.requestId,
+              tool: "thread_interrupt",
+              fingerprint,
+              processNonce: "exited-before-baseline-reconciliation",
+              admittedAt: acceptedAt,
+              intent,
+              completionMeans: "interruption_observed",
+              steps: ["dispatch_thread_interrupt", "observe_interruption_effect"],
+            });
+            const commandId = "interrupt-baseline-ended-command";
+            yield* store.updateOperation(input.requestId, {
+              now: acceptedAt,
+              intent,
+              target: input.thread,
+              commandId,
+              state: "pending",
+              dispatch: "accepted",
+              stepPosition: 0,
+              stepState: "succeeded",
+              evidence: [
+                {
+                  kind: "snapshot",
+                  observedAt: acceptedAt,
+                  sourceSequence: 10,
+                  nativeEventId: null,
+                  detail: "Before dispatch, turn turn-a was running.",
+                },
+                {
+                  kind: "rpc_result",
+                  observedAt: acceptedAt,
+                  sourceSequence: 13,
+                  nativeEventId: commandId,
+                  detail: "T3Code accepted the thread interrupt command at sequence 13.",
+                },
+              ],
+              evidenceStepPosition: 0,
+              recovery: "observe_thread",
+            });
+            yield* store.updateOperation(input.requestId, {
+              now: acceptedAt,
+              stepPosition: 1,
+              stepState: "pending",
+            });
+            const recovered = yield* callTool("operation_get", { requestId: input.requestId });
+            const observedAfterRecovery = detailCalls;
+            turnState = "interrupted";
+            sequence = 15;
+            const repeated = yield* callTool("operation_get", { requestId: input.requestId });
+            return { recovered, repeated, observedAfterRecovery };
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result.recovered[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              operation: {
+                state: "outcome_unknown",
+                dispatch: "accepted",
+                evidence: expect.arrayContaining([
+                  expect.objectContaining({
+                    sourceSequence: 14,
+                    detail: expect.stringContaining(
+                      "ended without supported interruption evidence",
+                    ),
+                  }),
+                ]),
+              },
+            },
+          },
+        });
+        expect(result.repeated[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              operation: {
+                state: "outcome_unknown",
+                dispatch: "accepted",
+                evidence: expect.arrayContaining([
+                  expect.objectContaining({
+                    sourceSequence: 14,
+                    detail: expect.stringContaining(
+                      "ended without supported interruption evidence",
+                    ),
+                  }),
+                ]),
+              },
+            },
+          },
+        });
+        expect(detailCalls).toBe(result.observedAfterRecovery);
+        expect(options.interruptCalls).toEqual([]);
+      }),
+    ),
+  );
+
+  it.effect("does not reobserve an unknown interrupt after the accepted-dispatch window", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        let detailCalls = 0;
+        options.threadStreams = {
+          "instance-a:thread-a": () => {
+            detailCalls += 1;
+            return detailSnapshotStream(
+              15,
+              observedThreadFixture("thread-a", {
+                latestTurn: { turnId: "turn-a", state: "running" },
+              }),
+            );
+          },
+        };
+        const input = {
+          requestId: "interrupt-reconciliation-expired",
+          thread: { instanceId: "instance-a", threadId: "thread-a" },
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const store = yield* LocalStore;
+            const now = yield* Clock.currentTimeMillis;
+            const acceptedAt = new Date(now).toISOString();
+            const intent = {
+              instanceId: input.thread.instanceId,
+              threadId: input.thread.threadId,
+              baselineSequence: 10,
+              baselineTurnId: "turn-a",
+              baselineTurnState: "running",
+              baselineTurnProjected: false,
+            };
+            const fingerprint = yield* store.fingerprintRequest("thread_interrupt", input);
+            yield* store.admitOperation({
+              requestId: input.requestId,
+              tool: "thread_interrupt",
+              fingerprint,
+              processNonce: "interrupt-expired-process",
+              admittedAt: acceptedAt,
+              intent,
+              completionMeans: "interruption_observed",
+              steps: ["dispatch_thread_interrupt", "observe_interruption_effect"],
+            });
+            const commandId = "interrupt-expired-command";
+            yield* store.updateOperation(input.requestId, {
+              now: acceptedAt,
+              intent,
+              target: input.thread,
+              commandId,
+              state: "outcome_unknown",
+              dispatch: "accepted",
+              stepPosition: 0,
+              stepState: "succeeded",
+              evidence: [
+                {
+                  kind: "snapshot",
+                  observedAt: acceptedAt,
+                  sourceSequence: 10,
+                  nativeEventId: null,
+                  detail: "Before dispatch, turn turn-a was running.",
+                },
+                {
+                  kind: "rpc_result",
+                  observedAt: acceptedAt,
+                  sourceSequence: 13,
+                  nativeEventId: commandId,
+                  detail: "T3Code accepted the thread interrupt command at sequence 13.",
+                },
+              ],
+              evidenceStepPosition: 0,
+              recovery: "observe_thread",
+            });
+            yield* TestClock.adjust(Duration.millis(LIVE_EFFECT_OBSERVATION_MILLIS * 2 + 1));
+            return yield* callTool("operation_get", { requestId: input.requestId });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: { operation: { state: "outcome_unknown", dispatch: "accepted" } },
+          },
+        });
+        expect(detailCalls).toBe(0);
+        expect(options.interruptCalls).toEqual([]);
+      }),
+    ),
+  );
+
+  it.live("keeps a replacement-turn interruption unknown without a turn fence", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const interruptDispatched = yield* Deferred.make<void>();
+        const allowInterruptProcessing = yield* Deferred.make<void>();
+        let turnId = "turn-a";
+        let state: "running" | "interrupted" = "running";
+        let sequence = 11;
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              sequence,
+              observedThreadFixture("thread-a", {
+                latestTurn: { turnId, state },
+                session: {
+                  status: state === "running" ? "running" : "stopped",
+                  activeTurnId: state === "running" ? turnId : null,
+                  lastError: null,
+                  updatedAt: "2026-09-23T00:00:00.000Z",
+                },
+              }),
+            ),
+        };
+        options.interruptThread = () =>
+          Effect.gen(function* () {
+            yield* Deferred.succeed(interruptDispatched, undefined);
+            yield* Deferred.await(allowInterruptProcessing);
+            state = "interrupted";
+            sequence = 14;
+            return { sequence: 13 };
+          });
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const interruption = yield* Effect.forkScoped(
+              callTool("thread_interrupt", {
+                requestId: "interrupt-replacement",
+                thread: { instanceId: "instance-a", threadId: "thread-a" },
+              }),
+            );
+            yield* Deferred.await(interruptDispatched);
+            // A UI prompt starts a replacement while this interrupt request
+            // is in flight. T3Code then processes the command for that turn.
+            turnId = "turn-b";
+            state = "running";
+            sequence = 12;
+            yield* Deferred.succeed(allowInterruptProcessing, undefined);
+            return yield* Fiber.join(interruption);
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "outcome_unknown",
+              dispatch: "accepted",
+              evidence: expect.arrayContaining([
+                expect.objectContaining({
+                  detail: expect.stringContaining("replacement turn appeared"),
+                }),
+              ]),
+            },
+          },
+        });
+      }),
+    ),
+  );
+
+  it.live("keeps a lost dispatch reply unknown and does not replay the request ID", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              11,
+              observedThreadFixture("thread-a", {
+                latestTurn: { turnId: "turn-a", state: "running" },
+              }),
+            ),
+        };
+        options.interruptThread = () =>
+          Effect.fail(
+            new T3CodeAdapterError({
+              kind: "transport",
+              message: "The interrupt reply was lost.",
+              uncertain: true,
+              status: null,
+            }),
+          );
+
+        const results = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const input = {
+              requestId: "interrupt-lost-reply",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            };
+            const first = yield* callTool("thread_interrupt", input);
+            const second = yield* callTool("thread_interrupt", input);
+            return { first, second };
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        for (const result of [results.first, results.second]) {
+          expect(result[0]?.result).toMatchObject({
+            result: {
+              kind: "ok",
+              value: {
+                state: "outcome_unknown",
+                dispatch: "unknown",
+                error: { code: "unavailable", retry: "reconcile_first" },
+              },
+            },
+          });
+        }
+        expect(results.second[0]?.result).toMatchObject({
+          result: {
+            value: {
+              steps: [
+                { name: "dispatch_thread_interrupt", state: "outcome_unknown" },
+                { name: "observe_interruption_effect", state: "not_started" },
+              ],
+            },
+          },
+        });
+        expect(options.interruptCalls).toHaveLength(1);
+      }),
+    ),
+  );
+
+  it.live("classifies connection, capacity, rejected, and uncertain dispatch failures", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              11,
+              observedThreadFixture("thread-a", {
+                latestTurn: { turnId: "turn-a", state: "running" },
+              }),
+            ),
+        };
+        let dispatchFailure: LocalStoreError | T3CodeAdapterError = new T3CodeAdapterError({
+          kind: "capacity",
+          message: "The instance RPC capacity is full.",
+          uncertain: false,
+          status: null,
+        });
+        options.interruptThread = () => Effect.fail(dispatchFailure);
+
+        const results = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const capacity = yield* callTool("thread_interrupt", {
+              requestId: "interrupt-capacity",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+            dispatchFailure = new T3CodeAdapterError({
+              kind: "authorization",
+              message: "The credential cannot operate this instance.",
+              uncertain: false,
+              status: 403,
+            });
+            const authorization = yield* callTool("thread_interrupt", {
+              requestId: "interrupt-authorization",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+            dispatchFailure = new T3CodeAdapterError({
+              kind: "authorization",
+              message: "The authorization reply arrived after dispatch became uncertain.",
+              uncertain: true,
+              status: 403,
+            });
+            const uncertainAuthorization = yield* callTool("thread_interrupt", {
+              requestId: "interrupt-uncertain-authorization",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+            dispatchFailure = new T3CodeAdapterError({
+              kind: "command_rejected",
+              message: "T3Code rejected the interruption command.",
+              uncertain: false,
+              status: null,
+            });
+            const rejected = yield* callTool("thread_interrupt", {
+              requestId: "interrupt-command-rejected",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+            dispatchFailure = new LocalStoreError({
+              kind: "registration_removed",
+              message: "The registration was removed before dispatch.",
+            });
+            const removed = yield* callTool("thread_interrupt", {
+              requestId: "interrupt-removed",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+            return { capacity, authorization, uncertainAuthorization, rejected, removed };
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(results.capacity[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: { state: "failed", dispatch: "not_dispatched", error: { code: "unavailable" } },
+          },
+        });
+        expect(results.authorization[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "failed",
+              dispatch: "not_dispatched",
+              error: { code: "operate_denied" },
+            },
+          },
+        });
+        expect(results.uncertainAuthorization[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "outcome_unknown",
+              dispatch: "unknown",
+              error: { code: "operate_denied", retry: "reconcile_first" },
+              evidence: expect.arrayContaining([
+                expect.objectContaining({ kind: "adapter_inference", sourceSequence: null }),
+              ]),
+            },
+          },
+        });
+        expect(results.rejected[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "failed",
+              dispatch: "rejected",
+              error: { code: "upstream_failure", retry: "change_request" },
+              evidence: expect.arrayContaining([
+                expect.objectContaining({ kind: "rpc_result", sourceSequence: null }),
+              ]),
+            },
+          },
+        });
+        expect(results.removed[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: { state: "failed", dispatch: "not_dispatched", error: { code: "stale_state" } },
+          },
+        });
+      }),
+    ),
+  );
+
+  it.live("does not gate distinct interrupt requests on one thread", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const bothDispatched = yield* Deferred.make<void>();
+        let turnState: "running" | "interrupted" = "running";
+        let sequence = 11;
+        let dispatchCount = 0;
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              sequence,
+              observedThreadFixture("thread-a", {
+                latestTurn: { turnId: "turn-a", state: turnState },
+                session: {
+                  status: turnState === "running" ? "running" : "stopped",
+                  activeTurnId: turnState === "running" ? "turn-a" : null,
+                  lastError: null,
+                  updatedAt: "2026-09-23T00:00:00.000Z",
+                },
+              }),
+            ),
+        };
+        options.interruptThread = () =>
+          Effect.gen(function* () {
+            const current = ++dispatchCount;
+            if (current === 2) {
+              turnState = "interrupted";
+              sequence = 15;
+              yield* Deferred.succeed(bothDispatched, undefined);
+            } else {
+              yield* Deferred.await(bothDispatched);
+            }
+            return { sequence: 11 + current };
+          });
+
+        const results = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* Effect.all(
+              [
+                callTool("thread_interrupt", {
+                  requestId: "interrupt-concurrent-a",
+                  thread: { instanceId: "instance-a", threadId: "thread-a" },
+                }),
+                callTool("thread_interrupt", {
+                  requestId: "interrupt-concurrent-b",
+                  thread: { instanceId: "instance-a", threadId: "thread-a" },
+                }),
+              ],
+              { concurrency: "unbounded" },
+            );
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(dispatchCount).toBe(2);
+        expect(options.interruptCalls).toHaveLength(2);
+        expect(results).toHaveLength(2);
+        for (const result of results) {
+          expect(result[0]?.result).toMatchObject({
+            result: { kind: "ok", value: { state: "completed" } },
+          });
+        }
+      }),
+    ),
+  );
+
+  it.live("does not dispatch after a peer fails admission during baseline inspection", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const ownerFixture = emptyThreadFixtures();
+        const peerFixture = emptyThreadFixtures();
+        const inspectionStarted = yield* Deferred.make<void>();
+        const continueInspection = yield* Deferred.make<void>();
+        ownerFixture.options.threadStreams = {
+          "instance-a:thread-a": () =>
+            Stream.unwrap(
+              Effect.gen(function* () {
+                yield* Deferred.succeed(inspectionStarted, undefined);
+                yield* Deferred.await(continueInspection);
+                return detailSnapshotStream(
+                  11,
+                  observedThreadFixture("thread-a", {
+                    latestTurn: { turnId: "turn-a", state: "running" },
+                  }),
+                );
+              }),
+            ),
+        };
+        const input = {
+          requestId: "interrupt-peer-fails-admission",
+          thread: { instanceId: "instance-a", threadId: "thread-a" },
+        };
+        const results = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const owner = yield* Effect.forkScoped(
+              callTool("thread_interrupt", input).pipe(
+                Effect.provide(appLayer(databasePath, ownerFixture.connections)),
+              ),
+            );
+            yield* Deferred.await(inspectionStarted);
+            yield* Effect.acquireUseRelease(
+              Effect.sync(() => new DatabaseSync(databasePath)),
+              (database) =>
+                Effect.sync(() =>
+                  database
+                    .prepare("UPDATE operations SET updated_at = ? WHERE request_id = ?")
+                    .run(
+                      new Date(Date.now() - LIVE_EFFECT_OBSERVATION_MILLIS - 1).toISOString(),
+                      input.requestId,
+                    ),
+                ),
+              (database) => Effect.sync(() => database.close()),
+            );
+            const peerReceipt = yield* callTool("operation_get", {
+              requestId: input.requestId,
+            }).pipe(Effect.provide(appLayer(databasePath, peerFixture.connections)));
+            yield* Deferred.succeed(continueInspection, undefined);
+            const ownerReceipt = yield* Fiber.join(owner);
+            return { peerReceipt, ownerReceipt };
+          }).pipe(Effect.provide(LocalStore.layer({ databasePath }))),
+        );
+
+        expect(results.peerReceipt[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              operation: {
+                state: "failed",
+                dispatch: "not_dispatched",
+                commandId: null,
+              },
+            },
+          },
+        });
+        expect(results.ownerReceipt[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "failed",
+              dispatch: "not_dispatched",
+              commandId: null,
+            },
+          },
+        });
+        expect(ownerFixture.options.interruptCalls).toEqual([]);
+      }),
+    ),
+  );
+
+  it.effect("fails a stale interrupt that was never prepared", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const input = {
+          requestId: "interrupt-before-prepare-restart",
+          thread: { instanceId: "instance-a", threadId: "thread-a" },
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const store = yield* LocalStore;
+            const now = yield* Clock.currentTimeMillis;
+            const admittedAt = new Date(now - 60_001).toISOString();
+            const fingerprint = yield* store.fingerprintRequest("thread_interrupt", input);
+            yield* store.admitOperation({
+              requestId: input.requestId,
+              tool: "thread_interrupt",
+              fingerprint,
+              processNonce: "exited-before-dispatch",
+              admittedAt,
+              intent: { instanceId: input.thread.instanceId, threadId: input.thread.threadId },
+              completionMeans: "interruption_observed",
+              steps: ["dispatch_thread_interrupt", "observe_interruption_effect"],
+            });
+            yield* TestClock.adjust(Duration.millis(60_001));
+            return yield* callTool("operation_get", { requestId: input.requestId });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              operation: {
+                tool: "thread_interrupt",
+                state: "failed",
+                dispatch: "not_dispatched",
+                commandId: null,
+                error: { code: "unavailable", retry: "change_request" },
+                recovery: "new_explicit_request",
+                recoverableUntil: expect.any(String),
+                steps: [
+                  { name: "dispatch_thread_interrupt", state: "failed" },
+                  { name: "observe_interruption_effect", state: "not_started" },
+                ],
+              },
+            },
+          },
+        });
+        expect(options.interruptCalls).toEqual([]);
+      }),
+    ),
+  );
+
+  it.effect("recovers an accepted interrupt after process restart without redispatch", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              13,
+              observedThreadFixture("thread-a", {
+                latestTurn: { turnId: "turn-a", state: "interrupted" },
+                session: {
+                  status: "stopped",
+                  activeTurnId: null,
+                  lastError: null,
+                  updatedAt: "2026-09-23T00:00:00.000Z",
+                },
+              }),
+            ),
+        };
+        const input = {
+          requestId: "interrupt-after-restart",
+          thread: { instanceId: "instance-a", threadId: "thread-a" },
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const store = yield* LocalStore;
+            const now = yield* Clock.currentTimeMillis;
+            const admittedAt = new Date(now).toISOString();
+            const intent = {
+              instanceId: input.thread.instanceId,
+              threadId: input.thread.threadId,
+              baselineSequence: 10,
+              baselineTurnId: "turn-a",
+              baselineTurnState: "running",
+              baselineTurnProjected: false,
+            };
+            const fingerprint = yield* store.fingerprintRequest("thread_interrupt", input);
+            yield* store.admitOperation({
+              requestId: input.requestId,
+              tool: "thread_interrupt",
+              fingerprint,
+              processNonce: "exited-process",
+              admittedAt,
+              intent,
+              completionMeans: "interruption_observed",
+              steps: ["dispatch_thread_interrupt", "observe_interruption_effect"],
+            });
+            const commandId = "interrupt-command-restarted";
+            yield* store.updateOperation(input.requestId, {
+              now: admittedAt,
+              intent,
+              target: input.thread,
+              commandId,
+              state: "pending",
+              dispatch: "accepted",
+              stepPosition: 0,
+              stepState: "succeeded",
+              evidence: [
+                {
+                  kind: "snapshot",
+                  observedAt: admittedAt,
+                  sourceSequence: 10,
+                  nativeEventId: null,
+                  detail: "Before dispatch, turn turn-a was running.",
+                },
+                {
+                  kind: "rpc_result",
+                  observedAt: admittedAt,
+                  sourceSequence: 11,
+                  nativeEventId: commandId,
+                  detail: "T3Code accepted the thread interrupt command at sequence 11.",
+                },
+              ],
+              evidenceStepPosition: 0,
+              recovery: "observe_thread",
+            });
+            yield* store.updateOperation(input.requestId, {
+              now: admittedAt,
+              stepPosition: 1,
+              stepState: "pending",
+            });
+            yield* TestClock.adjust(Duration.millis(60_001));
+            return yield* callTool("operation_get", { requestId: input.requestId });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              operation: {
+                tool: "thread_interrupt",
+                state: "completed",
+                dispatch: "accepted",
+                commandId: "interrupt-command-restarted",
+              },
+            },
+          },
+        });
+        expect(options.interruptCalls).toEqual([]);
+      }),
+    ),
+  );
+
+  it.effect("does not credit a later interrupted turn during restart recovery", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              13,
+              observedThreadFixture("thread-a", {
+                latestTurn: { turnId: "turn-b", state: "interrupted" },
+              }),
+            ),
+        };
+        const input = {
+          requestId: "interrupt-replacement-after-restart",
+          thread: { instanceId: "instance-a", threadId: "thread-a" },
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const store = yield* LocalStore;
+            const now = yield* Clock.currentTimeMillis;
+            const admittedAt = new Date(now).toISOString();
+            const intent = {
+              instanceId: input.thread.instanceId,
+              threadId: input.thread.threadId,
+              baselineSequence: 10,
+              baselineTurnId: "turn-a",
+              baselineTurnState: "running",
+              baselineTurnProjected: false,
+            };
+            const fingerprint = yield* store.fingerprintRequest("thread_interrupt", input);
+            yield* store.admitOperation({
+              requestId: input.requestId,
+              tool: "thread_interrupt",
+              fingerprint,
+              processNonce: "exited-process",
+              admittedAt,
+              intent,
+              completionMeans: "interruption_observed",
+              steps: ["dispatch_thread_interrupt", "observe_interruption_effect"],
+            });
+            const commandId = "interrupt-replacement-command-restarted";
+            yield* store.updateOperation(input.requestId, {
+              now: admittedAt,
+              intent,
+              target: input.thread,
+              commandId,
+              state: "pending",
+              dispatch: "accepted",
+              stepPosition: 0,
+              stepState: "succeeded",
+              evidence: [
+                {
+                  kind: "snapshot",
+                  observedAt: admittedAt,
+                  sourceSequence: 10,
+                  nativeEventId: null,
+                  detail: "Before dispatch, turn turn-a was running.",
+                },
+                {
+                  kind: "rpc_result",
+                  observedAt: admittedAt,
+                  sourceSequence: 11,
+                  nativeEventId: commandId,
+                  detail: "T3Code accepted the thread interrupt command at sequence 11.",
+                },
+              ],
+              evidenceStepPosition: 0,
+              recovery: "observe_thread",
+            });
+            yield* store.updateOperation(input.requestId, {
+              now: admittedAt,
+              stepPosition: 1,
+              stepState: "pending",
+            });
+            yield* TestClock.adjust(Duration.millis(60_001));
+            return yield* callTool("operation_get", { requestId: input.requestId });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              operation: {
+                tool: "thread_interrupt",
+                state: "outcome_unknown",
+                dispatch: "accepted",
+                commandId: "interrupt-replacement-command-restarted",
+              },
+            },
+          },
+        });
+        expect(options.interruptCalls).toEqual([]);
+      }),
+    ),
+  );
+
+  it.live("does not let a stale observer overwrite a peer's completed receipt", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const winnerFixture = emptyThreadFixtures();
+        const peerFixture = emptyThreadFixtures();
+        const peerObservationStarted = yield* Deferred.make<void>();
+        const releasePeerObservation = yield* Deferred.make<void>();
+        winnerFixture.options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              13,
+              observedThreadFixture("thread-a", {
+                latestTurn: { turnId: "turn-a", state: "interrupted" },
+              }),
+            ),
+        };
+        peerFixture.options.threadStreams = {
+          "instance-a:thread-a": () =>
+            Stream.unwrap(
+              Effect.gen(function* () {
+                yield* Deferred.succeed(peerObservationStarted, undefined);
+                yield* Deferred.await(releasePeerObservation);
+                return detailSnapshotStream(
+                  13,
+                  observedThreadFixture("thread-a", {
+                    latestTurn: { turnId: "turn-a", state: "completed" },
+                  }),
+                );
+              }),
+            ),
+        };
+        const input = {
+          requestId: "interrupt-peer-reconciliation",
+          thread: { instanceId: "instance-a", threadId: "thread-a" },
+        };
+        const admittedAt = new Date(Date.now() - 60_001).toISOString();
+        const commandId = "interrupt-peer-command";
+        const intent = {
+          instanceId: input.thread.instanceId,
+          threadId: input.thread.threadId,
+          baselineSequence: 10,
+          baselineTurnId: "turn-a",
+          baselineTurnState: "running",
+          baselineTurnProjected: false,
+        };
+        const results = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const store = yield* LocalStore;
+            const fingerprint = yield* store.fingerprintRequest("thread_interrupt", input);
+            yield* store.admitOperation({
+              requestId: input.requestId,
+              tool: "thread_interrupt",
+              fingerprint,
+              processNonce: "exited-peer-process",
+              admittedAt,
+              intent,
+              completionMeans: "interruption_observed",
+              steps: ["dispatch_thread_interrupt", "observe_interruption_effect"],
+            });
+            yield* store.updateOperation(input.requestId, {
+              now: admittedAt,
+              intent,
+              target: input.thread,
+              commandId,
+              state: "pending",
+              dispatch: "accepted",
+              stepPosition: 0,
+              stepState: "succeeded",
+              evidence: [
+                {
+                  kind: "snapshot",
+                  observedAt: admittedAt,
+                  sourceSequence: 10,
+                  nativeEventId: null,
+                  detail: "Before dispatch, T3Code reported turn turn-a running.",
+                },
+                {
+                  kind: "rpc_result",
+                  observedAt: admittedAt,
+                  sourceSequence: 11,
+                  nativeEventId: commandId,
+                  detail: "T3Code accepted the thread interrupt command at sequence 11.",
+                },
+              ],
+              evidenceStepPosition: 0,
+              recovery: "observe_thread",
+            });
+            yield* store.updateOperation(input.requestId, {
+              now: admittedAt,
+              stepPosition: 1,
+              stepState: "pending",
+            });
+
+            const peer = yield* Effect.forkScoped(
+              callTool("operation_get", { requestId: input.requestId }).pipe(
+                Effect.provide(appLayer(databasePath, threadConnections(peerFixture.options))),
+              ),
+            );
+            yield* Deferred.await(peerObservationStarted);
+            const winner = yield* callTool("operation_get", {
+              requestId: input.requestId,
+            }).pipe(
+              Effect.provide(appLayer(databasePath, threadConnections(winnerFixture.options))),
+            );
+            yield* Deferred.succeed(releasePeerObservation, undefined);
+            const stalePeer = yield* Fiber.join(peer);
+            return { winner, stalePeer };
+          }),
+        ).pipe(Effect.provide(LocalStore.layer({ databasePath })));
+
+        for (const response of [results.winner, results.stalePeer]) {
+          expect(response[0]?.result).toMatchObject({
+            result: {
+              kind: "ok",
+              value: { operation: { state: "completed", commandId } },
+            },
+          });
+        }
+      }),
+    ),
+  );
+
+  it.live("preserves a peer's unknown receipt when the delayed dispatch reply arrives", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const ownerFixture = emptyThreadFixtures();
+        const peerFixture = emptyThreadFixtures();
+        const dispatchStarted = yield* Deferred.make<void>();
+        const allowDispatchReply = yield* Deferred.make<void>();
+        const receiptObservationStarted = yield* Deferred.make<void>();
+        const allowReceiptObservation = yield* Deferred.make<void>();
+        let threadObservationCount = 0;
+        ownerFixture.options.threadStreams = {
+          "instance-a:thread-a": () => {
+            threadObservationCount += 1;
+            if (threadObservationCount === 1) {
+              return detailSnapshotStream(
+                11,
+                observedThreadFixture("thread-a", {
+                  latestTurn: { turnId: "turn-a", state: "running" },
+                }),
+              );
+            }
+            return Stream.unwrap(
+              Effect.gen(function* () {
+                yield* Deferred.succeed(receiptObservationStarted, undefined);
+                yield* Deferred.await(allowReceiptObservation);
+                return detailSnapshotStream(
+                  13,
+                  observedThreadFixture("thread-a", {
+                    latestTurn: { turnId: "turn-a", state: "interrupted" },
+                  }),
+                );
+              }),
+            );
+          },
+        };
+        ownerFixture.options.interruptThread = () =>
+          Effect.gen(function* () {
+            yield* Deferred.succeed(dispatchStarted, undefined);
+            yield* Deferred.await(allowDispatchReply);
+            return { sequence: 12 };
+          });
+        peerFixture.options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              13,
+              observedThreadFixture("thread-a", {
+                latestTurn: { turnId: "turn-a", state: "interrupted" },
+              }),
+            ),
+        };
+        const input = {
+          requestId: "interrupt-delayed-receipt",
+          thread: { instanceId: "instance-a", threadId: "thread-a" },
+        };
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const store = yield* LocalStore;
+            yield* Effect.forkScoped(
+              callTool("thread_interrupt", input).pipe(
+                Effect.provide(appLayer(databasePath, ownerFixture.connections)),
+              ),
+            );
+            yield* Deferred.await(dispatchStarted);
+            yield* Effect.acquireUseRelease(
+              Effect.sync(() => new DatabaseSync(databasePath)),
+              (database) =>
+                Effect.sync(() =>
+                  database
+                    .prepare("UPDATE operations SET updated_at = ? WHERE request_id = ?")
+                    .run(
+                      new Date(Date.now() - LIVE_EFFECT_OBSERVATION_MILLIS - 1).toISOString(),
+                      input.requestId,
+                    ),
+                ),
+              (database) => Effect.sync(() => database.close()),
+            );
+            const peerReceipt = yield* callTool("operation_get", {
+              requestId: input.requestId,
+            }).pipe(Effect.provide(appLayer(databasePath, peerFixture.connections)));
+            yield* Deferred.succeed(allowDispatchReply, undefined);
+            yield* Deferred.await(receiptObservationStarted);
+            const afterLateReceipt = yield* store.getOperation(input.requestId);
+            yield* Deferred.succeed(allowReceiptObservation, undefined);
+            const completed = yield* callTool("operation_get", {
+              requestId: input.requestId,
+            }).pipe(Effect.provide(appLayer(databasePath, peerFixture.connections)));
+            return { peerReceipt, afterLateReceipt, completed };
+          }).pipe(Effect.provide(LocalStore.layer({ databasePath }))),
+        );
+
+        expect(result.peerReceipt[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              operation: { state: "outcome_unknown", dispatch: "unknown" },
+            },
+          },
+        });
+        expect(result.afterLateReceipt?.record).toMatchObject({
+          state: "outcome_unknown",
+          dispatch: "accepted",
+          evidence: expect.arrayContaining([expect.objectContaining({ sourceSequence: 12 })]),
+        });
+        expect(result.completed[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              operation: { state: "completed", dispatch: "accepted" },
+            },
+          },
+        });
+        expect(ownerFixture.options.interruptCalls).toHaveLength(1);
+      }),
+    ),
+  );
+});
 
 describe("turn_wait", () => {
   it.effect("meets an already-completed turn immediately with a zero budget", () =>

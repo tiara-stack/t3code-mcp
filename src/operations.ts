@@ -5,6 +5,7 @@ import * as Data from "effect/Data";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Match from "effect/Match";
 import {
@@ -24,15 +25,16 @@ import {
   type OperationRecord,
   type ThreadSubmitInput,
   type PendingRequest,
+  type ThreadInterruptInput,
   type ToolFailure,
   type WorktreeCreateInput,
 } from "./domain";
 import { LocalStore, LocalStoreError, REQUEST_RECORD_UNAVAILABLE_MESSAGE } from "./local-store";
 import type { OperationIntent, StoredOperation } from "./local-store";
 import { InstanceConnections } from "./instance-connections";
-import { T3CodeAdapterError } from "./t3code-adapter";
+import { T3CodeAdapterError, type T3CodeAdapterErrorKind } from "./t3code-adapter";
 import { adapterErrorFailure } from "./tool-failure";
-import { ObservationError, Observations } from "./observations";
+import { ObservationError, Observations, type SynchronizedThreadDetail } from "./observations";
 
 export class OperationServiceError extends Data.TaggedError("OperationServiceError")<{
   readonly kind: "capacity" | "stale_approval" | "unsupported_approval_decision" | "unsupported";
@@ -40,6 +42,51 @@ export class OperationServiceError extends Data.TaggedError("OperationServiceErr
 }> {}
 
 class ApprovalDispatchClaimLost extends Data.TaggedError("ApprovalDispatchClaimLost")<{}> {}
+
+const threadInterruptAdapterFailure: Record<
+  T3CodeAdapterErrorKind,
+  Pick<ToolFailure, "code" | "retry">
+> = {
+  invalid_pairing_code: { code: "pairing_failed", retry: "change_request" },
+  pairing_code_used: { code: "pairing_failed", retry: "change_request" },
+  pairing_required: { code: "pairing_required", retry: "change_request" },
+  transport: { code: "unavailable", retry: "reconcile_first" },
+  timeout: { code: "unavailable", retry: "reconcile_first" },
+  authorization: { code: "operate_denied", retry: "change_request" },
+  identity_mismatch: { code: "identity_mismatch", retry: "reconcile_first" },
+  identity_conflict: { code: "identity_conflict", retry: "change_request" },
+  incompatible_instance: { code: "incompatible_instance", retry: "change_request" },
+  wire_incompatible: { code: "incompatible_instance", retry: "change_request" },
+  command_rejected: { code: "upstream_failure", retry: "change_request" },
+  upstream_failure: { code: "upstream_failure", retry: "reconcile_first" },
+  resource_not_found: { code: "resource_not_found", retry: "none" },
+  capacity: { code: "unavailable", retry: "safe_read" },
+};
+
+const threadInterruptPreDispatchErrors: ReadonlySet<T3CodeAdapterErrorKind> = new Set([
+  "pairing_required",
+  "transport",
+  "timeout",
+  "authorization",
+  "identity_mismatch",
+  "identity_conflict",
+  "incompatible_instance",
+  "resource_not_found",
+  "capacity",
+]);
+
+const THREAD_INTERRUPT_BASELINE_ENDED_PREFIX = "The previously observed turn ";
+const THREAD_INTERRUPT_BASELINE_ENDED_SUFFIX = " ended without supported interruption evidence.";
+const THREAD_INTERRUPT_RECONCILIATION_MILLIS = LIVE_EFFECT_OBSERVATION_MILLIS * 2;
+const THREAD_INTERRUPT_REPLACEMENT_DETAIL =
+  "A replacement turn appeared after the thread interrupt was accepted; its interruption cannot be attributed to this request without a turn fence.";
+
+const threadInterruptBaselineEndedDetail = (turnId: unknown): string =>
+  `${THREAD_INTERRUPT_BASELINE_ENDED_PREFIX}${String(turnId)}${THREAD_INTERRUPT_BASELINE_ENDED_SUFFIX}`;
+
+const isThreadInterruptBaselineEndedDetail = (detail: string): boolean =>
+  detail.startsWith(THREAD_INTERRUPT_BASELINE_ENDED_PREFIX) &&
+  detail.endsWith(THREAD_INTERRUPT_BASELINE_ENDED_SUFFIX);
 
 export interface OperationsService {
   readonly pairInstance: (
@@ -70,6 +117,9 @@ export interface OperationsService {
     OperationRecord,
     LocalStoreError | T3CodeAdapterError | OperationServiceError | ObservationError
   >;
+  readonly interruptThread: (
+    input: ThreadInterruptInput,
+  ) => Effect.Effect<OperationRecord, LocalStoreError | OperationServiceError>;
   readonly getOperation: (
     input: OperationGetInput,
   ) => Effect.Effect<OperationGetValue, LocalStoreError>;
@@ -454,6 +504,39 @@ export class Operations extends Context.Service<Operations, OperationsService>()
         };
       };
 
+      const threadInterruptFailure = (
+        error: LocalStoreError | T3CodeAdapterError | ObservationError,
+        forceReconcileFirst = false,
+      ): ToolFailure => {
+        let failure: ToolFailure;
+        if (error instanceof LocalStoreError) {
+          failure = operationFailure(error);
+        } else if (error instanceof ObservationError) {
+          if (error.kind === "stale_generation") {
+            failure = {
+              code: "stale_state",
+              message: error.message,
+              retry: "reconcile_first",
+              details: {},
+            };
+          } else {
+            failure = {
+              code: "unavailable",
+              message: error.message,
+              retry: "safe_read",
+              details: { action: "retry_observation" },
+            };
+          }
+        } else {
+          failure = {
+            ...threadInterruptAdapterFailure[error.kind],
+            message: error.message,
+            details: {},
+          };
+        }
+        return forceReconcileFirst ? { ...failure, retry: "reconcile_first" } : failure;
+      };
+
       const evidence = (
         detail: string,
         kind: Evidence["kind"] = "local_registration",
@@ -475,45 +558,43 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           : Deferred.succeed(signal, undefined).pipe(Effect.asVoid);
       };
 
-      const ignoreOperationRevisionConflict = (
-        error: LocalStoreError,
-      ): Effect.Effect<void, LocalStoreError> =>
-        error.kind === "revision_conflict" ? Effect.void : Effect.fail(error);
-
       const markOutcomeUnknown = (
         stored: StoredOperation,
         record: OperationRecord,
         detail: string,
         recoveryIntent?: OperationIntent,
       ): Effect.Effect<OperationRecord, LocalStoreError> =>
+        // fallow-ignore-next-line complexity
         Effect.gen(function* () {
-          if (record.evidence.some((item) => item.detail === detail)) return record;
+          if (record.evidence.some((item) => item.detail === detail)) {
+            const refreshed = yield* store.getOperation(stored.record.requestId);
+            return refreshed?.record ?? record;
+          }
           const observed = yield* evidence(detail, "adapter_inference");
-          yield* store
-            .updateOperation(stored.record.requestId, {
-              now: observed.observedAt,
-              expectedRevision: record.revision,
-              intent:
-                recoveryIntent ??
-                (record.tool === "thread_submit" || record.tool === "worktree_create"
-                  ? stored.intent
-                  : { instanceId: stored.intent.instanceId }),
-              state: "outcome_unknown",
-              dispatch: "unknown",
-              stepPosition: 0,
-              stepState: "outcome_unknown",
-              evidence: [observed],
-              evidenceStepPosition: null,
-              error: {
-                code: "unavailable",
-                message: "The mutation outcome is unknown; reconcile before making a new request.",
-                retry: "reconcile_first",
-                details: {},
-              },
-              recovery: "observe_operation",
-            })
-            .pipe(Effect.catch(ignoreOperationRevisionConflict));
-          yield* signalCompletion(stored.record.requestId);
+          const updated = yield* store.compareAndUpdateOperation(stored.record.requestId, {
+            now: observed.observedAt,
+            expectedRevision: record.revision,
+            onlyIfNonterminal: true,
+            intent:
+              recoveryIntent ??
+              (record.tool === "thread_submit" || record.tool === "worktree_create"
+                ? stored.intent
+                : { instanceId: stored.intent.instanceId }),
+            state: "outcome_unknown",
+            dispatch: "unknown",
+            stepPosition: 0,
+            stepState: "outcome_unknown",
+            evidence: [observed],
+            evidenceStepPosition: null,
+            error: {
+              code: "unavailable",
+              message: "The mutation outcome is unknown; reconcile before making a new request.",
+              retry: "reconcile_first",
+              details: {},
+            },
+            recovery: "observe_operation",
+          });
+          if (updated) yield* signalCompletion(stored.record.requestId);
           const refreshed = yield* store.getOperation(stored.record.requestId);
           return refreshed?.record ?? record;
         });
@@ -533,26 +614,25 @@ export class Operations extends Context.Service<Operations, OperationsService>()
             retry: "change_request",
             details: {},
           };
-          yield* store
-            .updateOperation(stored.record.requestId, {
-              now: observed.observedAt,
-              expectedRevision: record.revision,
-              intent: stored.intent,
-              state: "failed",
-              dispatch: "not_dispatched",
-              stepPosition: 0,
-              stepState: "failed",
-              stepError: failure,
-              evidence: [observed],
-              evidenceStepPosition: null,
-              error: failure,
-              recovery: "new_explicit_request",
-              recoverableUntil: new Date(
-                Date.parse(observed.observedAt) + OPERATION_DETAIL_RETENTION_MILLIS,
-              ).toISOString(),
-            })
-            .pipe(Effect.catch(ignoreOperationRevisionConflict));
-          yield* signalCompletion(stored.record.requestId);
+          const updated = yield* store.compareAndUpdateOperation(stored.record.requestId, {
+            now: observed.observedAt,
+            expectedRevision: record.revision,
+            onlyIfNonterminal: true,
+            intent: stored.intent,
+            state: "failed",
+            dispatch: "not_dispatched",
+            stepPosition: 0,
+            stepState: "failed",
+            stepError: failure,
+            evidence: [observed],
+            evidenceStepPosition: null,
+            error: failure,
+            recovery: "new_explicit_request",
+            recoverableUntil: new Date(
+              Date.parse(observed.observedAt) + OPERATION_DETAIL_RETENTION_MILLIS,
+            ).toISOString(),
+          });
+          if (updated) yield* signalCompletion(stored.record.requestId);
           const refreshed = yield* store.getOperation(stored.record.requestId);
           return refreshed?.record ?? record;
         });
@@ -655,13 +735,108 @@ export class Operations extends Context.Service<Operations, OperationsService>()
         Effect.gen(function* () {
           const record = stored.record as OperationRecord;
           if (activeRequests.has(record.requestId)) return record;
-          if (terminal(record)) return record;
           const previousOwner = stored.ownerProcessNonce !== processNonce;
           const lastUpdatedAt = Date.parse(record.updatedAt);
           const previousOwnerStale =
             previousOwner &&
             Number.isFinite(lastUpdatedAt) &&
             (yield* Clock.currentTimeMillis) - lastUpdatedAt >= LIVE_EFFECT_OBSERVATION_MILLIS;
+          if (record.tool === "thread_interrupt") {
+            if (
+              record.state === "completed" ||
+              record.state === "failed" ||
+              record.state === "partial"
+            ) {
+              return record;
+            }
+            if (
+              record.state === "outcome_unknown" &&
+              record.evidence.some((item) => isThreadInterruptBaselineEndedDetail(item.detail))
+            ) {
+              return record;
+            }
+            const now = yield* Clock.currentTimeMillis;
+            if (threadInterruptReconciliationExpired(record, now)) {
+              if (record.state === "outcome_unknown") return record;
+              yield* leaveThreadInterruptUnknown(
+                record,
+                stored.intent,
+                "The accepted thread interrupt exceeded its bounded reconciliation window without authoritative interruption evidence.",
+              );
+              const refreshed = yield* store.getOperation(record.requestId);
+              return refreshed?.record ?? record;
+            }
+            const sameOwnerStale =
+              !previousOwner &&
+              Number.isFinite(lastUpdatedAt) &&
+              now - lastUpdatedAt >= LIVE_EFFECT_OBSERVATION_MILLIS;
+            const ownerStale = previousOwner ? previousOwnerStale : sameOwnerStale;
+            if (
+              !interruptDispatchReceiptIsRecent(record, now) &&
+              (previousOwner ? !previousOwnerStale : !sameOwnerStale)
+            ) {
+              return record;
+            }
+            const threadId = stored.intent.threadId;
+            if (
+              typeof threadId === "string" &&
+              record.dispatch === "accepted" &&
+              runningTurnWasObserved(stored.intent) &&
+              interruptDispatchSequence(record) !== null
+            ) {
+              const current = yield* Effect.exit(
+                observations.threadDetail(stored.intent.instanceId, threadId),
+              );
+              if (Exit.isSuccess(current)) {
+                const dispatchSequence = interruptDispatchSequence(record);
+                if (threadInterruptObserved(record, stored.intent, current.value)) {
+                  const interruptedTurn = current.value.thread.latestTurn;
+                  if (interruptedTurn === null) return record;
+                  yield* completeThreadInterrupt(record, interruptedTurn.turnId, current.value);
+                  const refreshed = yield* store.getOperation(record.requestId);
+                  return refreshed?.record ?? record;
+                }
+                if (
+                  dispatchSequence !== null &&
+                  previouslyObservedTurnEndedWithoutInterruption(
+                    stored.intent,
+                    current.value,
+                    dispatchSequence,
+                  )
+                ) {
+                  yield* recordThreadInterruptBaselineEnded(record, stored.intent, current.value);
+                  const refreshed = yield* store.getOperation(record.requestId);
+                  return refreshed?.record ?? record;
+                }
+                if (
+                  dispatchSequence !== null &&
+                  current.value.snapshotSequence > dispatchSequence &&
+                  threadInterruptBaselineWasReplaced(stored.intent, current.value)
+                ) {
+                  yield* leaveThreadInterruptUnknown(
+                    record,
+                    stored.intent,
+                    THREAD_INTERRUPT_REPLACEMENT_DETAIL,
+                  );
+                  const refreshed = yield* store.getOperation(record.requestId);
+                  return refreshed?.record ?? record;
+                }
+              }
+            }
+            const detail =
+              "A later thread inspection did not establish the interrupt effect; the command will not be replayed.";
+            // A recent receipt permits an early completion check only. An
+            // inconclusive observation must not preempt a live owner.
+            if (!ownerStale && record.dispatch === "accepted") return record;
+            if (record.dispatch === "not_dispatched" && record.commandId === null) {
+              yield* failStaleThreadInterruptBeforeDispatch(record, stored.intent);
+            } else {
+              yield* leaveThreadInterruptUnknown(record, stored.intent, detail);
+            }
+            const refreshed = yield* store.getOperation(record.requestId);
+            return refreshed?.record ?? record;
+          }
+          if (terminal(record)) return record;
           if (record.tool === "instance_pair") {
             const inspection = yield* store.inspectRegistration(stored.intent.instanceId);
             if (inspection.state === "present") {
@@ -1418,6 +1593,618 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           Effect.asVoid,
         );
 
+      const runningTurnWasObserved = (intent: OperationIntent): boolean =>
+        intent.baselineTurnState === "running" && intent.baselineTurnProjected === false;
+
+      const interruptDispatchEvidence = (record: OperationRecord): Evidence | undefined => {
+        if (typeof record.commandId !== "string") return undefined;
+        return record.evidence.find(
+          (item) =>
+            item.kind === "rpc_result" &&
+            item.nativeEventId === record.commandId &&
+            item.sourceSequence !== null,
+        );
+      };
+
+      const interruptDispatchSequence = (record: OperationRecord): number | null =>
+        interruptDispatchEvidence(record)?.sourceSequence ?? null;
+
+      const interruptDispatchReceiptIsRecent = (record: OperationRecord, now: number): boolean => {
+        const receipt = interruptDispatchEvidence(record);
+        const latest = record.evidence.at(-1);
+        if (
+          receipt === undefined ||
+          latest?.kind !== "rpc_result" ||
+          latest.nativeEventId !== receipt.nativeEventId ||
+          latest.sourceSequence !== receipt.sourceSequence
+        ) {
+          return false;
+        }
+        const acceptedAt = Date.parse(receipt.observedAt);
+        return Number.isFinite(acceptedAt) && now < acceptedAt + LIVE_EFFECT_OBSERVATION_MILLIS;
+      };
+
+      const threadInterruptReconciliationExpired = (
+        record: OperationRecord,
+        now: number,
+      ): boolean => {
+        const dispatched = interruptDispatchEvidence(record);
+        if (dispatched === undefined) return false;
+        const acceptedAt = Date.parse(dispatched.observedAt);
+        return (
+          Number.isFinite(acceptedAt) && now >= acceptedAt + THREAD_INTERRUPT_RECONCILIATION_MILLIS
+        );
+      };
+
+      const isAuthoritativeInterruptedTurn = (detail: SynchronizedThreadDetail): boolean =>
+        detail.projectedTurnState === false && detail.thread.latestTurn?.state === "interrupted";
+
+      const threadInterruptObserved = (
+        record: OperationRecord,
+        intent: OperationIntent,
+        detail: SynchronizedThreadDetail,
+      ): boolean => {
+        const dispatchSequence = interruptDispatchSequence(record);
+        const turn = detail.thread.latestTurn;
+        return (
+          runningTurnWasObserved(intent) &&
+          dispatchSequence !== null &&
+          detail.snapshotSequence > dispatchSequence &&
+          isAuthoritativeInterruptedTurn(detail) &&
+          turn?.turnId === intent.baselineTurnId
+        );
+      };
+
+      const threadInterruptIntent = (
+        input: ThreadInterruptInput,
+        detail: SynchronizedThreadDetail,
+      ): OperationIntent => ({
+        instanceId: input.thread.instanceId,
+        threadId: input.thread.threadId,
+        baselineSequence: detail.snapshotSequence,
+        baselineTurnId: detail.thread.latestTurn?.turnId ?? null,
+        baselineTurnState: detail.thread.latestTurn?.state ?? null,
+        baselineTurnProjected: detail.projectedTurnState,
+      });
+
+      const threadInterruptBaselineEvidence = (detail: SynchronizedThreadDetail): Evidence => ({
+        kind: "snapshot",
+        observedAt: detail.observedAt,
+        sourceSequence: detail.snapshotSequence,
+        nativeEventId: null,
+        detail: `Before dispatch, T3Code reported turn ${detail.thread.latestTurn?.turnId ?? "none"} in state ${detail.thread.latestTurn?.state ?? "unknown"}; session_status=${detail.thread.session?.status ?? "unknown"}.`,
+      });
+
+      const completeThreadInterrupt = (
+        record: OperationRecord,
+        turnId: string,
+        detail: SynchronizedThreadDetail,
+      ): Effect.Effect<void, LocalStoreError> =>
+        Effect.gen(function* () {
+          if (
+            record.state === "completed" ||
+            record.state === "failed" ||
+            record.state === "partial"
+          ) {
+            return;
+          }
+          const observedAt = yield* nowIso;
+          const sessionStatus = detail.thread.session?.status ?? "unknown";
+          const observed: Evidence = {
+            kind: "snapshot",
+            observedAt,
+            sourceSequence: detail.snapshotSequence,
+            nativeEventId: null,
+            detail: `T3Code published turn ${turnId} as interrupted after accepting the thread-scoped command; provider_session_status=${sessionStatus}.`,
+          };
+          const updated = yield* store.compareAndUpdateOperation(record.requestId, {
+            now: observedAt,
+            expectedRevision: record.revision,
+            state: "completed",
+            dispatch: "accepted",
+            stepPosition: 1,
+            stepState: "succeeded",
+            evidence: [observed],
+            evidenceStepPosition: 1,
+            error: null,
+            recovery: "none",
+            recoverableUntil: new Date(
+              Date.parse(observedAt) + OPERATION_DETAIL_RETENTION_MILLIS,
+            ).toISOString(),
+          });
+          if (updated) yield* signalCompletion(record.requestId);
+        });
+
+      const completeObservedThreadInterrupt = (
+        record: OperationRecord,
+        intent: OperationIntent,
+        detail: SynchronizedThreadDetail,
+      ): Effect.Effect<boolean, LocalStoreError> =>
+        Effect.gen(function* () {
+          if (!threadInterruptObserved(record, intent, detail)) return false;
+          const turn = detail.thread.latestTurn;
+          if (turn === null) return false;
+          yield* completeThreadInterrupt(record, turn.turnId, detail);
+          return true;
+        });
+
+      const leaveThreadInterruptUnknown = (
+        record: OperationRecord,
+        intent: OperationIntent,
+        detail: string,
+      ): Effect.Effect<void, LocalStoreError> =>
+        Effect.gen(function* () {
+          if (record.evidence.some((item) => item.detail === detail)) return;
+          if (
+            record.state === "completed" ||
+            record.state === "failed" ||
+            record.state === "partial"
+          ) {
+            return;
+          }
+          const observedAt = yield* nowIso;
+          const observed: Evidence = {
+            kind: "adapter_inference",
+            observedAt,
+            sourceSequence: null,
+            nativeEventId: record.commandId,
+            detail,
+          };
+          const updated = yield* store.compareAndUpdateOperation(record.requestId, {
+            now: observedAt,
+            expectedRevision: record.revision,
+            intent,
+            state: "outcome_unknown",
+            dispatch: record.dispatch,
+            stepPosition: record.dispatch === "accepted" ? 1 : 0,
+            stepState: "outcome_unknown",
+            evidence: [observed],
+            evidenceStepPosition: record.dispatch === "accepted" ? 1 : 0,
+            error: {
+              code: "unavailable",
+              message:
+                "The interruption effect could not be established; inspect the thread before retrying.",
+              retry: "reconcile_first",
+              details: {},
+            },
+            recovery: "observe_thread",
+          });
+          if (updated) yield* signalCompletion(record.requestId);
+        });
+
+      const recordThreadInterruptBaselineEnded = (
+        record: OperationRecord,
+        intent: OperationIntent,
+        detail: SynchronizedThreadDetail,
+      ): Effect.Effect<void, LocalStoreError> =>
+        Effect.gen(function* () {
+          if (
+            record.state === "completed" ||
+            record.state === "failed" ||
+            record.state === "partial" ||
+            record.evidence.some((item) => isThreadInterruptBaselineEndedDetail(item.detail))
+          ) {
+            return;
+          }
+          const turnId = intent.baselineTurnId;
+          const observed: Evidence = {
+            kind: "snapshot",
+            observedAt: detail.observedAt,
+            sourceSequence: detail.snapshotSequence,
+            nativeEventId: null,
+            detail: threadInterruptBaselineEndedDetail(turnId),
+          };
+          const updated = yield* store.compareAndUpdateOperation(record.requestId, {
+            now: detail.observedAt,
+            expectedRevision: record.revision,
+            intent,
+            state: "outcome_unknown",
+            dispatch: "accepted",
+            stepPosition: 1,
+            stepState: "outcome_unknown",
+            evidence: [observed],
+            evidenceStepPosition: 1,
+            error: {
+              code: "unavailable",
+              message: "The previously running turn ended without supported interruption evidence.",
+              retry: "reconcile_first",
+              details: {},
+            },
+            recovery: "observe_thread",
+          });
+          if (updated) yield* signalCompletion(record.requestId);
+        });
+
+      const failStaleThreadInterruptBeforeDispatch = (
+        record: OperationRecord,
+        intent: OperationIntent,
+      ): Effect.Effect<void, LocalStoreError> =>
+        Effect.gen(function* () {
+          if (
+            record.state === "completed" ||
+            record.state === "failed" ||
+            record.state === "partial"
+          ) {
+            return;
+          }
+          const observedAt = yield* nowIso;
+          const failure: ToolFailure = {
+            code: "unavailable",
+            message:
+              "The thread interrupt command was not dispatched; use a new request ID to try again.",
+            retry: "change_request",
+            details: {},
+          };
+          const observed: Evidence = {
+            kind: "adapter_inference",
+            observedAt,
+            sourceSequence: null,
+            nativeEventId: null,
+            detail: "The thread interrupt command was not prepared or dispatched before recovery.",
+          };
+          const updated = yield* store.compareAndUpdateOperation(record.requestId, {
+            now: observedAt,
+            expectedRevision: record.revision,
+            intent,
+            state: "failed",
+            dispatch: "not_dispatched",
+            stepPosition: 0,
+            stepState: "failed",
+            stepError: failure,
+            evidence: [observed],
+            evidenceStepPosition: 0,
+            error: failure,
+            recovery: "new_explicit_request",
+            recoverableUntil: new Date(
+              Date.parse(observedAt) + OPERATION_DETAIL_RETENTION_MILLIS,
+            ).toISOString(),
+          });
+          if (updated) yield* signalCompletion(record.requestId);
+        });
+
+      const prepareThreadInterrupt = (
+        input: ThreadInterruptInput,
+        commandId: string,
+      ): Effect.Effect<
+        { readonly intent: OperationIntent; readonly dispatchAt: string },
+        LocalStoreError | T3CodeAdapterError | ObservationError
+      > =>
+        Effect.gen(function* () {
+          const before = yield* observations.threadDetail(
+            input.thread.instanceId,
+            input.thread.threadId,
+          );
+          const intent = threadInterruptIntent(input, before);
+          const observedBefore = threadInterruptBaselineEvidence(before);
+          const dispatchStart = yield* evidence(
+            "The thread interrupt command identity was persisted before dispatch; no turn ID fence was sent.",
+            "adapter_inference",
+          );
+          const current = yield* store.getOperation(input.requestId);
+          if (current === null) {
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: "request_record_unavailable",
+                message: "The thread interrupt receipt is unavailable before dispatch.",
+              }),
+            );
+          }
+          const receiptChanged = () =>
+            new LocalStoreError({
+              kind: "revision_conflict",
+              message: "The thread interrupt receipt changed before command preparation.",
+            });
+          if (
+            current.record.state !== "admitted" ||
+            current.record.dispatch !== "not_dispatched" ||
+            current.record.commandId !== null
+          ) {
+            return yield* Effect.fail(receiptChanged());
+          }
+          const prepared = yield* store.compareAndUpdateOperation(input.requestId, {
+            now: dispatchStart.observedAt,
+            expectedRevision: current.record.revision,
+            onlyIfNonterminal: true,
+            intent,
+            target: input.thread,
+            commandId,
+            state: "pending",
+            dispatch: "unknown",
+            stepPosition: 0,
+            stepState: "pending",
+            evidence: [observedBefore, dispatchStart],
+            evidenceStepPosition: 0,
+            recovery: "observe_thread",
+          });
+          if (!prepared) return yield* Effect.fail(receiptChanged());
+          return { intent, dispatchAt: dispatchStart.observedAt };
+        });
+
+      const recordThreadInterruptReceipt = (
+        input: ThreadInterruptInput,
+        commandId: string,
+        sequence: number,
+      ): Effect.Effect<void, LocalStoreError> =>
+        Effect.gen(function* () {
+          const acceptedAt = yield* nowIso;
+          const accepted: Evidence = {
+            kind: "rpc_result",
+            observedAt: acceptedAt,
+            sourceSequence: sequence,
+            nativeEventId: commandId,
+            detail: `T3Code accepted the thread interrupt command at sequence ${sequence}.`,
+          };
+          let receiptRecorded = false;
+          for (let attempt = 0; attempt < 3 && !receiptRecorded; attempt += 1) {
+            const current = yield* store.getOperation(input.requestId);
+            if (current === null) return;
+            receiptRecorded = yield* store.compareAndUpdateOperation(input.requestId, {
+              now: acceptedAt,
+              expectedRevision: current.record.revision,
+              state: current.record.state,
+              dispatch: "accepted",
+              stepPosition: 0,
+              stepState: "succeeded",
+              evidence: [accepted],
+              evidenceStepPosition: 0,
+            });
+          }
+          if (!receiptRecorded) return;
+
+          const current = yield* store.getOperation(input.requestId);
+          if (current === null) return;
+          if (current.record.state === "pending") {
+            yield* store.compareAndUpdateOperation(input.requestId, {
+              now: acceptedAt,
+              expectedRevision: current.record.revision,
+              onlyIfNonterminal: true,
+              stepPosition: 1,
+              stepState: "pending",
+            });
+          } else if (current.record.state === "outcome_unknown") {
+            yield* store.compareAndUpdateOperation(input.requestId, {
+              now: acceptedAt,
+              expectedRevision: current.record.revision,
+              stepPosition: 1,
+              stepState: "outcome_unknown",
+            });
+          }
+        });
+
+      const previouslyObservedTurnEndedWithoutInterruption = (
+        intent: OperationIntent,
+        detail: SynchronizedThreadDetail,
+        dispatchSequence: number,
+      ): boolean => {
+        if (typeof intent.baselineTurnId !== "string") return false;
+        const turn = detail.thread.latestTurn;
+        return (
+          detail.snapshotSequence > dispatchSequence &&
+          turn !== null &&
+          turn.turnId === intent.baselineTurnId &&
+          detail.projectedTurnState === false &&
+          turn.state !== "running" &&
+          turn.state !== "interrupted"
+        );
+      };
+
+      const threadInterruptBaselineWasReplaced = (
+        intent: OperationIntent,
+        detail: SynchronizedThreadDetail,
+      ): boolean => {
+        const turn = detail.thread.latestTurn;
+        return (
+          typeof intent.baselineTurnId === "string" &&
+          turn !== null &&
+          turn.turnId !== intent.baselineTurnId
+        );
+      };
+
+      const inspectThreadInterruptEffect = (
+        input: ThreadInterruptInput,
+        intent: OperationIntent,
+      ): Effect.Effect<"continue" | "completed" | "unknown", LocalStoreError> =>
+        Effect.gen(function* () {
+          const observation = yield* Effect.exit(
+            observations.threadDetail(input.thread.instanceId, input.thread.threadId),
+          );
+          if (Exit.isFailure(observation)) return "continue";
+          const stored = yield* store.getOperation(input.requestId);
+          if (stored === null) return "continue";
+          const detail = observation.value;
+          const dispatchSequence = interruptDispatchSequence(stored.record);
+          if (yield* completeObservedThreadInterrupt(stored.record, intent, detail)) {
+            return "completed";
+          }
+          if (
+            dispatchSequence !== null &&
+            previouslyObservedTurnEndedWithoutInterruption(intent, detail, dispatchSequence)
+          ) {
+            yield* recordThreadInterruptBaselineEnded(stored.record, intent, detail);
+            return "unknown";
+          }
+          if (
+            dispatchSequence !== null &&
+            detail.snapshotSequence > dispatchSequence &&
+            threadInterruptBaselineWasReplaced(intent, detail)
+          ) {
+            yield* leaveThreadInterruptUnknown(
+              stored.record,
+              intent,
+              THREAD_INTERRUPT_REPLACEMENT_DETAIL,
+            );
+            return "unknown";
+          }
+          return "continue";
+        });
+
+      const isThreadInterruptPreDispatchFailure = (
+        error: LocalStoreError | T3CodeAdapterError | ObservationError,
+        dispatchAccepted: boolean,
+      ): boolean => {
+        if (dispatchAccepted) return false;
+        if (error instanceof LocalStoreError) return true;
+        return (
+          error instanceof T3CodeAdapterError &&
+          !error.uncertain &&
+          threadInterruptPreDispatchErrors.has(error.kind)
+        );
+      };
+
+      const threadInterruptFailureState = (
+        error: LocalStoreError | T3CodeAdapterError | ObservationError,
+        dispatchStarted: boolean,
+        dispatchAccepted: boolean,
+      ): {
+        readonly rejected: boolean;
+        readonly uncertain: boolean;
+        readonly dispatch: OperationRecord["dispatch"];
+      } => {
+        const rejected = error instanceof T3CodeAdapterError && error.kind === "command_rejected";
+        const definitelyNotDispatched = isThreadInterruptPreDispatchFailure(
+          error,
+          dispatchAccepted,
+        );
+        const uncertain = dispatchStarted && !rejected && !definitelyNotDispatched;
+        let dispatch: OperationRecord["dispatch"] = "not_dispatched";
+        if (rejected) dispatch = "rejected";
+        else if (dispatchAccepted) dispatch = "accepted";
+        else if (uncertain) dispatch = "unknown";
+        return { rejected, uncertain, dispatch };
+      };
+
+      const observeThreadInterruptEffect = (
+        input: ThreadInterruptInput,
+        intent: OperationIntent,
+      ): Effect.Effect<void, LocalStoreError> =>
+        Effect.gen(function* () {
+          if (!runningTurnWasObserved(intent)) {
+            const stored = yield* store.getOperation(input.requestId);
+            if (stored !== null) {
+              yield* leaveThreadInterruptUnknown(
+                stored.record,
+                intent,
+                "T3Code accepted the interrupt command, but no authoritative running turn was observed before dispatch.",
+              );
+            }
+            return;
+          }
+
+          const deadline = (yield* Clock.currentTimeMillis) + LIVE_EFFECT_OBSERVATION_MILLIS;
+          let pollInterval = 250;
+          while (true) {
+            const current = yield* Clock.currentTimeMillis;
+            if (current >= deadline) {
+              const stored = yield* store.getOperation(input.requestId);
+              if (stored !== null) {
+                yield* leaveThreadInterruptUnknown(
+                  stored.record,
+                  intent,
+                  "T3Code accepted the interrupt command, but no supported interrupted-turn evidence arrived within the observation window.",
+                );
+              }
+              return;
+            }
+
+            const observation = yield* inspectThreadInterruptEffect(input, intent);
+            if (observation !== "continue") return;
+
+            const afterObservation = yield* Clock.currentTimeMillis;
+            yield* Effect.sleep(
+              Duration.millis(Math.min(pollInterval, Math.max(0, deadline - afterObservation))),
+            );
+            pollInterval = Math.min(2_000, pollInterval * 2);
+          }
+        });
+
+      const recordThreadInterruptFailure = (
+        input: ThreadInterruptInput,
+        commandId: string,
+        intent: OperationIntent,
+        dispatchStarted: boolean,
+        dispatchAccepted: boolean,
+        stepPosition: number,
+        error: LocalStoreError | T3CodeAdapterError | ObservationError,
+      ): Effect.Effect<void> =>
+        Effect.gen(function* () {
+          const current = yield* store.getOperation(input.requestId);
+          if (current === null) return;
+          const disposition = threadInterruptFailureState(error, dispatchStarted, dispatchAccepted);
+          const failure = threadInterruptFailure(error, disposition.uncertain);
+          const observedAt = yield* nowIso;
+          const observed: Evidence = {
+            kind: disposition.rejected ? "rpc_result" : "adapter_inference",
+            observedAt,
+            sourceSequence: null,
+            nativeEventId: commandId,
+            detail: disposition.uncertain
+              ? "The interrupt dispatch or its local receipt became uncertain; it will not be replayed."
+              : `The thread interrupt operation stopped before a confirmed effect: ${failure.message}`,
+          };
+          const updated = yield* store.compareAndUpdateOperation(input.requestId, {
+            now: observedAt,
+            expectedRevision: current.record.revision,
+            onlyIfNonterminal: true,
+            intent,
+            state: disposition.uncertain ? "outcome_unknown" : "failed",
+            dispatch: disposition.dispatch,
+            commandId,
+            stepPosition,
+            stepState: disposition.uncertain ? "outcome_unknown" : "failed",
+            stepError: failure,
+            evidence: [observed],
+            evidenceStepPosition: stepPosition,
+            error: failure,
+            recovery: disposition.uncertain ? "observe_thread" : "new_explicit_request",
+            recoverableUntil: disposition.uncertain
+              ? null
+              : new Date(Date.parse(observedAt) + OPERATION_DETAIL_RETENTION_MILLIS).toISOString(),
+          });
+          if (updated) yield* signalCompletion(input.requestId);
+        }).pipe(Effect.catch(() => Effect.void));
+
+      const executeThreadInterrupt = (
+        input: ThreadInterruptInput,
+        commandId: string,
+      ): Effect.Effect<void, never> => {
+        let intent: OperationIntent = {
+          instanceId: input.thread.instanceId,
+          threadId: input.thread.threadId,
+        };
+        let dispatchStarted = false;
+        let dispatchAccepted = false;
+        let stepPosition = 0;
+        const operation = Effect.gen(function* () {
+          const prepared = yield* prepareThreadInterrupt(input, commandId);
+          intent = prepared.intent;
+          dispatchStarted = true;
+          const receipt = yield* connections.interruptThread({
+            instanceId: input.thread.instanceId,
+            threadId: input.thread.threadId,
+            commandId,
+            createdAt: prepared.dispatchAt,
+          });
+          dispatchAccepted = true;
+          yield* recordThreadInterruptReceipt(input, commandId, receipt.sequence);
+          stepPosition = 1;
+          yield* observeThreadInterruptEffect(input, intent);
+        });
+        return operation.pipe(
+          Effect.catch((error: LocalStoreError | T3CodeAdapterError | ObservationError) =>
+            recordThreadInterruptFailure(
+              input,
+              commandId,
+              intent,
+              dispatchStarted,
+              dispatchAccepted,
+              stepPosition,
+              error,
+            ),
+          ),
+          Effect.asVoid,
+        );
+      };
+
       // fallow-ignore-next-line complexity
       const executeUpdate = (
         input: InstanceUpdateInput,
@@ -1601,6 +2388,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
         let messageId: string | null = null;
         let intent: OperationIntent | null = null;
 
+        // fallow-ignore-next-line complexity
         return Effect.gen(function* () {
           const observed = yield* observations.threadDetail(
             input.thread.instanceId,
@@ -1668,9 +2456,10 @@ export class Operations extends Context.Service<Operations, OperationsService>()
             "The native command and message identities were persisted before dispatch.",
             "adapter_inference",
           );
-          yield* store.updateOperation(input.requestId, {
+          const prepared = yield* store.compareAndUpdateOperation(input.requestId, {
             now: dispatchMarker.observedAt,
             expectedRevision,
+            onlyIfNonterminal: true,
             intent,
             state: "pending",
             dispatch: "unknown",
@@ -1688,6 +2477,10 @@ export class Operations extends Context.Service<Operations, OperationsService>()
             evidenceStepPosition: 0,
             recovery: "observe_operation",
           });
+          if (!prepared) {
+            yield* signalCompletion(input.requestId);
+            return;
+          }
           const accepted = yield* connections.dispatchTurn({
             instanceId: input.thread.instanceId,
             threadId: input.thread.threadId,
@@ -2138,7 +2931,10 @@ export class Operations extends Context.Service<Operations, OperationsService>()
               if (result.kind === "existing") {
                 yield* release(input.requestId);
                 reserved = false;
-                return { operation: yield* reconcile(result.operation), execute: false };
+                return {
+                  operation: yield* restore(reconcile(result.operation)),
+                  execute: false,
+                };
               }
               const completionSignal = yield* Deferred.make<void>();
               completionSignals.set(input.requestId, completionSignal);
@@ -2419,6 +3215,35 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           return yield* admitApprovalResponse(input, fingerprint);
         });
 
+      const interruptThread = (
+        input: ThreadInterruptInput,
+      ): Effect.Effect<OperationRecord, LocalStoreError | OperationServiceError> =>
+        Effect.gen(function* () {
+          const fingerprint = yield* store.fingerprintRequest("thread_interrupt", input);
+          const existing = yield* findExistingOperation(input.requestId, fingerprint);
+          if (existing !== null) return existing;
+          const commandId = yield* crypto.randomUUIDv4.pipe(
+            Effect.mapError(
+              () =>
+                new LocalStoreError({
+                  kind: "storage",
+                  message: "The operation supervisor could not create a command identity.",
+                }),
+            ),
+          );
+          return yield* admitAndRun({
+            requestId: input.requestId,
+            fingerprint,
+            tool: "thread_interrupt",
+            intent: {
+              instanceId: input.thread.instanceId,
+              threadId: input.thread.threadId,
+            },
+            completionMeans: "interruption_observed",
+            steps: ["dispatch_thread_interrupt", "observe_interruption_effect"],
+            execute: executeThreadInterrupt(input, commandId),
+          });
+        });
       return Operations.of({
         pairInstance,
         pairInstanceAgain,
@@ -2427,6 +3252,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
         submitThread,
         createWorktree,
         respondToApproval,
+        interruptThread,
         getOperation: readOperation,
       });
     }),

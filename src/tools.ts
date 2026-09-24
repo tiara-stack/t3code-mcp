@@ -81,6 +81,7 @@ import {
   ThreadOutputInputSchema,
   ThreadOutputToolResultSchema,
   ThreadSubmitInputSchema,
+  ThreadInterruptInputSchema,
   ThreadWaitInputSchema,
   ThreadWaitToolResultSchema,
   type ThreadWaitToolResult,
@@ -449,6 +450,17 @@ export const WorktreeCreateTool = Tool.make("worktree_create", {
   .annotate(Tool.OpenWorld, true);
 
 // fallow-ignore-next-line unused-export
+export const ThreadInterruptTool = asRegistrationMutation(
+  Tool.make("thread_interrupt", {
+    description:
+      "Interrupt the execution T3Code processes for this thread. The command has no turn fence. Some providers, including Claude, close their provider session during interruption. This does not stop the T3Code instance or establish work completion.",
+    parameters: ThreadInterruptInputSchema,
+    success: OperationToolResultSchema,
+  }),
+  { destructive: true, openWorld: true },
+);
+
+// fallow-ignore-next-line unused-export
 export const OperationGetTool = Tool.make("operation_get", {
   description: "Recover an admitted mutation receipt by request ID.",
   parameters: OperationGetInputSchema,
@@ -469,6 +481,7 @@ export const ServerToolkit = Toolkit.make(
   InstancePairAgainTool,
   InstanceRemoveTool,
   WorktreeCreateTool,
+  ThreadInterruptTool,
   ProjectListTool,
   ModelListTool,
   WorktreeListTool,
@@ -4031,9 +4044,12 @@ const retriableWaitObservationError = (
   return false;
 };
 
-type WaitObservationFailure =
-  | { readonly kind: "propagate" }
-  | { readonly kind: "unavailable" }
+const observationUnavailableWarnings = (message: string) => [
+  { code: "observation_unavailable", message },
+];
+
+type WaitObservationFailure<Value> =
+  | { readonly kind: "unavailable"; readonly value: Value }
   | { readonly kind: "retry"; readonly pollInterval: number };
 
 /**
@@ -4042,18 +4058,22 @@ type WaitObservationFailure =
  * remaining budget and retry, and anything else ends the wait so the caller
  * can report an unavailable observation.
  */
-const classifyWaitObservationFailure = (options: {
+const classifyWaitObservationFailure = <Value>(options: {
   readonly failure: LocalStoreError | T3CodeAdapterError | ObservationError;
   readonly firstEvaluation: boolean;
   readonly deadline: number;
   readonly pollInterval: number;
-}): Effect.Effect<WaitObservationFailure, never> =>
+  readonly unavailable: (failure: LocalStoreError | T3CodeAdapterError | ObservationError) => Value;
+}): Effect.Effect<
+  WaitObservationFailure<Value>,
+  LocalStoreError | T3CodeAdapterError | ObservationError
+> =>
   Effect.gen(function* () {
     const { failure, firstEvaluation, deadline, pollInterval } = options;
-    if (firstEvaluation) return { kind: "propagate" } as const;
+    if (firstEvaluation) return yield* Effect.fail(failure);
     const failedAt = yield* Clock.currentTimeMillis;
     if (!retriableWaitObservationError(failure) || failedAt >= deadline) {
-      return { kind: "unavailable" } as const;
+      return { kind: "unavailable", value: options.unavailable(failure) } as const;
     }
     yield* Effect.sleep(Duration.millis(Math.min(pollInterval, Math.max(0, deadline - failedAt))));
     return {
@@ -4062,28 +4082,20 @@ const classifyWaitObservationFailure = (options: {
     };
   });
 
-type WaitThreadDetailRead<UnavailableResult> =
+type WaitObservationAttempt<Value> =
   | { readonly kind: "observed"; readonly detail: SynchronizedThreadDetail }
-  | { readonly kind: "retry"; readonly pollInterval: number }
-  | { readonly kind: "unavailable"; readonly result: UnavailableResult };
+  | WaitObservationFailure<Value>;
 
-const unavailableObservationData = (message: string) => ({
-  observations: [] as ReadonlyArray<Observation>,
-  warnings: [{ code: "observation_unavailable" as const, message }],
-});
-
-const readThreadDetailForWait = <UnavailableResult>(options: {
+const observeThreadForWait = <Value>(options: {
   readonly observations: ObservationsService;
   readonly instanceId: string;
   readonly threadId: string;
   readonly firstEvaluation: boolean;
   readonly deadline: number;
   readonly pollInterval: number;
-  readonly unavailableResult: (
-    failure: LocalStoreError | T3CodeAdapterError | ObservationError,
-  ) => UnavailableResult;
+  readonly unavailable: (failure: LocalStoreError | T3CodeAdapterError | ObservationError) => Value;
 }): Effect.Effect<
-  WaitThreadDetailRead<UnavailableResult>,
+  WaitObservationAttempt<Value>,
   LocalStoreError | T3CodeAdapterError | ObservationError
 > =>
   Effect.gen(function* () {
@@ -4091,17 +4103,13 @@ const readThreadDetailForWait = <UnavailableResult>(options: {
       options.observations.threadDetail(options.instanceId, options.threadId),
     );
     if (Result.isSuccess(result)) return { kind: "observed", detail: result.success } as const;
-    const failure = yield* classifyWaitObservationFailure({
+    return yield* classifyWaitObservationFailure({
       failure: result.failure,
       firstEvaluation: options.firstEvaluation,
       deadline: options.deadline,
       pollInterval: options.pollInterval,
+      unavailable: options.unavailable,
     });
-    if (failure.kind === "propagate") return yield* Effect.fail(result.failure);
-    if (failure.kind === "unavailable") {
-      return { kind: "unavailable", result: options.unavailableResult(result.failure) } as const;
-    }
-    return failure;
   });
 
 /**
@@ -4168,34 +4176,35 @@ const runThreadWait = (
     let firstEvaluation = true;
     let pollInterval = THREAD_WAIT_POLL_INTERVAL_MILLIS;
     while (true) {
-      const detailRead = yield* readThreadDetailForWait({
+      const observation = yield* observeThreadForWait({
         observations,
         instanceId,
         threadId,
         firstEvaluation,
         deadline,
         pollInterval,
-        unavailableResult: (failure) =>
+        unavailable: (failure) =>
           threadWaitObservationResult({
             condition,
             observation: "unavailable",
             state: null,
-            ...unavailableObservationData(failure.message),
+            observations: [],
+            warnings: observationUnavailableWarnings(failure.message),
           }),
       });
-      if (detailRead.kind === "retry") {
-        pollInterval = detailRead.pollInterval;
+      if (observation.kind === "unavailable") return observation.value;
+      if (observation.kind === "retry") {
+        pollInterval = observation.pollInterval;
         continue;
       }
-      if (detailRead.kind === "unavailable") return detailRead.result;
       firstEvaluation = false;
-      const project = yield* projectLookupFor(detailRead.detail);
+      const project = yield* projectLookupFor(observation.detail);
       const poll = pollThreadWait({
         thread,
         condition,
         cursor,
         project,
-        detail: detailRead.detail,
+        detail: observation.detail,
       });
       if (poll.terminal !== null) return poll.terminal;
       const next = yield* sleepBeforeNextWaitPoll({ deadline, pollInterval });
@@ -4510,32 +4519,33 @@ const runTurnWait = (options: {
     let firstEvaluation = true;
     let pollInterval = THREAD_WAIT_POLL_INTERVAL_MILLIS;
     while (true) {
-      const detailRead = yield* readThreadDetailForWait({
+      const observation = yield* observeThreadForWait({
         observations,
         instanceId,
         threadId,
         firstEvaluation,
         deadline,
         pollInterval,
-        unavailableResult: (failure) =>
+        unavailable: (failure) =>
           turnWaitResult({
             turn,
             observation: "unavailable",
             evaluation: unknownTurnWaitEvaluation,
             pendingRequests: [],
-            ...unavailableObservationData(failure.message),
+            observations: [],
+            warnings: observationUnavailableWarnings(failure.message),
           }),
       });
-      if (detailRead.kind === "retry") {
-        pollInterval = detailRead.pollInterval;
+      if (observation.kind === "unavailable") return observation.value;
+      if (observation.kind === "retry") {
+        pollInterval = observation.pollInterval;
         continue;
       }
-      if (detailRead.kind === "unavailable") return detailRead.result;
       firstEvaluation = false;
       const outcome = yield* runTurnWaitPoll({
         turn,
         store,
-        detail: detailRead.detail,
+        detail: observation.detail,
       });
       if (outcome.kind === "result") return outcome.result;
       const next = yield* sleepBeforeNextWaitPoll({ deadline, pollInterval });
@@ -4616,6 +4626,11 @@ const serverToolHandlers = ServerToolkit.of({
     Effect.gen(function* () {
       const operations = yield* Operations;
       return yield* operationMutationResult(operations.removeRegistration(input));
+    }),
+  thread_interrupt: (input) =>
+    Effect.gen(function* () {
+      const operations = yield* Operations;
+      return yield* operationMutationResult(operations.interruptThread(input));
     }),
   project_list: ({ scope, cursor, limit, allowStale }) =>
     Effect.gen(function* () {
@@ -5019,6 +5034,7 @@ const operationMutatorTools: ReadonlySet<string> = new Set([
   "worktree_create",
   "thread_submit",
   "approval_respond",
+  "thread_interrupt",
 ]);
 
 // fallow-ignore-next-line complexity

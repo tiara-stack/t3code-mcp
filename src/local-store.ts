@@ -719,8 +719,6 @@ export type StoredOperation = {
 
 export interface OperationUpdate {
   readonly now: string;
-  /** Reject the update if another process has changed the operation. */
-  readonly expectedRevision?: number;
   /** The minimal nonsecret intent retained after transient dispatch data is dropped. */
   readonly intent?: OperationIntent;
   readonly state?: OperationState;
@@ -739,6 +737,16 @@ export interface OperationUpdate {
   readonly correlation?: OperationRecord["correlation"];
   readonly created?: OperationRecord["created"];
 }
+
+export type OperationCompareAndUpdateInput = OperationUpdate & {
+  readonly expectedRevision: number;
+  readonly onlyIfNonterminal?: true;
+};
+
+type GuardedOperationUpdate = OperationUpdate & {
+  readonly expectedRevision?: number;
+  readonly onlyIfNonterminal?: true;
+};
 
 export type RegistrationInspection =
   | { readonly state: "present"; readonly registration: InstanceSummary }
@@ -938,6 +946,10 @@ export interface LocalStoreService {
     expectedState: "admitted" | "pending",
     update: OperationUpdate,
     expectedDispatch?: "not_dispatched" | "unknown",
+  ) => Effect.Effect<boolean, LocalStoreError>;
+  readonly compareAndUpdateOperation: (
+    requestId: string,
+    update: OperationCompareAndUpdateInput,
   ) => Effect.Effect<boolean, LocalStoreError>;
   readonly inspectRegistration: (
     instanceId: string,
@@ -1319,7 +1331,20 @@ export class LocalStore extends Context.Service<LocalStore, LocalStoreService>()
           getOperationFromDatabase(sql, requestId, verifySchemaForOperation);
 
         const updateOperation = (requestId: string, update: OperationUpdate) =>
-          updateOperationInDatabase(sql, requestId, update, verifySchemaForOperation);
+          updateOperationInDatabase(sql, requestId, update, verifySchemaForOperation).pipe(
+            Effect.asVoid,
+          );
+
+        const compareAndUpdateOperation = (
+          requestId: string,
+          update: OperationCompareAndUpdateInput,
+        ) =>
+          updateOperationWithOwnerExpectationInDatabase(
+            sql,
+            requestId,
+            update,
+            verifySchemaForOperation,
+          );
 
         const compareAndSetApprovalDispatch = (
           requestId: string,
@@ -1389,6 +1414,7 @@ export class LocalStore extends Context.Service<LocalStore, LocalStoreService>()
           getOperation,
           updateOperation,
           compareAndSetApprovalDispatch,
+          compareAndUpdateOperation,
           inspectRegistration,
           removeRegistration,
           recordTurnEvidence,
@@ -4871,7 +4897,7 @@ const getOperationFromDatabase = (
 const updateOperationWithOwnerExpectationInDatabase = (
   sql: SqlClient.SqlClient,
   requestId: string,
-  update: OperationUpdate,
+  update: GuardedOperationUpdate,
   verify: SchemaVerifier,
   expectation?: {
     readonly ownerProcessNonce: string;
@@ -4918,12 +4944,7 @@ const updateOperationWithOwnerExpectationInDatabase = (
               update.expectedRevision < 0 ||
               update.expectedRevision !== revision)
           ) {
-            return yield* Effect.fail(
-              new LocalStoreError({
-                kind: "revision_conflict",
-                message: "The mutation operation changed before the update could be applied.",
-              }),
-            );
+            return false;
           }
           if (
             expectation !== undefined &&
@@ -4931,6 +4952,15 @@ const updateOperationWithOwnerExpectationInDatabase = (
               row.owner_process_nonce !== expectation.ownerProcessNonce ||
               row.state !== expectation.state ||
               row.dispatch !== (expectation.dispatch ?? "not_dispatched"))
+          ) {
+            return false;
+          }
+          if (
+            update.onlyIfNonterminal === true &&
+            (row.state === "completed" ||
+              row.state === "failed" ||
+              row.state === "partial" ||
+              row.state === "outcome_unknown")
           ) {
             return false;
           }

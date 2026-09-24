@@ -141,6 +141,12 @@ export interface InstanceConnectionsService {
     instanceId: string,
     repositoryPath: string,
   ) => Effect.Effect<DiscoveredVcsWorktreeRefs, LocalStoreError | T3CodeAdapterError>;
+  readonly interruptThread: (input: {
+    readonly instanceId: string;
+    readonly threadId: string;
+    readonly commandId: string;
+    readonly createdAt: string;
+  }) => Effect.Effect<{ readonly sequence: number }, LocalStoreError | T3CodeAdapterError>;
   /**
    * Open a scoped shell observation stream for the current registration
    * revision. The per-instance RPC capacity permit is held until the returned
@@ -186,8 +192,8 @@ export class InstanceConnections extends Context.Service<
   InstanceConnectionsService
 >()("t3code-mcp/InstanceConnections") {
   static readonly layerTest = (
-    service: Omit<InstanceConnectionsService, "dispatchTurn"> &
-      Partial<Pick<InstanceConnectionsService, "dispatchTurn">>,
+    service: Omit<InstanceConnectionsService, "dispatchTurn" | "interruptThread"> &
+      Partial<Pick<InstanceConnectionsService, "dispatchTurn" | "interruptThread">>,
   ): Layer.Layer<InstanceConnections> =>
     Layer.succeed(InstanceConnections, {
       ...service,
@@ -198,6 +204,17 @@ export class InstanceConnections extends Context.Service<
             new T3CodeAdapterError({
               kind: "capacity",
               message: "The test connection does not support dispatch.",
+              uncertain: false,
+              status: null,
+            }),
+          )),
+      interruptThread:
+        service.interruptThread ??
+        (() =>
+          Effect.fail(
+            new T3CodeAdapterError({
+              kind: "capacity",
+              message: "The test connection does not support thread interruption.",
               uncertain: false,
               status: null,
             }),
@@ -455,6 +472,57 @@ export class InstanceConnections extends Context.Service<
             );
             const observedAt = new Date(yield* Clock.currentTimeMillis).toISOString();
             return { ...listing, observedAt };
+          });
+
+        const interruptThread = (input: {
+          readonly instanceId: string;
+          readonly threadId: string;
+          readonly commandId: string;
+          readonly createdAt: string;
+        }): Effect.Effect<{ readonly sequence: number }, LocalStoreError | T3CodeAdapterError> =>
+          Effect.gen(function* () {
+            const registration = yield* store.getRegistration(input.instanceId);
+            if (registration === null) {
+              return yield* Effect.fail(
+                new LocalStoreError({
+                  kind: "registration_not_found",
+                  message: "The saved registration was not found.",
+                }),
+              );
+            }
+            if (registration.credential === null) {
+              return yield* Effect.fail(
+                new T3CodeAdapterError({
+                  kind: "pairing_required",
+                  message:
+                    "The saved registration requires pairing before threads can be interrupted.",
+                  uncertain: false,
+                  status: null,
+                }),
+              );
+            }
+            const connection = yield* acquire(input.instanceId).pipe(
+              Effect.catchTag("T3CodeAdapterError", (error) =>
+                Effect.fail(
+                  new T3CodeAdapterError({
+                    kind: error.kind === "wire_incompatible" ? "incompatible_instance" : error.kind,
+                    message: error.message,
+                    uncertain: false,
+                    status: error.status,
+                  }),
+                ),
+              ),
+            );
+            return yield* withInstanceCapacity(
+              input.instanceId,
+              adapter.interruptThread({
+                endpoint: connection.endpoint,
+                credential: connection.credential,
+                threadId: input.threadId,
+                commandId: input.commandId,
+                createdAt: input.createdAt,
+              }),
+            );
           });
 
         /**
@@ -850,6 +918,7 @@ export class InstanceConnections extends Context.Service<
           discoverVcsRefs,
           readVcsWorktreeStatus,
           discoverVcsWorktreeRefs,
+          interruptThread,
           openShellStream,
           openThreadStream,
           readArchivedShell,

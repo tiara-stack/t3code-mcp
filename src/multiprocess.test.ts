@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { LocalStore } from "./local-store";
+import { LIVE_EFFECT_OBSERVATION_MILLIS } from "./domain";
 import type { ThreadSummary, WorktreeInspectionFrame, WorktreeReference } from "./domain";
 
 const tsxCliPath = createRequire(import.meta.url).resolve("tsx/cli");
@@ -117,6 +118,7 @@ const startServer = async (databasePath: string): Promise<Server> => {
       "instance_pair_again",
       "instance_remove",
       "worktree_create",
+      "thread_interrupt",
       "project_list",
       "model_list",
       "worktree_list",
@@ -149,6 +151,13 @@ const operationValue = (message: JsonRpcMessage) => {
   const content = message.result?.structuredContent;
   if (content === undefined) return undefined;
   return (content["result"] as { value?: { state?: string; error?: { code?: string } } }).value;
+};
+
+const toolResultValue = <Value>(message: JsonRpcMessage): Value | undefined => {
+  const content = message.result?.structuredContent;
+  if (content === undefined) return undefined;
+  const result = content["result"] as { kind?: string; value?: Value };
+  return result.kind === "ok" ? result.value : undefined;
 };
 
 const seed = (
@@ -404,6 +413,252 @@ describe("shared SQLite mutation admission", () => {
           );
           expect(intentJson).toBeDefined();
           expect(intentJson).not.toContain(prompt);
+        }),
+      ),
+    60000,
+  );
+
+  it.live(
+    "admits thread interrupts once per request ID across processes and does not gate distinct IDs",
+    () =>
+      withServers("t3code-mcp-thread-interrupt-admission-", ({ databasePath, servers }) =>
+        Effect.gen(function* () {
+          const left = yield* Effect.promise(() => startServer(databasePath));
+          servers.add(left);
+          const right = yield* Effect.promise(() => startServer(databasePath));
+          servers.add(right);
+          const thread = { instanceId: "missing-instance", threadId: "ui-thread" };
+          const repeated = yield* Effect.promise(() =>
+            Promise.all([
+              call(left, 3, "thread_interrupt", {
+                requestId: "shared-interrupt",
+                thread,
+              }),
+              call(right, 3, "thread_interrupt", {
+                requestId: "shared-interrupt",
+                thread,
+              }),
+            ]),
+          );
+          const repeatedRecords = repeated.map((response) =>
+            toolResultValue<{
+              readonly commandId?: string | null;
+              readonly requestId?: string;
+              readonly tool?: string;
+            }>(response),
+          );
+          expect(repeatedRecords).toEqual([
+            expect.objectContaining({ requestId: "shared-interrupt", tool: "thread_interrupt" }),
+            expect.objectContaining({ requestId: "shared-interrupt", tool: "thread_interrupt" }),
+          ]);
+
+          const recovered = yield* Effect.promise(() =>
+            call(left, 4, "operation_get", { requestId: "shared-interrupt" }),
+          );
+          expect(recovered.result?.structuredContent).toMatchObject({
+            result: {
+              kind: "ok",
+              value: {
+                operation: {
+                  tool: "thread_interrupt",
+                  state: "failed",
+                  dispatch: "not_dispatched",
+                  error: { code: "registration_not_found" },
+                },
+              },
+            },
+          });
+          const recoveredOperation = toolResultValue<{
+            readonly operation?: {
+              readonly commandId?: string | null;
+              readonly state?: string;
+            };
+          }>(recovered)?.operation;
+          expect(recoveredOperation?.state).toBe("failed");
+          expect(recoveredOperation?.commandId).toEqual(expect.any(String));
+          const acceptedCommandIds = repeatedRecords
+            .map((record) => record?.commandId)
+            .filter((commandId): commandId is string => typeof commandId === "string");
+          acceptedCommandIds.push(recoveredOperation?.commandId as string);
+          expect(new Set(acceptedCommandIds).size).toBe(1);
+
+          const distinct = yield* Effect.promise(() =>
+            Promise.all([
+              call(left, 5, "thread_interrupt", {
+                requestId: "distinct-interrupt-a",
+                thread,
+              }),
+              call(right, 5, "thread_interrupt", {
+                requestId: "distinct-interrupt-b",
+                thread,
+              }),
+            ]),
+          );
+          const distinctRecords = distinct.map((response) =>
+            toolResultValue<{
+              readonly commandId?: string | null;
+              readonly requestId?: string;
+              readonly tool?: string;
+            }>(response),
+          );
+          expect(distinctRecords).toEqual([
+            expect.objectContaining({
+              requestId: "distinct-interrupt-a",
+              tool: "thread_interrupt",
+            }),
+            expect.objectContaining({
+              requestId: "distinct-interrupt-b",
+              tool: "thread_interrupt",
+            }),
+          ]);
+          const distinctCommandIds = distinctRecords
+            .map((record) => record?.commandId)
+            .filter((commandId): commandId is string => typeof commandId === "string");
+          expect(new Set(distinctCommandIds).size).toBe(distinctCommandIds.length);
+
+          const distinctLookups = yield* Effect.promise(() =>
+            Promise.all([
+              call(left, 6, "operation_get", { requestId: "distinct-interrupt-a" }),
+              call(right, 6, "operation_get", { requestId: "distinct-interrupt-b" }),
+            ]),
+          );
+          const distinctOperations = distinctLookups.map(
+            (response) =>
+              toolResultValue<{
+                readonly operation?: {
+                  readonly commandId?: string | null;
+                  readonly error?: { readonly code?: string };
+                  readonly state?: string;
+                };
+              }>(response)?.operation,
+          );
+          expect(distinctOperations).toEqual([
+            expect.objectContaining({
+              commandId: expect.any(String),
+              error: expect.objectContaining({ code: "registration_not_found" }),
+              state: "failed",
+            }),
+            expect.objectContaining({
+              commandId: expect.any(String),
+              error: expect.objectContaining({ code: "registration_not_found" }),
+              state: "failed",
+            }),
+          ]);
+          expect(new Set(distinctOperations.map((operation) => operation?.commandId)).size).toBe(2);
+
+          const rows = yield* Effect.acquireUseRelease(
+            Effect.sync(() => new DatabaseSync(databasePath)),
+            (database) =>
+              Effect.sync(
+                () =>
+                  database
+                    .prepare(
+                      "SELECT request_id FROM request_keys WHERE request_id LIKE '%interrupt%'",
+                    )
+                    .all() as Array<{ request_id: string }>,
+              ),
+            (database) => Effect.sync(() => database.close()),
+          );
+          expect(rows.map((row) => row.request_id).sort()).toEqual([
+            "distinct-interrupt-a",
+            "distinct-interrupt-b",
+            "shared-interrupt",
+          ]);
+        }),
+      ),
+    60000,
+  );
+
+  it.live(
+    "reconciles a stale thread interrupt receipt after a process restart without replay",
+    () =>
+      withServers("t3code-mcp-thread-interrupt-restart-", ({ databasePath, servers }) =>
+        Effect.gen(function* () {
+          const input = {
+            requestId: "restart-interrupt-request",
+            thread: { instanceId: "missing-instance", threadId: "ui-thread" },
+          };
+          const admittedAt = new Date(
+            Date.now() - LIVE_EFFECT_OBSERVATION_MILLIS - 1,
+          ).toISOString();
+          const commandId = "restart-interrupt-command";
+          const intent = {
+            instanceId: input.thread.instanceId,
+            threadId: input.thread.threadId,
+            baselineSequence: 10,
+            baselineTurnId: "turn-a",
+            baselineTurnState: "running",
+            baselineTurnProjected: false,
+          };
+          yield* Effect.scoped(
+            Effect.gen(function* () {
+              const store = yield* LocalStore;
+              const fingerprint = yield* store.fingerprintRequest("thread_interrupt", input);
+              yield* store.admitOperation({
+                requestId: input.requestId,
+                tool: "thread_interrupt",
+                fingerprint,
+                processNonce: "exited-mcp-process",
+                admittedAt,
+                intent,
+                completionMeans: "interruption_observed",
+                steps: ["dispatch_thread_interrupt", "observe_interruption_effect"],
+              });
+              yield* store.updateOperation(input.requestId, {
+                now: admittedAt,
+                intent,
+                target: input.thread,
+                commandId,
+                state: "pending",
+                dispatch: "accepted",
+                stepPosition: 0,
+                stepState: "succeeded",
+                evidence: [
+                  {
+                    kind: "snapshot",
+                    observedAt: admittedAt,
+                    sourceSequence: 10,
+                    nativeEventId: null,
+                    detail: "Before dispatch, T3Code reported turn turn-a running.",
+                  },
+                  {
+                    kind: "rpc_result",
+                    observedAt: admittedAt,
+                    sourceSequence: 11,
+                    nativeEventId: commandId,
+                    detail: "T3Code accepted the thread interrupt command at sequence 11.",
+                  },
+                ],
+                evidenceStepPosition: 0,
+                recovery: "observe_thread",
+              });
+              yield* store.updateOperation(input.requestId, {
+                now: admittedAt,
+                stepPosition: 1,
+                stepState: "pending",
+              });
+            }).pipe(Effect.provide(LocalStore.layer({ databasePath }))),
+          );
+
+          const restarted = yield* Effect.promise(() => startServer(databasePath));
+          servers.add(restarted);
+          const recovered = yield* Effect.promise(() =>
+            call(restarted, 3, "operation_get", { requestId: input.requestId }),
+          );
+          expect(recovered.result?.structuredContent).toMatchObject({
+            result: {
+              kind: "ok",
+              value: {
+                operation: {
+                  tool: "thread_interrupt",
+                  state: "outcome_unknown",
+                  dispatch: "accepted",
+                  commandId,
+                  recovery: "observe_thread",
+                },
+              },
+            },
+          });
         }),
       ),
     60000,

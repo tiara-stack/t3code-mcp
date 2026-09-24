@@ -136,6 +136,14 @@ const runtimeModeWireSchema = Schema.Literals([
 ]);
 
 const nonNegativeWireInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0));
+const isoDateTimeWireString = Schema.String.check(
+  Schema.makeFilter(
+    (value) =>
+      /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(value) &&
+      !Number.isNaN(Date.parse(value)),
+    { message: "expected a UTC ISO date-time" },
+  ),
+);
 
 /**
  * Thread-detail wire schemas for the pinned orchestration.subscribeThread
@@ -386,6 +394,20 @@ const OrchestrationDispatchCommandErrorWireSchema = Schema.Struct({
   bootstrapThreadDisposition: Schema.optionalKey(Schema.Literal("deleted")),
 });
 
+const OrchestrationCommandInvariantErrorWireSchema = Schema.Struct({
+  _tag: Schema.Literal("OrchestrationCommandInvariantError"),
+  commandType: Schema.String,
+  detail: Schema.String,
+  cause: Schema.optionalKey(Schema.Unknown),
+});
+
+const ThreadInterruptCommandWireSchema = Schema.Struct({
+  type: Schema.Literal("thread.turn.interrupt"),
+  commandId: trimmedNonEmptyWireString,
+  threadId: trimmedNonEmptyWireString,
+  createdAt: isoDateTimeWireString,
+});
+
 const DispatchResultWireSchema = Schema.Struct({ sequence: nonNegativeWireInt });
 const GitCommandErrorWireSchema = Schema.Struct({
   _tag: Schema.Literal("GitCommandError"),
@@ -588,12 +610,17 @@ const GetArchivedShellSnapshotRpc = Rpc.make("orchestration.getArchivedShellSnap
 });
 
 const DispatchCommandRpc = Rpc.make("orchestration.dispatchCommand", {
-  payload: Schema.Union([DispatchTurnCommandWireSchema, ApprovalResponseCommandWireSchema]),
+  payload: Schema.Union([
+    DispatchTurnCommandWireSchema,
+    ApprovalResponseCommandWireSchema,
+    ThreadInterruptCommandWireSchema,
+  ]),
   success: DispatchResultWireSchema,
   error: Schema.Union([
     EnvironmentAuthorizationErrorWireSchema,
     OrchestrationDispatchCommandErrorWireSchema,
     DispatchCommandErrorWireSchema,
+    OrchestrationCommandInvariantErrorWireSchema,
   ]),
 });
 
@@ -1083,6 +1110,50 @@ export class T3CodeAdapterError extends Data.TaggedError("T3CodeAdapterError")<{
   readonly requiredScopes?: ReadonlyArray<string>;
 }> {}
 
+export const mapThreadInterruptDispatchError = (error: {
+  readonly message: string;
+}): T3CodeAdapterError =>
+  new T3CodeAdapterError({
+    kind: "transport",
+    message: error.message.trim() || "The T3Code thread interruption dispatch outcome is unknown.",
+    uncertain: true,
+    status: null,
+  });
+
+// fallow-ignore-next-line complexity
+const mapThreadInterruptRpcError = (error: unknown): T3CodeAdapterError => {
+  if (error instanceof T3CodeAdapterError) return error;
+  const reason = error instanceof RpcClientError.RpcClientError ? error.reason : error;
+  if (
+    Predicate.hasProperty(reason, "_tag") &&
+    reason._tag === "EnvironmentAuthorizationError" &&
+    Predicate.hasProperty(reason, "requiredScope") &&
+    typeof reason.requiredScope === "string"
+  ) {
+    return new T3CodeAdapterError({
+      kind: "authorization",
+      message: "The T3Code credential lacks the required " + reason.requiredScope + " scope.",
+      uncertain: false,
+      status: null,
+    });
+  }
+  if (
+    Predicate.hasProperty(reason, "_tag") &&
+    reason._tag === "OrchestrationCommandInvariantError"
+  ) {
+    return new T3CodeAdapterError({
+      kind: "command_rejected",
+      message: "The T3Code instance rejected the thread interruption command.",
+      uncertain: false,
+      status: null,
+    });
+  }
+  if (Predicate.hasProperty(reason, "message") && typeof reason.message === "string") {
+    return mapThreadInterruptDispatchError({ message: reason.message });
+  }
+  return mapAuthenticatedChannelError(error);
+};
+
 export interface PairingExchangeInput {
   readonly endpoint: string;
   readonly pairingCode: string;
@@ -1395,6 +1466,13 @@ export interface T3CodeAdapterService {
     readonly credential: string;
     readonly cwd: string;
   }) => Effect.Effect<VcsWorktreeRefListing, T3CodeAdapterError>;
+  readonly interruptThread: (input: {
+    readonly endpoint: string;
+    readonly credential: string;
+    readonly threadId: string;
+    readonly commandId: string;
+    readonly createdAt: string;
+  }) => Effect.Effect<{ readonly sequence: number }, T3CodeAdapterError>;
   readonly subscribeShell: (input: {
     readonly endpoint: string;
     readonly credential: string;
@@ -2543,6 +2621,28 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
           ),
         ).pipe(Effect.mapError(worktreeCreateError));
 
+      const interruptThread = (input: {
+        readonly endpoint: string;
+        readonly credential: string;
+        readonly threadId: string;
+        readonly commandId: string;
+        readonly createdAt: string;
+      }): Effect.Effect<{ readonly sequence: number }, T3CodeAdapterError> =>
+        withCapacity(
+          withAuthenticatedRpc(
+            input.endpoint,
+            input.credential,
+            (client) =>
+              client["orchestration.dispatchCommand"]({
+                type: "thread.turn.interrupt",
+                commandId: input.commandId,
+                threadId: input.threadId,
+                createdAt: input.createdAt,
+              }).pipe(Effect.mapError(mapThreadInterruptRpcError)),
+            { uncertainOnTimeout: true },
+          ),
+        );
+
       /**
        * Open one authenticated streaming RPC subscription. The shared
        * adapter capacity permit is held for the whole stream lifetime; the
@@ -2877,6 +2977,7 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
         listProviderModels,
         refreshVcsStatus,
         listVcsWorktreeRefs,
+        interruptThread,
         subscribeShell,
         subscribeThread,
         getArchivedShellSnapshot,

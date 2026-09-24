@@ -116,6 +116,7 @@ describe("stdio transport", () => {
               "instance_pair_again",
               "instance_remove",
               "worktree_create",
+              "thread_interrupt",
               "project_list",
               "model_list",
               "worktree_list",
@@ -220,6 +221,32 @@ describe("stdio transport", () => {
               id: 8,
               method: "tools/call",
               params: {
+                name: "thread_interrupt",
+                arguments: {
+                  requestId: "stdio-failed-interrupt",
+                  thread: { instanceId: "missing-instance", threadId: "thread-a" },
+                },
+              },
+            });
+            let failedInterrupt = await nextMessage();
+            while (failedInterrupt.id !== 8) failedInterrupt = await nextMessage();
+            expect(failedInterrupt.result?.isError).toBe(true);
+            expect(failedInterrupt.result?.structuredContent).toMatchObject({
+              result: {
+                kind: "ok",
+                value: {
+                  tool: "thread_interrupt",
+                  state: "failed",
+                  dispatch: "not_dispatched",
+                  error: { code: "registration_not_found" },
+                },
+              },
+            });
+            send(child, {
+              jsonrpc: "2.0",
+              id: 9,
+              method: "tools/call",
+              params: {
                 name: "worktree_inspect",
                 arguments: {
                   worktree: {
@@ -231,7 +258,7 @@ describe("stdio transport", () => {
               },
             });
             let invalidWorktreePath = await nextMessage();
-            while (invalidWorktreePath.id !== 8) invalidWorktreePath = await nextMessage();
+            while (invalidWorktreePath.id !== 9) invalidWorktreePath = await nextMessage();
             expect(invalidWorktreePath.error?.code).toBe(-32602);
           }),
         ({ directory, child }) =>

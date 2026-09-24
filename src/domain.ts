@@ -872,6 +872,23 @@ const threadGetReferenceJsonShape = Schema.StructWithRest(threadReferenceSchema,
   Schema.Record(Schema.String, Schema.Never),
 ]);
 
+const threadInterruptReferenceRuntimeShape = Schema.StructWithRest(
+  Schema.Struct({
+    instanceId: nonEmptyString,
+    threadId: nonEmptyString,
+  }),
+  [
+    Schema.Record(
+      Schema.String.check(
+        Schema.makeFilter((key) => key !== "instanceId" && key !== "threadId", {
+          message: "unknown thread_interrupt thread argument",
+        }),
+      ),
+      Schema.Never,
+    ),
+  ],
+);
+
 const threadGetFields = Schema.Struct({
   thread: threadGetReferenceRuntimeShape,
   cursor: Schema.optionalKey(nonEmptyString),
@@ -1085,6 +1102,52 @@ export const ThreadWaitInputSchema = Schema.declare<{
 );
 
 export type ThreadWaitInput = typeof ThreadWaitInputSchema.Type;
+
+const threadInterruptFields = Schema.Struct({
+  requestId,
+  thread: threadInterruptReferenceRuntimeShape,
+});
+
+const threadInterruptJsonFields = Schema.Struct({
+  requestId,
+  thread: threadGetReferenceJsonShape,
+});
+
+const unknownThreadInterruptField = Schema.String.check(
+  Schema.makeFilter((key) => key !== "requestId" && key !== "thread", {
+    message: "unknown thread_interrupt argument",
+  }),
+);
+
+const threadInterruptRuntimeShape = Schema.StructWithRest(threadInterruptFields, [
+  Schema.Record(unknownThreadInterruptField, Schema.Never),
+]);
+
+const threadInterruptJsonShape = Schema.StructWithRest(threadInterruptJsonFields, [
+  Schema.Record(Schema.String, Schema.Never),
+]);
+
+/**
+ * Interrupt the execution the T3Code instance processes for this thread.
+ * The request has no turn fence because the pinned server targets the current
+ * provider session when it handles the command.
+ */
+export const ThreadInterruptInputSchema = Schema.declare<{
+  readonly requestId: string;
+  readonly thread: ThreadReference;
+}>(
+  (input): input is { readonly requestId: string; readonly thread: ThreadReference } =>
+    Schema.is(threadInterruptRuntimeShape)(input),
+  {
+    toCodecJson: () =>
+      Schema.link()(threadInterruptJsonShape, {
+        decode: SchemaGetter.passthrough({ strict: false }),
+        encode: SchemaGetter.passthrough({ strict: false }),
+      } as never),
+  },
+);
+
+export type ThreadInterruptInput = typeof ThreadInterruptInputSchema.Type;
 
 const turnWaitTurnReferenceRuntimeShape = Schema.StructWithRest(
   Schema.Struct({

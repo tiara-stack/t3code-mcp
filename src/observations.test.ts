@@ -1249,6 +1249,7 @@ describe("InstanceConnections observation capacity", () => {
                 Stream.fromEffect(Deferred.await(gate)).pipe(Stream.map(() => synchronizedItem)),
               ),
             subscribeThread: () => Stream.die("not used"),
+            interruptThread: () => Effect.die("not used"),
             getArchivedShellSnapshot: () => Effect.die("not used"),
             createWorktree: () => Effect.die("not used"),
             respondToApproval: () => Effect.die("not used"),
@@ -1340,6 +1341,7 @@ describe("InstanceConnections observation capacity", () => {
           subscribeShell: () =>
             Stream.make(snapshotItem(1, [project("project-a")], []), synchronizedItem),
           subscribeThread: () => Stream.die("not used"),
+          interruptThread: () => Effect.die("not used"),
           getArchivedShellSnapshot: () => Effect.die("not used"),
           createWorktree: () => Effect.die("not used"),
           respondToApproval: () => Effect.die("not used"),
