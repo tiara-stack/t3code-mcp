@@ -8,7 +8,6 @@ import * as Layer from "effect/Layer";
 import * as McpSchema from "effect/unstable/ai/McpSchema";
 import * as McpServer from "effect/unstable/ai/McpServer";
 import * as Option from "effect/Option";
-import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
@@ -25,8 +24,8 @@ import {
   InstanceUpdateInputSchema,
   InputRespondInputSchema,
   WorktreeCreateInputSchema,
+  WorktreeDiscardInputSchema,
   DEFAULT_THREAD_WAIT_MILLIS,
-  MAX_ACTIVE_THREAD_SUBSCRIPTIONS_PER_INSTANCE,
   MAX_OPERATION_CAPACITY,
   MAX_TOTAL_RPC_CAPACITY,
   THREAD_OUTPUT_PART_LIMIT_BYTES,
@@ -84,6 +83,7 @@ import {
   ThreadWaitToolResultSchema,
   type ThreadWaitToolResult,
   type WorktreeCreateInput,
+  type WorktreeDiscardInput,
   TurnWaitInputSchema,
   TurnWaitToolResultSchema,
   type TurnWaitResult,
@@ -127,7 +127,7 @@ import {
   type TurnEvidenceRecord,
   type WorktreeCaptureMetadata,
 } from "./local-store";
-import { OperationServiceError, Operations } from "./operations";
+import { OperationServiceError, Operations, type WorktreeDiscardEligibility } from "./operations";
 import {
   InstanceConnections,
   type DiscoveredModels,
@@ -150,7 +150,8 @@ import {
   type ObservedThreadDetail,
 } from "./t3code-adapter";
 import { pendingRequestsFromActivities } from "./pending-requests";
-import { adapterErrorFailure } from "./tool-failure";
+import { adapterErrorFailure, observationErrorFailure } from "./tool-failure";
+import { makeBoundedJitteredRetrySchedule } from "./retry-schedule";
 
 const withToolHints = <
   Name extends string,
@@ -284,6 +285,26 @@ export const WorktreeInspectTool = withToolHints(
   {
     readonly: false,
     destructive: false,
+    idempotent: false,
+    openWorld: true,
+  },
+);
+
+// fallow-ignore-next-line unused-export
+export const WorktreeDiscardTool = withToolHints(
+  Tool.make("worktree_discard", {
+    description:
+      "Explicitly discard one freshly verified orphan worktree, including modified, staged, untracked, and ignored contents, while retaining its branch. Shared or uncertain targets are refused; combined thread removal is not available yet.",
+    parameters: WorktreeDiscardInputSchema,
+    success: OperationToolResultSchema,
+  })
+    .addDependency(LocalStore)
+    .addDependency(Operations)
+    .addDependency(InstanceConnections)
+    .addDependency(Observations),
+  {
+    readonly: false,
+    destructive: true,
     idempotent: false,
     openWorld: true,
   },
@@ -506,6 +527,7 @@ export const ServerToolkit = Toolkit.make(
   WorktreeListTool,
   ThreadListTool,
   WorktreeInspectTool,
+  WorktreeDiscardTool,
   ThreadGetTool,
   ThreadSubmitTool,
   ApprovalRespondTool,
@@ -545,47 +567,18 @@ const operationServiceFailures = {
     retry: "change_request",
     details: {},
   },
+  unsupported_worktree_discard_variant: {
+    code: "invalid_argument",
+    retry: "change_request",
+    details: {},
+  },
 } satisfies Record<OperationServiceError["kind"], Pick<ToolFailure, "code" | "retry" | "details">>;
 
 // fallow-ignore-next-line complexity
 const toToolFailure = (
   error: LocalStoreError | OperationServiceError | T3CodeAdapterError | ObservationError,
 ) => {
-  if (error instanceof ObservationError) {
-    switch (error.kind) {
-      case "observation_overflow":
-        return makeToolFailure(error.message, "unavailable", "safe_read", {
-          action: "retry_observation",
-        });
-      case "synchronization_timeout":
-        return makeToolFailure(error.message, "unavailable", "safe_read", {
-          action: "retry_observation",
-        });
-      case "boundary_missing":
-        return makeToolFailure(error.message, "unavailable", "safe_read", {
-          action: "retry_observation",
-        });
-      case "ambiguous_target":
-        return makeToolFailure(error.message, "unavailable", "safe_read", {
-          action: "retry_observation",
-        });
-      case "repository_mismatch":
-        return makeToolFailure(error.message, "uncheckable_target", "change_request");
-      case "uncheckable_target":
-        return makeToolFailure(error.message, "uncheckable_target", "change_request");
-      case "stale_generation":
-        return makeToolFailure(error.message, "stale_state", "reconcile_first");
-      case "retention_budget":
-        return makeToolFailure(error.message, "unavailable", "safe_read", {
-          action: "retry_observation",
-        });
-      case "subscription_capacity":
-        return makeToolFailure(error.message, "unavailable", "safe_read", {
-          action: "retry_observation",
-          capacity: MAX_ACTIVE_THREAD_SUBSCRIPTIONS_PER_INSTANCE,
-        });
-    }
-  }
+  if (error instanceof ObservationError) return observationErrorFailure(error);
   if (error instanceof T3CodeAdapterError) {
     return adapterErrorFailure(error, "read");
   }
@@ -1808,13 +1801,26 @@ const discoverWorktreePage = (options: {
 
 const MAX_WORKTREE_INSPECTION_REFERENCES = 128;
 const WORKTREE_INSPECTION_BOUND_MILLIS = 60_000;
-const worktreeInspectionCapacityRetrySchedule = Schedule.exponential("25 millis").pipe(
-  Schedule.jittered,
-  Schedule.modifyDelay(({ duration }) =>
-    Effect.succeed(Duration.millis(Math.min(250, Math.max(25, Duration.toMillis(duration))))),
-  ),
-  Schedule.upTo({ duration: Duration.millis(WORKTREE_INSPECTION_BOUND_MILLIS) }),
+const worktreeInspectionCapacityRetrySchedule = makeBoundedJitteredRetrySchedule(
+  WORKTREE_INSPECTION_BOUND_MILLIS,
 );
+
+const withWorktreeInspectionBound = <A, E, R>(
+  effect: Effect.Effect<A, E, R>,
+  activity: string,
+): Effect.Effect<A, E | ObservationError, R> =>
+  effect.pipe(
+    Effect.timeoutOrElse({
+      duration: Duration.millis(WORKTREE_INSPECTION_BOUND_MILLIS),
+      orElse: () =>
+        Effect.fail(
+          new ObservationError({
+            kind: "synchronization_timeout",
+            message: `${activity} exceeded its ${WORKTREE_INSPECTION_BOUND_MILLIS} millisecond time bound.`,
+          }),
+        ),
+    }),
+  );
 
 const retryWorktreeInspectionCapacity = <A>(
   effect: Effect.Effect<A, LocalStoreError | T3CodeAdapterError | ObservationError>,
@@ -2338,6 +2344,76 @@ const readWorktreeVcsEvidence = (options: {
     };
   });
 
+const checkOrphanWorktree = (options: {
+  readonly connections: InstanceConnectionsService;
+  readonly observations: ObservationsService;
+  readonly worktree: WorktreeInspectionQuery["worktree"];
+}): Effect.Effect<
+  WorktreeDiscardEligibility,
+  LocalStoreError | T3CodeAdapterError | ObservationError
+> => {
+  const check = Effect.gen(function* () {
+    const registrationBefore = yield* retryWorktreeInspectionCapacity(
+      options.connections.acquire(options.worktree.instanceId),
+    );
+    const vcs = yield* readWorktreeVcsEvidence(options);
+    const references = yield* readWorktreeReferenceInventory({
+      observations: options.observations,
+      worktree: options.worktree,
+    });
+    if (references.items.length > 0) {
+      const threadIds = references.items.map((item) => item.summary.thread.threadId);
+      return yield* Effect.fail(
+        new ObservationError({
+          kind: "shared_worktree",
+          message: `The worktree is not orphaned; fresh active or archived thread references were found: ${threadIds.join(", ")}.`,
+        }),
+      );
+    }
+    const registrationAfter = yield* retryWorktreeInspectionCapacity(
+      options.connections.acquire(options.worktree.instanceId),
+    );
+    if (
+      registrationAfter.revision !== registrationBefore.revision ||
+      registrationAfter.environmentId !== registrationBefore.environmentId
+    ) {
+      return yield* Effect.fail(
+        new ObservationError({
+          kind: "stale_generation",
+          message:
+            "The saved instance registration changed while the worktree orphan check was running.",
+        }),
+      );
+    }
+    const evidence: Array<Evidence> = [
+      {
+        kind: "snapshot",
+        observedAt: vcs.status.observedAt,
+        sourceSequence: null,
+        nativeEventId: null,
+        detail: `Fresh VCS status and a complete local-ref inventory identify branch ${vcs.branch} at the requested worktree path.`,
+      },
+      ...references.observations.map((observation) => ({
+        kind: "snapshot" as const,
+        observedAt: observation.observedAt,
+        sourceSequence: observation.sourceSequence,
+        nativeEventId: null,
+        detail:
+          "Fresh active and archived thread inventories, including UI-created threads, contain no reference to the requested worktree.",
+      })),
+    ];
+    return {
+      branch: vcs.branch,
+      evidence,
+      registration: {
+        revision: registrationAfter.revision,
+        environmentId: registrationAfter.environmentId,
+      },
+    };
+  });
+  return withWorktreeInspectionBound(check, "The complete orphan worktree eligibility check");
+};
+
 const guardCheck = (
   name: WorktreeGuardCheck["name"],
   state: WorktreeGuardCheck["state"],
@@ -2722,18 +2798,7 @@ const inspectWorktreeFresh = (options: {
     });
     return makeWorktreeInspectionToolSuccess(captured.page, captured.observations);
   });
-  return inspection.pipe(
-    Effect.timeoutOrElse({
-      duration: Duration.millis(WORKTREE_INSPECTION_BOUND_MILLIS),
-      orElse: () =>
-        Effect.fail(
-          new ObservationError({
-            kind: "synchronization_timeout",
-            message: `The complete worktree inspection exceeded its ${WORKTREE_INSPECTION_BOUND_MILLIS} millisecond time bound.`,
-          }),
-        ),
-    }),
-  );
+  return withWorktreeInspectionBound(inspection, "The complete worktree inspection");
 };
 
 const serveRetainedWorktreeInspection = (options: {
@@ -4393,6 +4458,21 @@ const serverToolHandlers = ServerToolkit.of({
         }),
       ),
     ),
+  worktree_discard: (input: WorktreeDiscardInput) =>
+    Effect.gen(function* () {
+      const operations = yield* Operations;
+      const connections = yield* InstanceConnections;
+      const observations = yield* Observations;
+      return yield* operationMutationResult(
+        operations.discardWorktree(input, () =>
+          checkOrphanWorktree({
+            connections,
+            observations,
+            worktree: input.worktree,
+          }),
+        ),
+      );
+    }),
   thread_get: ({ thread, cursor, limit, allowStale }) =>
     Effect.gen(function* () {
       const store = yield* LocalStore;
@@ -4658,6 +4738,7 @@ const operationMutatorTools: ReadonlySet<string> = new Set([
   "input_respond",
   "worktree_create",
   "thread_submit",
+  "worktree_discard",
   "approval_respond",
   "thread_interrupt",
   "thread_stop_session",

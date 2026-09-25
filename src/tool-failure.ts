@@ -1,4 +1,5 @@
-import type { ToolFailure } from "./domain";
+import { MAX_ACTIVE_THREAD_SUBSCRIPTIONS_PER_INSTANCE, type ToolFailure } from "./domain";
+import { ObservationError } from "./observations";
 import { T3CodeAdapterError, type T3CodeAdapterErrorKind } from "./t3code-adapter";
 
 type AdapterFailureMapping = Pick<ToolFailure, "code" | "retry" | "details"> & {
@@ -201,6 +202,51 @@ const adapterFailureMappings = {
   approval: { ...sharedAdapterFailures, ...approvalOverrides },
   thread_stop: { ...sharedAdapterFailures, ...threadStopOverrides },
 } satisfies Record<AdapterFailureContext, Record<T3CodeAdapterErrorKind, AdapterFailurePolicy>>;
+
+const observationFailureMappings = {
+  observation_overflow: {
+    code: "unavailable",
+    retry: "safe_read",
+    details: { action: "retry_observation" },
+  },
+  synchronization_timeout: {
+    code: "unavailable",
+    retry: "safe_read",
+    details: { action: "retry_observation" },
+  },
+  boundary_missing: {
+    code: "unavailable",
+    retry: "safe_read",
+    details: { action: "retry_observation" },
+  },
+  ambiguous_target: {
+    code: "unavailable",
+    retry: "safe_read",
+    details: { action: "retry_observation" },
+  },
+  repository_mismatch: { code: "uncheckable_target", retry: "change_request", details: {} },
+  uncheckable_target: { code: "uncheckable_target", retry: "change_request", details: {} },
+  shared_worktree: { code: "shared_worktree", retry: "change_request", details: {} },
+  stale_generation: { code: "stale_state", retry: "reconcile_first", details: {} },
+  retention_budget: {
+    code: "unavailable",
+    retry: "safe_read",
+    details: { action: "retry_observation" },
+  },
+  subscription_capacity: {
+    code: "unavailable",
+    retry: "safe_read",
+    details: {
+      action: "retry_observation",
+      capacity: MAX_ACTIVE_THREAD_SUBSCRIPTIONS_PER_INSTANCE,
+    },
+  },
+} satisfies Record<ObservationError["kind"], Omit<ToolFailure, "message">>;
+
+export const observationErrorFailure = (error: ObservationError): ToolFailure => ({
+  ...observationFailureMappings[error.kind],
+  message: error.message,
+});
 
 export const adapterErrorFailure = (
   error: T3CodeAdapterError,

@@ -520,6 +520,15 @@ const VcsListRefsResultWireSchema = Schema.Struct({
   totalCount: nonNegativeWireInt,
 });
 
+const VcsRemoveWorktreeRpc = Rpc.make("vcs.removeWorktree", {
+  payload: Schema.Struct({
+    cwd: trimmedNonEmptyWireString,
+    path: trimmedNonEmptyWireString,
+    force: Schema.optionalKey(Schema.Boolean),
+  }),
+  error: Schema.Union([GitCommandErrorWireSchema, EnvironmentAuthorizationErrorWireSchema]),
+});
+
 /**
  * Provider/model entries tolerate elements the pinned server already filters
  * with ForwardCompatibleArray semantics: each provider, model, option choice,
@@ -712,6 +721,7 @@ const AdapterRpcGroup = RpcGroup.make(
   SubscribeThreadRpc,
   VcsRefreshStatusRpc,
   VcsListRefsRpc,
+  VcsRemoveWorktreeRpc,
 );
 
 type AdapterRpcClient = RpcClient.RpcClient<
@@ -1048,6 +1058,44 @@ const worktreeCreateError = (error: unknown): T3CodeAdapterError => {
     uncertain: true,
     status: mapped.status,
   });
+};
+
+const worktreeRemoveError = (error: unknown): T3CodeAdapterError => {
+  return Match.value(error).pipe(
+    Match.when(Match.instanceOf(T3CodeAdapterError), (adapterError) => adapterError),
+    Match.when(
+      Schema.is(EnvironmentAuthorizationErrorWireSchema),
+      (authorizationError) =>
+        new T3CodeAdapterError({
+          kind: "authorization",
+          message: "The T3Code credential lacks authorization for VCS operations.",
+          uncertain: false,
+          status: null,
+          requiredScopes: [authorizationError.requiredScope],
+        }),
+    ),
+    Match.when(
+      Schema.is(GitCommandErrorWireSchema),
+      () =>
+        new T3CodeAdapterError({
+          kind: "upstream_failure",
+          message:
+            "T3Code reported a VCS worktree removal failure; the checkout state must be observed.",
+          uncertain: true,
+          status: null,
+        }),
+    ),
+    Match.orElse((unknown) => {
+      const mapped = mapAuthenticatedChannelError(unknown);
+      if (mapped.uncertain) return mapped;
+      return new T3CodeAdapterError({
+        kind: mapped.kind,
+        message: mapped.message,
+        uncertain: true,
+        status: mapped.status,
+      });
+    }),
+  );
 };
 
 const mapApprovalDispatchError = (
@@ -1514,6 +1562,8 @@ export interface VcsWorktreeRef {
 export interface VcsWorktreeRefListing {
   readonly isRepo: boolean;
   readonly refs: ReadonlyArray<VcsWorktreeRef>;
+  /** Local branch names from the same complete ref inventory, including refs without a checkout. */
+  readonly localBranches?: ReadonlyArray<string>;
   readonly limitations: ReadonlyArray<string>;
   readonly truncated: boolean;
   readonly pageLimitExceeded?: boolean;
@@ -1596,6 +1646,12 @@ export interface T3CodeAdapterService {
   readonly createWorktree: (
     input: { readonly endpoint: string; readonly credential: string } & WorktreeCreateRequest,
   ) => Effect.Effect<CreatedWorktree, T3CodeAdapterError>;
+  readonly removeWorktree: (input: {
+    readonly endpoint: string;
+    readonly credential: string;
+    readonly repositoryPath: string;
+    readonly worktreePath: string;
+  }) => Effect.Effect<void, T3CodeAdapterError>;
   readonly respondToApproval: <E>(
     input: ApprovalResponseCommand & {
       readonly endpoint: string;
@@ -1633,6 +1689,9 @@ const worktreeRefsFromPage = (page: VcsListRefsPage): ReadonlyArray<VcsWorktreeR
       ? [{ branch: ref.name, worktreePath: ref.worktreePath }]
       : [],
   );
+
+const localBranchNamesFromPage = (page: VcsListRefsPage): ReadonlyArray<string> =>
+  page.refs.flatMap((ref) => (ref.isRemote === true ? [] : [ref.name]));
 
 const vcsRefPageInconsistency = (options: {
   readonly page: VcsListRefsPage;
@@ -1677,6 +1736,7 @@ const collectVcsWorktreeRefPages = (
 ): Effect.Effect<VcsWorktreeRefListing, T3CodeAdapterError> =>
   Effect.gen(function* () {
     const refs: Array<VcsWorktreeRef> = [];
+    const localBranches = new Set<string>();
     const limitations: Array<string> = [];
     const seenCursors = new Set<number>();
     let cursor: number | undefined;
@@ -1702,6 +1762,7 @@ const collectVcsWorktreeRefPages = (
       if (expectedTotal === null) expectedTotal = page.totalCount;
       if (expectedRepositoryState === null) expectedRepositoryState = page.isRepo;
       isRepo = page.isRepo;
+      for (const branch of localBranchNamesFromPage(page)) localBranches.add(branch);
       refs.push(...worktreeRefsFromPage(page));
       if (truncated) break;
 
@@ -1724,6 +1785,7 @@ const collectVcsWorktreeRefPages = (
     return {
       isRepo,
       refs,
+      localBranches: [...localBranches],
       limitations,
       truncated,
       pageLimitExceeded,
@@ -2782,6 +2844,26 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
           ),
         );
 
+      const removeWorktree = (input: {
+        readonly endpoint: string;
+        readonly credential: string;
+        readonly repositoryPath: string;
+        readonly worktreePath: string;
+      }): Effect.Effect<void, T3CodeAdapterError> =>
+        withCapacity(
+          withAuthenticatedRpc(
+            input.endpoint,
+            input.credential,
+            (client) =>
+              client["vcs.removeWorktree"]({
+                cwd: input.repositoryPath,
+                path: input.worktreePath,
+                force: true,
+              }).pipe(Effect.mapError(worktreeRemoveError)),
+            { uncertainOnTimeout: true },
+          ),
+        ).pipe(Effect.mapError(worktreeRemoveError));
+
       /**
        * Open one authenticated streaming RPC subscription. The shared
        * adapter capacity permit is held for the whole stream lifetime; the
@@ -3229,6 +3311,7 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
         getArchivedShellSnapshot,
         respondToInput,
         createWorktree,
+        removeWorktree,
         respondToApproval,
         listVcsRefs,
       });

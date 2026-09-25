@@ -844,6 +844,77 @@ export const WorktreeInspectInputSchema = Schema.declare<{
 
 export type WorktreeInspectInput = typeof WorktreeInspectInputSchema.Type;
 
+const worktreeDiscardThreadReferenceFields = Schema.Struct({
+  instanceId: nonEmptyString,
+  threadId: nonEmptyString,
+});
+
+const unknownWorktreeDiscardThreadReferenceField = Schema.String.check(
+  Schema.makeFilter((key) => key !== "instanceId" && key !== "threadId", {
+    message: "unknown worktree_discard removeSoleThread argument",
+  }),
+);
+
+const worktreeDiscardThreadReferenceRuntimeShape = Schema.StructWithRest(
+  worktreeDiscardThreadReferenceFields,
+  [Schema.Record(unknownWorktreeDiscardThreadReferenceField, Schema.Never)],
+);
+
+const worktreeDiscardThreadReferenceJsonShape = Schema.StructWithRest(
+  worktreeDiscardThreadReferenceFields,
+  [Schema.Record(Schema.String, Schema.Never)],
+);
+
+const worktreeDiscardFields = Schema.Struct({
+  requestId,
+  worktree: worktreeInspectReferenceRuntimeShape,
+  removeSoleThread: Schema.optionalKey(worktreeDiscardThreadReferenceRuntimeShape),
+});
+
+const worktreeDiscardJsonFields = Schema.Struct({
+  requestId,
+  worktree: worktreeInspectReferenceJsonShape,
+  removeSoleThread: Schema.optionalKey(worktreeDiscardThreadReferenceJsonShape),
+});
+
+const unknownWorktreeDiscardField = Schema.String.check(
+  Schema.makeFilter(
+    (key) => key !== "requestId" && key !== "worktree" && key !== "removeSoleThread",
+    { message: "unknown worktree_discard argument" },
+  ),
+);
+
+const worktreeDiscardRuntimeShape = Schema.StructWithRest(worktreeDiscardFields, [
+  Schema.Record(unknownWorktreeDiscardField, Schema.Never),
+]);
+
+const worktreeDiscardJsonShape = Schema.StructWithRest(worktreeDiscardJsonFields, [
+  Schema.Record(Schema.String, Schema.Never),
+]);
+
+export const WorktreeDiscardInputSchema = Schema.declare<{
+  readonly requestId: string;
+  readonly worktree: WorktreeReference;
+  readonly removeSoleThread?: ThreadReference;
+}>(
+  (
+    input,
+  ): input is {
+    readonly requestId: string;
+    readonly worktree: WorktreeReference;
+    readonly removeSoleThread?: ThreadReference;
+  } => Schema.is(worktreeDiscardRuntimeShape)(input),
+  {
+    toCodecJson: () =>
+      Schema.link()(worktreeDiscardJsonShape, {
+        decode: SchemaGetter.passthrough({ strict: false }),
+        encode: SchemaGetter.passthrough({ strict: false }),
+      } as never),
+  },
+);
+
+export type WorktreeDiscardInput = typeof WorktreeDiscardInputSchema.Type;
+
 export type WorktreeInspectionQuery = {
   readonly worktree: WorktreeReference;
 };

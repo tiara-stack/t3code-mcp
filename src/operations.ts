@@ -33,15 +33,18 @@ import {
   type ThreadStopSessionInput,
   type ToolFailure,
   type WorktreeCreateInput,
+  type WorktreeDiscardInput,
 } from "./domain";
 import { LocalStore, LocalStoreError, REQUEST_RECORD_UNAVAILABLE_MESSAGE } from "./local-store";
 import type {
   OperationCompareAndUpdateInput,
+  OperationDispatchExpectation,
   OperationIntent,
   OperationUpdate,
   StoredOperation,
 } from "./local-store";
 import { InstanceConnections } from "./instance-connections";
+import type { DiscoveredVcsWorktreeRefs, InstanceConnection } from "./instance-connections";
 import {
   ObservationError,
   Observations,
@@ -53,7 +56,7 @@ import {
 } from "./observations";
 import { T3CodeAdapterError, type T3CodeAdapterErrorKind } from "./t3code-adapter";
 import { validateObservedInputResponse } from "./pending-requests";
-import { adapterErrorFailure } from "./tool-failure";
+import { adapterErrorFailure, observationErrorFailure } from "./tool-failure";
 
 const ThreadSessionStopRecoverySchema = Schema.Struct({
   instanceId: Schema.NonEmptyString,
@@ -163,9 +166,25 @@ const threadSessionStopRecovery = (intent: OperationIntent): ThreadSessionStopRe
 };
 
 export class OperationServiceError extends Data.TaggedError("OperationServiceError")<{
-  readonly kind: "capacity" | "stale_approval" | "unsupported_approval_decision" | "unsupported";
+  readonly kind:
+    | "capacity"
+    | "stale_approval"
+    | "unsupported_approval_decision"
+    | "unsupported"
+    | "unsupported_worktree_discard_variant";
   readonly message: string;
 }> {}
+
+export interface WorktreeDiscardEligibility {
+  readonly branch: string;
+  readonly evidence: ReadonlyArray<Evidence>;
+  readonly registration: Pick<InstanceConnection, "revision" | "environmentId">;
+}
+
+export type WorktreeDiscardCheck = () => Effect.Effect<
+  WorktreeDiscardEligibility,
+  LocalStoreError | T3CodeAdapterError | ObservationError
+>;
 
 class ApprovalDispatchClaimLost extends Data.TaggedError("ApprovalDispatchClaimLost")<{}> {}
 
@@ -230,6 +249,10 @@ const isThreadInterruptBaselineEndedDetail = (detail: string): boolean =>
   detail.startsWith(THREAD_INTERRUPT_BASELINE_ENDED_PREFIX) &&
   detail.endsWith(THREAD_INTERRUPT_BASELINE_ENDED_SUFFIX);
 
+class WorktreeDiscardClaimLost extends Data.TaggedError("WorktreeDiscardClaimLost")<{}> {}
+
+const WORKTREE_DISCARD_RECONCILIATION_INTERVAL_MILLIS = 1_000;
+
 export interface OperationsService {
   readonly pairInstance: (
     input: InstancePairInput,
@@ -252,6 +275,13 @@ export interface OperationsService {
   readonly createWorktree: (
     input: WorktreeCreateInput,
   ) => Effect.Effect<OperationRecord, LocalStoreError | OperationServiceError>;
+  readonly discardWorktree: (
+    input: WorktreeDiscardInput,
+    checkOrphan: WorktreeDiscardCheck,
+  ) => Effect.Effect<
+    OperationRecord,
+    LocalStoreError | OperationServiceError | T3CodeAdapterError | ObservationError
+  >;
   readonly respondToApproval: (
     input: ApprovalRespondInput,
     observeRequest: Effect.Effect<
@@ -347,6 +377,35 @@ export class Operations extends Context.Service<Operations, OperationsService>()
       };
       let activeCapacity = 0;
       const completionSignals = new Map<string, Deferred.Deferred<void, never>>();
+      const worktreeDiscardReconciliationChecks = new Map<
+        string,
+        { readonly revision: number; readonly updatedAt: string; readonly checkedAt: number }
+      >();
+
+      const shouldReconcileWorktreeDiscard = (record: OperationRecord) =>
+        Effect.gen(function* () {
+          const now = yield* Clock.currentTimeMillis;
+          const previous = worktreeDiscardReconciliationChecks.get(record.requestId);
+          if (
+            previous !== undefined &&
+            previous.revision === record.revision &&
+            previous.updatedAt === record.updatedAt &&
+            now - previous.checkedAt < WORKTREE_DISCARD_RECONCILIATION_INTERVAL_MILLIS
+          ) {
+            return false;
+          }
+          if (worktreeDiscardReconciliationChecks.size >= MAX_OPERATION_CAPACITY) {
+            const oldest = worktreeDiscardReconciliationChecks.keys().next().value;
+            if (oldest !== undefined) worktreeDiscardReconciliationChecks.delete(oldest);
+          }
+          worktreeDiscardReconciliationChecks.delete(record.requestId);
+          worktreeDiscardReconciliationChecks.set(record.requestId, {
+            revision: record.revision,
+            updatedAt: record.updatedAt,
+            checkedAt: now,
+          });
+          return true;
+        });
 
       const release = (requestId: string) =>
         Effect.sync(() => {
@@ -754,11 +813,14 @@ export class Operations extends Context.Service<Operations, OperationsService>()
               : null;
           if (expectedDispatch === null) return false;
           return yield* store.compareAndSetOperationDispatch(
-            stored.record.requestId,
-            stored.ownerProcessNonce,
-            record.state,
+            {
+              requestId: stored.record.requestId,
+              ownerProcessNonce: stored.ownerProcessNonce,
+              tool: "input_respond",
+              state: record.state,
+              dispatch: expectedDispatch,
+            },
             update,
-            expectedDispatch,
           );
         });
 
@@ -1643,6 +1705,68 @@ export class Operations extends Context.Service<Operations, OperationsService>()
         );
       };
 
+      const unknownOperationIntent = (options: {
+        readonly stored: StoredOperation;
+        readonly recoveryIntent: OperationIntent | undefined;
+      }): OperationIntent => {
+        const { stored, recoveryIntent } = options;
+        if (recoveryIntent !== undefined) return recoveryIntent;
+        if (
+          stored.record.tool === "thread_submit" ||
+          stored.record.tool === "worktree_create" ||
+          stored.record.tool === "worktree_discard"
+        ) {
+          return stored.intent;
+        }
+        return { instanceId: stored.intent.instanceId };
+      };
+
+      const unknownOperationDispatch = (record: OperationRecord): OperationRecord["dispatch"] =>
+        record.tool === "worktree_discard" && record.dispatch === "accepted"
+          ? "accepted"
+          : "unknown";
+
+      const unknownOperationStepPosition = (record: OperationRecord): number | null => {
+        if (record.tool !== "worktree_discard") return 0;
+        const position = record.steps.findIndex(
+          (step) => step.state === "pending" || step.state === "not_started",
+        );
+        return position < 0 ? null : position;
+      };
+
+      const persistUnknownOperationOutcome = (
+        stored: StoredOperation,
+        record: OperationRecord,
+        update: OperationUpdate,
+      ): Effect.Effect<OperationRecord | null, LocalStoreError> =>
+        record.tool === "worktree_discard"
+          ? Effect.gen(function* () {
+              const claimed = yield* store.compareAndSetOperationDispatch(
+                {
+                  requestId: stored.record.requestId,
+                  ownerProcessNonce: stored.ownerProcessNonce,
+                  tool: "worktree_discard",
+                  state: record.state,
+                  dispatch: record.dispatch,
+                  revision: record.revision,
+                },
+                update,
+              );
+              if (claimed) return null;
+              const refreshed = yield* store.getOperation(stored.record.requestId);
+              return refreshed?.record ?? record;
+            })
+          : Effect.gen(function* () {
+              const updated = yield* store.compareAndUpdateOperation(stored.record.requestId, {
+                ...update,
+                expectedRevision: record.revision,
+                onlyIfNonterminal: true,
+              });
+              if (updated) return null;
+              const refreshed = yield* store.getOperation(stored.record.requestId);
+              return refreshed?.record ?? record;
+            });
+
       const markOtherOutcomeUnknown = (
         stored: StoredOperation,
         record: OperationRecord,
@@ -1656,19 +1780,16 @@ export class Operations extends Context.Service<Operations, OperationsService>()
             return refreshed?.record ?? record;
           }
           const observed = yield* evidence(detail, "adapter_inference");
-          const updated = yield* store.compareAndUpdateOperation(stored.record.requestId, {
+          const stepPosition = unknownOperationStepPosition(record);
+          const update: OperationUpdate = {
             now: observed.observedAt,
-            expectedRevision: record.revision,
-            onlyIfNonterminal: true,
-            intent:
-              recoveryIntent ??
-              (record.tool === "thread_submit" || record.tool === "worktree_create"
-                ? stored.intent
-                : { instanceId: stored.intent.instanceId }),
+            ...(record.tool === "worktree_discard" ? {} : { expectedRevision: record.revision }),
+            intent: unknownOperationIntent({ stored, recoveryIntent }),
             state: "outcome_unknown",
-            dispatch: "unknown",
-            stepPosition: 0,
-            stepState: "outcome_unknown",
+            dispatch: unknownOperationDispatch(record),
+            ...(stepPosition === null
+              ? {}
+              : { stepPosition, stepState: "outcome_unknown" as const }),
             evidence: [observed],
             evidenceStepPosition: null,
             error: {
@@ -1678,8 +1799,10 @@ export class Operations extends Context.Service<Operations, OperationsService>()
               details: {},
             },
             recovery: "observe_operation",
-          });
-          if (updated) yield* signalCompletion(stored.record.requestId);
+          };
+          const latest = yield* persistUnknownOperationOutcome(stored, record, update);
+          if (latest !== null) return latest;
+          yield* signalCompletion(stored.record.requestId);
           const refreshed = yield* store.getOperation(stored.record.requestId);
           return refreshed?.record ?? record;
         });
@@ -1750,9 +1873,13 @@ export class Operations extends Context.Service<Operations, OperationsService>()
             details: {},
           };
           const claimed = yield* store.compareAndSetOperationDispatch(
-            stored.record.requestId,
-            stored.ownerProcessNonce,
-            record.state,
+            {
+              requestId: stored.record.requestId,
+              ownerProcessNonce: stored.ownerProcessNonce,
+              tool: "input_respond",
+              state: record.state,
+              dispatch: "not_dispatched",
+            },
             {
               now: observed.observedAt,
               state: "failed",
@@ -1768,7 +1895,6 @@ export class Operations extends Context.Service<Operations, OperationsService>()
                 Date.parse(observed.observedAt) + OPERATION_DETAIL_RETENTION_MILLIS,
               ).toISOString(),
             },
-            "not_dispatched",
           );
           if (!claimed) {
             yield* signalCompletion(stored.record.requestId);
@@ -1778,6 +1904,424 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           yield* signalCompletion(stored.record.requestId);
           const refreshed = yield* store.getOperation(stored.record.requestId);
           return refreshed?.record ?? record;
+        });
+
+      type WorktreeDiscardReconciliation =
+        | { readonly kind: "unknown"; readonly detail: string }
+        | { readonly kind: "branch_missing"; readonly branch: string }
+        | { readonly kind: "absent"; readonly branch: string };
+
+      type WorktreeDiscardIdentity = {
+        readonly repositoryPath: string;
+        readonly worktreePath: string;
+        readonly branch: string;
+      };
+
+      type WorktreeDiscardPathPresence = "absent" | "present" | "unknown";
+
+      const inspectWorktreeDiscardPath = (
+        instanceId: string,
+        worktreePath: string,
+      ): Effect.Effect<WorktreeDiscardPathPresence, never> =>
+        Effect.gen(function* () {
+          const status = yield* Effect.result(
+            connections.readVcsWorktreeStatus(instanceId, worktreePath),
+          );
+          if (Result.isFailure(status)) {
+            return status.failure instanceof T3CodeAdapterError &&
+              status.failure.kind === "resource_not_found"
+              ? "absent"
+              : "unknown";
+          }
+          return status.success.isRepo ? "present" : "absent";
+        });
+
+      const requireWorktreeDiscardPathAbsent = (
+        instanceId: string,
+        worktreePath: string,
+      ): Effect.Effect<void, ObservationError> =>
+        inspectWorktreeDiscardPath(instanceId, worktreePath).pipe(
+          Effect.flatMap((presence) => {
+            if (presence === "absent") return Effect.void;
+            return Effect.fail(
+              new ObservationError({
+                kind: presence === "present" ? "stale_generation" : "boundary_missing",
+                message:
+                  presence === "present"
+                    ? "The complete VCS ref listing omitted the checkout path, but a direct status read still reports a repository there."
+                    : "The complete VCS ref listing omitted the checkout path, but a direct status read could not confirm its absence.",
+              }),
+            );
+          }),
+        );
+
+      const worktreeDiscardIdentity = (stored: StoredOperation): WorktreeDiscardIdentity | null => {
+        const repositoryPath = stored.intent.repositoryPath;
+        const worktreePath = stored.intent.worktreePath;
+        const branch = stored.intent.branch;
+        if (
+          typeof repositoryPath !== "string" ||
+          typeof worktreePath !== "string" ||
+          typeof branch !== "string" ||
+          branch.length === 0
+        ) {
+          return null;
+        }
+        return { repositoryPath, worktreePath, branch };
+      };
+
+      const classifyWorktreeDiscardListing = (options: {
+        readonly listing: DiscoveredVcsWorktreeRefs;
+        readonly identity: WorktreeDiscardIdentity;
+      }): WorktreeDiscardReconciliation => {
+        const { listing, identity } = options;
+        if (
+          !listing.isRepo ||
+          listing.truncated ||
+          listing.limitations.length > 0 ||
+          listing.localBranches === undefined
+        ) {
+          return {
+            kind: "unknown",
+            detail:
+              "The VCS listing is unavailable or incomplete, so worktree absence and branch retention cannot be confirmed; the prior request will not be replayed.",
+          };
+        }
+        if (listing.refs.some((ref) => ref.worktreePath === identity.worktreePath)) {
+          return {
+            kind: "unknown",
+            detail:
+              "A checkout currently occupies the recorded path. The prior discard does not authorize removal of a checkout that may have replaced it, so no RPC was repeated.",
+          };
+        }
+        return listing.localBranches.includes(identity.branch)
+          ? { kind: "absent", branch: identity.branch }
+          : { kind: "branch_missing", branch: identity.branch };
+      };
+
+      const inspectWorktreeDiscardReconciliation = (
+        stored: StoredOperation,
+      ): Effect.Effect<WorktreeDiscardReconciliation, LocalStoreError> =>
+        Effect.gen(function* () {
+          const identity = worktreeDiscardIdentity(stored);
+          if (identity === null) {
+            return {
+              kind: "unknown",
+              detail:
+                "The prior worktree-discard receipt lacks the verified branch identity required for read-only reconciliation; it will not be replayed.",
+            };
+          }
+
+          const listingResult = yield* Effect.result(
+            connections.discoverVcsWorktreeRefs(stored.intent.instanceId, identity.repositoryPath),
+          );
+          if (Result.isFailure(listingResult)) {
+            return {
+              kind: "unknown",
+              detail:
+                "The target instance could not produce a fresh VCS listing during worktree-discard reconciliation; the prior request will not be replayed.",
+            };
+          }
+          const listingOutcome = classifyWorktreeDiscardListing({
+            listing: listingResult.success,
+            identity,
+          });
+          if (listingOutcome.kind === "unknown") return listingOutcome;
+
+          const pathPresence = yield* inspectWorktreeDiscardPath(
+            stored.intent.instanceId,
+            identity.worktreePath,
+          );
+          if (pathPresence === "absent") return listingOutcome;
+          return {
+            kind: "unknown",
+            detail:
+              pathPresence === "present"
+                ? "The complete VCS ref listing omitted the recorded checkout path, but a direct status read still reports a repository there; the prior request will not be replayed."
+                : "A complete VCS ref listing omitted the recorded checkout path, but a direct status read could not confirm its absence; the prior request will not be replayed.",
+          };
+        });
+
+      const markUnconfirmedWorktreeDiscardStep = (
+        stored: StoredOperation,
+        record: OperationRecord,
+        revision: number,
+        options: {
+          readonly name: string;
+          readonly state: "outcome_unknown" | "skipped";
+          readonly detail: string;
+        },
+      ): Effect.Effect<number | null, LocalStoreError> =>
+        Effect.gen(function* () {
+          const position = record.steps.findIndex((step) => step.name === options.name);
+          const step = position < 0 ? undefined : record.steps[position];
+          if (position < 0 || (step?.state !== "pending" && step?.state !== "not_started")) {
+            return revision;
+          }
+          const observed = yield* evidence(options.detail, "adapter_inference");
+          const claimed = yield* store.compareAndSetOperationDispatch(
+            {
+              requestId: stored.record.requestId,
+              ownerProcessNonce: stored.ownerProcessNonce,
+              tool: "worktree_discard",
+              state: record.state,
+              dispatch: record.dispatch,
+              revision,
+            },
+            {
+              now: observed.observedAt,
+              intent: stored.intent,
+              target: record.target,
+              stepPosition: position,
+              stepState: options.state,
+              evidence: [observed],
+              evidenceStepPosition: position,
+              recovery: "observe_operation",
+            },
+          );
+          return claimed ? revision + 1 : null;
+        });
+
+      const markUnconfirmedWorktreeDiscardSteps = (
+        stored: StoredOperation,
+        record: OperationRecord,
+        revision: number,
+      ): Effect.Effect<number | null, LocalStoreError> =>
+        Effect.gen(function* () {
+          const dispatchRevision = yield* markUnconfirmedWorktreeDiscardStep(
+            stored,
+            record,
+            revision,
+            {
+              name: "dispatch_worktree_remove",
+              state: "outcome_unknown",
+              detail:
+                "The previous process did not persist a response for its single remove attempt; the observed checkout state will be reconciled without replay.",
+            },
+          );
+          if (dispatchRevision === null) return null;
+          return yield* markUnconfirmedWorktreeDiscardStep(stored, record, dispatchRevision, {
+            name: "record_worktree_remove_response",
+            state: "skipped",
+            detail: "No remove RPC response was retained before the previous process stopped.",
+          });
+        });
+
+      const failWorktreeDiscardBranchRetention = (
+        stored: StoredOperation,
+        record: OperationRecord,
+        branch: string,
+        revision: number,
+      ): Effect.Effect<OperationRecord, LocalStoreError> =>
+        Effect.gen(function* () {
+          const observed = yield* evidence(
+            `The recorded checkout path is absent, but a fresh complete VCS listing did not find branch ${branch}.`,
+            "snapshot",
+          );
+          const failure: ToolFailure = {
+            code: "upstream_failure",
+            message:
+              "The worktree path is absent, but branch retention cannot be confirmed after the prior discard.",
+            retry: "reconcile_first",
+            details: {},
+          };
+          const claimed = yield* store.compareAndSetOperationDispatch(
+            {
+              requestId: stored.record.requestId,
+              ownerProcessNonce: stored.ownerProcessNonce,
+              tool: "worktree_discard",
+              state: record.state,
+              dispatch: record.dispatch,
+              revision,
+            },
+            {
+              now: observed.observedAt,
+              intent: stored.intent,
+              state: "partial",
+              dispatch: record.dispatch,
+              target: record.target,
+              stepPosition: Math.max(0, record.steps.length - 1),
+              stepState: "failed",
+              stepError: failure,
+              evidence: [observed],
+              evidenceStepPosition: Math.max(0, record.steps.length - 1),
+              error: failure,
+              recovery: "inspect_target",
+              recoverableUntil: new Date(
+                Date.parse(observed.observedAt) + OPERATION_DETAIL_RETENTION_MILLIS,
+              ).toISOString(),
+            },
+          );
+          if (!claimed) {
+            const refreshed = yield* store.getOperation(stored.record.requestId);
+            return refreshed?.record ?? record;
+          }
+          yield* signalCompletion(stored.record.requestId);
+          const refreshed = yield* store.getOperation(stored.record.requestId);
+          return refreshed?.record ?? record;
+        });
+
+      const completeWorktreeDiscardReconciliation = (
+        stored: StoredOperation,
+        record: OperationRecord,
+        branch: string,
+        revision: number,
+      ): Effect.Effect<OperationRecord, LocalStoreError> =>
+        Effect.gen(function* () {
+          const stepsRevision = yield* markUnconfirmedWorktreeDiscardSteps(
+            stored,
+            record,
+            revision,
+          );
+          if (stepsRevision === null) {
+            const refreshed = yield* store.getOperation(stored.record.requestId);
+            return refreshed?.record ?? record;
+          }
+          const observed = yield* evidence(
+            `A fresh complete VCS listing confirms the recorded checkout path is absent and branch ${branch} remains. This state read does not identify which client removed the checkout; the prior request was not repeated.`,
+            "snapshot",
+          );
+          const claimed = yield* store.compareAndSetOperationDispatch(
+            {
+              requestId: stored.record.requestId,
+              ownerProcessNonce: stored.ownerProcessNonce,
+              tool: "worktree_discard",
+              state: record.state,
+              dispatch: record.dispatch,
+              revision: stepsRevision,
+            },
+            {
+              now: observed.observedAt,
+              intent: stored.intent,
+              state: "completed",
+              dispatch: record.dispatch,
+              target: record.target,
+              stepPosition: Math.max(0, record.steps.length - 1),
+              stepState: "already_absent",
+              evidence: [observed],
+              evidenceStepPosition: Math.max(0, record.steps.length - 1),
+              error: null,
+              recovery: "none",
+              recoverableUntil: new Date(
+                Date.parse(observed.observedAt) + OPERATION_DETAIL_RETENTION_MILLIS,
+              ).toISOString(),
+            },
+          );
+          if (!claimed) {
+            const refreshed = yield* store.getOperation(stored.record.requestId);
+            return refreshed?.record ?? record;
+          }
+          yield* signalCompletion(stored.record.requestId);
+          const refreshed = yield* store.getOperation(stored.record.requestId);
+          return refreshed?.record ?? record;
+        });
+
+      const failUnsentWorktreeDiscard = (
+        stored: StoredOperation,
+        record: OperationRecord,
+      ): Effect.Effect<OperationRecord, LocalStoreError> =>
+        Effect.gen(function* () {
+          if (record.state !== "admitted" && record.state !== "pending") return record;
+          const position = Math.max(
+            0,
+            record.steps.findIndex(
+              (step) => step.state === "pending" || step.state === "not_started",
+            ),
+          );
+          const observed = yield* evidence(
+            "A prior worktree-discard process stopped before a confirmed remove response; this request will not dispatch again.",
+            "adapter_inference",
+          );
+          const failure: ToolFailure = {
+            code: "unavailable",
+            message:
+              "The admitted discard was not confirmed as dispatched. Inspect the target, then make a new explicit request if it is still eligible.",
+            retry: "change_request",
+            details: {},
+          };
+          const claimed = yield* store.compareAndSetOperationDispatch(
+            {
+              requestId: stored.record.requestId,
+              ownerProcessNonce: stored.ownerProcessNonce,
+              tool: "worktree_discard",
+              state: record.state,
+              dispatch: record.dispatch,
+              revision: record.revision,
+            },
+            {
+              now: observed.observedAt,
+              intent: stored.intent,
+              state: "failed",
+              dispatch: record.dispatch,
+              stepPosition: position,
+              stepState: "failed",
+              stepError: failure,
+              evidence: [observed],
+              evidenceStepPosition: null,
+              error: failure,
+              recovery: "new_explicit_request",
+              recoverableUntil: new Date(
+                Date.parse(observed.observedAt) + OPERATION_DETAIL_RETENTION_MILLIS,
+              ).toISOString(),
+            },
+          );
+          if (!claimed) {
+            const refreshed = yield* store.getOperation(stored.record.requestId);
+            return refreshed?.record ?? record;
+          }
+          yield* signalCompletion(stored.record.requestId);
+          const refreshed = yield* store.getOperation(stored.record.requestId);
+          return refreshed?.record ?? record;
+        });
+
+      const reconcileWorktreeDiscardOutcome = (
+        stored: StoredOperation,
+        record: OperationRecord,
+        outcome: WorktreeDiscardReconciliation,
+      ): Effect.Effect<OperationRecord, LocalStoreError> =>
+        Match.value(outcome).pipe(
+          Match.when({ kind: "unknown" }, ({ detail }) =>
+            markOutcomeUnknown(stored, record, detail, stored.intent),
+          ),
+          Match.when({ kind: "branch_missing" }, ({ branch }) =>
+            Effect.gen(function* () {
+              const stepsRevision = yield* markUnconfirmedWorktreeDiscardSteps(
+                stored,
+                record,
+                record.revision,
+              );
+              if (stepsRevision === null) {
+                const refreshed = yield* store.getOperation(stored.record.requestId);
+                return refreshed?.record ?? record;
+              }
+              return yield* failWorktreeDiscardBranchRetention(
+                stored,
+                record,
+                branch,
+                stepsRevision,
+              );
+            }),
+          ),
+          Match.when({ kind: "absent" }, ({ branch }) =>
+            completeWorktreeDiscardReconciliation(stored, record, branch, record.revision),
+          ),
+          Match.exhaustive,
+        );
+
+      const reconcileWorktreeDiscard = (
+        stored: StoredOperation,
+        record: OperationRecord,
+        previousOwner: boolean,
+        previousOwnerStale: boolean,
+      ): Effect.Effect<OperationRecord, LocalStoreError> =>
+        Effect.gen(function* () {
+          if (previousOwner && !previousOwnerStale) return record;
+          if (record.dispatch === "not_dispatched" || record.dispatch === "rejected") {
+            return yield* failUnsentWorktreeDiscard(stored, record);
+          }
+          if (!(yield* shouldReconcileWorktreeDiscard(record))) return record;
+          const outcome = yield* inspectWorktreeDiscardReconciliation(stored);
+          return yield* reconcileWorktreeDiscardOutcome(stored, record, outcome);
         });
 
       const markApprovalNotDispatched = (
@@ -1798,9 +2342,13 @@ export class Operations extends Context.Service<Operations, OperationsService>()
             details: {},
           };
           const claimed = yield* store.compareAndSetOperationDispatch(
-            stored.record.requestId,
-            stored.ownerProcessNonce,
-            record.state,
+            {
+              requestId: stored.record.requestId,
+              ownerProcessNonce: stored.ownerProcessNonce,
+              tool: "approval_respond",
+              state: record.state,
+              dispatch: "not_dispatched",
+            },
             {
               now: observed.observedAt,
               state: "failed",
@@ -1842,9 +2390,13 @@ export class Operations extends Context.Service<Operations, OperationsService>()
             details: {},
           };
           const claimed = yield* store.compareAndSetOperationDispatch(
-            stored.record.requestId,
-            stored.ownerProcessNonce,
-            "pending",
+            {
+              requestId: stored.record.requestId,
+              ownerProcessNonce: stored.ownerProcessNonce,
+              tool: "approval_respond",
+              state: "pending",
+              dispatch: "unknown",
+            },
             {
               now: observed.observedAt,
               intent: stored.intent,
@@ -1859,7 +2411,6 @@ export class Operations extends Context.Service<Operations, OperationsService>()
               recovery: "observe_operation",
               recoverableUntil: null,
             },
-            "unknown",
           );
           if (!claimed) {
             const refreshed = yield* store.getOperation(stored.record.requestId);
@@ -2161,7 +2712,12 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           if (record.tool === "thread_stop_session") {
             return yield* reconcileThreadSessionStop(stored, previousOwner, previousOwnerStale);
           }
-          if (terminal(record)) return record;
+          if (
+            terminal(record) &&
+            !(record.tool === "worktree_discard" && record.state === "outcome_unknown")
+          ) {
+            return record;
+          }
           if (record.tool === "instance_pair") {
             const inspection = yield* store.inspectRegistration(stored.intent.instanceId);
             if (inspection.state === "present") {
@@ -2243,6 +2799,15 @@ export class Operations extends Context.Service<Operations, OperationsService>()
               previousOwner
                 ? "An earlier process left this dispatched submission unresolved past the observation window. Its outcome is unknown and it was not redispatched."
                 : "The current process has no live dispatch for this submission. Its outcome is unknown and it was not redispatched.",
+            );
+          }
+          if (record.tool === "worktree_discard") {
+            if (terminal(record) && record.state !== "outcome_unknown") return record;
+            return yield* reconcileWorktreeDiscard(
+              stored,
+              record,
+              previousOwner,
+              previousOwnerStale,
             );
           }
           if (record.tool === "worktree_create") {
@@ -3959,6 +4524,95 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           Match.exhaustive,
         );
 
+      const worktreeDiscardFailure = (
+        error: LocalStoreError | T3CodeAdapterError | ObservationError,
+      ): ToolFailure =>
+        Match.value(error).pipe(
+          Match.tag("LocalStoreError", operationFailure),
+          Match.tag("T3CodeAdapterError", (adapterError) =>
+            adapterErrorFailure(adapterError, "worktree"),
+          ),
+          Match.tag("ObservationError", observationErrorFailure),
+          Match.exhaustive,
+        );
+
+      const worktreeDiscardNoEffect = (
+        error: LocalStoreError | T3CodeAdapterError | ObservationError,
+      ): boolean =>
+        Match.value(error).pipe(
+          Match.tag("LocalStoreError", () => true),
+          Match.tag(
+            "T3CodeAdapterError",
+            (adapterError) => !adapterError.uncertain && adapterError.kind !== "upstream_failure",
+          ),
+          Match.tag("ObservationError", () => true),
+          Match.exhaustive,
+        );
+
+      const worktreeDiscardFailureKinds = {
+        accepted: {
+          knownNoEffect: false,
+          state: "outcome_unknown",
+          dispatch: "accepted",
+          stepState: "outcome_unknown",
+          recovery: "observe_operation",
+          evidenceDetail:
+            "The discard response was accepted, but final absence evidence is unavailable; recovery is read-only and will not repeat it.",
+        },
+        rejected: {
+          knownNoEffect: true,
+          state: "failed",
+          dispatch: "rejected",
+          stepState: "failed",
+          recovery: "new_explicit_request",
+          evidenceDetail: "T3Code rejected the remove attempt without an uncertain effect.",
+        },
+        not_dispatched: {
+          knownNoEffect: true,
+          state: "failed",
+          dispatch: "not_dispatched",
+          stepState: "failed",
+          recovery: "new_explicit_request",
+          evidenceDetail: "The discard stopped before an upstream removal effect was confirmed.",
+        },
+        unknown: {
+          knownNoEffect: false,
+          state: "outcome_unknown",
+          dispatch: "unknown",
+          stepState: "outcome_unknown",
+          recovery: "observe_operation",
+          evidenceDetail:
+            "The discard may have reached T3Code; recovery is read-only and will not repeat it.",
+        },
+      } as const;
+
+      const worktreeDiscardFailureKind = (options: {
+        readonly error: LocalStoreError | T3CodeAdapterError | ObservationError;
+        readonly dispatchStarted: boolean;
+        readonly dispatchAccepted: boolean;
+      }): keyof typeof worktreeDiscardFailureKinds => {
+        if (options.dispatchAccepted) return "accepted";
+        if (!options.dispatchStarted) return "not_dispatched";
+        return worktreeDiscardNoEffect(options.error) ? "rejected" : "unknown";
+      };
+
+      const worktreeDiscardFailureProgress = (options: {
+        readonly error: LocalStoreError | T3CodeAdapterError | ObservationError;
+        readonly dispatchStarted: boolean;
+        readonly dispatchAccepted: boolean;
+        readonly now: string;
+      }) => {
+        const kind = worktreeDiscardFailureKind(options);
+        const shape = worktreeDiscardFailureKinds[kind];
+        return {
+          failure: worktreeDiscardFailure(options.error),
+          ...shape,
+          recoverableUntil: shape.knownNoEffect
+            ? new Date(Date.parse(options.now) + OPERATION_DETAIL_RETENTION_MILLIS).toISOString()
+            : null,
+        };
+      };
+
       const finishWorktreeCreation = (
         requestId: string,
         reference: WorktreeCreationReference,
@@ -4086,6 +4740,378 @@ export class Operations extends Context.Service<Operations, OperationsService>()
         );
       };
 
+      const recordWorktreeDiscardOutcome = (
+        input: WorktreeDiscardInput,
+        branch: string,
+        intent: OperationIntent,
+        persist: (
+          expectation: Pick<OperationDispatchExpectation, "state" | "dispatch">,
+          update: OperationUpdate,
+        ) => Effect.Effect<void, LocalStoreError | WorktreeDiscardClaimLost>,
+      ): Effect.Effect<
+        void,
+        LocalStoreError | T3CodeAdapterError | ObservationError | WorktreeDiscardClaimLost
+      > =>
+        Effect.gen(function* () {
+          const refs = yield* connections.discoverVcsWorktreeRefs(
+            input.worktree.instanceId,
+            input.worktree.repositoryPath,
+          );
+          if (
+            !refs.isRepo ||
+            refs.truncated ||
+            refs.limitations.length > 0 ||
+            refs.localBranches === undefined
+          ) {
+            return yield* Effect.fail(
+              new ObservationError({
+                kind: "boundary_missing",
+                message:
+                  refs.limitations[0] ??
+                  "A complete fresh local-ref inventory was unavailable after the remove response.",
+              }),
+            );
+          }
+          const remaining = refs.refs.filter(
+            (ref) => ref.worktreePath === input.worktree.worktreePath,
+          );
+          if (remaining.length > 0) {
+            return yield* Effect.fail(
+              new ObservationError({
+                kind: "stale_generation",
+                message:
+                  "A checkout still occupies the requested path after the remove response; it may be a replacement checkout, so the operation will not apply the old intent again.",
+              }),
+            );
+          }
+          yield* requireWorktreeDiscardPathAbsent(
+            input.worktree.instanceId,
+            input.worktree.worktreePath,
+          );
+          if (!refs.localBranches.includes(branch)) {
+            const observed = yield* evidence(
+              `A fresh complete VCS inventory shows the checkout absent, but branch ${branch} was not observed retained.`,
+              "snapshot",
+            );
+            const failure: ToolFailure = {
+              code: "upstream_failure",
+              message: "The worktree checkout is absent, but its branch was not observed retained.",
+              retry: "reconcile_first",
+              details: {},
+            };
+            yield* persist(
+              { state: "pending", dispatch: "accepted" },
+              {
+                now: observed.observedAt,
+                state: "partial",
+                dispatch: "accepted",
+                target: input.worktree,
+                stepPosition: 4,
+                stepState: "failed",
+                stepError: failure,
+                evidence: [observed],
+                evidenceStepPosition: 4,
+                error: failure,
+                recovery: "inspect_target",
+                recoverableUntil: new Date(
+                  Date.parse(observed.observedAt) + OPERATION_DETAIL_RETENTION_MILLIS,
+                ).toISOString(),
+              },
+            );
+            yield* signalCompletion(input.requestId);
+            return;
+          }
+
+          const confirmed = yield* evidence(
+            `A fresh complete VCS inventory confirms ${input.worktree.worktreePath} is absent and local branch ${branch} remains.`,
+            "snapshot",
+          );
+          yield* persist(
+            { state: "pending", dispatch: "accepted" },
+            {
+              now: confirmed.observedAt,
+              intent: { ...intent, branch },
+              state: "completed",
+              dispatch: "accepted",
+              target: input.worktree,
+              stepPosition: 4,
+              stepState: "succeeded",
+              evidence: [confirmed],
+              evidenceStepPosition: 4,
+              error: null,
+              recovery: "none",
+              recoverableUntil: new Date(
+                Date.parse(confirmed.observedAt) + OPERATION_DETAIL_RETENTION_MILLIS,
+              ).toISOString(),
+            },
+          );
+          yield* signalCompletion(input.requestId);
+        });
+
+      const executeWorktreeDiscard = (
+        input: WorktreeDiscardInput,
+        checkOrphan: WorktreeDiscardCheck,
+      ): Effect.Effect<void, never> => {
+        let stepPosition = 0;
+        let branch: string | null = null;
+        let dispatchStarted = false;
+        let dispatchAccepted = false;
+        let operationState: OperationRecord["state"] = "admitted";
+        let operationDispatch: OperationRecord["dispatch"] = "not_dispatched";
+        let operationRevision: number | null = null;
+        const worktree = input.worktree;
+        const intent: OperationIntent = {
+          instanceId: worktree.instanceId,
+          repositoryPath: worktree.repositoryPath,
+          worktreePath: worktree.worktreePath,
+        };
+        const compareAndSet = (
+          expectation: Pick<OperationDispatchExpectation, "state" | "dispatch">,
+          update: OperationUpdate,
+        ) =>
+          store
+            .compareAndSetOperationDispatch(
+              {
+                requestId: input.requestId,
+                ownerProcessNonce: processNonce,
+                tool: "worktree_discard",
+                ...expectation,
+                ...(operationRevision === null ? {} : { revision: operationRevision }),
+              },
+              update,
+            )
+            .pipe(
+              Effect.map((claimed) => {
+                if (claimed) {
+                  operationState = update.state ?? expectation.state;
+                  operationDispatch = update.dispatch ?? expectation.dispatch;
+                  if (operationRevision !== null) operationRevision += 1;
+                }
+                return claimed;
+              }),
+            );
+        const persist = (
+          expectation: Pick<OperationDispatchExpectation, "state" | "dispatch">,
+          update: OperationUpdate,
+        ) =>
+          compareAndSet(expectation, update).pipe(
+            Effect.flatMap((claimed) =>
+              claimed ? Effect.void : Effect.fail(new WorktreeDiscardClaimLost()),
+            ),
+          );
+
+        return Effect.gen(function* () {
+          const current = yield* store.getOperation(input.requestId);
+          if (current === null) {
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: "request_record_unavailable",
+                message: REQUEST_RECORD_UNAVAILABLE_MESSAGE,
+              }),
+            );
+          }
+          operationRevision = current.record.revision;
+          const admitted = yield* evidence(
+            "Worktree discard admission was committed; this process owns the guarded attempt.",
+            "adapter_inference",
+          );
+          yield* persist(
+            { state: "admitted", dispatch: "not_dispatched" },
+            {
+              now: admitted.observedAt,
+              intent,
+              state: "pending",
+              dispatch: "not_dispatched",
+              target: worktree,
+              stepPosition,
+              stepState: "pending",
+              evidence: [admitted],
+              evidenceStepPosition: stepPosition,
+              recovery: "observe_operation",
+            },
+          );
+
+          const initialCheck = yield* checkOrphan();
+          branch = initialCheck.branch;
+          const initialEvidence = yield* evidence(
+            `Fresh VCS identity and complete active/archived thread inventories show ${worktree.worktreePath} on branch ${branch} with zero thread references.`,
+            "snapshot",
+          );
+          yield* persist(
+            { state: "pending", dispatch: "not_dispatched" },
+            {
+              now: initialEvidence.observedAt,
+              intent: { ...intent, branch },
+              state: "pending",
+              dispatch: "not_dispatched",
+              target: worktree,
+              stepPosition,
+              stepState: "succeeded",
+              evidence: [...initialCheck.evidence, initialEvidence],
+              evidenceStepPosition: stepPosition,
+              recovery: "observe_operation",
+            },
+          );
+
+          stepPosition = 1;
+          const finalCheck = yield* checkOrphan();
+          if (finalCheck.branch !== branch) {
+            return yield* Effect.fail(
+              new ObservationError({
+                kind: "stale_generation",
+                message:
+                  "The worktree branch changed between the initial orphan check and the final pre-dispatch check.",
+              }),
+            );
+          }
+          if (
+            finalCheck.registration.revision !== initialCheck.registration.revision ||
+            finalCheck.registration.environmentId !== initialCheck.registration.environmentId
+          ) {
+            return yield* Effect.fail(
+              new ObservationError({
+                kind: "stale_generation",
+                message:
+                  "The saved instance registration changed between orphan verification and dispatch.",
+              }),
+            );
+          }
+          const finalEvidence = yield* evidence(
+            `A second fresh check immediately before dispatch confirms branch ${branch} and zero active or archived thread references.`,
+            "snapshot",
+          );
+          yield* persist(
+            { state: "pending", dispatch: "not_dispatched" },
+            {
+              now: finalEvidence.observedAt,
+              intent: { ...intent, branch },
+              state: "pending",
+              dispatch: "not_dispatched",
+              target: worktree,
+              stepPosition,
+              stepState: "succeeded",
+              evidence: [...finalCheck.evidence, finalEvidence],
+              evidenceStepPosition: stepPosition,
+              recovery: "observe_operation",
+            },
+          );
+
+          stepPosition = 2;
+          const dispatchMarker = yield* evidence(
+            "The single VCS remove attempt is crossing its dispatch boundary; recovery must observe state and never resend it.",
+            "adapter_inference",
+          );
+          yield* persist(
+            { state: "pending", dispatch: "not_dispatched" },
+            {
+              now: dispatchMarker.observedAt,
+              intent: { ...intent, branch },
+              state: "pending",
+              dispatch: "unknown",
+              target: worktree,
+              stepPosition,
+              stepState: "pending",
+              evidence: [dispatchMarker],
+              evidenceStepPosition: stepPosition,
+              recovery: "observe_operation",
+            },
+          );
+          yield* connections.removeWorktree(worktree, finalCheck.registration, () => {
+            dispatchStarted = true;
+          });
+          dispatchAccepted = true;
+
+          const dispatched = yield* evidence(
+            "The T3Code VCS remove RPC returned successfully; a separate fresh inventory is required to establish absence.",
+            "adapter_inference",
+          );
+          yield* persist(
+            { state: "pending", dispatch: "unknown" },
+            {
+              now: dispatched.observedAt,
+              state: "pending",
+              dispatch: "accepted",
+              target: worktree,
+              stepPosition,
+              stepState: "succeeded",
+              evidence: [dispatched],
+              evidenceStepPosition: stepPosition,
+              recovery: "observe_operation",
+            },
+          );
+
+          stepPosition = 3;
+          const response = yield* evidence(
+            "T3Code acknowledged the forced checkout removal request; this reply alone does not establish that the checkout is absent.",
+            "rpc_result",
+          );
+          yield* persist(
+            { state: "pending", dispatch: "accepted" },
+            {
+              now: response.observedAt,
+              state: "pending",
+              dispatch: "accepted",
+              target: worktree,
+              stepPosition,
+              stepState: "succeeded",
+              evidence: [response],
+              evidenceStepPosition: stepPosition,
+              recovery: "observe_operation",
+            },
+          );
+
+          stepPosition = 4;
+          yield* recordWorktreeDiscardOutcome(input, branch, intent, persist);
+        }).pipe(
+          Effect.catchTags({
+            WorktreeDiscardClaimLost: () => signalCompletion(input.requestId),
+          }),
+          Effect.catch((error: LocalStoreError | T3CodeAdapterError | ObservationError) =>
+            nowIso.pipe(
+              Effect.flatMap((now) => {
+                const progress = worktreeDiscardFailureProgress({
+                  error,
+                  dispatchStarted,
+                  dispatchAccepted,
+                  now,
+                });
+                const evidenceItem: Evidence = {
+                  kind: "adapter_inference",
+                  observedAt: now,
+                  sourceSequence: null,
+                  nativeEventId: null,
+                  detail: progress.evidenceDetail,
+                };
+                return compareAndSet(
+                  { state: operationState, dispatch: operationDispatch },
+                  {
+                    now,
+                    intent: branch === null ? intent : { ...intent, branch },
+                    state: progress.state,
+                    dispatch: progress.dispatch,
+                    target: worktree,
+                    stepPosition,
+                    stepState: progress.stepState,
+                    stepError: progress.failure,
+                    evidence: [evidenceItem],
+                    evidenceStepPosition: stepPosition,
+                    error: progress.failure,
+                    recovery: progress.recovery,
+                    recoverableUntil: progress.recoverableUntil,
+                  },
+                ).pipe(
+                  Effect.flatMap(() =>
+                    signalCompletion(input.requestId).pipe(Effect.catch(() => Effect.void)),
+                  ),
+                  Effect.catch(() => Effect.void),
+                );
+              }),
+            ),
+          ),
+          Effect.asVoid,
+        );
+      };
+
       const executeApprovalResponse = (
         input: ApprovalRespondInput,
         commandId: string,
@@ -4125,9 +5151,13 @@ export class Operations extends Context.Service<Operations, OperationsService>()
             "adapter_inference",
           );
           const claimed = yield* store.compareAndSetOperationDispatch(
-            input.requestId,
-            processNonce,
-            "admitted",
+            {
+              requestId: input.requestId,
+              ownerProcessNonce: processNonce,
+              tool: "approval_respond",
+              state: "admitted",
+              dispatch: "not_dispatched",
+            },
             {
               now: admitted.observedAt,
               intent,
@@ -4154,9 +5184,13 @@ export class Operations extends Context.Service<Operations, OperationsService>()
             onDispatch: Effect.gen(function* () {
               const dispatchAt = yield* nowIso;
               const claimed = yield* store.compareAndSetOperationDispatch(
-                input.requestId,
-                processNonce,
-                "pending",
+                {
+                  requestId: input.requestId,
+                  ownerProcessNonce: processNonce,
+                  tool: "approval_respond",
+                  state: "pending",
+                  dispatch: "not_dispatched",
+                },
                 {
                   now: dispatchAt,
                   state: "pending",
@@ -4376,9 +5410,13 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           Effect.flatMap((now) =>
             store
               .compareAndSetOperationDispatch(
-                input.requestId,
-                processNonce,
-                options.expectedState,
+                {
+                  requestId: input.requestId,
+                  ownerProcessNonce: processNonce,
+                  tool: "input_respond",
+                  state: options.expectedState,
+                  dispatch: options.expectedDispatch,
+                },
                 {
                   now,
                   intent: inputResponseIntent(input),
@@ -4395,7 +5433,6 @@ export class Operations extends Context.Service<Operations, OperationsService>()
                       ? new Date(Date.parse(now) + OPERATION_DETAIL_RETENTION_MILLIS).toISOString()
                       : null,
                 },
-                options.expectedDispatch,
               )
               .pipe(Effect.asVoid),
           ),
@@ -4555,9 +5592,13 @@ export class Operations extends Context.Service<Operations, OperationsService>()
             "adapter_inference",
           );
           const claimedAdmission = yield* store.compareAndSetOperationDispatch(
-            input.requestId,
-            processNonce,
-            "admitted",
+            {
+              requestId: input.requestId,
+              ownerProcessNonce: processNonce,
+              tool: "input_respond",
+              state: "admitted",
+              dispatch: "not_dispatched",
+            },
             {
               now: admitted.observedAt,
               intent: inputResponseIntent(input),
@@ -4570,7 +5611,6 @@ export class Operations extends Context.Service<Operations, OperationsService>()
               evidenceStepPosition: 0,
               recovery: "observe_thread",
             },
-            "not_dispatched",
           );
           if (!claimedAdmission) {
             yield* signalCompletion(input.requestId);
@@ -4612,9 +5652,13 @@ export class Operations extends Context.Service<Operations, OperationsService>()
             "snapshot",
           );
           const claimedValidation = yield* store.compareAndSetOperationDispatch(
-            input.requestId,
-            processNonce,
-            "pending",
+            {
+              requestId: input.requestId,
+              ownerProcessNonce: processNonce,
+              tool: "input_respond",
+              state: "pending",
+              dispatch: "not_dispatched",
+            },
             {
               now: validated.observedAt,
               intent: inputResponseIntent(input),
@@ -4625,7 +5669,6 @@ export class Operations extends Context.Service<Operations, OperationsService>()
               evidenceStepPosition: 0,
               recovery: "observe_operation",
             },
-            "not_dispatched",
           );
           if (!claimedValidation) {
             yield* signalCompletion(input.requestId);
@@ -4647,9 +5690,13 @@ export class Operations extends Context.Service<Operations, OperationsService>()
             "adapter_inference",
           );
           const claimedDispatch = yield* store.compareAndSetOperationDispatch(
-            input.requestId,
-            processNonce,
-            "pending",
+            {
+              requestId: input.requestId,
+              ownerProcessNonce: processNonce,
+              tool: "input_respond",
+              state: "pending",
+              dispatch: "not_dispatched",
+            },
             {
               now: dispatchEvidence.observedAt,
               intent: inputResponseIntent(input),
@@ -4663,7 +5710,6 @@ export class Operations extends Context.Service<Operations, OperationsService>()
               evidenceStepPosition: 1,
               recovery: "observe_operation",
             },
-            "not_dispatched",
           );
           if (!claimedDispatch) {
             yield* signalCompletion(input.requestId);
@@ -4906,6 +5952,50 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           });
         });
 
+      const discardWorktree = (
+        input: WorktreeDiscardInput,
+        checkOrphan: WorktreeDiscardCheck,
+      ): Effect.Effect<
+        OperationRecord,
+        LocalStoreError | OperationServiceError | T3CodeAdapterError | ObservationError
+      > =>
+        Effect.gen(function* () {
+          const fingerprint = yield* store.fingerprintRequest("worktree_discard", input);
+          const existing = yield* findExistingOperation(input.requestId, fingerprint);
+          if (existing !== null) return existing;
+          if (input.removeSoleThread !== undefined) {
+            return yield* Effect.fail(
+              new OperationServiceError({
+                kind: "unsupported_worktree_discard_variant",
+                message:
+                  "Combined thread removal and worktree discard is not available yet. Remove the thread with thread_remove, then make a separate explicit worktree_discard request.",
+              }),
+            );
+          }
+
+          const { worktree } = input;
+          return yield* admitAndRun({
+            requestId: input.requestId,
+            fingerprint,
+            tool: "worktree_discard",
+            intent: {
+              instanceId: worktree.instanceId,
+              repositoryPath: worktree.repositoryPath,
+              worktreePath: worktree.worktreePath,
+            },
+            target: worktree,
+            completionMeans: "worktree_absent",
+            steps: [
+              "check_orphan_eligibility",
+              "recheck_orphan_eligibility",
+              "dispatch_worktree_remove",
+              "record_worktree_remove_response",
+              "confirm_worktree_absence",
+            ],
+            execute: executeWorktreeDiscard(input, checkOrphan),
+          });
+        });
+
       const admitApprovalResponse = (
         input: ApprovalRespondInput,
         fingerprint: string,
@@ -5023,6 +6113,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
         respondToInput,
         submitThread,
         createWorktree,
+        discardWorktree,
         respondToApproval,
         interruptThread,
         stopThreadSession,

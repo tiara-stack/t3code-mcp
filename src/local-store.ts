@@ -11,7 +11,6 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Predicate from "effect/Predicate";
 import * as Result from "effect/Result";
-import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as SqlError from "effect/unstable/sql/SqlError";
@@ -78,6 +77,7 @@ import {
 } from "./domain";
 import type { InstanceListPage, InstanceSummary } from "./domain";
 import { databaseDirectory, LocalStoreConfig, normalizeLocalStoreConfig } from "./config";
+import { makeBoundedJitteredRetrySchedule } from "./retry-schedule";
 import type { LocalStoreConfigValue } from "./config";
 import {
   MIGRATION_NAME,
@@ -748,6 +748,15 @@ type GuardedOperationUpdate = OperationUpdate & {
   readonly onlyIfNonterminal?: true;
 };
 
+export interface OperationDispatchExpectation {
+  readonly requestId: string;
+  readonly ownerProcessNonce: string;
+  readonly tool: "approval_respond" | "input_respond" | "worktree_discard";
+  readonly state: OperationRecord["state"];
+  readonly dispatch: OperationRecord["dispatch"];
+  readonly revision?: number;
+}
+
 export type RegistrationInspection =
   | { readonly state: "present"; readonly registration: InstanceSummary }
   | { readonly state: "removed"; readonly removedByRequestId: string | null }
@@ -941,11 +950,8 @@ export interface LocalStoreService {
     update: OperationUpdate,
   ) => Effect.Effect<void, LocalStoreError>;
   readonly compareAndSetOperationDispatch: (
-    requestId: string,
-    ownerProcessNonce: string,
-    expectedState: "admitted" | "pending",
+    expectation: OperationDispatchExpectation,
     update: OperationUpdate,
-    expectedDispatch?: "not_dispatched" | "unknown",
   ) => Effect.Effect<boolean, LocalStoreError>;
   readonly compareAndUpdateOperation: (
     requestId: string,
@@ -1347,20 +1353,14 @@ export class LocalStore extends Context.Service<LocalStore, LocalStoreService>()
           );
 
         const compareAndSetOperationDispatch = (
-          requestId: string,
-          ownerProcessNonce: string,
-          expectedState: "admitted" | "pending",
+          expectation: OperationDispatchExpectation,
           update: OperationUpdate,
-          expectedDispatch?: "not_dispatched" | "unknown",
         ) =>
           compareAndSetOperationDispatchInDatabase(
             sql,
-            requestId,
-            ownerProcessNonce,
-            expectedState,
+            expectation,
             update,
             verifySchemaForOperation,
-            expectedDispatch,
           );
 
         const inspectRegistration = (instanceId: string) =>
@@ -1413,8 +1413,8 @@ export class LocalStore extends Context.Service<LocalStore, LocalStoreService>()
           admitOperation,
           getOperation,
           updateOperation,
-          compareAndSetOperationDispatch,
           compareAndUpdateOperation,
+          compareAndSetOperationDispatch,
           inspectRegistration,
           removeRegistration,
           recordTurnEvidence,
@@ -1516,13 +1516,7 @@ const initializeDatabase = Effect.gen(function* () {
   ),
 );
 
-const startupRetrySchedule = Schedule.exponential("25 millis").pipe(
-  Schedule.jittered,
-  Schedule.modifyDelay(({ duration }) =>
-    Effect.succeed(Duration.millis(Math.min(250, Math.max(25, Duration.toMillis(duration))))),
-  ),
-  Schedule.upTo({ duration: "5 seconds" }),
-);
+const startupRetrySchedule = makeBoundedJitteredRetrySchedule(5_000);
 
 const storageRetrySchedule = startupRetrySchedule;
 
@@ -4907,11 +4901,7 @@ const updateOperationWithOwnerExpectationInDatabase = (
   requestId: string,
   update: GuardedOperationUpdate,
   verify: SchemaVerifier,
-  expectation?: {
-    readonly ownerProcessNonce: string;
-    readonly state: "admitted" | "pending";
-    readonly dispatch?: "not_dispatched" | "unknown";
-  },
+  expectation?: OperationDispatchExpectation,
 ): Effect.Effect<boolean, LocalStoreError> =>
   retryStorage(
     Effect.gen(function* () {
@@ -4956,9 +4946,11 @@ const updateOperationWithOwnerExpectationInDatabase = (
           }
           if (
             expectation !== undefined &&
-            (row.owner_process_nonce !== expectation.ownerProcessNonce ||
+            (row.tool !== expectation.tool ||
+              row.owner_process_nonce !== expectation.ownerProcessNonce ||
               row.state !== expectation.state ||
-              row.dispatch !== (expectation.dispatch ?? "not_dispatched"))
+              row.dispatch !== expectation.dispatch ||
+              (expectation.revision !== undefined && Number(row.revision) !== expectation.revision))
           ) {
             return false;
           }
@@ -5081,18 +5073,17 @@ const updateOperationInDatabase = (
 
 const compareAndSetOperationDispatchInDatabase = (
   sql: SqlClient.SqlClient,
-  requestId: string,
-  ownerProcessNonce: string,
-  expectedState: "admitted" | "pending",
+  expectation: OperationDispatchExpectation,
   update: OperationUpdate,
   verify: SchemaVerifier,
-  expectedDispatch?: "not_dispatched" | "unknown",
 ): Effect.Effect<boolean, LocalStoreError> =>
-  updateOperationWithOwnerExpectationInDatabase(sql, requestId, update, verify, {
-    ownerProcessNonce,
-    state: expectedState,
-    ...(expectedDispatch === undefined ? {} : { dispatch: expectedDispatch }),
-  });
+  updateOperationWithOwnerExpectationInDatabase(
+    sql,
+    expectation.requestId,
+    update,
+    verify,
+    expectation,
+  );
 
 const inspectRegistrationInDatabase = (
   sql: SqlClient.SqlClient,

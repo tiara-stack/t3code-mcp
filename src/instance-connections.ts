@@ -12,6 +12,7 @@ import type {
   InstanceDetails,
   InteractionMode,
   RuntimeMode,
+  WorktreeReference,
 } from "./domain";
 import { MAX_INSTANCE_RPC_CAPACITY, REVISION_POLL_INTERVAL_MILLIS } from "./domain";
 import { LocalStore, LocalStoreError } from "./local-store";
@@ -144,6 +145,11 @@ export interface InstanceConnectionsService {
   readonly prepareThreadSessionStop: (
     instanceId: string,
   ) => Effect.Effect<PreparedThreadSessionStop, LocalStoreError | T3CodeAdapterError>;
+  readonly removeWorktree: (
+    worktree: WorktreeReference,
+    expectedRegistration: Pick<InstanceConnection, "revision" | "environmentId">,
+    onDispatchStart: () => void,
+  ) => Effect.Effect<void, LocalStoreError | T3CodeAdapterError>;
   /**
    * Read the VCS refs for one repository path on the target instance, keeping
    * only refs that report a worktree checkout. A missing registration or an
@@ -222,12 +228,20 @@ export class InstanceConnections extends Context.Service<
   static readonly layerTest = (
     service: Omit<
       InstanceConnectionsService,
-      "respondToInput" | "dispatchTurn" | "interruptThread" | "prepareThreadSessionStop"
+      | "respondToInput"
+      | "dispatchTurn"
+      | "interruptThread"
+      | "prepareThreadSessionStop"
+      | "removeWorktree"
     > &
       Partial<
         Pick<
           InstanceConnectionsService,
-          "respondToInput" | "dispatchTurn" | "interruptThread" | "prepareThreadSessionStop"
+          | "respondToInput"
+          | "dispatchTurn"
+          | "interruptThread"
+          | "prepareThreadSessionStop"
+          | "removeWorktree"
         >
       >,
   ): Layer.Layer<InstanceConnections> =>
@@ -280,6 +294,17 @@ export class InstanceConnections extends Context.Service<
                 }),
               ),
           })),
+      removeWorktree:
+        service.removeWorktree ??
+        (() =>
+          Effect.fail(
+            new T3CodeAdapterError({
+              kind: "capacity",
+              message: "The test connection does not support worktree removal.",
+              uncertain: false,
+              status: null,
+            }),
+          )),
     });
 
   static readonly layerWithAdapter = (adapterLayer: Layer.Layer<T3CodeAdapter>) =>
@@ -1011,6 +1036,49 @@ export class InstanceConnections extends Context.Service<
               }),
             );
           });
+
+        const removeWorktree = (
+          worktree: WorktreeReference,
+          expectedRegistration: Pick<InstanceConnection, "revision" | "environmentId">,
+          onDispatchStart: () => void,
+        ) =>
+          Effect.gen(function* () {
+            const { instanceId } = worktree;
+            yield* requireReadableRegistration(
+              instanceId,
+              "The saved registration requires pairing before worktrees can be removed.",
+            );
+            const connection = yield* acquire(instanceId);
+            if (
+              connection.revision !== expectedRegistration.revision ||
+              connection.environmentId !== expectedRegistration.environmentId
+            ) {
+              return yield* Effect.fail(
+                new T3CodeAdapterError({
+                  kind: "identity_mismatch",
+                  message:
+                    "The saved instance registration changed after orphan verification; worktree removal was not dispatched.",
+                  uncertain: false,
+                  status: null,
+                }),
+              );
+            }
+            yield* withInstanceCapacity(
+              instanceId,
+              Effect.suspend(() => {
+                // Keep dispatch on this verified connection snapshot. A later
+                // registration update cannot retarget the removal to another
+                // endpoint after the identity check above.
+                onDispatchStart();
+                return adapter.removeWorktree({
+                  endpoint: connection.endpoint,
+                  credential: connection.credential,
+                  repositoryPath: worktree.repositoryPath,
+                  worktreePath: worktree.worktreePath,
+                });
+              }),
+            );
+          });
         return InstanceConnections.of({
           exchangePairingCode,
           verifyCredential,
@@ -1023,6 +1091,7 @@ export class InstanceConnections extends Context.Service<
           discoverModels,
           createWorktree,
           prepareThreadSessionStop,
+          removeWorktree,
           discoverVcsRefs,
           readVcsWorktreeStatus,
           discoverVcsWorktreeRefs,

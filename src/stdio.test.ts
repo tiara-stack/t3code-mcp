@@ -122,6 +122,7 @@ describe("stdio transport", () => {
               "worktree_list",
               "thread_list",
               "worktree_inspect",
+              "worktree_discard",
               "thread_get",
               "thread_submit",
               "approval_respond",
@@ -138,6 +139,14 @@ describe("stdio transport", () => {
             ).toMatchObject({
               readOnlyHint: false,
               destructiveHint: false,
+              idempotentHint: false,
+            });
+            expect(
+              toolsMessage.result?.tools?.find((tool) => tool.name === "worktree_discard")
+                ?.annotations,
+            ).toMatchObject({
+              readOnlyHint: false,
+              destructiveHint: true,
               idempotentHint: false,
             });
             for (const tool of toolsMessage.result?.tools ?? []) {

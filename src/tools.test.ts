@@ -5,6 +5,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
@@ -13,7 +14,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { LocalStore, LocalStoreError } from "./local-store";
+import { LocalStore, LocalStoreError, type LocalStoreService } from "./local-store";
 import {
   InstanceConnections,
   type DiscoveredVcsRefs,
@@ -70,6 +71,16 @@ const withDatabasePath = <A, E, R>(
     ({ directory }) => Effect.sync(() => rmSync(directory, { recursive: true, force: true })),
   );
 
+const withDatabaseSync = <A, E, R>(
+  databasePath: string,
+  use: (database: DatabaseSync) => Effect.Effect<A, E, R>,
+): Effect.Effect<A, E, R> =>
+  Effect.acquireUseRelease(
+    Effect.sync(() => new DatabaseSync(databasePath)),
+    use,
+    (database) => Effect.sync(() => database.close()),
+  );
+
 const approvalResponseUnavailable = () =>
   new T3CodeAdapterError({
     kind: "capacity",
@@ -95,6 +106,15 @@ const unsupportedVcsAdapterMethods = {
       new T3CodeAdapterError({
         kind: "transport",
         message: "This test adapter does not list VCS refs.",
+        uncertain: false,
+        status: null,
+      }),
+    ),
+  removeWorktree: () =>
+    Effect.fail(
+      new T3CodeAdapterError({
+        kind: "transport",
+        message: "This test adapter does not remove worktrees.",
         uncertain: false,
         status: null,
       }),
@@ -292,6 +312,7 @@ const fakeConnections = (options?: {
         }),
       ),
     createWorktree: () => Effect.die("not used"),
+    removeWorktree: () => Effect.die("not used"),
     respondToApproval: failApprovalResponse,
     invalidate: () => Effect.void,
   });
@@ -313,6 +334,7 @@ const fakeAdapterLayer = (
     input: DispatchTurnInput,
   ) => Effect.Effect<DispatchTurnResult, T3CodeAdapterError>,
   verificationFailure?: T3CodeAdapterError,
+  removeWorktree: T3CodeAdapterService["removeWorktree"] = () => Effect.die("not used"),
 ) =>
   T3CodeAdapter.layerTest({
     exchangePairingCode: () =>
@@ -388,6 +410,7 @@ const fakeAdapterLayer = (
     respondToInput: () => Effect.die("not used"),
     ...unsupportedVcsAdapterMethods,
     createWorktree,
+    removeWorktree,
     respondToApproval: failApprovalResponse,
     listVcsRefs: () =>
       Effect.fail(
@@ -414,6 +437,95 @@ const callTool = (name: string, input: unknown) =>
     const stream = yield* toolkit.handle(name as never, input as never);
     return yield* Stream.runCollect(stream);
   });
+
+describe("InstanceConnections.removeWorktree", () => {
+  it.live("refuses removal after the verified registration changes", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        let removeCalls = 0;
+        const adapter = fakeAdapterLayer(
+          { current: null },
+          {
+            "https://initial.test": "environment-initial",
+            "https://replacement.test": "environment-replacement",
+          },
+          undefined,
+          ({ endpoint }) =>
+            Effect.succeed({
+              environmentId:
+                endpoint === "https://initial.test"
+                  ? "environment-initial"
+                  : "environment-replacement",
+              serverVersion: "0.0.38",
+              scopes: ["orchestration:read", "orchestration:operate"],
+              capabilities: {},
+            }),
+          undefined,
+          undefined,
+          () =>
+            Effect.sync(() => {
+              removeCalls += 1;
+            }),
+        );
+        const layer = InstanceConnections.layerWithAdapter(adapter).pipe(
+          Layer.provideMerge(LocalStore.layer({ databasePath })),
+        );
+        const worktree = {
+          instanceId: "registration-race",
+          repositoryPath: "/repositories/initial",
+          worktreePath: "/worktrees/orphan",
+        };
+        let dispatchStarted = false;
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            const store = yield* LocalStore;
+            yield* store.putRegistration({
+              instanceId: worktree.instanceId,
+              alias: "Initial",
+              endpoint: "https://initial.test",
+              environmentId: "environment-initial",
+              connection: "connected",
+              lastObservedAt: null,
+              credential: "initial-token",
+            });
+            const connections = yield* InstanceConnections;
+            const checkedRegistration = yield* connections.acquire(worktree.instanceId);
+            yield* store.putRegistration({
+              instanceId: worktree.instanceId,
+              alias: "Replacement",
+              endpoint: "https://replacement.test",
+              environmentId: "environment-replacement",
+              connection: "connected",
+              lastObservedAt: null,
+              credential: "replacement-token",
+            });
+            const removal = yield* Effect.result(
+              connections.removeWorktree(
+                worktree,
+                {
+                  revision: checkedRegistration.revision,
+                  environmentId: checkedRegistration.environmentId,
+                },
+                () => {
+                  dispatchStarted = true;
+                },
+              ),
+            );
+            return { removal, removeCalls };
+          }).pipe(Effect.provide(layer)),
+        );
+
+        expect(Result.isFailure(result.removal)).toBe(true);
+        if (Result.isFailure(result.removal)) {
+          expect(result.removal.failure).toMatchObject({ kind: "identity_mismatch" });
+        }
+        expect(result.removeCalls).toBe(0);
+        expect(dispatchStarted).toBe(false);
+      }),
+    ),
+  );
+});
 
 describe("InstanceConnections.dispatchTurn", () => {
   it.live("passes the bound environment ID and marks native send start", () =>
@@ -1694,6 +1806,7 @@ describe("instance_pair_again", () => {
           }),
         ),
       createWorktree: () => Effect.die("not used"),
+      removeWorktree: () => Effect.die("not used"),
       respondToApproval: failApprovalResponse,
       invalidate: () => Effect.void,
     });
@@ -2104,6 +2217,7 @@ describe("instance_pair_again", () => {
               }),
             ),
           createWorktree: () => Effect.die("not used"),
+          removeWorktree: () => Effect.die("not used"),
           respondToApproval: failApprovalResponse,
           invalidate: () => Effect.void,
         });
@@ -5094,6 +5208,14 @@ interface ThreadFixtureOptions {
   >;
   respondToInput?: InstanceConnectionsService["respondToInput"];
   acquire?: InstanceConnectionsService["acquire"];
+  vcsWorktreeRefStreams?: Readonly<
+    Record<
+      string,
+      (
+        repositoryPath: string,
+      ) => Effect.Effect<DiscoveredVcsWorktreeRefs, LocalStoreError | T3CodeAdapterError>
+    >
+  >;
   approvalResponse?: (input: {
     readonly instanceId: string;
     readonly threadId: string;
@@ -5107,6 +5229,15 @@ interface ThreadFixtureOptions {
   vcsStatusFailures?: Readonly<Record<string, T3CodeAdapterError>>;
   vcsStatuses?: Readonly<Record<string, ObservedVcsWorktreeStatus>>;
   vcsRefs?: Readonly<Record<string, DiscoveredVcsWorktreeRefs>>;
+  removeWorktree?: (
+    worktree: {
+      readonly instanceId: string;
+      readonly repositoryPath: string;
+      readonly worktreePath: string;
+    },
+    expectedRegistration: Pick<InstanceConnection, "revision" | "environmentId">,
+  ) => Effect.Effect<void, LocalStoreError | T3CodeAdapterError>;
+  removeWorktreeBeforeDispatchFailure?: T3CodeAdapterError;
   readonly seenActive: Array<string>;
   readonly seenArchived: Array<string>;
   readonly seenThreads: Array<string>;
@@ -5279,6 +5410,8 @@ const threadConnections = (options: ThreadFixtureOptions) =>
         : Effect.succeed(status);
     },
     discoverVcsWorktreeRefs: (instanceId: string, repositoryPath: string) => {
+      const scripted = options.vcsWorktreeRefStreams?.[instanceId];
+      if (scripted !== undefined) return scripted(repositoryPath);
       const refs = options.vcsRefs?.[JSON.stringify([instanceId, repositoryPath])];
       return refs === undefined
         ? Effect.fail(
@@ -5366,6 +5499,25 @@ const threadConnections = (options: ThreadFixtureOptions) =>
           )
         : options.respondToInput(input),
     createWorktree: () => Effect.die("not used"),
+    removeWorktree: (worktree, expectedRegistration, onDispatchStart) => {
+      if (options.removeWorktreeBeforeDispatchFailure !== undefined) {
+        return Effect.fail(options.removeWorktreeBeforeDispatchFailure);
+      }
+      if (options.removeWorktree === undefined) {
+        return Effect.fail(
+          new T3CodeAdapterError({
+            kind: "capacity",
+            message: "The thread test connection does not remove worktrees.",
+            uncertain: false,
+            status: null,
+          }),
+        );
+      }
+      return Effect.suspend(() => {
+        onDispatchStart();
+        return options.removeWorktree!(worktree, expectedRegistration);
+      });
+    },
     respondToApproval: <E>(
       input: ApprovalResponseCommand & {
         readonly instanceId: string;
@@ -7368,6 +7520,1491 @@ const detailSnapshotStream = (
     },
     { kind: "synchronized" as const },
   );
+
+describe("worktree_discard", () => {
+  const configureWorktree = (
+    options: ThreadFixtureOptions,
+    worktree: {
+      readonly instanceId: string;
+      readonly repositoryPath: string;
+      readonly worktreePath: string;
+    },
+    branch: string,
+    at: string,
+    activeThreads: ReadonlyArray<ReturnType<typeof shellThreadFixture>> = [],
+    archivedThreads: ReadonlyArray<ReturnType<typeof shellThreadFixture>> = [],
+  ) => {
+    options.activeStreams = {
+      [worktree.instanceId]: () =>
+        Stream.make(
+          shellSnapshotItem(
+            61,
+            [shellProjectFixture("project-a", worktree.repositoryPath)],
+            activeThreads,
+          ),
+          shellSynchronizedItem,
+        ),
+    };
+    options.archivedShells = {
+      [worktree.instanceId]: () =>
+        Effect.succeed({
+          snapshotSequence: 62,
+          projects: [shellProjectFixture("project-a", worktree.repositoryPath)],
+          threads: archivedThreads,
+          observedAt: at,
+        }),
+    };
+    options.vcsStatuses = {
+      [JSON.stringify([worktree.instanceId, worktree.worktreePath])]: {
+        isRepo: true,
+        branch,
+        hasWorkingTreeChanges: false,
+        changedFiles: 0,
+        stagedFiles: null,
+        untrackedFiles: null,
+        hasUpstream: true,
+        ahead: 0,
+        behind: 0,
+        limitations: [],
+        observedAt: at,
+      },
+    };
+    options.vcsRefs = {
+      [JSON.stringify([worktree.instanceId, worktree.repositoryPath])]: {
+        isRepo: true,
+        refs: [{ branch, worktreePath: worktree.worktreePath }],
+        localBranches: [branch],
+        limitations: [],
+        truncated: false,
+        observedAt: at,
+      },
+    };
+  };
+
+  const markWorktreePathAbsent = (
+    options: ThreadFixtureOptions,
+    worktree: { readonly instanceId: string; readonly worktreePath: string },
+  ) => {
+    const statusKey = JSON.stringify([worktree.instanceId, worktree.worktreePath]);
+    const status = options.vcsStatuses?.[statusKey];
+    if (status === undefined) throw new Error("missing VCS status fixture");
+    options.vcsStatuses = {
+      ...options.vcsStatuses,
+      [statusKey]: {
+        ...status,
+        isRepo: false,
+        branch: null,
+        hasWorkingTreeChanges: false,
+        changedFiles: null,
+        hasUpstream: false,
+        ahead: null,
+        behind: null,
+      },
+    };
+  };
+
+  const seedDispatchingDiscard = (input: {
+    readonly store: LocalStoreService;
+    readonly requestId: string;
+    readonly worktree: {
+      readonly instanceId: string;
+      readonly repositoryPath: string;
+      readonly worktreePath: string;
+    };
+    readonly branch: string;
+    readonly admittedAt: string;
+    readonly processNonce?: string;
+  }) =>
+    Effect.gen(function* () {
+      const request = { requestId: input.requestId, worktree: input.worktree };
+      const intent = {
+        instanceId: input.worktree.instanceId,
+        repositoryPath: input.worktree.repositoryPath,
+        worktreePath: input.worktree.worktreePath,
+        branch: input.branch,
+      };
+      const fingerprint = yield* input.store.fingerprintRequest("worktree_discard", request);
+      yield* input.store.admitOperation({
+        requestId: input.requestId,
+        tool: "worktree_discard",
+        fingerprint,
+        processNonce: input.processNonce ?? "crashed-process",
+        admittedAt: input.admittedAt,
+        intent,
+        completionMeans: "worktree_absent",
+        target: input.worktree,
+        steps: [
+          "check_orphan_eligibility",
+          "recheck_orphan_eligibility",
+          "dispatch_worktree_remove",
+          "record_worktree_remove_response",
+          "confirm_worktree_absence",
+        ],
+      });
+      const checkEvidence = {
+        kind: "snapshot" as const,
+        observedAt: input.admittedAt,
+        sourceSequence: null,
+        nativeEventId: null,
+        detail: `Fresh inventories verified orphan branch ${input.branch}.`,
+      };
+      yield* input.store.updateOperation(input.requestId, {
+        now: input.admittedAt,
+        intent,
+        state: "pending",
+        dispatch: "not_dispatched",
+        target: input.worktree,
+        stepPosition: 0,
+        stepState: "succeeded",
+        evidence: [checkEvidence],
+        evidenceStepPosition: 0,
+        recovery: "observe_operation",
+      });
+      yield* input.store.updateOperation(input.requestId, {
+        now: input.admittedAt,
+        intent,
+        state: "pending",
+        dispatch: "not_dispatched",
+        target: input.worktree,
+        stepPosition: 1,
+        stepState: "succeeded",
+        evidence: [checkEvidence],
+        evidenceStepPosition: 1,
+        recovery: "observe_operation",
+      });
+      yield* input.store.updateOperation(input.requestId, {
+        now: input.admittedAt,
+        intent,
+        state: "pending",
+        dispatch: "unknown",
+        target: input.worktree,
+        stepPosition: 2,
+        stepState: "pending",
+        recovery: "observe_operation",
+      });
+      return request;
+    });
+
+  it.live("discards a freshly verified orphan while retaining its branch", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/repo",
+          worktreePath: "/srv/worktrees/orphan",
+        };
+        const at = "2026-09-24T03:30:00.000Z";
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(
+                41,
+                [shellProjectFixture("project-a", worktree.repositoryPath)],
+                [],
+              ),
+              shellSynchronizedItem,
+            ),
+        };
+        options.archivedShells = {
+          "instance-a": () =>
+            Effect.succeed({
+              snapshotSequence: 42,
+              projects: [shellProjectFixture("project-a", worktree.repositoryPath)],
+              threads: [],
+              observedAt: at,
+            }),
+        };
+        options.vcsStatuses = {
+          [JSON.stringify([worktree.instanceId, worktree.worktreePath])]: {
+            isRepo: true,
+            branch: "feature/orphan",
+            hasWorkingTreeChanges: true,
+            changedFiles: 2,
+            stagedFiles: null,
+            untrackedFiles: null,
+            hasUpstream: false,
+            ahead: null,
+            behind: null,
+            limitations: [],
+            observedAt: at,
+          },
+        };
+        options.vcsRefs = {
+          [JSON.stringify([worktree.instanceId, worktree.repositoryPath])]: {
+            isRepo: true,
+            refs: [{ branch: "feature/orphan", worktreePath: worktree.worktreePath }],
+            localBranches: ["feature/orphan"],
+            limitations: [],
+            truncated: false,
+            observedAt: at,
+          },
+        };
+        let removeCalls = 0;
+        const vcsKey = JSON.stringify([worktree.instanceId, worktree.repositoryPath]);
+        options.removeWorktree = (target) => {
+          removeCalls += 1;
+          expect(target).toEqual(worktree);
+          const current = options.vcsRefs?.[vcsKey];
+          if (current === undefined) throw new Error("missing VCS refs fixture");
+          options.vcsRefs = {
+            ...options.vcsRefs,
+            [vcsKey]: { ...current, refs: [] },
+          };
+          markWorktreePathAbsent(options, worktree);
+          return Effect.void;
+        };
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const request = {
+              requestId: "discard-orphan",
+              worktree,
+            };
+            const discarded = yield* callTool("worktree_discard", request);
+            const replayed = yield* callTool("worktree_discard", request);
+            return { discarded, replayed };
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result.discarded[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              tool: "worktree_discard",
+              state: "completed",
+              completionMeans: "worktree_absent",
+              dispatch: "accepted",
+              target: worktree,
+              steps: [
+                { name: "check_orphan_eligibility", state: "succeeded" },
+                { name: "recheck_orphan_eligibility", state: "succeeded" },
+                { name: "dispatch_worktree_remove", state: "succeeded" },
+                { name: "record_worktree_remove_response", state: "succeeded" },
+                { name: "confirm_worktree_absence", state: "succeeded" },
+              ],
+            },
+          },
+        });
+        expect(result.replayed[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              tool: "worktree_discard",
+              state: "completed",
+              completionMeans: "worktree_absent",
+            },
+          },
+        });
+        expect(removeCalls).toBe(1);
+        expect(result.discarded[0]?.encodedResult).toEqual(result.discarded[0]?.result);
+      }),
+    ),
+  );
+
+  it.live("records a registration mismatch before removal dispatch", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/repo",
+          worktreePath: "/srv/worktrees/registration-changed",
+        };
+        const at = "2026-09-24T03:32:00.000Z";
+        configureWorktree(options, worktree, "feature/registration-changed", at);
+        let removeCalls = 0;
+        options.removeWorktree = () =>
+          Effect.sync(() => {
+            removeCalls += 1;
+          });
+        options.removeWorktreeBeforeDispatchFailure = new T3CodeAdapterError({
+          kind: "identity_mismatch",
+          message: "The saved registration changed after orphan verification.",
+          uncertain: false,
+          status: null,
+        });
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("worktree_discard", {
+              requestId: "discard-registration-changed",
+              worktree,
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "failed",
+              dispatch: "not_dispatched",
+              error: { code: "identity_mismatch" },
+              recovery: "new_explicit_request",
+            },
+          },
+        });
+        expect(removeCalls).toBe(0);
+      }),
+    ),
+  );
+
+  it.live("does not complete when the refs listing omits a live worktree path", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/repo",
+          worktreePath: "/srv/worktrees/omitted-live-checkout",
+        };
+        const at = "2026-09-24T03:35:00.000Z";
+        configureWorktree(options, worktree, "feature/omitted-live-checkout", at);
+        const vcsKey = JSON.stringify([worktree.instanceId, worktree.repositoryPath]);
+        let removeCalls = 0;
+        options.removeWorktree = () => {
+          removeCalls += 1;
+          const current = options.vcsRefs?.[vcsKey];
+          if (current === undefined) throw new Error("missing VCS refs fixture");
+          options.vcsRefs = {
+            ...options.vcsRefs,
+            [vcsKey]: { ...current, refs: [] },
+          };
+          return Effect.void;
+        };
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("worktree_discard", {
+              requestId: "discard-omitted-live-checkout",
+              worktree,
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              requestId: "discard-omitted-live-checkout",
+              state: "outcome_unknown",
+              dispatch: "accepted",
+              recovery: "observe_operation",
+            },
+          },
+        });
+        expect(removeCalls).toBe(1);
+      }),
+    ),
+  );
+
+  it.live(
+    "does not reconcile a missing refs entry as absence while the path is still a repository",
+    () =>
+      withDatabasePath((databasePath) =>
+        Effect.gen(function* () {
+          const { options, connections } = emptyThreadFixtures();
+          const worktree = {
+            instanceId: "instance-a",
+            repositoryPath: "/srv/repo",
+            worktreePath: "/srv/worktrees/reconcile-omitted-live-checkout",
+          };
+          const branch = "feature/reconcile-omitted-live-checkout";
+          const at = new Date(Date.now() - 3 * 60_000).toISOString();
+          configureWorktree(options, worktree, branch, at);
+          const vcsKey = JSON.stringify([worktree.instanceId, worktree.repositoryPath]);
+          const currentRefs = options.vcsRefs?.[vcsKey];
+          if (currentRefs === undefined) throw new Error("missing VCS refs fixture");
+          options.vcsRefs = { ...options.vcsRefs, [vcsKey]: { ...currentRefs, refs: [] } };
+          let removeCalls = 0;
+          options.removeWorktree = () => {
+            removeCalls += 1;
+            return Effect.void;
+          };
+
+          const result = yield* Effect.scoped(
+            Effect.gen(function* () {
+              yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+              const store = yield* LocalStore;
+              const request = yield* seedDispatchingDiscard({
+                store,
+                requestId: "discard-reconcile-omitted-live-checkout",
+                worktree,
+                branch,
+                admittedAt: at,
+              });
+              return yield* callTool("operation_get", { requestId: request.requestId });
+            }).pipe(Effect.provide(appLayer(databasePath, connections))),
+          );
+
+          expect(result[0]?.result).toMatchObject({
+            result: {
+              kind: "ok",
+              value: {
+                operation: {
+                  requestId: "discard-reconcile-omitted-live-checkout",
+                  state: "outcome_unknown",
+                  dispatch: "unknown",
+                  recovery: "observe_operation",
+                },
+              },
+            },
+          });
+          expect(removeCalls).toBe(0);
+        }),
+      ),
+  );
+
+  it.live("refuses an archived UI-created thread reference before dispatch", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/repo",
+          worktreePath: "/srv/worktrees/shared",
+        };
+        const at = "2026-09-24T03:40:00.000Z";
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(
+                51,
+                [shellProjectFixture("project-a", worktree.repositoryPath)],
+                [],
+              ),
+              shellSynchronizedItem,
+            ),
+        };
+        options.archivedShells = {
+          "instance-a": () =>
+            Effect.succeed({
+              snapshotSequence: 52,
+              projects: [shellProjectFixture("project-a", worktree.repositoryPath)],
+              threads: [
+                shellThreadFixture("archived-ui-thread", {
+                  archivedAt: "2026-09-23T00:00:00.000Z",
+                  worktreePath: worktree.worktreePath,
+                }),
+              ],
+              observedAt: at,
+            }),
+        };
+        options.vcsStatuses = {
+          [JSON.stringify([worktree.instanceId, worktree.worktreePath])]: {
+            isRepo: true,
+            branch: "feature/shared",
+            hasWorkingTreeChanges: false,
+            changedFiles: 0,
+            stagedFiles: null,
+            untrackedFiles: null,
+            hasUpstream: true,
+            ahead: 0,
+            behind: 0,
+            limitations: [],
+            observedAt: at,
+          },
+        };
+        options.vcsRefs = {
+          [JSON.stringify([worktree.instanceId, worktree.repositoryPath])]: {
+            isRepo: true,
+            refs: [{ branch: "feature/shared", worktreePath: worktree.worktreePath }],
+            localBranches: ["feature/shared"],
+            limitations: [],
+            truncated: false,
+            observedAt: at,
+          },
+        };
+        let removeCalls = 0;
+        options.removeWorktree = () => {
+          removeCalls += 1;
+          return Effect.void;
+        };
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("worktree_discard", {
+              requestId: "discard-shared",
+              worktree,
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              tool: "worktree_discard",
+              state: "failed",
+              dispatch: "not_dispatched",
+              error: { code: "shared_worktree" },
+            },
+          },
+        });
+        const discarded = result[0];
+        if (discarded === undefined) throw new Error("worktree_discard returned no response");
+        expect(
+          (
+            discarded.result as unknown as {
+              readonly result: { readonly value: { readonly steps: ReadonlyArray<unknown> } };
+            }
+          ).result.value.steps,
+        ).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ name: "check_orphan_eligibility", state: "failed" }),
+          ]),
+        );
+        expect(removeCalls).toBe(0);
+      }),
+    ),
+  );
+
+  it.live("explicitly refuses the unfinished combined thread-removal variant", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            const refused = yield* callTool("worktree_discard", {
+              requestId: "discard-with-thread",
+              worktree: {
+                instanceId: "instance-a",
+                repositoryPath: "/srv/repo",
+                worktreePath: "/srv/worktrees/feature-a",
+              },
+              removeSoleThread: {
+                instanceId: "instance-a",
+                threadId: "thread-a",
+              },
+            });
+            const lookup = yield* callTool("operation_get", {
+              requestId: "discard-with-thread",
+            });
+            return { refused, lookup };
+          }).pipe(Effect.provide(appLayer(databasePath))),
+        );
+
+        expect(result.refused[0]?.result).toMatchObject({
+          result: {
+            kind: "error",
+            error: {
+              code: "invalid_argument",
+              message: expect.stringContaining("Combined thread removal and worktree discard"),
+            },
+          },
+        });
+        expect(result.lookup[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "request_record_unavailable" } },
+        });
+      }),
+    ),
+  );
+
+  it.live("rejects unknown worktree_discard and removeSoleThread fields", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/repo",
+          worktreePath: "/srv/worktrees/strict-input",
+        };
+        const exits = yield* Effect.all(
+          [
+            Effect.exit(
+              callTool("worktree_discard", {
+                requestId: "discard-unknown-top-level",
+                worktree,
+                unexpected: true,
+              }).pipe(Effect.provide(appLayer(databasePath))),
+            ),
+            Effect.exit(
+              callTool("worktree_discard", {
+                requestId: "discard-unknown-thread-field",
+                worktree,
+                removeSoleThread: {
+                  instanceId: "instance-a",
+                  threadId: "thread-a",
+                  unexpected: true,
+                },
+              }).pipe(Effect.provide(appLayer(databasePath))),
+            ),
+          ],
+          { concurrency: 1 },
+        );
+
+        for (const exit of exits) {
+          expect(Exit.isFailure(exit)).toBe(true);
+          if (Exit.isSuccess(exit)) continue;
+          expect(String(exit.cause)).toContain("Invalid parameters for tool 'worktree_discard'");
+        }
+      }),
+    ),
+  );
+
+  it.live("refuses when the archived thread inventory is unavailable", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/repo",
+          worktreePath: "/srv/worktrees/unavailable-archive",
+        };
+        const at = "2026-09-24T04:00:00.000Z";
+        configureWorktree(options, worktree, "feature/archive", at);
+        options.archivedShells = {
+          "instance-a": () =>
+            Effect.fail(
+              new T3CodeAdapterError({
+                kind: "transport",
+                message: "The archived inventory is unavailable.",
+                uncertain: false,
+                status: null,
+              }),
+            ),
+        };
+        let removeCalls = 0;
+        options.removeWorktree = () => {
+          removeCalls += 1;
+          return Effect.void;
+        };
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("worktree_discard", {
+              requestId: "discard-unavailable-archive",
+              worktree,
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "failed",
+              dispatch: "not_dispatched",
+              error: { code: "unavailable" },
+            },
+          },
+        });
+        expect(removeCalls).toBe(0);
+      }),
+    ),
+  );
+
+  it.effect("bounds the orphan guard when archived synchronization hangs", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/repo",
+          worktreePath: "/srv/worktrees/hung-archive",
+        };
+        configureWorktree(options, worktree, "feature/hung-archive", new Date().toISOString());
+        const archiveReadStarted = yield* Deferred.make<void>();
+        options.archivedShells = {
+          "instance-a": () =>
+            Effect.gen(function* () {
+              yield* Deferred.succeed(archiveReadStarted, undefined);
+              return yield* Effect.never;
+            }),
+        };
+        let removeCalls = 0;
+        options.removeWorktree = () => {
+          removeCalls += 1;
+          return Effect.void;
+        };
+
+        const operation = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const caller = yield* Effect.forkScoped(
+              callTool("worktree_discard", {
+                requestId: "discard-hung-archive",
+                worktree,
+              }),
+            );
+            yield* Deferred.await(archiveReadStarted);
+            yield* TestClock.adjust(Duration.millis(60_000));
+            yield* Fiber.join(caller);
+            return yield* callTool("operation_get", { requestId: "discard-hung-archive" });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(operation[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              operation: {
+                requestId: "discard-hung-archive",
+                state: "failed",
+                dispatch: "not_dispatched",
+                error: { code: "unavailable" },
+              },
+            },
+          },
+        });
+        expect(removeCalls).toBe(0);
+      }),
+    ),
+  );
+
+  it.live("refuses an oversized complete thread-reference inventory", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/repo",
+          worktreePath: "/srv/worktrees/oversized",
+        };
+        const at = "2026-09-24T04:01:00.000Z";
+        const activeThreads = Array.from({ length: 129 }, (_, index) =>
+          shellThreadFixture(`thread-${index}`, { worktreePath: worktree.worktreePath }),
+        );
+        configureWorktree(options, worktree, "feature/oversized", at, activeThreads);
+        let removeCalls = 0;
+        options.removeWorktree = () => {
+          removeCalls += 1;
+          return Effect.void;
+        };
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("worktree_discard", {
+              requestId: "discard-oversized",
+              worktree,
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "failed",
+              dispatch: "not_dispatched",
+              error: { code: "uncheckable_target" },
+            },
+          },
+        });
+        expect(removeCalls).toBe(0);
+      }),
+    ),
+  );
+
+  it.live("rechecks for a UI-created reference immediately before dispatch", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/repo",
+          worktreePath: "/srv/worktrees/ui-race",
+        };
+        const at = "2026-09-24T04:02:00.000Z";
+        configureWorktree(options, worktree, "feature/ui-race", at);
+        let activeReads = 0;
+        options.activeStreams = {
+          "instance-a": () => {
+            activeReads += 1;
+            const threads =
+              activeReads === 1
+                ? []
+                : [
+                    shellThreadFixture("ui-created-active", {
+                      settledOverride: "active",
+                      worktreePath: worktree.worktreePath,
+                    }),
+                  ];
+            return Stream.make(
+              shellSnapshotItem(
+                70 + activeReads,
+                [shellProjectFixture("project-a", worktree.repositoryPath)],
+                threads,
+              ),
+              shellSynchronizedItem,
+            );
+          },
+        };
+        let removeCalls = 0;
+        options.removeWorktree = () => {
+          removeCalls += 1;
+          return Effect.void;
+        };
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("worktree_discard", {
+              requestId: "discard-ui-race",
+              worktree,
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "failed",
+              dispatch: "not_dispatched",
+              error: { code: "shared_worktree" },
+            },
+          },
+        });
+        expect(removeCalls).toBe(0);
+      }),
+    ),
+  );
+
+  it.live("does not remove a worktree after another process wins the pre-dispatch claim", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/repo",
+          worktreePath: "/srv/worktrees/lost-dispatch-claim",
+        };
+        const at = new Date().toISOString();
+        configureWorktree(options, worktree, "feature/lost-claim", at);
+        let archivedReads = 0;
+        options.archivedShells = {
+          "instance-a": () =>
+            Effect.gen(function* () {
+              archivedReads += 1;
+              if (archivedReads === 2) {
+                const now = new Date().toISOString();
+                const failure = {
+                  code: "unavailable",
+                  message: "A recovering process claimed this discard before dispatch.",
+                  retry: "change_request",
+                  details: {},
+                };
+                yield* withDatabaseSync(databasePath, (database) =>
+                  Effect.sync(() => {
+                    database.exec("PRAGMA busy_timeout = 5000");
+                    database
+                      .prepare(
+                        "UPDATE operations SET revision = revision + 1, state = 'failed', updated_at = ?, recoverable_until = ?, dispatch = 'not_dispatched', error_json = ?, recovery = 'new_explicit_request' WHERE request_id = ?",
+                      )
+                      .run(
+                        now,
+                        new Date(Date.parse(now) + THIRTY_DAYS_MILLIS).toISOString(),
+                        JSON.stringify(failure),
+                        "discard-lost-dispatch-claim",
+                      );
+                  }),
+                );
+              }
+              return {
+                snapshotSequence: 62,
+                projects: [shellProjectFixture("project-a", worktree.repositoryPath)],
+                threads: [],
+                observedAt: at,
+              };
+            }),
+        };
+        let removeCalls = 0;
+        options.removeWorktree = () => {
+          removeCalls += 1;
+          return Effect.void;
+        };
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("worktree_discard", {
+              requestId: "discard-lost-dispatch-claim",
+              worktree,
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(archivedReads).toBe(2);
+        expect(removeCalls).toBe(0);
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              requestId: "discard-lost-dispatch-claim",
+              tool: "worktree_discard",
+              state: "failed",
+              dispatch: "not_dispatched",
+              recovery: "new_explicit_request",
+            },
+          },
+        });
+      }),
+    ),
+  );
+
+  it.live("does not apply an old discard request to a replacement checkout at the same path", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/repo",
+          worktreePath: "/srv/worktrees/reused-path",
+        };
+        const at = "2026-09-24T04:03:00.000Z";
+        configureWorktree(options, worktree, "feature/original", at);
+        const vcsKey = JSON.stringify([worktree.instanceId, worktree.repositoryPath]);
+        let removeCalls = 0;
+        options.removeWorktree = () => {
+          removeCalls += 1;
+          const current = options.vcsRefs?.[vcsKey];
+          if (current === undefined) throw new Error("missing VCS refs fixture");
+          options.vcsRefs = {
+            ...options.vcsRefs,
+            [vcsKey]: {
+              ...current,
+              refs: [{ branch: "feature/replacement", worktreePath: worktree.worktreePath }],
+              localBranches: ["feature/original", "feature/replacement"],
+            },
+          };
+          return Effect.void;
+        };
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const request = {
+              requestId: "discard-reused-path",
+              worktree,
+            };
+            const first = yield* callTool("worktree_discard", request);
+            const replayed = yield* callTool("worktree_discard", request);
+            return { first, replayed };
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        for (const response of [result.first, result.replayed]) {
+          expect(response[0]?.result).toMatchObject({
+            result: {
+              kind: "ok",
+              value: {
+                state: "outcome_unknown",
+                dispatch: "accepted",
+              },
+            },
+          });
+        }
+        expect(removeCalls).toBe(1);
+      }),
+    ),
+  );
+
+  it.live("reconciles a lost remove reply from confirmed absence without replaying the RPC", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/repo",
+          worktreePath: "/srv/worktrees/lost-reply",
+        };
+        const at = new Date(Date.now() - 3 * 60_000).toISOString();
+        const branch = "feature/lost-reply";
+        configureWorktree(options, worktree, branch, at);
+        const vcsKey = JSON.stringify([worktree.instanceId, worktree.repositoryPath]);
+        const originalRefs = options.vcsRefs?.[vcsKey];
+        if (originalRefs === undefined) throw new Error("missing VCS refs fixture");
+        options.vcsRefs = {
+          ...options.vcsRefs,
+          [vcsKey]: { ...originalRefs, refs: [] },
+        };
+        options.vcsStatusFailures = {
+          [JSON.stringify([worktree.instanceId, worktree.worktreePath])]: new T3CodeAdapterError({
+            kind: "resource_not_found",
+            message: "The removed worktree path no longer resolves to a repository.",
+            uncertain: false,
+            status: null,
+          }),
+        };
+        let removeCalls = 0;
+        options.removeWorktree = () => {
+          removeCalls += 1;
+          return Effect.void;
+        };
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            const store = yield* LocalStore;
+            const input = yield* seedDispatchingDiscard({
+              store,
+              requestId: "discard-lost-reply",
+              worktree,
+              branch,
+              admittedAt: at,
+            });
+            const recovered = yield* callTool("operation_get", { requestId: input.requestId });
+            const replayed = yield* callTool("worktree_discard", input);
+            return { recovered, replayed };
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        const recovered = result.recovered[0];
+        if (recovered === undefined) throw new Error("operation_get returned no response");
+        const recoveredOperation = (
+          recovered.result as unknown as {
+            readonly result: {
+              readonly value: {
+                readonly operation: {
+                  readonly state: string;
+                  readonly dispatch: string;
+                  readonly completionMeans: string;
+                  readonly steps: ReadonlyArray<{
+                    readonly name: string;
+                    readonly state: string;
+                    readonly evidence: ReadonlyArray<{ readonly kind: string }>;
+                  }>;
+                };
+              };
+            };
+          }
+        ).result.value.operation;
+        expect(recoveredOperation).toMatchObject({
+          state: "completed",
+          dispatch: "unknown",
+          completionMeans: "worktree_absent",
+        });
+        const recoveredSteps = new Map(recoveredOperation.steps.map((step) => [step.name, step]));
+        expect(recoveredSteps.get("dispatch_worktree_remove")).toMatchObject({
+          state: "outcome_unknown",
+          evidence: [expect.objectContaining({ kind: "adapter_inference" })],
+        });
+        expect(recoveredSteps.get("record_worktree_remove_response")).toMatchObject({
+          state: "skipped",
+          evidence: [expect.objectContaining({ kind: "adapter_inference" })],
+        });
+        expect(recoveredSteps.get("confirm_worktree_absence")).toMatchObject({
+          state: "already_absent",
+          evidence: [expect.objectContaining({ kind: "snapshot" })],
+        });
+        expect(result.replayed[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: { state: "completed", dispatch: "unknown" },
+          },
+        });
+        expect(removeCalls).toBe(0);
+      }),
+    ),
+  );
+
+  it.live("leaves a replacement checkout untouched during restart reconciliation", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/repo",
+          worktreePath: "/srv/worktrees/replaced-after-crash",
+        };
+        const branch = "feature/original-after-crash";
+        const at = new Date(Date.now() - 3 * 60_000).toISOString();
+        configureWorktree(options, worktree, branch, at);
+        const vcsKey = JSON.stringify([worktree.instanceId, worktree.repositoryPath]);
+        const currentRefs = options.vcsRefs?.[vcsKey];
+        if (currentRefs === undefined) throw new Error("missing VCS refs fixture");
+        const replacementRefs = {
+          ...currentRefs,
+          refs: [
+            { branch: "feature/replacement-after-crash", worktreePath: worktree.worktreePath },
+          ],
+          localBranches: [branch, "feature/replacement-after-crash"],
+        };
+        options.vcsRefs = { ...options.vcsRefs, [vcsKey]: replacementRefs };
+        let vcsRefReads = 0;
+        options.vcsWorktreeRefStreams = {
+          "instance-a": () =>
+            Effect.sync(() => {
+              vcsRefReads += 1;
+              return replacementRefs;
+            }),
+        };
+        let removeCalls = 0;
+        options.removeWorktree = () => {
+          removeCalls += 1;
+          return Effect.void;
+        };
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            const store = yield* LocalStore;
+            const input = yield* seedDispatchingDiscard({
+              store,
+              requestId: "discard-replaced-after-crash",
+              worktree,
+              branch,
+              admittedAt: at,
+            });
+            for (const stepPosition of [2, 3, 4]) {
+              yield* store.updateOperation(input.requestId, {
+                now: at,
+                state: "pending",
+                dispatch: "unknown",
+                stepPosition,
+                stepState: "succeeded",
+                recovery: "observe_operation",
+              });
+            }
+            yield* store.updateOperation(input.requestId, {
+              now: at,
+              state: "outcome_unknown",
+              dispatch: "unknown",
+              evidence: [
+                {
+                  kind: "adapter_inference",
+                  observedAt: at,
+                  sourceSequence: null,
+                  nativeEventId: null,
+                  detail:
+                    "A checkout currently occupies the recorded path. The prior discard does not authorize removal of a checkout that may have replaced it, so no RPC was repeated.",
+                },
+              ],
+              evidenceStepPosition: null,
+              recovery: "observe_operation",
+            });
+            const recovered = yield* callTool("operation_get", { requestId: input.requestId });
+            const replayed = yield* callTool("worktree_discard", input);
+            yield* store.updateOperation(input.requestId, {
+              now: at,
+              evidence: [
+                {
+                  kind: "adapter_inference",
+                  observedAt: at,
+                  sourceSequence: null,
+                  nativeEventId: null,
+                  detail: "The receipt changed without changing its state or observed target.",
+                },
+              ],
+              evidenceStepPosition: null,
+            });
+            const afterRevisionChange = yield* callTool("operation_get", {
+              requestId: input.requestId,
+            });
+            const afterThrottle = yield* callTool("operation_get", {
+              requestId: input.requestId,
+            });
+            return { recovered, replayed, afterRevisionChange, afterThrottle };
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result.recovered[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              operation: {
+                state: "outcome_unknown",
+                dispatch: "unknown",
+                recovery: "observe_operation",
+                steps: expect.arrayContaining([
+                  expect.objectContaining({
+                    name: "check_orphan_eligibility",
+                    state: "succeeded",
+                  }),
+                  expect.objectContaining({
+                    name: "recheck_orphan_eligibility",
+                    state: "succeeded",
+                  }),
+                  expect.objectContaining({
+                    name: "dispatch_worktree_remove",
+                    state: "succeeded",
+                  }),
+                  expect.objectContaining({
+                    name: "record_worktree_remove_response",
+                    state: "succeeded",
+                  }),
+                  expect.objectContaining({
+                    name: "confirm_worktree_absence",
+                    state: "succeeded",
+                  }),
+                ]),
+              },
+            },
+          },
+        });
+        expect(result.replayed[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "outcome_unknown",
+              dispatch: "unknown",
+              recovery: "observe_operation",
+              steps: expect.arrayContaining([
+                expect.objectContaining({
+                  name: "check_orphan_eligibility",
+                  state: "succeeded",
+                }),
+                expect.objectContaining({
+                  name: "recheck_orphan_eligibility",
+                  state: "succeeded",
+                }),
+                expect.objectContaining({ name: "dispatch_worktree_remove", state: "succeeded" }),
+                expect.objectContaining({
+                  name: "record_worktree_remove_response",
+                  state: "succeeded",
+                }),
+                expect.objectContaining({ name: "confirm_worktree_absence", state: "succeeded" }),
+              ]),
+            },
+          },
+        });
+        for (const response of [result.afterRevisionChange, result.afterThrottle]) {
+          expect(response[0]?.result).toMatchObject({
+            result: {
+              kind: "ok",
+              value: {
+                operation: {
+                  state: "outcome_unknown",
+                  dispatch: "unknown",
+                },
+              },
+            },
+          });
+        }
+        expect(vcsRefReads).toBe(2);
+        expect(removeCalls).toBe(0);
+      }),
+    ),
+  );
+
+  it.live("does not regress a receipt completed during stale reconciliation", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/repo",
+          worktreePath: "/srv/worktrees/reconcile-receipt-race",
+        };
+        const branch = "feature/reconcile-receipt-race";
+        const at = new Date(Date.now() - 3 * 60_000).toISOString();
+        configureWorktree(options, worktree, branch, at);
+        options.vcsWorktreeRefStreams = {
+          "instance-a": () =>
+            withDatabaseSync(databasePath, (database) =>
+              Effect.sync(() => {
+                const now = new Date().toISOString();
+                database.exec("PRAGMA busy_timeout = 5000");
+                database
+                  .prepare(
+                    "UPDATE operations SET revision = revision + 1, state = 'completed', updated_at = ?, recoverable_until = ?, dispatch = 'accepted', error_json = NULL, recovery = 'none' WHERE request_id = ?",
+                  )
+                  .run(
+                    now,
+                    new Date(Date.parse(now) + THIRTY_DAYS_MILLIS).toISOString(),
+                    "discard-reconcile-receipt-race",
+                  );
+                return {
+                  isRepo: true,
+                  refs: [],
+                  localBranches: [branch],
+                  limitations: ["The listing is incomplete during the receipt race."],
+                  truncated: true,
+                  observedAt: now,
+                };
+              }),
+            ),
+        };
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const store = yield* LocalStore;
+            const request = yield* seedDispatchingDiscard({
+              store,
+              requestId: "discard-reconcile-receipt-race",
+              worktree,
+              branch,
+              admittedAt: at,
+            });
+            return yield* callTool("operation_get", { requestId: request.requestId });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              operation: {
+                requestId: "discard-reconcile-receipt-race",
+                state: "completed",
+                dispatch: "accepted",
+                recovery: "none",
+              },
+            },
+          },
+        });
+      }),
+    ),
+  );
+
+  it.live("reconciles an unknown post-dispatch result when a later complete listing arrives", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/repo",
+          worktreePath: "/srv/worktrees/later-listing",
+        };
+        const branch = "feature/later-listing";
+        const at = "2026-09-24T04:10:00.000Z";
+        configureWorktree(options, worktree, branch, at);
+        const vcsKey = JSON.stringify([worktree.instanceId, worktree.repositoryPath]);
+        let removeCalls = 0;
+        options.removeWorktree = () => {
+          removeCalls += 1;
+          const current = options.vcsRefs?.[vcsKey];
+          if (current === undefined) throw new Error("missing VCS refs fixture");
+          options.vcsRefs = {
+            ...options.vcsRefs,
+            [vcsKey]: {
+              ...current,
+              refs: [],
+              limitations: ["The first post-dispatch listing was incomplete."],
+              truncated: true,
+            },
+          };
+          markWorktreePathAbsent(options, worktree);
+          return Effect.void;
+        };
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const request = {
+              requestId: "discard-later-listing",
+              worktree,
+            };
+            const first = yield* callTool("worktree_discard", request);
+            const incomplete = options.vcsRefs?.[vcsKey];
+            if (incomplete === undefined) throw new Error("missing incomplete VCS refs fixture");
+            options.vcsRefs = {
+              ...options.vcsRefs,
+              [vcsKey]: { ...incomplete, limitations: [], truncated: false },
+            };
+            const recovered = yield* callTool("operation_get", {
+              requestId: request.requestId,
+            });
+            const replayed = yield* callTool("worktree_discard", request);
+            return { first, recovered, replayed };
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result.first[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "outcome_unknown",
+              dispatch: "accepted",
+              error: { code: "unavailable" },
+              recovery: "observe_operation",
+            },
+          },
+        });
+        expect(result.recovered[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              operation: {
+                state: "completed",
+                dispatch: "accepted",
+                completionMeans: "worktree_absent",
+              },
+            },
+          },
+        });
+        expect(result.replayed[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: { state: "completed", dispatch: "accepted" },
+          },
+        });
+        expect(removeCalls).toBe(1);
+      }),
+    ),
+  );
+
+  it.live("continues an admitted discard after the caller cancels its wait", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/repo",
+          worktreePath: "/srv/worktrees/cancelled-wait",
+        };
+        const at = "2026-09-24T04:11:00.000Z";
+        configureWorktree(options, worktree, "feature/cancelled-wait", at);
+        const dispatched = yield* Deferred.make<void>();
+        const reply = yield* Deferred.make<void>();
+        const vcsKey = JSON.stringify([worktree.instanceId, worktree.repositoryPath]);
+        let removeCalls = 0;
+        options.removeWorktree = () =>
+          Effect.gen(function* () {
+            removeCalls += 1;
+            yield* Deferred.succeed(dispatched, undefined);
+            yield* Deferred.await(reply);
+            const current = options.vcsRefs?.[vcsKey];
+            if (current === undefined) throw new Error("missing VCS refs fixture");
+            options.vcsRefs = {
+              ...options.vcsRefs,
+              [vcsKey]: { ...current, refs: [] },
+            };
+            markWorktreePathAbsent(options, worktree);
+          });
+
+        const completed = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const caller = yield* Effect.forkScoped(
+              callTool("worktree_discard", {
+                requestId: "discard-cancelled-wait",
+                worktree,
+              }),
+            );
+            yield* Deferred.await(dispatched);
+            yield* Fiber.interrupt(caller);
+            yield* Deferred.succeed(reply, undefined);
+            return yield* callTool("operation_get", {
+              requestId: "discard-cancelled-wait",
+              waitMs: 5_000,
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(removeCalls).toBe(1);
+        expect(completed[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              operation: {
+                tool: "worktree_discard",
+                state: "completed",
+                completionMeans: "worktree_absent",
+                dispatch: "accepted",
+              },
+            },
+          },
+        });
+      }),
+    ),
+  );
+});
 
 describe("worktree_inspect", () => {
   const hasSingleFreshInspectionFailure = (response: unknown): boolean => {

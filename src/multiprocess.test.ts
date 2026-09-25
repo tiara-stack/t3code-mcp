@@ -126,6 +126,7 @@ const startServer = async (databasePath: string): Promise<Server> => {
       "worktree_list",
       "thread_list",
       "worktree_inspect",
+      "worktree_discard",
       "thread_get",
       "thread_submit",
       "approval_respond",
@@ -924,6 +925,63 @@ describe("shared SQLite mutation admission", () => {
   );
 
   it.live(
+    "persists an orphan-discard admission for replay from another OS process",
+    () =>
+      withServers("t3code-mcp-worktree-discard-multiprocess-", ({ databasePath, servers }) =>
+        Effect.gen(function* () {
+          const [left, right] = yield* Effect.promise(() =>
+            Promise.all([startServer(databasePath), startServer(databasePath)]),
+          );
+          servers.add(left);
+          servers.add(right);
+          const request = {
+            requestId: "discard-multiprocess-request",
+            worktree: {
+              instanceId: "unregistered-discard-instance",
+              repositoryPath: "/remote/repository",
+              worktreePath: "/remote/worktrees/orphan",
+            },
+          };
+          const first = yield* Effect.promise(() => call(left, 3, "worktree_discard", request));
+          const replayed = yield* Effect.promise(() => call(right, 3, "worktree_discard", request));
+          const recovered = yield* Effect.promise(() =>
+            call(right, 4, "operation_get", { requestId: request.requestId }),
+          );
+
+          for (const response of [first, replayed]) {
+            expect(response.result?.structuredContent).toMatchObject({
+              result: {
+                kind: "ok",
+                value: {
+                  requestId: request.requestId,
+                  tool: "worktree_discard",
+                  state: "failed",
+                  dispatch: "not_dispatched",
+                  error: { code: "registration_not_found" },
+                },
+              },
+            });
+          }
+          expect(recovered.result?.structuredContent).toMatchObject({
+            result: {
+              kind: "ok",
+              value: {
+                operation: {
+                  requestId: request.requestId,
+                  tool: "worktree_discard",
+                  state: "failed",
+                  dispatch: "not_dispatched",
+                },
+                wait: "not_requested",
+              },
+            },
+          });
+        }),
+      ),
+    60000,
+  );
+
+  it.live(
     "recovers a completed receipt after the originating process exits",
     () =>
       withServers("t3code-mcp-recovery-", ({ databasePath, servers }) =>
@@ -1403,9 +1461,13 @@ describe("shared SQLite mutation admission", () => {
                 recovery: "observe_operation",
               });
               const wrongOwnerClaim = yield* store.compareAndSetOperationDispatch(
-                inputs[0]!.requestId,
-                "different-process-owner",
-                "pending",
+                {
+                  requestId: inputs[0]!.requestId,
+                  ownerProcessNonce: "different-process-owner",
+                  tool: "approval_respond",
+                  state: "pending",
+                  dispatch: "not_dispatched",
+                },
                 dispatchUpdate,
               );
               expect(wrongOwnerClaim).toBe(false);
@@ -1427,17 +1489,24 @@ describe("shared SQLite mutation admission", () => {
             Effect.gen(function* () {
               const store = yield* LocalStore;
               const notDispatchedClaim = yield* store.compareAndSetOperationDispatch(
-                inputs[0]!.requestId,
-                "approval-stale-test-owner",
-                "pending",
+                {
+                  requestId: inputs[0]!.requestId,
+                  ownerProcessNonce: "approval-stale-test-owner",
+                  tool: "approval_respond",
+                  state: "pending",
+                  dispatch: "not_dispatched",
+                },
                 dispatchUpdate,
               );
               const unknownClaim = yield* store.compareAndSetOperationDispatch(
-                inputs[1]!.requestId,
-                "approval-stale-test-owner",
-                "pending",
+                {
+                  requestId: inputs[1]!.requestId,
+                  ownerProcessNonce: "approval-stale-test-owner",
+                  tool: "approval_respond",
+                  state: "pending",
+                  dispatch: "unknown",
+                },
                 dispatchUpdate,
-                "unknown",
               );
               return {
                 notDispatchedClaim,

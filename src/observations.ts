@@ -39,6 +39,7 @@ export class ObservationError extends Data.TaggedError("ObservationError")<{
     | "ambiguous_target"
     | "uncheckable_target"
     | "repository_mismatch"
+    | "shared_worktree"
     | "stale_generation"
     | "retention_budget"
     | "subscription_capacity";
