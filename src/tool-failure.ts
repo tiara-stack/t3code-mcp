@@ -47,10 +47,20 @@ const sharedAdapterFailures = {
     retry: "safe_read",
     details: {},
   },
-  authorization: {
-    code: "read_denied",
-    retry: "change_request",
-    details: {},
+  authorization: (error: T3CodeAdapterError): AdapterFailureMapping => {
+    const requiredScopes = error.requiredScopes ?? [];
+    const canRePairForReviewScope = requiredScopes.includes("review:write");
+    return {
+      code: "read_denied",
+      retry: "change_request",
+      details:
+        requiredScopes.length === 0
+          ? {}
+          : {
+              ...(canRePairForReviewScope ? { action: "instance_pair_again" } : {}),
+              requiredScopes: [...requiredScopes],
+            },
+    };
   },
   identity_mismatch: {
     code: "identity_mismatch",
@@ -72,6 +82,11 @@ const sharedAdapterFailures = {
     retry: "change_request",
     details: {},
   },
+  unsupported_capability: {
+    code: "unsupported_capability",
+    retry: "change_request",
+    details: {},
+  },
   resource_not_found: {
     code: "resource_not_found",
     retry: "reconcile_first",
@@ -87,7 +102,7 @@ const sharedAdapterFailures = {
     retry: "safe_read",
     details: {},
   },
-} satisfies Record<T3CodeAdapterErrorKind, AdapterFailureMapping>;
+} satisfies Record<T3CodeAdapterErrorKind, AdapterFailurePolicy>;
 
 const pairingOverrides = {
   pairing_required: {

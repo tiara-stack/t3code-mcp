@@ -76,35 +76,35 @@ References work without prior discovery or resource enrollment. Paths belong to 
 
 All mutation inputs include a caller-supplied `requestId`. The table omits that repeated field. Targeted tools require explicit instance qualification. Names are the exact tool names, without a transport-dependent prefix.
 
-| Tool                  | Inputs and purpose                                                                                                                                   |
-| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `instance_list`       | Page through saved registration summaries, including connection and pairing state.                                                                   |
-| `instance_get`        | `instanceId`; current identity, version, authorization, capabilities, and connection diagnostics.                                                    |
-| `instance_pair`       | `alias`, `endpoint`, `pairingCode`; exchange the code and create a persistent registration. Return no token.                                         |
-| `instance_update`     | `instanceId`, optional `alias` and `endpoint`; an endpoint change must verify the bound environment identity.                                        |
-| `instance_pair_again` | `instanceId`, `pairingCode`; replace credentials only for the bound environment.                                                                     |
-| `instance_remove`     | `instanceId`; disconnect and forget local credentials without changing upstream work.                                                                |
-| `project_list`        | A selected instance or an explicit all-instances scope, with pagination. Return per-instance failures and inventory completeness.                    |
-| `model_list`          | `instanceId`, optional provider selection, and pagination; discovered provider/model choices and option descriptors.                                 |
-| `worktree_list`       | An instance and repository path, with pagination. Return discovered worktrees and explicitly describe inventory limits.                              |
-| `worktree_inspect`    | A worktree reference; status, relevant thread references, freshness, available checks, and discard consequences.                                     |
-| `worktree_create`     | `instanceId`, `repositoryPath`, `startRef`, optional `newBranch`, optional `path`; create a checkout. Omitted path asks T3Code to choose the path.   |
-| `thread_list`         | Project or instance scope, filters including archived threads, and pagination.                                                                       |
-| `thread_get`          | A thread reference; compact execution, session, settlement, pending-request, configuration, and worktree state.                                      |
-| `thread_create`       | Project reference, `title`, checkout selection, model selection, runtime mode, and interaction mode. Create without submitting a prompt.             |
-| `thread_submit`       | Thread reference, `text`, submission intent, and context requirement. Starts or supplies input to execution according to verified provider behavior. |
-| `thread_interrupt`    | Thread reference; interrupt the execution T3Code processes at that time. Exact-turn fencing is unsupported in the baseline.                          |
-| `thread_stop_session` | Thread reference; request provider-session shutdown. This never stops the T3Code server.                                                             |
-| `thread_set_settled`  | Thread reference and `settled: boolean`; preserve native eligibility checks and asynchronous shutdown consequences.                                  |
-| `approval_respond`    | Pending-request reference and an offered approval decision.                                                                                          |
-| `input_respond`       | Pending-request reference and answers conforming to the observed request.                                                                            |
-| `thread_output`       | Thread reference, optional output cursor, and byte budget; bounded conversation and activity output, with provenance and truncation information.     |
-| `diff_read`           | An explicit worktree or thread-history diff source, optional cursor, and byte budget.                                                                |
-| `turn_wait`           | Exact observed turn reference and wait budget; outcome and evidence for that turn.                                                                   |
-| `thread_wait`         | Thread reference, an explicit state condition, optional observation cursor, and wait budget; reports activity from all clients.                      |
-| `operation_get`       | Mutation `requestId` and optional bounded wait; admission, dispatch, observed outcome, and partial-step information.                                 |
-| `thread_remove`       | Thread reference; guarded removal of its conversation while retaining its worktree.                                                                  |
-| `worktree_discard`    | Worktree reference and optional explicitly named sole thread to remove first; retain the branch.                                                     |
+| Tool                  | Inputs and purpose                                                                                                                                                                 |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `instance_list`       | Page through saved registration summaries, including connection and pairing state.                                                                                                 |
+| `instance_get`        | `instanceId`; current identity, version, authorization, capabilities, and connection diagnostics.                                                                                  |
+| `instance_pair`       | `alias`, `endpoint`, `pairingCode`; exchange the code and create a persistent registration. Set `includeDiffReadScope` to request `review:write` for `diff_read`. Return no token. |
+| `instance_update`     | `instanceId`, optional `alias` and `endpoint`; an endpoint change must verify the bound environment identity.                                                                      |
+| `instance_pair_again` | `instanceId`, `pairingCode`; replace credentials only for the bound environment. Set `includeDiffReadScope` to request `review:write` for `diff_read`.                             |
+| `instance_remove`     | `instanceId`; disconnect and forget local credentials without changing upstream work.                                                                                              |
+| `project_list`        | A selected instance or an explicit all-instances scope, with pagination. Return per-instance failures and inventory completeness.                                                  |
+| `model_list`          | `instanceId`, optional provider selection, and pagination; discovered provider/model choices and option descriptors.                                                               |
+| `worktree_list`       | An instance and repository path, with pagination. Return discovered worktrees and explicitly describe inventory limits.                                                            |
+| `worktree_inspect`    | A worktree reference; status, relevant thread references, freshness, available checks, and discard consequences.                                                                   |
+| `worktree_create`     | `instanceId`, `repositoryPath`, `startRef`, optional `newBranch`, optional `path`; create a checkout. Omitted path asks T3Code to choose the path.                                 |
+| `thread_list`         | Project or instance scope, filters including archived threads, and pagination.                                                                                                     |
+| `thread_get`          | A thread reference; compact execution, session, settlement, pending-request, configuration, and worktree state.                                                                    |
+| `thread_create`       | Project reference, `title`, checkout selection, model selection, runtime mode, and interaction mode. Create without submitting a prompt.                                           |
+| `thread_submit`       | Thread reference, `text`, submission intent, and context requirement. Starts or supplies input to execution according to verified provider behavior.                               |
+| `thread_interrupt`    | Thread reference; interrupt the execution T3Code processes at that time. Exact-turn fencing is unsupported in the baseline.                                                        |
+| `thread_stop_session` | Thread reference; request provider-session shutdown. This never stops the T3Code server.                                                                                           |
+| `thread_set_settled`  | Thread reference and `settled: boolean`; preserve native eligibility checks and asynchronous shutdown consequences.                                                                |
+| `approval_respond`    | Pending-request reference and an offered approval decision.                                                                                                                        |
+| `input_respond`       | Pending-request reference and answers conforming to the observed request.                                                                                                          |
+| `thread_output`       | Thread reference, optional output cursor, and byte budget; bounded conversation and activity output, with provenance and truncation information.                                   |
+| `diff_read`           | `worktree_changes` or `worktree_against_base`, optional cursor and byte budget; requires `review:write`. Thread-history variants return `unsupported_capability`.                  |
+| `turn_wait`           | Exact observed turn reference and wait budget; outcome and evidence for that turn.                                                                                                 |
+| `thread_wait`         | Thread reference, an explicit state condition, optional observation cursor, and wait budget; reports activity from all clients.                                                    |
+| `operation_get`       | Mutation `requestId` and optional bounded wait; admission, dispatch, observed outcome, and partial-step information.                                                               |
+| `thread_remove`       | Thread reference; guarded removal of its conversation while retaining its worktree.                                                                                                |
+| `worktree_discard`    | Worktree reference and optional explicitly named sole thread to remove first; retain the branch.                                                                                   |
 
 No required MCP resources, subscription notifications, progress notifications, or MCP Tasks form part of this contract. Optional protocol additions must not change tool semantics or become necessary for recovery.
 
@@ -136,6 +136,7 @@ type ToolInputs = {
     alias: string;
     endpoint: string;
     pairingCode: string;
+    includeDiffReadScope?: boolean;
   };
   instance_update: MutationInput & {
     instanceId: string;
@@ -145,6 +146,7 @@ type ToolInputs = {
   instance_pair_again: MutationInput & {
     instanceId: string;
     pairingCode: string;
+    includeDiffReadScope?: boolean;
   };
   instance_remove: MutationInput & { instanceId: string };
   project_list: { scope: InstanceScope } & PageInput & ReadPolicy;

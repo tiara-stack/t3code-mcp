@@ -31,6 +31,7 @@ import {
   T3CodeAdapterError,
   decodeProviderModelListing,
   type DiscoveredProvider,
+  type PairingExchangeInput,
   type ShellStreamItem,
   type T3CodeAdapterService,
   type ThreadStreamItem,
@@ -110,6 +111,15 @@ const unsupportedVcsAdapterMethods = {
         status: null,
       }),
     ),
+  getReviewDiffPreview: () =>
+    Effect.fail(
+      new T3CodeAdapterError({
+        kind: "transport",
+        message: "This test adapter does not read VCS diffs.",
+        uncertain: false,
+        status: null,
+      }),
+    ),
   removeWorktree: () =>
     Effect.fail(
       new T3CodeAdapterError({
@@ -120,6 +130,13 @@ const unsupportedVcsAdapterMethods = {
       }),
     ),
 };
+
+const worktreeRefListing = (worktreePath: string) => ({
+  isRepo: true,
+  refs: [{ branch: "feature", worktreePath }],
+  limitations: [],
+  truncated: false,
+});
 
 const appLayer = (
   databasePath: string,
@@ -134,6 +151,7 @@ const fakeConnections = (options?: {
   readonly environmentId?: string;
   readonly rejectPairing?: boolean;
   readonly rejectVerification?: boolean;
+  readonly pairingScopeRequests?: Array<boolean | undefined>;
   readonly inspection?: {
     readonly serverVersion?: string | null;
     readonly read?: "allowed" | "denied" | "unknown";
@@ -155,11 +173,9 @@ const fakeConnections = (options?: {
   readonly inspectFailure?: T3CodeAdapterError;
 }) => {
   const environmentId = options?.environmentId ?? "environment-paired";
-  const exchangePairingCode = (_input: {
-    readonly endpoint: string;
-    readonly pairingCode: string;
-  }) =>
-    options?.rejectPairing
+  const exchangePairingCode = (input: PairingExchangeInput) => {
+    options?.pairingScopeRequests?.push(input.includeDiffReadScope);
+    return options?.rejectPairing
       ? Effect.fail(
           new T3CodeAdapterError({
             kind: "invalid_pairing_code",
@@ -169,6 +185,7 @@ const fakeConnections = (options?: {
           }),
         )
       : Effect.succeed({ credential: "secret-token", expiresAtMillis: null });
+  };
   const verifyCredential = (_input: { readonly endpoint: string; readonly credential: string }) =>
     options?.rejectVerification
       ? Effect.fail(
@@ -330,6 +347,9 @@ const fakeAdapterLayer = (
       scopes: ["orchestration:read", "orchestration:operate"],
       capabilities: {},
     }),
+  vcsOverrides: Partial<
+    Pick<T3CodeAdapterService, "refreshVcsStatus" | "getReviewDiffPreview" | "listVcsWorktreeRefs">
+  > = {},
   dispatchTurn?: (
     input: DispatchTurnInput,
   ) => Effect.Effect<DispatchTurnResult, T3CodeAdapterError>,
@@ -409,6 +429,11 @@ const fakeAdapterLayer = (
       ),
     respondToInput: () => Effect.die("not used"),
     ...unsupportedVcsAdapterMethods,
+    listVcsWorktreeRefs:
+      vcsOverrides.listVcsWorktreeRefs ??
+      (vcsOverrides.getReviewDiffPreview === undefined
+        ? unsupportedVcsAdapterMethods.listVcsWorktreeRefs
+        : ({ cwd }) => Effect.succeed(worktreeRefListing(`${cwd}/.worktrees/feature`))),
     createWorktree,
     removeWorktree,
     respondToApproval: failApprovalResponse,
@@ -421,6 +446,12 @@ const fakeAdapterLayer = (
           status: null,
         }),
       ),
+    ...(vcsOverrides.refreshVcsStatus === undefined
+      ? {}
+      : { refreshVcsStatus: vcsOverrides.refreshVcsStatus }),
+    ...(vcsOverrides.getReviewDiffPreview === undefined
+      ? {}
+      : { getReviewDiffPreview: vcsOverrides.getReviewDiffPreview }),
     ...(dispatchTurn === undefined ? {} : { dispatchTurn }),
   });
 
@@ -437,6 +468,856 @@ const callTool = (name: string, input: unknown) =>
     const stream = yield* toolkit.handle(name as never, input as never);
     return yield* Stream.runCollect(stream);
   });
+
+describe("diff_read", () => {
+  it.live("rejects a missing source at the public tool boundary", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const exit = yield* Effect.exit(
+          Effect.scoped(callTool("diff_read", {}).pipe(Effect.provide(appLayer(databasePath)))),
+        );
+
+        expect(Exit.isFailure(exit)).toBe(true);
+        if (Exit.isSuccess(exit)) return;
+        expect(String(exit.cause)).toContain("Invalid parameters for tool 'diff_read'");
+      }),
+    ),
+  );
+
+  it.live("rejects unknown arguments and byte budgets outside the published range", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const source = {
+          kind: "worktree_changes",
+          worktree: {
+            instanceId: "instance-a",
+            repositoryPath: "/srv/project",
+            worktreePath: "/srv/project/.worktrees/feature",
+          },
+        };
+        const layer = appLayer(databasePath);
+        const outcomes = yield* Effect.scoped(
+          Effect.gen(function* () {
+            const unknown = yield* Effect.exit(callTool("diff_read", { source, extra: true }));
+            const oversized = yield* Effect.exit(
+              callTool("diff_read", { source, maxBytes: 65_537 }),
+            );
+            return { unknown, oversized };
+          }).pipe(Effect.provide(layer)),
+        );
+
+        for (const outcome of [outcomes.unknown, outcomes.oversized]) {
+          expect(Exit.isFailure(outcome)).toBe(true);
+          if (Exit.isSuccess(outcome)) continue;
+          expect(String(outcome.cause)).toContain("Invalid parameters for tool 'diff_read'");
+        }
+      }),
+    ),
+  );
+
+  it.live("captures one direct worktree diff and serves UTF-8 pages from the same view", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const originalDiff = "λ".repeat(12_000);
+        let currentDiff = originalDiff;
+        const previewInputs: Array<{ readonly cwd: string; readonly ignoreWhitespace: boolean }> =
+          [];
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/project",
+          worktreePath: "/srv/project/.worktrees/feature",
+        };
+        const source = { kind: "worktree_changes" as const, worktree };
+        const layer = appLayer(
+          databasePath,
+          InstanceConnections.layerWithAdapter(
+            fakeAdapterLayer({ current: null }, {}, undefined, undefined, {
+              getReviewDiffPreview: (input) => {
+                previewInputs.push({ cwd: input.cwd, ignoreWhitespace: input.ignoreWhitespace });
+                return Effect.succeed({
+                  cwd: input.cwd,
+                  generatedAt: "2026-09-24T04:00:00.000Z",
+                  sources: [
+                    {
+                      id: "working-tree",
+                      kind: "working-tree",
+                      title: "Dirty worktree",
+                      baseRef: "HEAD",
+                      headRef: null,
+                      diff: currentDiff,
+                      diffHash: "hash-working-tree",
+                      truncated: false,
+                    },
+                    {
+                      id: "branch-range",
+                      kind: "branch-range",
+                      title: "Against main",
+                      baseRef: "main",
+                      headRef: "feature",
+                      diff: "branch diff",
+                      diffHash: "hash-branch-range",
+                      truncated: false,
+                    },
+                  ],
+                });
+              },
+            }),
+          ),
+        );
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const first = yield* callTool("diff_read", {
+              source,
+              ignoreWhitespace: true,
+              maxBytes: 1024,
+            });
+            const firstResult = first[0]?.result;
+            if (firstResult === undefined) throw new Error("diff_read returned no first page.");
+            const pages = [
+              (
+                firstResult as unknown as {
+                  result: { kind: string; value: Record<string, unknown> };
+                }
+              ).result.value,
+            ];
+            let cursor = pages[0]?.nextCursor as string | null;
+            currentDiff = "the worktree changed after the capture";
+            let continuations = 0;
+            while (cursor !== null) {
+              const mismatch = yield* callTool("diff_read", {
+                source,
+                ignoreWhitespace: false,
+                cursor,
+                maxBytes: 1024,
+              });
+              expect(mismatch[0]?.result).toMatchObject({
+                result: { kind: "error", error: { code: "cursor_mismatch" } },
+              });
+              const next = yield* callTool("diff_read", {
+                source,
+                ignoreWhitespace: true,
+                cursor,
+                maxBytes: 1024,
+              });
+              const nextResult = next[0]?.result;
+              if (nextResult === undefined)
+                throw new Error("diff_read returned no continuation page.");
+              const page = (
+                nextResult as unknown as {
+                  result: { kind: string; value: Record<string, unknown> };
+                }
+              ).result.value;
+              pages.push(page);
+              cursor = page.nextCursor as string | null;
+              continuations += 1;
+              expect(continuations).toBeLessThan(40);
+            }
+            return pages;
+          }).pipe(Effect.provide(layer)),
+        );
+
+        const firstPage = result[0]!;
+        expect(firstPage).toMatchObject({
+          sourceCompleteness: "complete",
+          upstreamTruncated: false,
+        });
+        expect(firstPage.nextCursor).toEqual(expect.any(String));
+        expect(
+          result
+            .flatMap((page) => page.items as Array<{ text: string }>)
+            .map((item) => item.text)
+            .join(""),
+        ).toBe(originalDiff);
+        expect(previewInputs).toEqual([{ cwd: worktree.worktreePath, ignoreWhitespace: true }]);
+        expect(
+          result.every((page) =>
+            (page.items as Array<{ text: string }>).every(
+              (item) => new TextEncoder().encode(item.text).byteLength <= 1024,
+            ),
+          ),
+        ).toBe(true);
+      }),
+    ),
+  );
+
+  it.live(
+    "keeps empty named-base previews unknown with arbitrary source IDs and effective base refs",
+    () =>
+      withDatabasePath((databasePath) =>
+        Effect.gen(function* () {
+          const previewInputs: Array<{
+            readonly cwd: string;
+            readonly baseRef: string | undefined;
+            readonly ignoreWhitespace: boolean;
+          }> = [];
+          const worktree = {
+            instanceId: "instance-base",
+            repositoryPath: "/srv/repository",
+            worktreePath: "/srv/repository/.worktrees/feature",
+          };
+          const layer = appLayer(
+            databasePath,
+            InstanceConnections.layerWithAdapter(
+              fakeAdapterLayer({ current: null }, {}, undefined, undefined, {
+                getReviewDiffPreview: (input) => {
+                  previewInputs.push({
+                    cwd: input.cwd,
+                    baseRef: input.baseRef,
+                    ignoreWhitespace: input.ignoreWhitespace,
+                  });
+                  return Effect.succeed({
+                    cwd: input.cwd,
+                    generatedAt: "2026-09-24T04:01:00.000Z",
+                    sources: [
+                      {
+                        id: "working-tree",
+                        kind: "working-tree",
+                        title: "Dirty worktree",
+                        baseRef: "HEAD",
+                        headRef: null,
+                        diff: "",
+                        diffHash: "hash-empty-working-tree",
+                        truncated: false,
+                      },
+                      {
+                        id: "native-comparison",
+                        kind: "branch-range",
+                        title: "Against main",
+                        baseRef: "refs/heads/main",
+                        headRef: "feature",
+                        diff: "",
+                        diffHash: "hash-empty-branch-range",
+                        truncated: false,
+                      },
+                    ],
+                  });
+                },
+              }),
+            ),
+          );
+          const source = { kind: "worktree_against_base" as const, worktree, baseRef: "main" };
+
+          const result = yield* Effect.scoped(
+            Effect.gen(function* () {
+              yield* seedProjectRegistration("instance-base", "https://base.test", "secret-base");
+              return yield* callTool("diff_read", {
+                source,
+                ignoreWhitespace: true,
+                maxBytes: 1024,
+              });
+            }).pipe(Effect.provide(layer)),
+          );
+
+          expect(result[0]?.result).toMatchObject({
+            result: {
+              kind: "ok",
+              value: {
+                sourceCompleteness: "unknown",
+                upstreamTruncated: false,
+                items: [],
+                limitations: [
+                  expect.stringContaining("native diff hash"),
+                  expect.stringContaining("empty preview"),
+                ],
+              },
+            },
+            observations: [{ freshness: "fresh", coverage: "partial" }],
+          });
+          expect(previewInputs).toEqual([
+            { cwd: worktree.worktreePath, baseRef: "main", ignoreWhitespace: true },
+          ]);
+        }),
+      ),
+  );
+
+  it.live("rejects a named-base preview with no effective base reference", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const worktree = {
+          instanceId: "instance-unresolved-base",
+          repositoryPath: "/srv/repository",
+          worktreePath: "/srv/repository/.worktrees/feature",
+        };
+        const layer = appLayer(
+          databasePath,
+          InstanceConnections.layerWithAdapter(
+            fakeAdapterLayer({ current: null }, {}, undefined, undefined, {
+              getReviewDiffPreview: ({ cwd, baseRef }) =>
+                Effect.succeed({
+                  cwd,
+                  generatedAt: "2026-09-24T04:01:30.000Z",
+                  sources: [
+                    {
+                      id: "native-comparison",
+                      kind: "branch-range",
+                      title: `Against ${baseRef}`,
+                      baseRef: null,
+                      headRef: null,
+                      diff: "",
+                      diffHash: "hash-unresolved-base",
+                      truncated: false,
+                    },
+                  ],
+                }),
+            }),
+          ),
+        );
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration(
+              worktree.instanceId,
+              "https://unresolved-base.test",
+              "secret-unresolved-base",
+            );
+            return yield* callTool("diff_read", {
+              source: { kind: "worktree_against_base", worktree, baseRef: "main" },
+            });
+          }).pipe(Effect.provide(layer)),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "invalid_argument" } },
+        });
+      }),
+    ),
+  );
+
+  it.live("preserves native truncation in the captured result", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const worktree = {
+          instanceId: "instance-truncated",
+          repositoryPath: "/srv/repository",
+          worktreePath: "/srv/repository/.worktrees/feature",
+        };
+        const layer = appLayer(
+          databasePath,
+          InstanceConnections.layerWithAdapter(
+            fakeAdapterLayer({ current: null }, {}, undefined, undefined, {
+              getReviewDiffPreview: ({ cwd }) =>
+                Effect.succeed({
+                  cwd,
+                  generatedAt: "2026-09-24T04:02:00.000Z",
+                  sources: [
+                    {
+                      id: "working-tree",
+                      kind: "working-tree",
+                      title: "Dirty worktree",
+                      baseRef: "HEAD",
+                      headRef: null,
+                      diff: "partial native patch",
+                      diffHash: "hash-truncated-preview",
+                      truncated: true,
+                    },
+                    {
+                      id: "branch-range",
+                      kind: "branch-range",
+                      title: "Against main",
+                      baseRef: "main",
+                      headRef: "feature",
+                      diff: "",
+                      diffHash: "hash-empty-branch-range",
+                      truncated: false,
+                    },
+                  ],
+                }),
+            }),
+          ),
+        );
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration(
+              "instance-truncated",
+              "https://truncated.test",
+              "secret-truncated",
+            );
+            return yield* callTool("diff_read", {
+              source: { kind: "worktree_changes", worktree },
+              maxBytes: 1024,
+            });
+          }).pipe(Effect.provide(layer)),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: { kind: "ok", value: { sourceCompleteness: "partial", upstreamTruncated: true } },
+        });
+      }),
+    ),
+  );
+
+  it.live("serves the matching retained capture only when stale reads are explicitly allowed", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        let failPreview = false;
+        let failWorktreeRefs = false;
+        let previewFailureKind: "transport" | "pairing_required" | "authorization" = "transport";
+        const worktree = {
+          instanceId: "instance-stale-diff",
+          repositoryPath: "/srv/repository",
+          worktreePath: "/srv/repository/.worktrees/feature",
+        };
+        const layer = appLayer(
+          databasePath,
+          InstanceConnections.layerWithAdapter(
+            fakeAdapterLayer({ current: null }, {}, undefined, undefined, {
+              listVcsWorktreeRefs: ({ cwd }) =>
+                failWorktreeRefs
+                  ? Effect.fail(
+                      new T3CodeAdapterError({
+                        kind: "transport",
+                        message: "The live VCS worktree references are unavailable.",
+                        uncertain: false,
+                        status: null,
+                      }),
+                    )
+                  : Effect.succeed(worktreeRefListing(`${cwd}/.worktrees/feature`)),
+              getReviewDiffPreview: ({ cwd }) => {
+                if (failPreview) {
+                  return Effect.fail(
+                    new T3CodeAdapterError({
+                      kind: previewFailureKind,
+                      message: "The live worktree diff is unavailable.",
+                      uncertain: false,
+                      status: null,
+                      ...(previewFailureKind === "authorization"
+                        ? { requiredScopes: ["review:write"] }
+                        : {}),
+                    }),
+                  );
+                }
+                return Effect.succeed({
+                  cwd,
+                  generatedAt: "2026-09-24T04:03:00.000Z",
+                  sources: [
+                    {
+                      id: "working-tree",
+                      kind: "working-tree",
+                      title: "Dirty worktree",
+                      baseRef: "HEAD",
+                      headRef: null,
+                      diff: "retained diff",
+                      diffHash: "hash-retained-diff",
+                      truncated: false,
+                    },
+                    {
+                      id: "branch-range",
+                      kind: "branch-range",
+                      title: "Against main",
+                      baseRef: "main",
+                      headRef: "feature",
+                      diff: "",
+                      diffHash: "hash-empty-branch-range",
+                      truncated: false,
+                    },
+                  ],
+                });
+              },
+            }),
+          ),
+        );
+
+        const results = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration(
+              "instance-stale-diff",
+              "https://stale-diff.test",
+              "secret-stale-diff",
+            );
+            const fresh = yield* callTool("diff_read", {
+              source: { kind: "worktree_changes", worktree },
+            });
+            failPreview = true;
+            previewFailureKind = "pairing_required";
+            const pairingFailure = yield* callTool("diff_read", {
+              source: { kind: "worktree_changes", worktree },
+              allowStale: true,
+            });
+            previewFailureKind = "authorization";
+            const authorizationFailure = yield* callTool("diff_read", {
+              source: { kind: "worktree_changes", worktree },
+              allowStale: true,
+            });
+            failWorktreeRefs = true;
+            const staleFromRefs = yield* callTool("diff_read", {
+              source: { kind: "worktree_changes", worktree },
+              allowStale: true,
+            });
+            failWorktreeRefs = false;
+            previewFailureKind = "transport";
+            const stale = yield* callTool("diff_read", {
+              source: { kind: "worktree_changes", worktree },
+              allowStale: true,
+            });
+            const staleAgain = yield* callTool("diff_read", {
+              source: { kind: "worktree_changes", worktree },
+              allowStale: true,
+            });
+            const rejected = yield* callTool("diff_read", {
+              source: { kind: "worktree_changes", worktree },
+            });
+            return {
+              fresh,
+              pairingFailure,
+              authorizationFailure,
+              staleFromRefs,
+              stale,
+              staleAgain,
+              rejected,
+            };
+          }).pipe(Effect.provide(layer)),
+        );
+
+        expect(results.fresh[0]?.result).toMatchObject({
+          result: { kind: "ok", value: { items: [{ text: "retained diff" }] } },
+          observations: [{ freshness: "fresh" }],
+        });
+        expect(results.pairingFailure[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "pairing_required" } },
+        });
+        expect(results.authorizationFailure[0]?.result).toMatchObject({
+          result: {
+            kind: "error",
+            error: {
+              code: "read_denied",
+              message:
+                "The saved T3Code credential lacks the review:write scope required to read worktree diffs. Run instance_pair_again with includeDiffReadScope: true and a grant that includes review:write.",
+              details: {
+                action: "instance_pair_again",
+                requiredScopes: ["review:write"],
+                includeDiffReadScope: true,
+              },
+            },
+          },
+        });
+        expect(results.staleFromRefs[0]?.result).toMatchObject({
+          result: { kind: "ok", value: { items: [{ text: "retained diff" }] } },
+          observations: [{ freshness: "stale", coverage: "partial" }],
+          warnings: [
+            {
+              code: "fresh_read_failed",
+              message: expect.stringContaining("The live VCS worktree references are unavailable."),
+            },
+          ],
+        });
+        expect(results.stale[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              items: [{ text: "retained diff" }],
+              limitations: [
+                "Captured T3Code source 'working-tree' with base HEAD, head not reported, and native diff hash hash-retained-diff.",
+                "Served from a retained capture after a fresh read failed. (The live worktree diff is unavailable.)",
+              ],
+            },
+          },
+          observations: [
+            {
+              freshness: "stale",
+              coverage: "partial",
+              observedAt: "2026-09-24T04:03:00.000Z",
+            },
+          ],
+          warnings: [{ code: "fresh_read_failed" }],
+        });
+        expect(results.staleAgain[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              items: [{ text: "retained diff" }],
+              limitations: [
+                "Captured T3Code source 'working-tree' with base HEAD, head not reported, and native diff hash hash-retained-diff.",
+                "Served from a retained capture after a fresh read failed. (The live worktree diff is unavailable.)",
+              ],
+            },
+          },
+          observations: [{ freshness: "stale", coverage: "partial" }],
+        });
+        expect(results.rejected[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "unavailable" } },
+        });
+      }),
+    ),
+  );
+
+  it.live("rejects thread-history variants explicitly and rejects missing named bases", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const layer = appLayer(databasePath);
+        const results = yield* Effect.scoped(
+          Effect.gen(function* () {
+            const unsupported = yield* callTool("diff_read", {
+              source: {
+                kind: "thread_turn_range",
+                thread: { instanceId: "instance-a", threadId: "thread-a" },
+                fromTurnCount: 1,
+                toTurnCount: 2,
+              },
+            });
+            const unsupportedThrough = yield* callTool("diff_read", {
+              source: {
+                kind: "thread_through_turn",
+                thread: { instanceId: "instance-a", threadId: "thread-a" },
+                toTurnCount: 2,
+              },
+            });
+            const missingBase = yield* Effect.exit(
+              callTool("diff_read", {
+                source: {
+                  kind: "worktree_against_base",
+                  worktree: {
+                    instanceId: "instance-a",
+                    repositoryPath: "/srv/repository",
+                    worktreePath: "/srv/repository/.worktrees/feature",
+                  },
+                },
+              }),
+            );
+            const emptyBase = yield* Effect.exit(
+              callTool("diff_read", {
+                source: {
+                  kind: "worktree_against_base",
+                  worktree: {
+                    instanceId: "instance-a",
+                    repositoryPath: "/srv/repository",
+                    worktreePath: "/srv/repository/.worktrees/feature",
+                  },
+                  baseRef: " ",
+                },
+              }),
+            );
+            return { unsupported, unsupportedThrough, missingBase, emptyBase };
+          }).pipe(Effect.provide(layer)),
+        );
+
+        expect(results.unsupported[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "unsupported_capability" } },
+        });
+        expect(results.unsupportedThrough[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "unsupported_capability" } },
+        });
+        expect(Exit.isFailure(results.missingBase)).toBe(true);
+        if (Exit.isSuccess(results.missingBase)) return;
+        expect(String(results.missingBase.cause)).toContain(
+          "Invalid parameters for tool 'diff_read'",
+        );
+        expect(Exit.isFailure(results.emptyBase)).toBe(true);
+        if (Exit.isSuccess(results.emptyBase)) return;
+        expect(String(results.emptyBase.cause)).toContain(
+          "Invalid parameters for tool 'diff_read'",
+        );
+      }),
+    ),
+  );
+
+  it.live("reports a missing worktree from the direct diff preview read", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        let previewCalls = 0;
+        const worktree = {
+          instanceId: "instance-missing",
+          repositoryPath: "/srv/repository",
+          worktreePath: "/srv/repository/.worktrees/missing",
+        };
+        const layer = appLayer(
+          databasePath,
+          InstanceConnections.layerWithAdapter(
+            fakeAdapterLayer({ current: null }, {}, undefined, undefined, {
+              getReviewDiffPreview: ({ cwd }) => {
+                previewCalls += 1;
+                return Effect.succeed({
+                  cwd,
+                  generatedAt: "2026-09-24T04:04:00.000Z",
+                  sources: [],
+                });
+              },
+              listVcsWorktreeRefs: ({ cwd }) =>
+                Effect.succeed(worktreeRefListing(`${cwd}/.worktrees/missing`)),
+            }),
+          ),
+        );
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-missing", "https://missing.test", "secret");
+            return yield* callTool("diff_read", {
+              source: { kind: "worktree_changes", worktree },
+            });
+          }).pipe(Effect.provide(layer)),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "resource_not_found" } },
+        });
+        expect(previewCalls).toBe(1);
+      }),
+    ),
+  );
+
+  it.live("reports an invalid diff-preview timestamp separately from a worktree mismatch", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const worktree = {
+          instanceId: "instance-invalid-preview-time",
+          repositoryPath: "/srv/repository",
+          worktreePath: "/srv/repository/.worktrees/feature",
+        };
+        const layer = appLayer(
+          databasePath,
+          InstanceConnections.layerWithAdapter(
+            fakeAdapterLayer({ current: null }, {}, undefined, undefined, {
+              getReviewDiffPreview: ({ cwd }) =>
+                Effect.succeed({ cwd, generatedAt: "2026-02-30T00:00:00Z", sources: [] }),
+            }),
+          ),
+        );
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration(
+              worktree.instanceId,
+              "https://invalid-preview-time.test",
+              "secret-invalid-preview-time",
+            );
+            return yield* callTool("diff_read", {
+              source: { kind: "worktree_changes", worktree },
+            });
+          }).pipe(Effect.provide(layer)),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "error",
+            error: {
+              code: "incompatible_instance",
+              message: "The T3Code diff preview reported an invalid generation timestamp.",
+            },
+          },
+        });
+      }),
+    ),
+  );
+
+  it.live("rejects a worktree path not attached to the supplied repository", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        let previewCalls = 0;
+        const worktree = {
+          instanceId: "instance-wrong-repository",
+          repositoryPath: "/srv/repository",
+          worktreePath: "/srv/another-repository/.worktrees/feature",
+        };
+        const layer = appLayer(
+          databasePath,
+          InstanceConnections.layerWithAdapter(
+            fakeAdapterLayer({ current: null }, {}, undefined, undefined, {
+              listVcsWorktreeRefs: ({ cwd }) =>
+                Effect.succeed(worktreeRefListing(`${cwd}/.worktrees/feature`)),
+              getReviewDiffPreview: ({ cwd }) => {
+                previewCalls += 1;
+                return Effect.succeed({
+                  cwd,
+                  generatedAt: "2026-09-24T04:06:00.000Z",
+                  sources: [],
+                });
+              },
+            }),
+          ),
+        );
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration(
+              worktree.instanceId,
+              "https://wrong-repository.test",
+              "secret-wrong-repository",
+            );
+            return yield* callTool("diff_read", {
+              source: { kind: "worktree_changes", worktree },
+            });
+          }).pipe(Effect.provide(layer)),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "uncheckable_target" } },
+        });
+        expect(previewCalls).toBe(0);
+      }),
+    ),
+  );
+
+  it.live("reports diff-specific guidance when shared capture capacity is exhausted", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const worktree = {
+          instanceId: "instance-capture-budget",
+          repositoryPath: "/srv/repository",
+          worktreePath: "/srv/repository/.worktrees/feature",
+        };
+        const connections = InstanceConnections.layerWithAdapter(
+          fakeAdapterLayer({ current: null }, {}, undefined, undefined, {
+            getReviewDiffPreview: ({ cwd }) =>
+              Effect.succeed({
+                cwd,
+                generatedAt: "2026-09-24T04:05:00.000Z",
+                sources: [
+                  {
+                    id: "working-tree",
+                    kind: "working-tree",
+                    title: "Dirty worktree",
+                    baseRef: "HEAD",
+                    headRef: null,
+                    diff: "diff contents",
+                    diffHash: "hash-working-tree",
+                    truncated: false,
+                  },
+                  {
+                    id: "branch-range",
+                    kind: "branch-range",
+                    title: "Against main",
+                    baseRef: "main",
+                    headRef: "feature",
+                    diff: "",
+                    diffHash: "hash-empty-branch-range",
+                    truncated: false,
+                  },
+                ],
+              }),
+          }),
+        );
+        const layer = serverToolkitLayer.pipe(
+          Layer.provideMerge(connections),
+          Layer.provideMerge(LocalStore.layer({ databasePath, captureBudgetBytes: 1 })),
+        );
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration(
+              worktree.instanceId,
+              "https://capture-budget.test",
+              "secret-capture-budget",
+            );
+            return yield* callTool("diff_read", {
+              source: { kind: "worktree_changes", worktree },
+            });
+          }).pipe(Effect.provide(layer)),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "error",
+            error: {
+              code: "result_too_large",
+              details: { action: "reduce_diff_size_or_retry_later" },
+            },
+          },
+        });
+      }),
+    ),
+  );
+});
 
 describe("InstanceConnections.removeWorktree", () => {
   it.live("refuses removal after the verified registration changes", () =>
@@ -460,6 +1341,7 @@ describe("InstanceConnections.removeWorktree", () => {
               scopes: ["orchestration:read", "orchestration:operate"],
               capabilities: {},
             }),
+          undefined,
           undefined,
           undefined,
           () =>
@@ -533,7 +1415,7 @@ describe("InstanceConnections.dispatchTurn", () => {
       Effect.gen(function* () {
         const dispatches: Array<DispatchTurnInput> = [];
         const connections = InstanceConnections.layerWithAdapter(
-          fakeAdapterLayer({ current: null }, {}, undefined, undefined, (input) =>
+          fakeAdapterLayer({ current: null }, {}, undefined, undefined, {}, (input) =>
             Effect.sync(() => {
               dispatches.push(input);
               input.onDispatchStart();
@@ -962,6 +1844,7 @@ describe("instance_pair", () => {
   it.live("persists a verified registration without exposing pairing credentials", () =>
     withDatabasePath((databasePath) =>
       Effect.gen(function* () {
+        const pairingScopeRequests: Array<boolean | undefined> = [];
         const result = yield* Effect.scoped(
           Effect.gen(function* () {
             const pairing = yield* callTool("instance_pair", {
@@ -973,7 +1856,9 @@ describe("instance_pair", () => {
             const list = yield* callList();
             const lookup = yield* callTool("operation_get", { requestId: "pair-1" });
             return { pairing, list, lookup };
-          }).pipe(Effect.provide(appLayer(databasePath, fakeConnections()))),
+          }).pipe(
+            Effect.provide(appLayer(databasePath, fakeConnections({ pairingScopeRequests }))),
+          ),
         );
 
         expect(result.pairing[0]?.result).toMatchObject({
@@ -1009,6 +1894,31 @@ describe("instance_pair", () => {
         });
         expect(JSON.stringify(result.lookup)).not.toContain("secret-token");
         expect(JSON.stringify(result.lookup)).not.toContain("one-use-code");
+        expect(pairingScopeRequests).toEqual([false]);
+      }),
+    ),
+  );
+
+  it.live("requests diff-read authorization only when explicitly selected", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const pairingScopeRequests: Array<boolean | undefined> = [];
+        const result = yield* Effect.scoped(
+          callTool("instance_pair", {
+            requestId: "pair-diff-scope",
+            alias: "Diff-enabled instance",
+            endpoint: "https://pair-diff.test",
+            pairingCode: "one-use-diff-code",
+            includeDiffReadScope: true,
+          }).pipe(
+            Effect.provide(appLayer(databasePath, fakeConnections({ pairingScopeRequests }))),
+          ),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: { kind: "ok", value: { state: "completed", tool: "instance_pair" } },
+        });
+        expect(pairingScopeRequests).toEqual([true]);
       }),
     ),
   );
@@ -1666,6 +2576,7 @@ describe("instance_pair_again", () => {
     readonly rejectVerification?: boolean;
     readonly onExchange?: () => void;
     readonly seen?: Array<{ readonly endpoint: string; readonly pairingCode: string }>;
+    readonly scopeRequests?: Array<boolean | undefined>;
   }) => {
     const environmentId = options?.environmentId ?? "env-repair";
     const verified = {
@@ -1674,10 +2585,7 @@ describe("instance_pair_again", () => {
       scopes: ["orchestration:read", "orchestration:operate"],
       capabilities: {},
     };
-    const exchangePairingCode = (_input: {
-      readonly endpoint: string;
-      readonly pairingCode: string;
-    }) =>
+    const exchangePairingCode = (_input: PairingExchangeInput) =>
       options?.rejectPairing
         ? Effect.fail(
             new T3CodeAdapterError({
@@ -1691,6 +2599,7 @@ describe("instance_pair_again", () => {
     return InstanceConnections.layerTest({
       exchangePairingCode: (input) =>
         Effect.gen(function* () {
+          options?.scopeRequests?.push(input.includeDiffReadScope);
           options?.seen?.push({
             endpoint: input.endpoint,
             pairingCode: input.pairingCode,
@@ -1836,6 +2745,7 @@ describe("instance_pair_again", () => {
       withDatabasePath((databasePath) =>
         Effect.gen(function* () {
           const seen: Array<{ readonly endpoint: string; readonly pairingCode: string }> = [];
+          const scopeRequests: Array<boolean | undefined> = [];
           const result = yield* Effect.scoped(
             Effect.gen(function* () {
               const store = yield* LocalStore;
@@ -1847,12 +2757,15 @@ describe("instance_pair_again", () => {
                 requestId: "repair-1",
                 instanceId: "instance-repair",
                 pairingCode: "fresh-one-use-code",
+                includeDiffReadScope: true,
               });
               const after = yield* store.getRegistration("instance-repair");
               const lookup = yield* callTool("operation_get", { requestId: "repair-1" });
               const list = yield* callList();
               return { before, repair, after, lookup, list };
-            }).pipe(Effect.provide(appLayer(databasePath, rePairConnections({ seen })))),
+            }).pipe(
+              Effect.provide(appLayer(databasePath, rePairConnections({ seen, scopeRequests }))),
+            ),
           );
 
           // The exchange targets the saved registration's endpoint with the
@@ -1860,6 +2773,7 @@ describe("instance_pair_again", () => {
           expect(seen).toEqual([
             { endpoint: "https://expired-credentials.test", pairingCode: "fresh-one-use-code" },
           ]);
+          expect(scopeRequests).toEqual([true]);
 
           expect(result.before?.revision).toBe(0);
           expect(result.before?.credential).toBe("old-secret");
@@ -16011,6 +16925,7 @@ describe("thread_interrupt", () => {
                     undefined,
                     undefined,
                     undefined,
+                    undefined,
                     uncertainAcquisitionError,
                   ),
                 ),
@@ -18775,6 +19690,7 @@ describe("thread_stop_session", () => {
                   fakeAdapterLayer(
                     { current: null },
                     {},
+                    undefined,
                     undefined,
                     undefined,
                     undefined,

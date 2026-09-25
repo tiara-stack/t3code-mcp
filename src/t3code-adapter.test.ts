@@ -12,10 +12,59 @@ import * as RpcGroup from "effect/unstable/rpc/RpcGroup";
 import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization";
 import * as RpcServer from "effect/unstable/rpc/RpcServer";
 import {
+  diffReadScopeGrantFailure,
   mapOrchestrationDispatchCommandError,
+  mapReviewDiffPreviewError,
   mapThreadInterruptDispatchError,
+  requestedT3CodePairingScopes,
   T3CodeAdapter,
 } from "./t3code-adapter";
+
+describe("T3Code pairing scopes", () => {
+  it.effect("requests diff-read authorization only when explicitly selected", () =>
+    Effect.sync(() => {
+      expect(requestedT3CodePairingScopes()).toEqual([
+        "orchestration:read",
+        "orchestration:operate",
+      ]);
+      expect(requestedT3CodePairingScopes(true)).toEqual([
+        "orchestration:read",
+        "orchestration:operate",
+        "review:write",
+      ]);
+      expect(
+        diffReadScopeGrantFailure("orchestration:read orchestration:operate", true),
+      ).toMatchObject({
+        kind: "authorization",
+        requiredScopes: ["review:write"],
+      });
+      expect(
+        diffReadScopeGrantFailure("orchestration:read orchestration:operate", true)?.message,
+      ).toContain("Obtain a new pairing code");
+      expect(
+        diffReadScopeGrantFailure("orchestration:read orchestration:operate review:write", true),
+      ).toBeNull();
+      expect(
+        diffReadScopeGrantFailure("orchestration:read orchestration:operate", false),
+      ).toBeNull();
+    }),
+  );
+});
+
+describe("T3Code diff-preview errors", () => {
+  it.effect("reports the approved-project-root restriction explicitly", () =>
+    Effect.sync(() => {
+      const error = mapReviewDiffPreviewError({
+        _tag: "VcsRepositoryDetectionError",
+        operation: "review.getDiffPreview",
+        cwd: "/srv/worktree",
+        detail: "workspace root is not approved",
+      });
+      expect(error.kind).toBe("unsupported_capability");
+      expect(error.message).toContain("upstream-approved project root");
+    }),
+  );
+});
 
 const ThreadSubscriptionFixtureRpc = Rpc.make("orchestration.subscribeThread", {
   payload: Schema.Unknown,

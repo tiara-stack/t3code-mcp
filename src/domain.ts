@@ -182,11 +182,17 @@ const instancePairFields = Schema.Struct({
   alias: nonEmptyString,
   endpoint,
   pairingCode: nonEmptyString,
+  includeDiffReadScope: Schema.optionalKey(Schema.Boolean),
 });
 
 const unknownInstancePairField = Schema.String.check(
   Schema.makeFilter(
-    (key) => key !== "requestId" && key !== "alias" && key !== "endpoint" && key !== "pairingCode",
+    (key) =>
+      key !== "requestId" &&
+      key !== "alias" &&
+      key !== "endpoint" &&
+      key !== "pairingCode" &&
+      key !== "includeDiffReadScope",
     { message: "unknown instance_pair argument" },
   ),
 );
@@ -204,6 +210,7 @@ export const InstancePairInputSchema = Schema.declare<{
   readonly alias: string;
   readonly endpoint: string;
   readonly pairingCode: string;
+  readonly includeDiffReadScope?: boolean;
 }>(
   (
     input,
@@ -212,6 +219,7 @@ export const InstancePairInputSchema = Schema.declare<{
     readonly alias: string;
     readonly endpoint: string;
     readonly pairingCode: string;
+    readonly includeDiffReadScope?: boolean;
   } => Schema.is(instancePairRuntimeShape)(input),
   {
     toCodecJson: () =>
@@ -275,12 +283,20 @@ const instancePairAgainFields = Schema.Struct({
   requestId,
   instanceId: nonEmptyString,
   pairingCode: nonEmptyString,
+  includeDiffReadScope: Schema.optionalKey(Schema.Boolean),
 });
 
 const unknownInstancePairAgainField = Schema.String.check(
-  Schema.makeFilter((key) => key !== "requestId" && key !== "instanceId" && key !== "pairingCode", {
-    message: "unknown instance_pair_again argument",
-  }),
+  Schema.makeFilter(
+    (key) =>
+      key !== "requestId" &&
+      key !== "instanceId" &&
+      key !== "pairingCode" &&
+      key !== "includeDiffReadScope",
+    {
+      message: "unknown instance_pair_again argument",
+    },
+  ),
 );
 
 const instancePairAgainRuntimeShape = Schema.StructWithRest(instancePairAgainFields, [
@@ -295,6 +311,7 @@ export const InstancePairAgainInputSchema = Schema.declare<{
   readonly requestId: string;
   readonly instanceId: string;
   readonly pairingCode: string;
+  readonly includeDiffReadScope?: boolean;
 }>(
   (
     input,
@@ -302,6 +319,7 @@ export const InstancePairAgainInputSchema = Schema.declare<{
     readonly requestId: string;
     readonly instanceId: string;
     readonly pairingCode: string;
+    readonly includeDiffReadScope?: boolean;
   } => Schema.is(instancePairAgainRuntimeShape)(input),
   {
     toCodecJson: () =>
@@ -1133,6 +1151,296 @@ export const ThreadOutputInputSchema = Schema.declare<{
 );
 
 export type ThreadOutputInput = typeof ThreadOutputInputSchema.Type;
+
+const diffReadWorktreeReferenceFields = Schema.Struct({
+  instanceId: nonEmptyString,
+  repositoryPath: worktreeInspectPath,
+  worktreePath: worktreeInspectPath,
+});
+
+const unknownDiffReadWorktreeReferenceField = Schema.String.check(
+  Schema.makeFilter(
+    (key) => key !== "instanceId" && key !== "repositoryPath" && key !== "worktreePath",
+    { message: "unknown diff_read worktree argument" },
+  ),
+);
+
+const diffReadWorktreeReferenceRuntimeShape = Schema.StructWithRest(
+  diffReadWorktreeReferenceFields,
+  [Schema.Record(unknownDiffReadWorktreeReferenceField, Schema.Never)],
+);
+
+const diffReadWorktreeReferenceJsonShape = Schema.StructWithRest(diffReadWorktreeReferenceFields, [
+  Schema.Record(Schema.String, Schema.Never),
+]);
+
+const diffReadThreadReferenceFields = Schema.Struct({
+  instanceId: nonEmptyString,
+  threadId: nonEmptyString,
+});
+
+const unknownDiffReadThreadReferenceField = Schema.String.check(
+  Schema.makeFilter((key) => key !== "instanceId" && key !== "threadId", {
+    message: "unknown diff_read thread argument",
+  }),
+);
+
+const diffReadThreadReferenceRuntimeShape = Schema.StructWithRest(diffReadThreadReferenceFields, [
+  Schema.Record(unknownDiffReadThreadReferenceField, Schema.Never),
+]);
+
+const diffReadThreadReferenceJsonShape = Schema.StructWithRest(diffReadThreadReferenceFields, [
+  Schema.Record(Schema.String, Schema.Never),
+]);
+
+const diffReadSourceVariants = {
+  worktreeChanges: {
+    runtime: Schema.StructWithRest(
+      Schema.Struct({
+        kind: Schema.Literal("worktree_changes"),
+        worktree: diffReadWorktreeReferenceRuntimeShape,
+      }),
+      [
+        Schema.Record(
+          Schema.String.check(
+            Schema.makeFilter((key) => key !== "kind" && key !== "worktree", {
+              message: "unknown diff_read source argument",
+            }),
+          ),
+          Schema.Never,
+        ),
+      ],
+    ),
+    json: Schema.StructWithRest(
+      Schema.Struct({
+        kind: Schema.Literal("worktree_changes"),
+        worktree: diffReadWorktreeReferenceJsonShape,
+      }),
+      [Schema.Record(Schema.String, Schema.Never)],
+    ),
+  },
+  worktreeAgainstBase: {
+    runtime: Schema.StructWithRest(
+      Schema.Struct({
+        kind: Schema.Literal("worktree_against_base"),
+        worktree: diffReadWorktreeReferenceRuntimeShape,
+        baseRef: nonEmptyString.check(
+          Schema.makeFilter((value) => value.trim() === value, {
+            message: "expected a trimmed non-empty base reference",
+          }),
+        ),
+      }),
+      [
+        Schema.Record(
+          Schema.String.check(
+            Schema.makeFilter((key) => key !== "kind" && key !== "worktree" && key !== "baseRef", {
+              message: "unknown diff_read source argument",
+            }),
+          ),
+          Schema.Never,
+        ),
+      ],
+    ),
+    json: Schema.StructWithRest(
+      Schema.Struct({
+        kind: Schema.Literal("worktree_against_base"),
+        worktree: diffReadWorktreeReferenceJsonShape,
+        baseRef: nonEmptyString.check(
+          Schema.makeFilter((value) => value.trim() === value, {
+            message: "expected a trimmed non-empty base reference",
+          }),
+        ),
+      }),
+      [Schema.Record(Schema.String, Schema.Never)],
+    ),
+  },
+  threadTurnRange: {
+    runtime: Schema.StructWithRest(
+      Schema.Struct({
+        kind: Schema.Literal("thread_turn_range"),
+        thread: diffReadThreadReferenceRuntimeShape,
+        fromTurnCount: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+        toTurnCount: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+      }).check(
+        Schema.makeFilter((source) => source.fromTurnCount <= source.toTurnCount, {
+          message: "expected the end turn count to be no earlier than the start",
+        }),
+      ),
+      [
+        Schema.Record(
+          Schema.String.check(
+            Schema.makeFilter(
+              (key) =>
+                key !== "kind" &&
+                key !== "thread" &&
+                key !== "fromTurnCount" &&
+                key !== "toTurnCount",
+              { message: "unknown diff_read source argument" },
+            ),
+          ),
+          Schema.Never,
+        ),
+      ],
+    ),
+    json: Schema.StructWithRest(
+      Schema.Struct({
+        kind: Schema.Literal("thread_turn_range"),
+        thread: diffReadThreadReferenceJsonShape,
+        fromTurnCount: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+        toTurnCount: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+      }).check(
+        Schema.makeFilter((source) => source.fromTurnCount <= source.toTurnCount, {
+          message: "expected the end turn count to be no earlier than the start",
+        }),
+      ),
+      [Schema.Record(Schema.String, Schema.Never)],
+    ),
+  },
+  threadThroughTurn: {
+    runtime: Schema.StructWithRest(
+      Schema.Struct({
+        kind: Schema.Literal("thread_through_turn"),
+        thread: diffReadThreadReferenceRuntimeShape,
+        toTurnCount: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+      }),
+      [
+        Schema.Record(
+          Schema.String.check(
+            Schema.makeFilter(
+              (key) => key !== "kind" && key !== "thread" && key !== "toTurnCount",
+              { message: "unknown diff_read source argument" },
+            ),
+          ),
+          Schema.Never,
+        ),
+      ],
+    ),
+    json: Schema.StructWithRest(
+      Schema.Struct({
+        kind: Schema.Literal("thread_through_turn"),
+        thread: diffReadThreadReferenceJsonShape,
+        toTurnCount: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+      }),
+      [Schema.Record(Schema.String, Schema.Never)],
+    ),
+  },
+};
+
+const diffReadSourceRuntimeShape = Schema.Union([
+  diffReadSourceVariants.worktreeChanges.runtime,
+  diffReadSourceVariants.worktreeAgainstBase.runtime,
+  diffReadSourceVariants.threadTurnRange.runtime,
+  diffReadSourceVariants.threadThroughTurn.runtime,
+]);
+
+const diffReadSourceJsonShape = Schema.Union([
+  diffReadSourceVariants.worktreeChanges.json,
+  diffReadSourceVariants.worktreeAgainstBase.json,
+  diffReadSourceVariants.threadTurnRange.json,
+  diffReadSourceVariants.threadThroughTurn.json,
+]);
+
+export type DiffReadSource =
+  | { readonly kind: "worktree_changes"; readonly worktree: WorktreeReference }
+  | {
+      readonly kind: "worktree_against_base";
+      readonly worktree: WorktreeReference;
+      readonly baseRef: string;
+    }
+  | {
+      readonly kind: "thread_turn_range";
+      readonly thread: ThreadReference;
+      readonly fromTurnCount: number;
+      readonly toTurnCount: number;
+    }
+  | {
+      readonly kind: "thread_through_turn";
+      readonly thread: ThreadReference;
+      readonly toTurnCount: number;
+    };
+
+export type WorktreeDiffReadSource = Extract<
+  DiffReadSource,
+  { readonly kind: "worktree_changes" | "worktree_against_base" }
+>;
+
+export type DiffReadCaptureQuery = {
+  readonly source: WorktreeDiffReadSource;
+  readonly ignoreWhitespace: boolean;
+};
+
+const worktreeDiffReadSourceRuntimeShape = Schema.Union([
+  diffReadSourceVariants.worktreeChanges.runtime,
+  diffReadSourceVariants.worktreeAgainstBase.runtime,
+]);
+
+export const DiffReadCaptureQuerySchema = Schema.Struct({
+  source: worktreeDiffReadSourceRuntimeShape,
+  ignoreWhitespace: Schema.Boolean,
+});
+
+const diffReadFields = Schema.Struct({
+  source: diffReadSourceRuntimeShape,
+  ignoreWhitespace: Schema.optionalKey(Schema.Boolean),
+  cursor: Schema.optionalKey(nonEmptyString),
+  maxBytes: Schema.optionalKey(outputByteBudget),
+  allowStale: Schema.optionalKey(Schema.Boolean),
+});
+
+const diffReadJsonFields = Schema.Struct({
+  source: diffReadSourceJsonShape,
+  ignoreWhitespace: Schema.optionalKey(Schema.Boolean),
+  cursor: Schema.optionalKey(nonEmptyString),
+  maxBytes: Schema.optionalKey(outputByteBudget),
+  allowStale: Schema.optionalKey(Schema.Boolean),
+});
+
+const unknownDiffReadField = Schema.String.check(
+  Schema.makeFilter(
+    (key) =>
+      key !== "source" &&
+      key !== "ignoreWhitespace" &&
+      key !== "cursor" &&
+      key !== "maxBytes" &&
+      key !== "allowStale",
+    { message: "unknown diff_read argument" },
+  ),
+);
+
+const diffReadRuntimeShape = Schema.StructWithRest(diffReadFields, [
+  Schema.Record(unknownDiffReadField, Schema.Never),
+]);
+
+const diffReadJsonShape = Schema.StructWithRest(diffReadJsonFields, [
+  Schema.Record(Schema.String, Schema.Never),
+]);
+
+export const DiffReadInputSchema = Schema.declare<{
+  readonly source: DiffReadSource;
+  readonly ignoreWhitespace?: boolean;
+  readonly cursor?: string;
+  readonly maxBytes?: number;
+  readonly allowStale?: boolean;
+}>(
+  (
+    input,
+  ): input is {
+    readonly source: DiffReadSource;
+    readonly ignoreWhitespace?: boolean;
+    readonly cursor?: string;
+    readonly maxBytes?: number;
+    readonly allowStale?: boolean;
+  } => Schema.is(diffReadRuntimeShape)(input),
+  {
+    toCodecJson: () =>
+      Schema.link()(diffReadJsonShape, {
+        decode: SchemaGetter.passthrough({ strict: false }),
+        encode: SchemaGetter.passthrough({ strict: false }),
+      } as never),
+  },
+);
+
+export type DiffReadInput = typeof DiffReadInputSchema.Type;
 
 /**
  * The published thread-wait conditions observe all clients' activity on one
@@ -2510,17 +2818,25 @@ export const ThreadOutputToolResultSchema = toolResultFields(OutputChunkSchema);
 
 export type ThreadOutputToolResult = typeof ThreadOutputToolResultSchema.Type;
 
+export const DiffReadToolResultSchema = toolResultFields(OutputChunkSchema);
+
+export type DiffReadToolResult = typeof DiffReadToolResultSchema.Type;
+
 /**
  * The captured thread-output frame persists the chunk-level provenance beside
  * the part items so every continuation page is accompanied by the one
  * immutable view it was cut from.
  */
-export const ThreadOutputCaptureFrameSchema = Schema.Struct({
+export const OutputCaptureFrameSchema = Schema.Struct({
   sourceCompleteness: Schema.Literals(sourceCompletenessStates),
   upstreamTruncated: Schema.NullOr(Schema.Boolean),
 });
 
-export type ThreadOutputCaptureFrame = typeof ThreadOutputCaptureFrameSchema.Type;
+export type OutputCaptureFrame = typeof OutputCaptureFrameSchema.Type;
+
+export const ThreadOutputCaptureFrameSchema = OutputCaptureFrameSchema;
+
+export type ThreadOutputCaptureFrame = OutputCaptureFrame;
 
 /**
  * A model list binds one saved instance registration and an optional native
@@ -2684,6 +3000,8 @@ export const staleThreadGetReadLimitation = staleProjectReadLimitation;
 
 export const staleThreadOutputReadLimitation = staleProjectReadLimitation;
 
+export const staleDiffReadLimitation = staleProjectReadLimitation;
+
 export const makeThreadOutputToolSuccess = (
   value: OutputChunk,
   observations: ReadonlyArray<Observation>,
@@ -2696,6 +3014,24 @@ export const makeThreadOutputToolSuccess = (
           {
             code: "fresh_read_failed" as const,
             message: observation.limitations[0] ?? staleThreadOutputReadLimitation,
+          },
+        ]
+      : [],
+  ),
+});
+
+export const makeDiffReadToolSuccess = (
+  value: OutputChunk,
+  observations: ReadonlyArray<Observation>,
+): DiffReadToolResult => ({
+  result: { kind: "ok" as const, value },
+  observations,
+  warnings: observations.flatMap((observation) =>
+    observation.freshness === "stale"
+      ? [
+          {
+            code: "fresh_read_failed" as const,
+            message: observation.limitations[0] ?? staleDiffReadLimitation,
           },
         ]
       : [],

@@ -15,6 +15,8 @@ import type { JsonObject } from "effect/Schema";
 import { Tool, Toolkit } from "effect/unstable/ai";
 import {
   ApprovalRespondInputSchema,
+  DiffReadInputSchema,
+  DiffReadToolResultSchema,
   InstanceRemoveInputSchema,
   InstanceListInputSchema,
   InstanceGetInputSchema,
@@ -31,6 +33,9 @@ import {
   THREAD_OUTPUT_PART_LIMIT_BYTES,
   THREAD_SNAPSHOT_TURN_LIMIT,
   type CapturedThreadState,
+  type DiffReadCaptureQuery,
+  type DiffReadInput,
+  type DiffReadToolResult,
   type Evidence,
   type OperationRecord,
   type OutputChunkItem,
@@ -41,6 +46,7 @@ import {
   type ThreadObservationCursor,
   type ThreadOutputCaptureFrame,
   type ThreadOutputCaptureQuery,
+  type OutputCaptureFrame,
   type ThreadState,
   type ThreadWaitResult,
   decodeThreadObservationCursor,
@@ -52,11 +58,13 @@ import {
   makeThreadListToolSuccess,
   makeWorktreeInspectionToolSuccess,
   makeThreadOutputToolSuccess,
+  makeDiffReadToolSuccess,
   makeWorktreeListToolSuccess,
   staleModelReadLimitation,
   staleProjectReadLimitation,
   staleThreadGetReadLimitation,
   staleThreadOutputReadLimitation,
+  staleDiffReadLimitation,
   staleThreadReadLimitation,
   staleWorktreeReadLimitation,
   unknownModelCapabilities,
@@ -123,6 +131,7 @@ import {
   type ThreadCaptureMetadata,
   type ThreadGetCaptureMetadata,
   type ThreadOutputCaptureMetadata,
+  type DiffReadCaptureMetadata,
   type WorktreeInspectionCaptureMetadata,
   type TurnEvidenceRecord,
   type WorktreeCaptureMetadata,
@@ -136,6 +145,7 @@ import {
   type InstanceConnectionsService,
   type DiscoveredVcsWorktreeRefs,
   type ObservedVcsWorktreeStatus,
+  type ObservedVcsDiffPreview,
 } from "./instance-connections";
 import {
   ObservationError,
@@ -148,6 +158,7 @@ import {
   T3CodeAdapterError,
   type DiscoveredModelSelection,
   type ObservedThreadDetail,
+  type VcsDiffPreviewSource,
 } from "./t3code-adapter";
 import { pendingRequestsFromActivities } from "./pending-requests";
 import { adapterErrorFailure, observationErrorFailure } from "./tool-failure";
@@ -351,6 +362,19 @@ export const ThreadOutputTool = asReadTool(
 );
 
 // fallow-ignore-next-line unused-export
+export const DiffReadTool = asReadTool(
+  Tool.make("diff_read", {
+    description:
+      "Read one explicitly qualified worktree diff as a stable, bounded UTF-8 capture with native provenance, truncation, completeness, and continuation cursors.",
+    parameters: DiffReadInputSchema,
+    success: DiffReadToolResultSchema,
+  })
+    .addDependency(LocalStore)
+    .addDependency(InstanceConnections),
+  true,
+);
+
+// fallow-ignore-next-line unused-export
 export const ThreadWaitTool = asReadTool(
   Tool.make("thread_wait", {
     description:
@@ -425,7 +449,8 @@ export const InstanceRemoveTool = asRegistrationMutation(
 // fallow-ignore-next-line unused-export
 export const InstancePairTool = asRegistrationMutation(
   Tool.make("instance_pair", {
-    description: "Pair an existing T3Code instance with a one-use bearer code.",
+    description:
+      "Pair an existing T3Code instance with a one-use bearer code. Set includeDiffReadScope to request the review:write grant required by diff_read.",
     parameters: InstancePairInputSchema,
     success: OperationToolResultSchema,
   }),
@@ -447,7 +472,7 @@ export const InstanceUpdateTool = asRegistrationMutation(
 export const InstancePairAgainTool = asRegistrationMutation(
   Tool.make("instance_pair_again", {
     description:
-      "Replace a saved registration's credentials with a new one-use pairing code after expiry or revocation, verifying the bound environment first.",
+      "Replace a saved registration's credentials with a new one-use pairing code after expiry or revocation, verifying the bound environment first. Set includeDiffReadScope to request the review:write grant required by diff_read.",
     parameters: InstancePairAgainInputSchema,
     success: OperationToolResultSchema,
   }),
@@ -532,6 +557,7 @@ export const ServerToolkit = Toolkit.make(
   ThreadSubmitTool,
   ApprovalRespondTool,
   ThreadOutputTool,
+  DiffReadTool,
   ThreadWaitTool,
   TurnWaitTool,
   InputRespondTool,
@@ -3516,6 +3542,332 @@ const discoverThreadOutput = (options: {
     });
   });
 
+const diffReadOutputParts = (sourceId: string, diff: string): ReadonlyArray<OutputChunkItem> => {
+  if (diff.length === 0) return [];
+  const parts = splitOutputTextParts(diff, THREAD_OUTPUT_PART_LIMIT_BYTES);
+  return parts.map((text, part) => ({
+    id: sourceId,
+    kind: "diff",
+    turn: null,
+    part,
+    lastPart: part === parts.length - 1,
+    text,
+  }));
+};
+
+const diffReadSpecificFailure = (
+  error: LocalStoreError | T3CodeAdapterError,
+): ReturnType<typeof makeToolFailure> | null => {
+  if (error instanceof T3CodeAdapterError && error.kind === "authorization") {
+    const requiredScopes = error.requiredScopes ?? [];
+    if (requiredScopes.includes("review:write")) {
+      return makeToolFailure(
+        "The saved T3Code credential lacks the review:write scope required to read worktree diffs. Run instance_pair_again with includeDiffReadScope: true and a grant that includes review:write.",
+        "read_denied",
+        "change_request",
+        {
+          action: "instance_pair_again",
+          requiredScopes: [...requiredScopes],
+          includeDiffReadScope: true,
+        },
+      );
+    }
+  }
+  if (error instanceof LocalStoreError && error.kind === "capture_budget") {
+    return makeToolFailure(error.message, "result_too_large", "change_request", {
+      action: "reduce_diff_size_or_retry_later",
+    });
+  }
+  return null;
+};
+
+const diffReadFailureResult = (
+  error:
+    | LocalStoreError
+    | T3CodeAdapterError
+    | ObservationError
+    | {
+        readonly code: ToolFailure["code"];
+        readonly message: string;
+        readonly retry: ToolFailure["retry"];
+        readonly details: JsonObject;
+      },
+): DiffReadToolResult => {
+  const specificFailure =
+    error instanceof LocalStoreError || error instanceof T3CodeAdapterError
+      ? diffReadSpecificFailure(error)
+      : null;
+  const failure =
+    specificFailure ??
+    (error instanceof LocalStoreError ||
+    error instanceof T3CodeAdapterError ||
+    error instanceof ObservationError
+      ? toToolFailure(error)
+      : error);
+  return { result: { kind: "error", error: failure }, observations: [], warnings: [] };
+};
+
+const serveRetainedDiffRead = (options: {
+  readonly store: LocalStoreService;
+  readonly query: DiffReadCaptureQuery;
+  readonly maxBytes: number | undefined;
+  readonly error: LocalStoreError | T3CodeAdapterError;
+}): Effect.Effect<ReturnType<typeof makeDiffReadToolSuccess>, LocalStoreError> =>
+  Effect.gen(function* () {
+    const { store, query, maxBytes, error } = options;
+    const retained = yield* store.findRetainedDiffReadCapture(query);
+    if (retained === null) return diffReadFailureResult(error);
+    const fallbackObservedAt = new Date(yield* Clock.currentTimeMillis).toISOString();
+    const observations = staleReadObservations({
+      retainedObservations: retained.observations,
+      staleLimitation: staleDiffReadLimitation,
+      instanceId: query.source.worktree.instanceId,
+      fallbackObservedAt,
+      causeMessage: error.message,
+    });
+    const limitations = [
+      ...new Set([
+        ...retained.limitations.filter(
+          (limitation) => !limitation.startsWith(staleDiffReadLimitation),
+        ),
+        ...observations.flatMap((observation) => observation.limitations),
+      ]),
+    ];
+    const metadata: DiffReadCaptureMetadata = {
+      failures: [],
+      coverage: "partial",
+      limitations,
+      observations,
+    };
+    const captured = yield* store.captureDiffReadPage({
+      query,
+      items: retained.items,
+      metadata,
+      frame: retained.frame,
+      ...(maxBytes === undefined ? {} : { maxBytes }),
+    });
+    return makeDiffReadToolSuccess(captured.chunk, captured.observations);
+  });
+
+type DiffReadQueryResolution =
+  | { readonly kind: "supported"; readonly query: DiffReadCaptureQuery }
+  | { readonly kind: "unsupported"; readonly error: ToolFailure };
+
+const resolveDiffReadQuery = (input: DiffReadInput): DiffReadQueryResolution => {
+  const ignoreWhitespace = input.ignoreWhitespace ?? false;
+  switch (input.source.kind) {
+    case "worktree_changes":
+    case "worktree_against_base":
+      return { kind: "supported", query: { source: input.source, ignoreWhitespace } };
+    case "thread_turn_range":
+    case "thread_through_turn":
+      return {
+        kind: "unsupported",
+        error: makeToolFailure(
+          "Thread-history diff sources are not supported by this slice.",
+          "unsupported_capability",
+          "change_request",
+          { sourceKind: input.source.kind },
+        ),
+      };
+  }
+};
+
+const readDiffReadContinuation = (
+  store: LocalStoreService,
+  input: DiffReadInput,
+  query: DiffReadCaptureQuery,
+  cursor: string,
+) =>
+  Effect.gen(function* () {
+    const captured = yield* store.readDiffReadPage({
+      query,
+      cursor,
+      ...(input.maxBytes === undefined ? {} : { maxBytes: input.maxBytes }),
+    });
+    return makeDiffReadToolSuccess(captured.chunk, captured.observations);
+  });
+
+const isAmbiguousEmptyDiff = (native: VcsDiffPreviewSource): boolean =>
+  native.diff.length === 0 && !native.truncated;
+
+const nativeDiffCompleteness = (
+  native: VcsDiffPreviewSource,
+  ambiguousEmpty: boolean,
+): OutputCaptureFrame["sourceCompleteness"] => {
+  if (native.truncated) return "partial";
+  return ambiguousEmpty ? "unknown" : "complete";
+};
+
+const nativeDiffLimitations = (
+  native: VcsDiffPreviewSource,
+  ambiguousEmpty: boolean,
+): ReadonlyArray<string> => [
+  `Captured T3Code source '${native.id}' with base ${native.baseRef ?? "not reported"}, head ${native.headRef ?? "not reported"}, and native diff hash ${native.diffHash}.`,
+  ...(native.truncated ? ["T3Code truncated the native diff preview before this capture."] : []),
+  ...(ambiguousEmpty
+    ? [
+        "T3Code returned an empty preview while native Git errors may also produce an empty string, so this capture cannot establish that no changes exist.",
+      ]
+    : []),
+];
+
+const makeDiffFrame = (
+  native: VcsDiffPreviewSource,
+): {
+  readonly frame: OutputCaptureFrame;
+  readonly coverage: "complete_for_query" | "partial";
+  readonly limitations: ReadonlyArray<string>;
+} => {
+  const ambiguousEmpty = isAmbiguousEmptyDiff(native);
+  const sourceCompleteness = nativeDiffCompleteness(native, ambiguousEmpty);
+  return {
+    frame: { sourceCompleteness, upstreamTruncated: native.truncated },
+    coverage: sourceCompleteness === "complete" ? "complete_for_query" : "partial",
+    limitations: nativeDiffLimitations(native, ambiguousEmpty),
+  };
+};
+
+const nativeDiffSource = (
+  query: DiffReadCaptureQuery,
+  sources: ReadonlyArray<VcsDiffPreviewSource>,
+): VcsDiffPreviewSource | undefined => {
+  const kind = query.source.kind === "worktree_changes" ? "working-tree" : "branch-range";
+  const matching = sources.filter((source) => source.kind === kind);
+  return matching.length === 1 ? matching[0] : undefined;
+};
+
+const invalidNamedBaseFailure = (
+  query: DiffReadCaptureQuery,
+  native: VcsDiffPreviewSource,
+): ToolFailure | null =>
+  query.source.kind === "worktree_against_base" &&
+  (native.baseRef === null || native.headRef === null)
+    ? makeToolFailure(
+        "T3Code could not apply the requested base reference to this worktree.",
+        "invalid_argument",
+        "change_request",
+        { sourceKind: query.source.kind, baseRef: query.source.baseRef },
+      )
+    : null;
+
+const captureObservedDiffRead = (options: {
+  readonly store: LocalStoreService;
+  readonly input: DiffReadInput;
+  readonly query: DiffReadCaptureQuery;
+  readonly observed: ObservedVcsDiffPreview;
+}) =>
+  Effect.gen(function* () {
+    const { store, input, query, observed } = options;
+    const native = nativeDiffSource(query, observed.preview.sources);
+    if (native === undefined) {
+      return diffReadFailureResult(
+        makeToolFailure(
+          "The T3Code instance did not return the requested worktree diff source.",
+          "resource_not_found",
+          "reconcile_first",
+          { sourceKind: query.source.kind },
+        ),
+      );
+    }
+    const baseFailure = invalidNamedBaseFailure(query, native);
+    if (baseFailure !== null) return diffReadFailureResult(baseFailure);
+    const completeness = makeDiffFrame(native);
+    const observations: ReadonlyArray<Observation> = [
+      {
+        instanceId: query.source.worktree.instanceId,
+        observedAt: observed.observedAt,
+        freshness: "fresh",
+        sourceSequence: null,
+        coverage: completeness.coverage,
+        limitations: completeness.limitations,
+      },
+    ];
+    const metadata: DiffReadCaptureMetadata = {
+      failures: [],
+      coverage: completeness.coverage,
+      limitations: completeness.limitations,
+      observations,
+    };
+    const captured = yield* store.captureDiffReadPage({
+      query,
+      items: diffReadOutputParts(native.id, native.diff),
+      metadata,
+      frame: completeness.frame,
+      ...(input.maxBytes === undefined ? {} : { maxBytes: input.maxBytes }),
+    });
+    return makeDiffReadToolSuccess(captured.chunk, captured.observations);
+  });
+
+const readFreshDiffRead = (options: {
+  readonly store: LocalStoreService;
+  readonly connections: InstanceConnectionsService;
+  readonly input: DiffReadInput;
+  readonly query: DiffReadCaptureQuery;
+}) =>
+  Effect.gen(function* () {
+    const { store, connections, input, query } = options;
+    const target = yield* Effect.result(
+      Effect.gen(function* () {
+        const refs = yield* connections.discoverVcsWorktreeRefs(
+          query.source.worktree.instanceId,
+          query.source.worktree.repositoryPath,
+        );
+        yield* verifyCompleteVcsRefInventory(refs);
+        yield* worktreeRefForPath(refs, query.source.worktree.worktreePath);
+      }),
+    );
+    if (Result.isFailure(target)) {
+      const error = target.failure;
+      return input.allowStale === true &&
+        error instanceof T3CodeAdapterError &&
+        staleEligibleReadError(error)
+        ? yield* serveRetainedDiffRead({
+            store,
+            query,
+            maxBytes: input.maxBytes,
+            error,
+          })
+        : diffReadFailureResult(error);
+    }
+
+    const read = yield* Effect.result(
+      connections.readVcsWorktreeDiffPreview({
+        instanceId: query.source.worktree.instanceId,
+        worktreePath: query.source.worktree.worktreePath,
+        ...(query.source.kind === "worktree_against_base" ? { baseRef: query.source.baseRef } : {}),
+        ignoreWhitespace: query.ignoreWhitespace,
+      }),
+    );
+    if (Result.isSuccess(read)) {
+      return yield* captureObservedDiffRead({ store, input, query, observed: read.success });
+    }
+    return input.allowStale === true && staleEligibleReadError(read.failure)
+      ? yield* serveRetainedDiffRead({
+          store,
+          query,
+          maxBytes: input.maxBytes,
+          error: read.failure,
+        })
+      : diffReadFailureResult(read.failure);
+  });
+
+const diffReadToolHandler = (input: DiffReadInput) =>
+  Effect.gen(function* () {
+    const store = yield* LocalStore;
+    const connections = yield* InstanceConnections;
+    const resolution = resolveDiffReadQuery(input);
+    if (resolution.kind === "unsupported") return diffReadFailureResult(resolution.error);
+    if (input.cursor !== undefined) {
+      return yield* readDiffReadContinuation(store, input, resolution.query, input.cursor);
+    }
+    return yield* readFreshDiffRead({ store, connections, input, query: resolution.query });
+  }).pipe(
+    Effect.catch((error: LocalStoreError | T3CodeAdapterError) =>
+      Effect.succeed(diffReadFailureResult(error)),
+    ),
+  );
+
 /**
  * Between observations one wait polls at an interval that doubles from 100 ms
  * up to one second; every poll is a full bounded synchronization resuming
@@ -4562,6 +4914,7 @@ const serverToolHandlers = ServerToolkit.of({
         }),
       ),
     ),
+  diff_read: diffReadToolHandler,
   thread_wait: ({ thread, condition, afterCursor, waitMs }) =>
     Effect.gen(function* () {
       const observations = yield* Observations;

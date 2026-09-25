@@ -23,11 +23,13 @@ import {
   MAX_SERIALIZED_RESULT_BYTES,
   OPERATION_DETAIL_RETENTION_MILLIS,
   THREAD_OUTPUT_DEFAULT_MAX_BYTES,
+  DiffReadCaptureQuerySchema,
   CapturedThreadStateSchema,
   EvidenceSchema,
   ModelSummarySchema,
   ObservationSchema,
   OperationRecordSchema,
+  OutputCaptureFrameSchema,
   OutputChunkItemSchema,
   PendingRequestSchema,
   ProjectSummarySchema,
@@ -37,6 +39,7 @@ import {
   WorktreeInspectionFrameSchema,
   type CapturedThreadState,
   type Evidence,
+  type DiffReadCaptureQuery,
   type ModelListPage,
   type ModelListQuery,
   type ModelSummary,
@@ -46,6 +49,7 @@ import {
   type OperationStepState,
   type OutputChunk,
   type OutputChunkItem,
+  type OutputCaptureFrame,
   type PendingRequest,
   type PendingRequestPage,
   type ProjectListPage,
@@ -70,6 +74,7 @@ import {
   makeThreadGetToolSuccess,
   makeThreadListToolSuccess,
   makeThreadOutputToolSuccess,
+  makeDiffReadToolSuccess,
   makeWorktreeListToolSuccess,
   makeWorktreeInspectionToolSuccess,
   serializedByteLength,
@@ -106,6 +111,8 @@ const THREAD_GET_CAPTURE_SCOPE = "thread_get";
 const THREAD_GET_CAPTURE_ORDER = "activity_id_asc";
 const THREAD_OUTPUT_CAPTURE_SCOPE = "thread_output";
 const THREAD_OUTPUT_CAPTURE_ORDER = "created_at_desc";
+const DIFF_READ_CAPTURE_SCOPE = "diff_read";
+const DIFF_READ_CAPTURE_ORDER = "diff_part_asc";
 const WORKTREE_INSPECT_CAPTURE_SCOPE = "worktree_inspect";
 const WORKTREE_INSPECT_CAPTURE_ORDER = "instance_id_thread_id_asc";
 const OPERATION_DETAIL_CLEANUP_BATCH_SIZE = 64;
@@ -198,6 +205,27 @@ const threadOutputQueriesEqual = (
 ): boolean =>
   left.thread.instanceId === right.thread.instanceId &&
   left.thread.threadId === right.thread.threadId;
+
+const diffReadScopeKey = (query: DiffReadCaptureQuery): string =>
+  JSON.stringify([
+    DIFF_READ_CAPTURE_SCOPE,
+    query.source.kind,
+    query.source.worktree.instanceId,
+    query.source.worktree.repositoryPath,
+    query.source.worktree.worktreePath,
+    query.source.kind === "worktree_against_base" ? query.source.baseRef : null,
+    query.ignoreWhitespace,
+  ]);
+
+const diffReadQueriesEqual = (left: DiffReadCaptureQuery, right: DiffReadCaptureQuery): boolean =>
+  left.ignoreWhitespace === right.ignoreWhitespace &&
+  left.source.kind === right.source.kind &&
+  left.source.worktree.instanceId === right.source.worktree.instanceId &&
+  left.source.worktree.repositoryPath === right.source.worktree.repositoryPath &&
+  left.source.worktree.worktreePath === right.source.worktree.worktreePath &&
+  (left.source.kind !== "worktree_against_base" ||
+    (right.source.kind === "worktree_against_base" &&
+      left.source.baseRef === right.source.baseRef));
 
 export const REQUEST_RECORD_UNAVAILABLE_MESSAGE =
   "The mutation receipt details are unavailable; the request ID remains permanently reserved.";
@@ -481,6 +509,26 @@ const ThreadOutputCursorPayloadSchema = Schema.Struct({
   position: Schema.Natural,
 });
 
+type DiffReadCursorPayload = {
+  readonly version: 1;
+  readonly databaseId: string;
+  readonly captureId: string;
+  readonly scope: typeof DIFF_READ_CAPTURE_SCOPE;
+  readonly order: typeof DIFF_READ_CAPTURE_ORDER;
+  readonly query: DiffReadCaptureQuery;
+  readonly position: number;
+};
+
+const DiffReadCursorPayloadSchema = Schema.Struct({
+  version: Schema.Literal(1),
+  databaseId: Schema.NonEmptyString,
+  captureId: Schema.NonEmptyString,
+  scope: Schema.Literal(DIFF_READ_CAPTURE_SCOPE),
+  order: Schema.Literal(DIFF_READ_CAPTURE_ORDER),
+  query: DiffReadCaptureQuerySchema,
+  position: Schema.Natural,
+});
+
 const CaptureMetadataSchema = Schema.Struct({
   failures: Schema.Array(
     Schema.Struct({
@@ -577,10 +625,13 @@ export interface RetainedThreadGetCapture {
 }
 
 export type ThreadOutputCaptureMetadata = ListCaptureMetadata;
-export interface ThreadOutputCapturePage {
+export interface OutputCapturePage {
   readonly chunk: OutputChunk;
   readonly observations: ReadonlyArray<Observation>;
 }
+export type ThreadOutputCapturePage = OutputCapturePage;
+export type DiffReadCaptureMetadata = ListCaptureMetadata;
+export type DiffReadCapturePage = OutputCapturePage;
 /**
  * A retained thread-output capture keeps the captured provenance frame beside
  * the latest-first part items so an explicit stale read can serve the same
@@ -590,6 +641,13 @@ export interface RetainedThreadOutputCapture {
   readonly items: ReadonlyArray<OutputChunkItem>;
   readonly observations: ReadonlyArray<Observation>;
   readonly frame: ThreadOutputCaptureFrame;
+}
+
+export interface RetainedDiffReadCapture {
+  readonly items: ReadonlyArray<OutputChunkItem>;
+  readonly limitations: ReadonlyArray<string>;
+  readonly observations: ReadonlyArray<Observation>;
+  readonly frame: OutputCaptureFrame;
 }
 
 type RegistrationRowDecode = {
@@ -904,6 +962,21 @@ export interface LocalStoreService {
   readonly findRetainedThreadOutputCapture: (
     query: ThreadOutputCaptureQuery,
   ) => Effect.Effect<RetainedThreadOutputCapture | null, LocalStoreError>;
+  readonly captureDiffReadPage: (input: {
+    readonly query: DiffReadCaptureQuery;
+    readonly items: ReadonlyArray<OutputChunkItem>;
+    readonly metadata: DiffReadCaptureMetadata;
+    readonly frame: OutputCaptureFrame;
+    readonly maxBytes?: number;
+  }) => Effect.Effect<DiffReadCapturePage, LocalStoreError>;
+  readonly readDiffReadPage: (options: {
+    readonly query: DiffReadCaptureQuery;
+    readonly cursor: string;
+    readonly maxBytes?: number;
+  }) => Effect.Effect<DiffReadCapturePage, LocalStoreError>;
+  readonly findRetainedDiffReadCapture: (
+    query: DiffReadCaptureQuery,
+  ) => Effect.Effect<RetainedDiffReadCapture | null, LocalStoreError>;
   readonly putRegistration: (
     registration: PutRegistrationInput,
   ) => Effect.Effect<void, LocalStoreError>;
@@ -1262,6 +1335,31 @@ export class LocalStore extends Context.Service<LocalStore, LocalStoreService>()
         const findRetainedThreadOutputCapture = (query: ThreadOutputCaptureQuery) =>
           findRetainedThreadOutputCaptureInDatabase(sql, query, verifySchemaForOperation);
 
+        const captureDiffReadPage = (input: {
+          readonly query: DiffReadCaptureQuery;
+          readonly items: ReadonlyArray<OutputChunkItem>;
+          readonly metadata: DiffReadCaptureMetadata;
+          readonly frame: OutputCaptureFrame;
+          readonly maxBytes?: number;
+        }) =>
+          captureDiffReadPageInDatabase(
+            sql,
+            crypto,
+            config,
+            databaseId,
+            input,
+            verifySchemaForOperation,
+          );
+
+        const readDiffReadPage = (options: {
+          readonly query: DiffReadCaptureQuery;
+          readonly cursor: string;
+          readonly maxBytes?: number;
+        }) => readDiffReadPageFromDatabase(sql, databaseId, options, verifySchemaForOperation);
+
+        const findRetainedDiffReadCapture = (query: DiffReadCaptureQuery) =>
+          findRetainedDiffReadCaptureInDatabase(sql, query, verifySchemaForOperation);
+
         const putRegistration = (registration: PutRegistrationInput) =>
           putRegistrationInDatabase(
             sql,
@@ -1399,6 +1497,9 @@ export class LocalStore extends Context.Service<LocalStore, LocalStoreService>()
           captureThreadOutputPage,
           readThreadOutputPage,
           findRetainedThreadOutputCapture,
+          captureDiffReadPage,
+          readDiffReadPage,
+          findRetainedDiffReadCapture,
           putRegistration,
           stagePairing,
           publishPairing,
@@ -3160,34 +3261,44 @@ const findRetainedThreadStateCaptureInDatabase = (
  * at least one whole part because parts never exceed the smallest allowed
  * content budget.
  */
-const readThreadOutputChunkAtPosition = (
+const readOutputChunkAtPosition = (
   sql: SqlClient.SqlClient,
   databaseId: string,
-  query: ThreadOutputCaptureQuery,
   captureId: string,
   now: number,
   position: number,
   maxBytes: number,
-): Effect.Effect<ThreadOutputCapturePage, LocalStoreError | SqlError.SqlError> =>
+  settings: {
+    readonly scopeKey: string;
+    readonly orderKey: string;
+    readonly scopeName: string;
+    readonly decodeFrame: (
+      capture: CaptureRow,
+    ) => Effect.Effect<OutputCaptureFrame, LocalStoreError>;
+    readonly decodeItem: (payload: unknown) => Effect.Effect<OutputChunkItem, LocalStoreError>;
+    readonly makeCursor: (position: number) => string;
+    readonly makeSuccess: (chunk: OutputChunk, observations: ReadonlyArray<Observation>) => unknown;
+  },
+): Effect.Effect<OutputCapturePage, LocalStoreError | SqlError.SqlError> =>
   // fallow-ignore-next-line complexity
   Effect.gen(function* () {
-    const capture = yield* loadCaptureForCursor(sql, captureId, now, "thread output");
+    const capture = yield* loadCaptureForCursor(sql, captureId, now, settings.scopeName);
     if (
       capture.database_id !== databaseId ||
-      capture.scope !== threadOutputScopeKey(query) ||
-      capture.order_key !== THREAD_OUTPUT_CAPTURE_ORDER ||
+      capture.scope !== settings.scopeKey ||
+      capture.order_key !== settings.orderKey ||
       !Number.isSafeInteger(position) ||
       position < 0
     ) {
       return yield* Effect.fail(
         new LocalStoreError({
           kind: "cursor_mismatch",
-          message: "The thread output cursor does not match its capture.",
+          message: `The ${settings.scopeName} cursor does not match its capture.`,
         }),
       );
     }
     const metadata = yield* decodeThreadOutputCaptureMetadata(capture);
-    const frame = yield* decodeThreadOutputCaptureFrame(capture);
+    const frame = yield* settings.decodeFrame(capture);
     const itemCount = Number(capture.item_count);
     // Candidates are capped well below the content budget: the shared
     // envelope allows only on the order of a thousand parts per page, so
@@ -3201,9 +3312,7 @@ const readThreadOutputChunkAtPosition = (
       ORDER BY position ASC
       LIMIT ${candidateLimit}
     `;
-    const candidates = yield* Effect.forEach(rows, (row) =>
-      decodeThreadOutputCaptureItem(row.payload),
-    );
+    const candidates = yield* Effect.forEach(rows, (row) => settings.decodeItem(row.payload));
     const capturedId = String(capture.capture_id);
     const encodeText = new TextEncoder();
     // The result skeleton is measured once with an empty item list; each
@@ -3213,7 +3322,7 @@ const readThreadOutputChunkAtPosition = (
     // a part is compared against the ceiling, so the accounting is exact at
     // every step.
     const baseBytes = serializedByteLength(
-      makeThreadOutputToolSuccess(
+      settings.makeSuccess(
         {
           captureId: capturedId,
           nextCursor: null,
@@ -3229,7 +3338,7 @@ const readThreadOutputChunkAtPosition = (
       return yield* Effect.fail(
         new LocalStoreError({
           kind: "malformed_row",
-          message: "The thread output failure metadata exceeds the result size limit.",
+          message: `The ${settings.scopeName} metadata exceeds the result size limit.`,
         }),
       );
     }
@@ -3245,11 +3354,7 @@ const readThreadOutputChunkAtPosition = (
       // A pending continuation swaps the null cursor for its string form;
       // a page that ends the view keeps the null cursor.
       const cursorCost =
-        nextPosition < itemCount
-          ? serializedByteLength(
-              makeThreadOutputCaptureCursor(databaseId, capturedId, query, nextPosition),
-            ) - 4
-          : 0;
+        nextPosition < itemCount ? serializedByteLength(settings.makeCursor(nextPosition)) - 4 : 0;
       const nextContentBytes = contentBytes + encodeText.encode(part.text).byteLength;
       const nextEnvelopeBytes = baseBytes + partsBytes + partJsonBytes + cursorCost;
       if (nextContentBytes > maxBytes || nextEnvelopeBytes > MAX_SERIALIZED_RESULT_BYTES) break;
@@ -3261,15 +3366,12 @@ const readThreadOutputChunkAtPosition = (
       return yield* Effect.fail(
         new LocalStoreError({
           kind: "result_too_large",
-          message: "A thread output part exceeds the result size limit.",
+          message: `A ${settings.scopeName} part exceeds the result size limit.`,
         }),
       );
     }
     const nextPosition = position + items.length;
-    const nextCursor =
-      nextPosition < itemCount
-        ? makeThreadOutputCaptureCursor(databaseId, capturedId, query, nextPosition)
-        : null;
+    const nextCursor = nextPosition < itemCount ? settings.makeCursor(nextPosition) : null;
     return {
       chunk: {
         captureId: capturedId,
@@ -3281,6 +3383,46 @@ const readThreadOutputChunkAtPosition = (
       },
       observations: metadata.observations,
     };
+  });
+
+const readThreadOutputChunkAtPosition = (
+  sql: SqlClient.SqlClient,
+  databaseId: string,
+  query: ThreadOutputCaptureQuery,
+  captureId: string,
+  now: number,
+  position: number,
+  maxBytes: number,
+): Effect.Effect<ThreadOutputCapturePage, LocalStoreError | SqlError.SqlError> =>
+  readOutputChunkAtPosition(sql, databaseId, captureId, now, position, maxBytes, {
+    scopeKey: threadOutputScopeKey(query),
+    orderKey: THREAD_OUTPUT_CAPTURE_ORDER,
+    scopeName: "thread output",
+    decodeFrame: decodeThreadOutputCaptureFrame,
+    decodeItem: decodeOutputChunkItem,
+    makeCursor: (nextPosition) =>
+      makeThreadOutputCaptureCursor(databaseId, captureId, query, nextPosition),
+    makeSuccess: makeThreadOutputToolSuccess,
+  });
+
+const readDiffReadChunkAtPosition = (
+  sql: SqlClient.SqlClient,
+  databaseId: string,
+  query: DiffReadCaptureQuery,
+  captureId: string,
+  now: number,
+  position: number,
+  maxBytes: number,
+): Effect.Effect<DiffReadCapturePage, LocalStoreError | SqlError.SqlError> =>
+  readOutputChunkAtPosition(sql, databaseId, captureId, now, position, maxBytes, {
+    scopeKey: diffReadScopeKey(query),
+    orderKey: DIFF_READ_CAPTURE_ORDER,
+    scopeName: "worktree diff",
+    decodeFrame: decodeDiffReadCaptureFrame,
+    decodeItem: decodeOutputChunkItem,
+    makeCursor: (nextPosition) =>
+      makeDiffReadCaptureCursor(databaseId, captureId, query, nextPosition),
+    makeSuccess: makeDiffReadToolSuccess,
   });
 
 /**
@@ -3404,13 +3546,134 @@ const findRetainedThreadOutputCaptureInDatabase = (
         const frame = yield* decodeThreadOutputCaptureFrame(capture);
         return { metadata, frame };
       }),
-    decodeThreadOutputCaptureItem,
+    decodeOutputChunkItem,
     (decoded, items) =>
       ({
         items,
         observations: decoded.metadata.observations,
         frame: decoded.frame,
       }) satisfies RetainedThreadOutputCapture,
+    verify,
+  );
+
+const captureDiffReadPageInDatabase = (
+  sql: SqlClient.SqlClient,
+  crypto: Crypto.Crypto,
+  config: Required<LocalStoreConfigValue>,
+  databaseId: string,
+  input: {
+    readonly query: DiffReadCaptureQuery;
+    readonly items: ReadonlyArray<OutputChunkItem>;
+    readonly metadata: DiffReadCaptureMetadata;
+    readonly frame: OutputCaptureFrame;
+    readonly maxBytes?: number;
+  },
+  verify: SchemaVerifier,
+): Effect.Effect<DiffReadCapturePage, LocalStoreError> => {
+  const maxBytes = input.maxBytes ?? THREAD_OUTPUT_DEFAULT_MAX_BYTES;
+  const effect = Effect.gen(function* () {
+    yield* verify();
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        const captureId = yield* newCaptureId(crypto, "worktree diff");
+        const now = yield* Clock.currentTimeMillis;
+        yield* publishCapture(
+          sql,
+          config,
+          databaseId,
+          diffReadScopeKey(input.query),
+          DIFF_READ_CAPTURE_ORDER,
+          captureId,
+          now,
+          input.items,
+          input.metadata,
+          JSON.stringify(input.metadata.observations),
+          JSON.stringify(input.frame),
+        );
+        return yield* readDiffReadChunkAtPosition(
+          sql,
+          databaseId,
+          input.query,
+          captureId,
+          now,
+          0,
+          maxBytes,
+        );
+      }),
+    );
+  });
+  return retryStorage(effect.pipe(Effect.mapError(toStoreError)));
+};
+
+const readDiffReadPageFromDatabase = (
+  sql: SqlClient.SqlClient,
+  databaseId: string,
+  options: {
+    readonly query: DiffReadCaptureQuery;
+    readonly cursor: string;
+    readonly maxBytes?: number;
+  },
+  verify: SchemaVerifier,
+): Effect.Effect<DiffReadCapturePage, LocalStoreError> => {
+  const maxBytes = options.maxBytes ?? THREAD_OUTPUT_DEFAULT_MAX_BYTES;
+  const effect = Effect.gen(function* () {
+    yield* verify();
+    const payload = yield* decodeDiffReadCursor(options.cursor);
+    if (
+      payload.databaseId !== databaseId ||
+      payload.scope !== DIFF_READ_CAPTURE_SCOPE ||
+      payload.order !== DIFF_READ_CAPTURE_ORDER ||
+      !diffReadQueriesEqual(payload.query, options.query)
+    ) {
+      return yield* Effect.fail(
+        new LocalStoreError({
+          kind: "cursor_mismatch",
+          message: "The diff cursor does not match the requested source and target.",
+        }),
+      );
+    }
+    const now = yield* Clock.currentTimeMillis;
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        yield* sql`DELETE FROM captures WHERE expires_at <= ${now}`;
+        return yield* readDiffReadChunkAtPosition(
+          sql,
+          databaseId,
+          options.query,
+          payload.captureId,
+          now,
+          payload.position,
+          maxBytes,
+        );
+      }),
+    );
+  });
+  return retryStorage(effect.pipe(Effect.mapError(toStoreError)));
+};
+
+const findRetainedDiffReadCaptureInDatabase = (
+  sql: SqlClient.SqlClient,
+  query: DiffReadCaptureQuery,
+  verify: SchemaVerifier,
+): Effect.Effect<RetainedDiffReadCapture | null, LocalStoreError> =>
+  findRetainedCaptureInDatabase(
+    sql,
+    diffReadScopeKey(query),
+    DIFF_READ_CAPTURE_ORDER,
+    (capture) =>
+      Effect.gen(function* () {
+        const metadata = yield* decodeThreadOutputCaptureMetadata(capture);
+        const frame = yield* decodeDiffReadCaptureFrame(capture);
+        return { metadata, frame };
+      }),
+    decodeOutputChunkItem,
+    (decoded, items) =>
+      ({
+        items,
+        limitations: decoded.metadata.limitations,
+        observations: decoded.metadata.observations,
+        frame: decoded.frame,
+      }) satisfies RetainedDiffReadCapture,
     verify,
   );
 
@@ -4065,9 +4328,12 @@ const decodeThreadOutputCaptureFrame = (
 ): Effect.Effect<ThreadOutputCaptureFrame, LocalStoreError> =>
   decodeCaptureStateJson(capture, ThreadOutputCaptureFrameSchema, "thread output");
 
-const decodeThreadOutputCaptureItem = (
-  payload: unknown,
-): Effect.Effect<OutputChunkItem, LocalStoreError> =>
+const decodeDiffReadCaptureFrame = (
+  capture: CaptureRow,
+): Effect.Effect<OutputCaptureFrame, LocalStoreError> =>
+  decodeCaptureStateJson(capture, OutputCaptureFrameSchema, "worktree diff");
+
+const decodeOutputChunkItem = (payload: unknown): Effect.Effect<OutputChunkItem, LocalStoreError> =>
   decodeListCaptureItem(payload, OutputChunkItemSchema);
 
 const makeListPage = <Items>(
@@ -5533,6 +5799,22 @@ const makeThreadOutputCaptureCursor = (
     position,
   } satisfies ThreadOutputCursorPayload);
 
+const makeDiffReadCaptureCursor = (
+  databaseId: string,
+  captureId: string,
+  query: DiffReadCaptureQuery,
+  position: number,
+): string =>
+  encodeCursor({
+    version: 1,
+    databaseId,
+    captureId,
+    scope: DIFF_READ_CAPTURE_SCOPE,
+    order: DIFF_READ_CAPTURE_ORDER,
+    query,
+    position,
+  } satisfies DiffReadCursorPayload);
+
 const makeInstanceListPage = (
   items: ReadonlyArray<InstanceSummary>,
   nextCursor: string | null,
@@ -5558,7 +5840,8 @@ const encodeCursor = (
     | WorktreeCursorPayload
     | WorktreeInspectionCursorPayload
     | ThreadGetCursorPayload
-    | ThreadOutputCursorPayload,
+    | ThreadOutputCursorPayload
+    | DiffReadCursorPayload,
 ): string => Encoding.encodeBase64Url(JSON.stringify(payload));
 
 const decodeCursorPayload = <Payload>(
@@ -5572,7 +5855,8 @@ const decodeCursorPayload = <Payload>(
     | "worktree"
     | "worktree inspection"
     | "thread state"
-    | "thread output",
+    | "thread output"
+    | "worktree diff",
 ): Effect.Effect<Payload, LocalStoreError> => {
   const malformed = new LocalStoreError({
     kind: "cursor_mismatch",
@@ -5620,3 +5904,8 @@ const decodeThreadOutputCursor = (
   value: string,
 ): Effect.Effect<ThreadOutputCursorPayload, LocalStoreError> =>
   decodeCursorPayload(value, ThreadOutputCursorPayloadSchema, "thread output");
+
+const decodeDiffReadCursor = (
+  value: string,
+): Effect.Effect<DiffReadCursorPayload, LocalStoreError> =>
+  decodeCursorPayload(value, DiffReadCursorPayloadSchema, "worktree diff");

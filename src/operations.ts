@@ -221,6 +221,7 @@ const threadInterruptAdapterFailure: Record<
   command_rejected: { code: "upstream_failure", retry: "change_request" },
   upstream_failure: { code: "upstream_failure", retry: "reconcile_first" },
   resource_not_found: { code: "resource_not_found", retry: "none" },
+  unsupported_capability: { code: "unsupported_capability", retry: "change_request" },
   capacity: { code: "unavailable", retry: "safe_read" },
 };
 
@@ -233,6 +234,7 @@ const threadInterruptPreDispatchErrors: ReadonlySet<T3CodeAdapterErrorKind> = ne
   "identity_conflict",
   "incompatible_instance",
   "resource_not_found",
+  "unsupported_capability",
   "capacity",
 ]);
 
@@ -601,6 +603,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
         command_rejected: { code: "upstream_failure", retry: "change_request" },
         upstream_failure: { code: "upstream_failure", retry: "change_request" },
         capacity: { code: "unavailable", retry: "safe_read" },
+        unsupported_capability: { code: "unsupported_capability", retry: "change_request" },
       };
 
       const submissionFailure = (
@@ -3044,6 +3047,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           const staged = yield* connections.exchangePairingCode({
             endpoint: input.endpoint,
             pairingCode: input.pairingCode,
+            includeDiffReadScope: input.includeDiffReadScope === true,
           });
           exchangeAccepted = true;
           const exchanged = yield* evidence(
@@ -3232,6 +3236,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           const staged = yield* connections.exchangePairingCode({
             endpoint,
             pairingCode: input.pairingCode,
+            includeDiffReadScope: input.includeDiffReadScope === true,
           });
           exchangeAccepted = true;
           const exchanged = yield* evidence(

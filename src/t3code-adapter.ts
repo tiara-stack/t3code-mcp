@@ -137,13 +137,25 @@ const runtimeModeWireSchema = Schema.Literals([
 ]);
 
 const nonNegativeWireInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0));
+const isoDateTimeWirePattern = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.\d+)?Z$/;
+
+export const parseUtcIsoDateTime = (value: string): number | null => {
+  const match = isoDateTimeWirePattern.exec(value);
+  if (match === null) return null;
+  const milliseconds = Date.parse(value);
+  if (
+    !Number.isFinite(milliseconds) ||
+    new Date(milliseconds).toISOString().slice(0, 19) !== match[1]
+  ) {
+    return null;
+  }
+  return milliseconds;
+};
+
 const isoDateTimeWireString = Schema.String.check(
-  Schema.makeFilter(
-    (value) =>
-      /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(value) &&
-      !Number.isNaN(Date.parse(value)),
-    { message: "expected a UTC ISO date-time" },
-  ),
+  Schema.makeFilter((value) => parseUtcIsoDateTime(value) !== null, {
+    message: "expected a UTC ISO date-time",
+  }),
 );
 
 /**
@@ -441,6 +453,96 @@ const GitCommandErrorWireSchema = Schema.Struct({
   cause: Schema.optionalKey(Schema.Unknown),
 });
 
+const vcsProcessBoundaryErrorFields = {
+  operation: Schema.String,
+  command: Schema.String,
+  cwd: Schema.String,
+  argumentCount: Schema.optionalKey(nonNegativeWireInt),
+};
+
+const VcsErrorWireSchema = Schema.Union([
+  Schema.Struct({
+    _tag: Schema.Literal("VcsProcessSpawnError"),
+    ...vcsProcessBoundaryErrorFields,
+    cause: Schema.Unknown,
+  }),
+  Schema.Struct({
+    _tag: Schema.Literal("VcsProcessExitError"),
+    ...vcsProcessBoundaryErrorFields,
+    exitCode: Schema.Number,
+    detail: Schema.String,
+    failureKind: Schema.optionalKey(
+      Schema.Literals(["authentication", "not-found", "rate-limited", "command-failed"]),
+    ),
+    stderrLength: Schema.optionalKey(nonNegativeWireInt),
+    stderrTruncated: Schema.optionalKey(Schema.Boolean),
+  }),
+  Schema.Struct({
+    _tag: Schema.Literal("VcsProcessTimeoutError"),
+    ...vcsProcessBoundaryErrorFields,
+    timeoutMs: Schema.Number,
+  }),
+  Schema.Struct({
+    _tag: Schema.Literal("VcsProcessStdinWriteError"),
+    ...vcsProcessBoundaryErrorFields,
+    stdinBytes: nonNegativeWireInt,
+    cause: Schema.Unknown,
+  }),
+  Schema.Struct({
+    _tag: Schema.Literal("VcsProcessOutputReadError"),
+    ...vcsProcessBoundaryErrorFields,
+    stream: Schema.Literals(["stdout", "stderr", "exitCode"]),
+    cause: Schema.Unknown,
+  }),
+  Schema.Struct({
+    _tag: Schema.Literal("VcsProcessOutputLimitError"),
+    ...vcsProcessBoundaryErrorFields,
+    stream: Schema.Literals(["stdout", "stderr"]),
+    maxBytes: nonNegativeWireInt,
+    observedBytes: nonNegativeWireInt,
+  }),
+  Schema.Struct({
+    _tag: Schema.Literal("VcsProcessMissingExitCodeError"),
+    ...vcsProcessBoundaryErrorFields,
+  }),
+  Schema.Struct({
+    _tag: Schema.Literal("VcsRepositoryDetectionError"),
+    operation: Schema.String,
+    cwd: Schema.String,
+    detail: Schema.String,
+    cause: Schema.optionalKey(Schema.Unknown),
+  }),
+  Schema.Struct({
+    _tag: Schema.Literal("VcsUnsupportedOperationError"),
+    operation: Schema.String,
+    kind: Schema.Literals(["git", "jj", "unknown"]),
+    detail: Schema.String,
+  }),
+]);
+
+const ReviewDiffPreviewErrorWireSchema = Schema.Union([
+  VcsErrorWireSchema,
+  GitCommandErrorWireSchema,
+  EnvironmentAuthorizationErrorWireSchema,
+]);
+
+const ReviewDiffPreviewSourceWireSchema = Schema.Struct({
+  id: trimmedNonEmptyWireString,
+  kind: Schema.Literals(["working-tree", "branch-range"]),
+  title: trimmedNonEmptyWireString,
+  baseRef: Schema.NullOr(trimmedNonEmptyWireString),
+  headRef: Schema.NullOr(trimmedNonEmptyWireString),
+  diff: Schema.String,
+  diffHash: trimmedNonEmptyWireString,
+  truncated: Schema.Boolean,
+});
+
+const ReviewDiffPreviewResultWireSchema = Schema.Struct({
+  cwd: trimmedNonEmptyWireString,
+  generatedAt: trimmedNonEmptyWireString,
+  sources: Schema.Array(ReviewDiffPreviewSourceWireSchema),
+});
+
 const GitManagerErrorWireSchema = Schema.Struct({
   _tag: Schema.Literal("GitManagerError"),
   operation: Schema.String,
@@ -711,6 +813,16 @@ const VcsListRefsRpc = Rpc.make("vcs.listRefs", {
   ]),
 });
 
+const ReviewGetDiffPreviewRpc = Rpc.make("review.getDiffPreview", {
+  payload: Schema.Struct({
+    cwd: trimmedNonEmptyWireString,
+    baseRef: Schema.optionalKey(trimmedNonEmptyWireString),
+    ignoreWhitespace: Schema.optionalKey(Schema.Boolean),
+  }),
+  success: ReviewDiffPreviewResultWireSchema,
+  error: ReviewDiffPreviewErrorWireSchema,
+});
+
 const AdapterRpcGroup = RpcGroup.make(
   ServerProbeRpc,
   ServerGetConfigRpc,
@@ -721,6 +833,7 @@ const AdapterRpcGroup = RpcGroup.make(
   SubscribeThreadRpc,
   VcsRefreshStatusRpc,
   VcsListRefsRpc,
+  ReviewGetDiffPreviewRpc,
   VcsRemoveWorktreeRpc,
 );
 
@@ -731,6 +844,12 @@ type AdapterRpcClient = RpcClient.RpcClient<
 
 const PINNED_T3CODE_VERSION = "0.0.38";
 const REQUIRED_T3CODE_SCOPES = ["orchestration:read", "orchestration:operate"] as const;
+export const requestedT3CodePairingScopes = (
+  includeDiffReadScope = false,
+): ReadonlyArray<string> => [
+  ...REQUIRED_T3CODE_SCOPES,
+  ...(includeDiffReadScope ? ["review:write"] : []),
+];
 const MAX_INCOMING_WEBSOCKET_MESSAGE_BYTES = 16 * 1024 * 1024;
 /**
  * The pinned server accepts at most 200 refs per vcs.listRefs page; the
@@ -1158,6 +1277,55 @@ const mapVcsReadError = (operation: "status" | "refs", error: unknown): T3CodeAd
   return mapped instanceof T3CodeAdapterError ? mapped : mapAuthenticatedChannelError(mapped);
 };
 
+export const mapReviewDiffPreviewError = (error: unknown): T3CodeAdapterError => {
+  const reason = error instanceof RpcClientError.RpcClientError ? error.reason : error;
+  const decoded = Schema.decodeUnknownResult(ReviewDiffPreviewErrorWireSchema)(reason);
+  if (Result.isFailure(decoded)) return mapAuthenticatedChannelError(error);
+  return Match.value(decoded.success).pipe(
+    Match.tag(
+      "EnvironmentAuthorizationError",
+      (authorizationError) =>
+        new T3CodeAdapterError({
+          kind: "authorization",
+          message: "The T3Code credential lacks authorization to read worktree diffs.",
+          uncertain: false,
+          status: null,
+          requiredScopes: [authorizationError.requiredScope],
+        }),
+    ),
+    Match.tag(
+      "VcsUnsupportedOperationError",
+      () =>
+        new T3CodeAdapterError({
+          kind: "unsupported_capability",
+          message: "The target T3Code instance does not support this worktree diff source.",
+          uncertain: false,
+          status: null,
+        }),
+    ),
+    Match.tag(
+      "VcsRepositoryDetectionError",
+      () =>
+        new T3CodeAdapterError({
+          kind: "unsupported_capability",
+          message:
+            "T3Code could not verify the requested worktree as an upstream-approved project root. Diff previews are available only for approved project roots.",
+          uncertain: false,
+          status: null,
+        }),
+    ),
+    Match.orElse(
+      () =>
+        new T3CodeAdapterError({
+          kind: "transport",
+          message: "T3Code could not read the requested worktree diff.",
+          uncertain: false,
+          status: null,
+        }),
+    ),
+  );
+};
+
 /**
  * Map a failed vcs.listRefs read to a typed adapter error. Upstream git
  * failures stay explicit so the caller can mark the VCS evidence stream
@@ -1224,6 +1392,7 @@ export type T3CodeAdapterErrorKind =
   | "identity_conflict"
   | "incompatible_instance"
   | "wire_incompatible"
+  | "unsupported_capability"
   | "command_rejected"
   | "resource_not_found"
   | "capacity";
@@ -1235,6 +1404,21 @@ export class T3CodeAdapterError extends Data.TaggedError("T3CodeAdapterError")<{
   readonly status: number | null;
   readonly requiredScopes?: ReadonlyArray<string>;
 }> {}
+
+export const diffReadScopeGrantFailure = (
+  grantedScopes: string,
+  requested: boolean,
+): T3CodeAdapterError | null => {
+  if (!requested || grantedScopes.split(/\s+/).includes("review:write")) return null;
+  return new T3CodeAdapterError({
+    kind: "authorization",
+    message:
+      "The pairing code was consumed, but T3Code did not grant review:write. Obtain a new pairing code, then pair with includeDiffReadScope: true and a grant that includes review:write.",
+    uncertain: false,
+    status: null,
+    requiredScopes: ["review:write"],
+  });
+};
 
 export const mapThreadInterruptDispatchError = (error: {
   readonly message: string;
@@ -1283,6 +1467,7 @@ const mapThreadInterruptRpcError = (error: unknown): T3CodeAdapterError => {
 export interface PairingExchangeInput {
   readonly endpoint: string;
   readonly pairingCode: string;
+  readonly includeDiffReadScope?: boolean;
 }
 
 export interface DispatchTurnInput {
@@ -1554,6 +1739,23 @@ export interface VcsWorktreeStatus {
   readonly limitations: ReadonlyArray<string>;
 }
 
+export interface VcsDiffPreviewSource {
+  readonly id: string;
+  readonly kind: "working-tree" | "branch-range";
+  readonly title: string;
+  readonly baseRef: string | null;
+  readonly headRef: string | null;
+  readonly diff: string;
+  readonly diffHash: string;
+  readonly truncated: boolean;
+}
+
+export interface VcsDiffPreview {
+  readonly cwd: string;
+  readonly generatedAt: string;
+  readonly sources: ReadonlyArray<VcsDiffPreviewSource>;
+}
+
 export interface VcsWorktreeRef {
   readonly branch: string;
   readonly worktreePath: string;
@@ -1597,6 +1799,13 @@ export interface T3CodeAdapterService {
     readonly credential: string;
     readonly cwd: string;
   }) => Effect.Effect<VcsWorktreeStatus, T3CodeAdapterError>;
+  readonly getReviewDiffPreview: (input: {
+    readonly endpoint: string;
+    readonly credential: string;
+    readonly cwd: string;
+    readonly baseRef?: string;
+    readonly ignoreWhitespace: boolean;
+  }) => Effect.Effect<VcsDiffPreview, T3CodeAdapterError>;
   readonly listVcsWorktreeRefs: (input: {
     readonly endpoint: string;
     readonly credential: string;
@@ -2502,7 +2711,7 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
                   subject_token: input.pairingCode,
                   subject_token_type: "urn:t3:params:oauth:token-type:environment-bootstrap",
                   requested_token_type: "urn:ietf:params:oauth:token-type:access_token",
-                  scope: REQUIRED_T3CODE_SCOPES.join(" "),
+                  scope: requestedT3CodePairingScopes(input.includeDiffReadScope).join(" "),
                   client_label: "t3code-mcp",
                   client_device_type: "bot",
                   client_os: process.platform,
@@ -2511,6 +2720,11 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
               AccessTokenWireSchema,
               "exchange",
             );
+            const scopeFailure = diffReadScopeGrantFailure(
+              response.scope,
+              input.includeDiffReadScope === true,
+            );
+            if (scopeFailure !== null) return yield* Effect.fail(scopeFailure);
             return {
               credential: response.access_token,
               expiresAtMillis:
@@ -3123,6 +3337,26 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
           }),
         );
 
+      const getReviewDiffPreview = (input: {
+        readonly endpoint: string;
+        readonly credential: string;
+        readonly cwd: string;
+        readonly baseRef?: string;
+        readonly ignoreWhitespace: boolean;
+      }): Effect.Effect<VcsDiffPreview, T3CodeAdapterError> =>
+        withCapacity(
+          Effect.gen(function* () {
+            yield* requireReadSession(input);
+            return yield* withAuthenticatedRpc(input.endpoint, input.credential, (client) =>
+              client["review.getDiffPreview"]({
+                cwd: input.cwd,
+                ...(input.baseRef === undefined ? {} : { baseRef: input.baseRef }),
+                ignoreWhitespace: input.ignoreWhitespace,
+              }).pipe(Effect.mapError(mapReviewDiffPreviewError)),
+            );
+          }),
+        );
+
       const listVcsWorktreeRefs = (input: {
         readonly endpoint: string;
         readonly credential: string;
@@ -3303,6 +3537,7 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
         listProjects,
         listProviderModels,
         refreshVcsStatus,
+        getReviewDiffPreview,
         listVcsWorktreeRefs,
         interruptThread,
         stopThreadSession,

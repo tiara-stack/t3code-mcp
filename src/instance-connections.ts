@@ -19,6 +19,7 @@ import { LocalStore, LocalStoreError } from "./local-store";
 import {
   T3CodeAdapter,
   T3CodeAdapterError,
+  parseUtcIsoDateTime,
   type DiscoveredProject,
   type DiscoveredProvider,
   type DispatchTurnResult,
@@ -31,6 +32,7 @@ import {
   type ThreadStreamItem,
   type VcsWorktreeRefListing,
   type VcsWorktreeStatus,
+  type VcsDiffPreview,
   type VerifiedInstance,
   type CreatedWorktree,
   type WorktreeCreateRequest,
@@ -69,6 +71,11 @@ export interface DiscoveredVcsRefs {
 }
 
 export interface ObservedVcsWorktreeStatus extends VcsWorktreeStatus {
+  readonly observedAt: string;
+}
+
+export interface ObservedVcsDiffPreview {
+  readonly preview: VcsDiffPreview;
   readonly observedAt: string;
 }
 
@@ -163,6 +170,12 @@ export interface InstanceConnectionsService {
     instanceId: string,
     worktreePath: string,
   ) => Effect.Effect<ObservedVcsWorktreeStatus, LocalStoreError | T3CodeAdapterError>;
+  readonly readVcsWorktreeDiffPreview: (input: {
+    readonly instanceId: string;
+    readonly worktreePath: string;
+    readonly baseRef?: string;
+    readonly ignoreWhitespace: boolean;
+  }) => Effect.Effect<ObservedVcsDiffPreview, LocalStoreError | T3CodeAdapterError>;
   readonly discoverVcsWorktreeRefs: (
     instanceId: string,
     repositoryPath: string,
@@ -228,6 +241,7 @@ export class InstanceConnections extends Context.Service<
   static readonly layerTest = (
     service: Omit<
       InstanceConnectionsService,
+      | "readVcsWorktreeDiffPreview"
       | "respondToInput"
       | "dispatchTurn"
       | "interruptThread"
@@ -237,6 +251,7 @@ export class InstanceConnections extends Context.Service<
       Partial<
         Pick<
           InstanceConnectionsService,
+          | "readVcsWorktreeDiffPreview"
           | "respondToInput"
           | "dispatchTurn"
           | "interruptThread"
@@ -247,6 +262,17 @@ export class InstanceConnections extends Context.Service<
   ): Layer.Layer<InstanceConnections> =>
     Layer.succeed(InstanceConnections, {
       ...service,
+      readVcsWorktreeDiffPreview:
+        service.readVcsWorktreeDiffPreview ??
+        (() =>
+          Effect.fail(
+            new T3CodeAdapterError({
+              kind: "capacity",
+              message: "The test connection does not support VCS diff reads.",
+              uncertain: false,
+              status: null,
+            }),
+          )),
       respondToInput:
         service.respondToInput ??
         (() =>
@@ -564,6 +590,55 @@ export class InstanceConnections extends Context.Service<
             );
             const observedAt = new Date(yield* Clock.currentTimeMillis).toISOString();
             return { ...status, observedAt };
+          });
+
+        const readVcsWorktreeDiffPreview = (input: {
+          readonly instanceId: string;
+          readonly worktreePath: string;
+          readonly baseRef?: string;
+          readonly ignoreWhitespace: boolean;
+        }): Effect.Effect<ObservedVcsDiffPreview, LocalStoreError | T3CodeAdapterError> =>
+          Effect.gen(function* () {
+            yield* requireReadableRegistration(
+              input.instanceId,
+              "The saved registration requires pairing before worktree diffs can be read.",
+            );
+            const connection = yield* acquire(input.instanceId);
+            const preview = yield* withInstanceCapacity(
+              input.instanceId,
+              adapter.getReviewDiffPreview({
+                endpoint: connection.endpoint,
+                credential: connection.credential,
+                cwd: input.worktreePath,
+                ...(input.baseRef === undefined ? {} : { baseRef: input.baseRef }),
+                ignoreWhitespace: input.ignoreWhitespace,
+              }),
+            );
+            if (preview.cwd !== input.worktreePath) {
+              return yield* Effect.fail(
+                new T3CodeAdapterError({
+                  kind: "wire_incompatible",
+                  message: "The T3Code diff preview did not match the requested worktree.",
+                  uncertain: false,
+                  status: null,
+                }),
+              );
+            }
+            const generatedAtMillis = parseUtcIsoDateTime(preview.generatedAt);
+            if (generatedAtMillis === null) {
+              return yield* Effect.fail(
+                new T3CodeAdapterError({
+                  kind: "wire_incompatible",
+                  message: "The T3Code diff preview reported an invalid generation timestamp.",
+                  uncertain: false,
+                  status: null,
+                }),
+              );
+            }
+            return {
+              preview,
+              observedAt: new Date(generatedAtMillis).toISOString(),
+            } satisfies ObservedVcsDiffPreview;
           });
 
         const discoverVcsWorktreeRefs = (
@@ -1094,6 +1169,7 @@ export class InstanceConnections extends Context.Service<
           removeWorktree,
           discoverVcsRefs,
           readVcsWorktreeStatus,
+          readVcsWorktreeDiffPreview,
           discoverVcsWorktreeRefs,
           interruptThread,
           openShellStream,
