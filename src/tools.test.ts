@@ -17375,20 +17375,25 @@ describe("thread_submit", () => {
       Effect.gen(function* () {
         const { options, connections } = emptyThreadFixtures();
         const prompt = "secret prompt after a lost acknowledgement";
+        const distinctPrompt = "new explicit request after uncertain recovery";
+        const dispatchedTexts: Array<string> = [];
         let dispatches = 0;
         options.threadStreams = {
           "instance-a:thread-a": () => detailSnapshotStream(81, observedThreadFixture("thread-a")),
         };
-        options.dispatchTurn = () => {
+        options.dispatchTurn = (input) => {
           dispatches += 1;
-          return Effect.fail(
-            new T3CodeAdapterError({
-              kind: "transport",
-              message: "The test connection dropped after dispatch.",
-              uncertain: true,
-              status: null,
-            }),
-          );
+          dispatchedTexts.push(input.text);
+          return input.text === prompt
+            ? Effect.fail(
+                new T3CodeAdapterError({
+                  kind: "transport",
+                  message: "The test connection dropped after dispatch.",
+                  uncertain: true,
+                  status: null,
+                }),
+              )
+            : Effect.succeed({ sequence: 82 });
         };
 
         const result = yield* Effect.scoped(
@@ -17408,8 +17413,18 @@ describe("thread_submit", () => {
               intent: "provider_default",
               context: "thread_default",
             });
+            const distinct = yield* callTool("thread_submit", {
+              requestId: "submit-after-uncertain-recovery",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+              text: distinctPrompt,
+              intent: "provider_default",
+              context: "thread_default",
+            });
             const lookup = yield* callTool("operation_get", { requestId: "submit-lost-ack" });
-            return { first, duplicate, lookup };
+            const distinctLookup = yield* callTool("operation_get", {
+              requestId: "submit-after-uncertain-recovery",
+            });
+            return { first, duplicate, distinct, lookup, distinctLookup };
           }).pipe(Effect.provide(appLayer(databasePath, connections))),
         );
 
@@ -17428,14 +17443,94 @@ describe("thread_submit", () => {
         expect(result.duplicate[0]?.result).toMatchObject({
           result: { kind: "ok", value: { state: "outcome_unknown" } },
         });
+        expect(result.distinct[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "completed",
+              dispatch: "accepted",
+              correlation: { kind: "unestablished" },
+            },
+          },
+        });
         expect(result.lookup[0]?.result).toMatchObject({
           result: {
             kind: "ok",
             value: { operation: { requestId: "submit-lost-ack", state: "outcome_unknown" } },
           },
         });
+        expect(result.distinctLookup[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              operation: { requestId: "submit-after-uncertain-recovery", state: "completed" },
+            },
+          },
+        });
         expect(JSON.stringify(result)).not.toContain(prompt);
-        expect(dispatches).toBe(1);
+        expect(JSON.stringify(result)).not.toContain(distinctPrompt);
+        expect(dispatchedTexts).toEqual([prompt, distinctPrompt]);
+        expect(dispatches).toBe(2);
+      }),
+    ),
+  );
+
+  it.live("accepts a new provider-default submission while the previous turn is interrupted", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              83,
+              observedThreadFixture("thread-a", {
+                latestTurn: { turnId: "interrupted-turn", state: "interrupted" },
+                session: {
+                  status: "interrupted",
+                  activeTurnId: null,
+                  lastError: "Execution was interrupted.",
+                  updatedAt: "2026-09-23T09:00:00.000Z",
+                },
+              }),
+            ),
+        };
+        const dispatched: Array<InstanceDispatchTurnInput> = [];
+        options.dispatchTurn = (input) =>
+          Effect.sync(() => {
+            dispatched.push(input);
+            return { sequence: 84 };
+          });
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_submit", {
+              requestId: "submit-after-interruption",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+              text: "continue with a new explicit submission",
+              intent: "provider_default",
+              context: "thread_default",
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "completed",
+              dispatch: "accepted",
+              completionMeans: "submission_accepted",
+              correlation: { kind: "unestablished" },
+            },
+          },
+        });
+        expect(dispatched).toHaveLength(1);
+        expect(dispatched[0]).toMatchObject({
+          intent: "provider_default",
+          context: "thread_default",
+        });
+        expect(JSON.stringify(result[0]?.result)).not.toContain("resumed");
       }),
     ),
   );

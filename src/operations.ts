@@ -454,9 +454,6 @@ const sameModelSelection = (left: ModelSelection, right: ModelSelection): boolea
   );
 };
 
-const submissionNeedsCapabilityCheck = (input: ThreadSubmitInput): boolean =>
-  input.intent === "steer_current" || input.context === "require_retained";
-
 type SubmissionGuarantee = Extract<Capability["name"], "steer_current" | "resume_retained">;
 
 const requiredSubmissionGuarantees = (
@@ -465,6 +462,9 @@ const requiredSubmissionGuarantees = (
   ...(input.intent === "steer_current" ? ["steer_current" as const] : []),
   ...(input.context === "require_retained" ? ["resume_retained" as const] : []),
 ];
+
+const submissionNeedsCapabilityCheck = (input: ThreadSubmitInput): boolean =>
+  requiredSubmissionGuarantees(input).length > 0;
 
 const activeSubmissionTurnId = (thread: SynchronizedThreadDetail["thread"]): string | null => {
   if (thread.latestTurn?.state === "running") return thread.latestTurn.turnId;
