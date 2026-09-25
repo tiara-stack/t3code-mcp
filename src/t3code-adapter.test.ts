@@ -175,6 +175,48 @@ describe("T3Code thread subscriptions", () => {
 });
 
 describe("T3Code dispatch command errors", () => {
+  it.live("refuses guaranteed submission variants before the pinned generic turn-start RPC", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const adapter = yield* T3CodeAdapter;
+        for (const request of [
+          { intent: "steer_current" as const, context: "thread_default" as const },
+          { intent: "provider_default" as const, context: "require_retained" as const },
+          { intent: "steer_current" as const, context: "require_retained" as const },
+        ]) {
+          let dispatchStarted = false;
+          const result = yield* adapter
+            .dispatchTurn({
+              endpoint: "http://127.0.0.1:1",
+              credential: "fixture-credential",
+              expectedEnvironmentId: "fixture-environment",
+              threadId: "fixture-thread",
+              commandId: "fixture-command",
+              messageId: "fixture-message",
+              text: "requested guaranteed submission",
+              ...request,
+              runtimeMode: "auto",
+              interactionMode: "default",
+              createdAt: "2026-09-24T00:00:00.000Z",
+              onDispatchStart: () => {
+                dispatchStarted = true;
+              },
+            })
+            .pipe(
+              Effect.map((value) => ({ kind: "success" as const, value })),
+              Effect.catch((error) => Effect.succeed({ kind: "failure" as const, error })),
+            );
+
+          expect(result.kind).toBe("failure");
+          if (result.kind === "success") return;
+          expect(result.error.kind).toBe("unsupported_capability");
+          expect(result.error.message).toContain("cannot guarantee current-turn steering");
+          expect(dispatchStarted).toBe(false);
+        }
+      }).pipe(Effect.provide(pinnedT3CodeFixtureAdapter)),
+    ),
+  );
+
   it.effect("maps command invariant failures to definite rejections", () =>
     Effect.sync(() => {
       expect(

@@ -34,6 +34,7 @@ import {
   type InteractionMode,
   type InstanceCapabilityName,
   type RuntimeMode,
+  unknownModelCapabilities,
 } from "./domain";
 
 /**
@@ -1583,6 +1584,8 @@ export interface DispatchTurnInput {
   readonly commandId: string;
   readonly messageId: string;
   readonly text: string;
+  readonly intent: "provider_default" | "steer_current";
+  readonly context: "thread_default" | "require_retained";
   readonly runtimeMode: RuntimeMode;
   readonly interactionMode: InteractionMode;
   readonly createdAt: string;
@@ -1805,6 +1808,7 @@ export type DiscoveredModelOption =
 export interface DiscoveredProviderModel {
   readonly slug: string;
   readonly displayName: string;
+  readonly capabilities: ReadonlyArray<Capability>;
   readonly options: ReadonlyArray<DiscoveredModelOption>;
 }
 
@@ -2192,7 +2196,12 @@ const decodeProviderModel = (
   const model = modelResult.success;
   const decodedOptions = decodeProviderModelOptions(model.capabilities?.optionDescriptors);
   return {
-    model: { slug: model.slug, displayName: model.name, options: decodedOptions.options },
+    model: {
+      slug: model.slug,
+      displayName: model.name,
+      capabilities: unknownModelCapabilities(),
+      options: decodedOptions.options,
+    },
     skippedOptions: decodedOptions.skipped,
   };
 };
@@ -3559,6 +3568,17 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
       ): Effect.Effect<DispatchTurnResult, T3CodeAdapterError> =>
         withCapacity(
           Effect.gen(function* () {
+            if (input.intent !== "provider_default" || input.context !== "thread_default") {
+              return yield* Effect.fail(
+                new T3CodeAdapterError({
+                  kind: "unsupported_capability",
+                  message:
+                    "The pinned T3Code adapter cannot guarantee current-turn steering or retained-context continuation.",
+                  uncertain: false,
+                  status: null,
+                }),
+              );
+            }
             const { descriptor, authorization } = yield* verifyEnvironmentSession(input);
             if (descriptor.environmentId !== input.expectedEnvironmentId) {
               return yield* Effect.fail(
