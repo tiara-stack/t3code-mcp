@@ -43,6 +43,11 @@ const sharedAdapterFailures = {
     retry: "reconcile_first",
     details: {},
   },
+  upstream_rejected: {
+    code: "upstream_failure",
+    retry: "change_request",
+    details: {},
+  },
   transport: {
     code: "unavailable",
     retry: "safe_read",

@@ -92,6 +92,7 @@ import {
   ThreadStopSessionInputSchema,
   ThreadWaitInputSchema,
   ThreadWaitToolResultSchema,
+  ThreadSetSettledInputSchema,
   type ThreadWaitToolResult,
   type WorktreeCreateInput,
   type WorktreeDiscardInput,
@@ -157,6 +158,7 @@ import {
 import {
   ObservationError,
   Observations,
+  type ObservationServiceError,
   type ObservationsService,
   type SynchronizedShell,
   type SynchronizedThreadDetail,
@@ -413,11 +415,8 @@ export const TurnWaitTool = asReadTool(
   true,
 );
 
-/**
- * The registration mutations share one admission/supervision dependency set
- * and differ only in their destructive and open-world hints.
- */
-const asRegistrationMutation = <
+/** Share the admission and supervision dependencies across durable mutations. */
+const asDurableMutation = <
   Name extends string,
   Config extends {
     readonly parameters: Schema.Constraint;
@@ -428,18 +427,22 @@ const asRegistrationMutation = <
   Requirements,
 >(
   tool: Tool.Tool<Name, Config, Requirements>,
-  hints: { readonly destructive: boolean; readonly openWorld: boolean },
+  hints: {
+    readonly destructive: boolean;
+    readonly openWorld: boolean;
+    readonly idempotent?: boolean;
+  },
 ): Tool.Tool<Name, Config, Requirements | LocalStore | Operations> =>
   tool
     .addDependency(LocalStore)
     .addDependency(Operations)
     .annotate(Tool.Readonly, false)
     .annotate(Tool.Destructive, hints.destructive)
-    .annotate(Tool.Idempotent, true)
+    .annotate(Tool.Idempotent, hints.idempotent ?? true)
     .annotate(Tool.OpenWorld, hints.openWorld);
 
 // fallow-ignore-next-line unused-export
-export const ThreadSubmitTool = asRegistrationMutation(
+export const ThreadSubmitTool = asDurableMutation(
   Tool.make("thread_submit", {
     description:
       "Submit text to an existing thread using its current provider and configuration. The receipt confirms T3Code accepted the turn-start command, not provider execution or when active-thread input will be consumed.",
@@ -450,7 +453,7 @@ export const ThreadSubmitTool = asRegistrationMutation(
 );
 
 // fallow-ignore-next-line unused-export
-export const InstanceRemoveTool = asRegistrationMutation(
+export const InstanceRemoveTool = asDurableMutation(
   Tool.make("instance_remove", {
     description: "Remove a saved T3Code registration without changing upstream work.",
     parameters: InstanceRemoveInputSchema,
@@ -460,7 +463,7 @@ export const InstanceRemoveTool = asRegistrationMutation(
 );
 
 // fallow-ignore-next-line unused-export
-export const InstancePairTool = asRegistrationMutation(
+export const InstancePairTool = asDurableMutation(
   Tool.make("instance_pair", {
     description:
       "Pair an existing T3Code instance with a one-use bearer code. Set includeDiffReadScope to request the review:write grant required by diff_read.",
@@ -471,7 +474,7 @@ export const InstancePairTool = asRegistrationMutation(
 );
 
 // fallow-ignore-next-line unused-export
-export const InstanceUpdateTool = asRegistrationMutation(
+export const InstanceUpdateTool = asDurableMutation(
   Tool.make("instance_update", {
     description:
       "Edit a saved T3Code registration's alias or endpoint, verifying the bound environment before publishing.",
@@ -482,7 +485,7 @@ export const InstanceUpdateTool = asRegistrationMutation(
 );
 
 // fallow-ignore-next-line unused-export
-export const InstancePairAgainTool = asRegistrationMutation(
+export const InstancePairAgainTool = asDurableMutation(
   Tool.make("instance_pair_again", {
     description:
       "Replace a saved registration's credentials with a new one-use pairing code after expiry or revocation, verifying the bound environment first. Set includeDiffReadScope to request the review:write grant required by diff_read.",
@@ -493,7 +496,7 @@ export const InstancePairAgainTool = asRegistrationMutation(
 );
 
 // fallow-ignore-next-line unused-export
-export const InputRespondTool = asRegistrationMutation(
+export const InputRespondTool = asDurableMutation(
   Tool.make("input_respond", {
     description:
       "Respond to one currently observed native input request with answers validated against its current form.",
@@ -503,6 +506,7 @@ export const InputRespondTool = asRegistrationMutation(
   { destructive: false, openWorld: true },
 );
 
+// fallow-ignore-next-line unused-export
 export const WorktreeCreateTool = Tool.make("worktree_create", {
   description:
     "Create a worktree on one T3Code instance. Reusing its request ID reads the original creation receipt and never repeats the VCS operation.",
@@ -517,7 +521,7 @@ export const WorktreeCreateTool = Tool.make("worktree_create", {
   .annotate(Tool.OpenWorld, true);
 
 // fallow-ignore-next-line unused-export
-export const ThreadInterruptTool = asRegistrationMutation(
+export const ThreadInterruptTool = asDurableMutation(
   Tool.make("thread_interrupt", {
     description:
       "Interrupt the execution T3Code processes for this thread. The command has no turn fence. Some providers, including Claude, close their provider session during interruption. This does not stop the T3Code instance or establish work completion.",
@@ -528,18 +532,26 @@ export const ThreadInterruptTool = asRegistrationMutation(
 );
 
 // fallow-ignore-next-line unused-export
-export const ThreadCreateTool = Tool.make("thread_create", {
-  description:
-    "Create an unstarted thread on a discovered project using a verified project-root or existing worktree checkout and explicit effective settings. This does not create a worktree or submit a prompt.",
-  parameters: ThreadCreateInputSchema,
-  success: OperationToolResultSchema,
-})
-  .addDependency(LocalStore)
-  .addDependency(Operations)
-  .annotate(Tool.Readonly, false)
-  .annotate(Tool.Destructive, false)
-  .annotate(Tool.Idempotent, false)
-  .annotate(Tool.OpenWorld, true);
+export const ThreadCreateTool = asDurableMutation(
+  Tool.make("thread_create", {
+    description:
+      "Create an unstarted thread on a discovered project using a verified project-root or existing worktree checkout and explicit effective settings. This does not create a worktree or submit a prompt.",
+    parameters: ThreadCreateInputSchema,
+    success: OperationToolResultSchema,
+  }),
+  { destructive: false, openWorld: true, idempotent: false },
+);
+
+// fallow-ignore-next-line unused-export
+export const ThreadSetSettledTool = asDurableMutation(
+  Tool.make("thread_set_settled", {
+    description:
+      "Set a thread's native settled or active attention state and wait for that exact native override to be observed. Native pin/snooze changes and conditional provider-session shutdown remain separate state.",
+    parameters: ThreadSetSettledInputSchema,
+    success: OperationToolResultSchema,
+  }),
+  { destructive: true, openWorld: true },
+);
 
 // fallow-ignore-next-line unused-export
 export const OperationGetTool = Tool.make("operation_get", {
@@ -555,7 +567,7 @@ export const OperationGetTool = Tool.make("operation_get", {
   .annotate(Tool.OpenWorld, false);
 
 // fallow-ignore-next-line unused-export
-export const ThreadStopSessionTool = asRegistrationMutation(
+export const ThreadStopSessionTool = asDurableMutation(
   Tool.make("thread_stop_session", {
     description:
       "Request provider-session shutdown for one thread and wait for an observed stopped-session update tied to the captured session. A command acknowledgement, turn outcome, settlement, or replacement session does not establish shutdown. This does not stop the T3Code instance or establish process-tree termination or work completion.",
@@ -587,6 +599,7 @@ export const ServerToolkit = Toolkit.make(
   ThreadOutputTool,
   DiffReadTool,
   ThreadWaitTool,
+  ThreadSetSettledTool,
   TurnWaitTool,
   InputRespondTool,
   OperationGetTool,
@@ -1188,8 +1201,10 @@ const projectThreadSummary = (options: {
   readonly repositoryPath: string | null;
   readonly worktreePath: string | null;
   readonly latestTurnId: string | null;
-  readonly settledOverride: "settled" | "active" | null;
-  readonly settledAt: string | null;
+  readonly attention: Pick<
+    ObservedThreadDetail,
+    "settledOverride" | "settledAt" | "snoozedAt" | "snoozedUntil" | "pinnedAt"
+  >;
 }): ThreadSummary => {
   const {
     instanceId,
@@ -1200,8 +1215,7 @@ const projectThreadSummary = (options: {
     repositoryPath,
     worktreePath,
     latestTurnId,
-    settledOverride,
-    settledAt,
+    attention,
   } = options;
   return {
     thread: { instanceId, threadId },
@@ -1213,9 +1227,26 @@ const projectThreadSummary = (options: {
         ? null
         : { instanceId, repositoryPath, worktreePath },
     latestTurn: latestTurnId === null ? null : { instanceId, threadId, turnId: latestTurnId },
-    settlement: settlementFromNative(settledOverride, settledAt),
+    ...threadAttentionSummary(attention),
   };
 };
+
+const threadAttentionSummary = (
+  thread: Pick<
+    ObservedThreadDetail,
+    "settledOverride" | "settledAt" | "snoozedAt" | "snoozedUntil" | "pinnedAt"
+  >,
+): Pick<
+  ThreadSummary,
+  "settlement" | "settledOverride" | "settledAt" | "snoozedAt" | "snoozedUntil" | "pinnedAt"
+> => ({
+  settlement: settlementFromNative(thread.settledOverride, thread.settledAt),
+  settledOverride: thread.settledOverride,
+  settledAt: thread.settledAt,
+  snoozedAt: thread.snoozedAt,
+  snoozedUntil: thread.snoozedUntil,
+  pinnedAt: thread.pinnedAt,
+});
 
 const toThreadSummaries = (
   shell: SynchronizedShell,
@@ -1242,8 +1273,7 @@ const toThreadSummaries = (
           repositoryPath: project?.repositoryPath ?? null,
           worktreePath: thread.worktreePath,
           latestTurnId: thread.latestTurnId,
-          settledOverride: thread.settledOverride,
-          settledAt: thread.settledAt,
+          attention: thread,
         });
       })
   );
@@ -1974,8 +2004,7 @@ const worktreeThreadSummary = (options: {
     repositoryPath: project.repositoryPath,
     worktreePath: thread.worktreePath,
     latestTurnId: thread.latestTurnId,
-    settledOverride: thread.settledOverride,
-    settledAt: thread.settledAt,
+    attention: thread,
   });
 };
 
@@ -2522,7 +2551,14 @@ const inspectWorktreeThread = (options: {
     const summary = threadSummaryFromDetail({
       instanceId: worktree.instanceId,
       detail,
-      project: { repositoryPath: candidate.repositoryPath, limitations: [] },
+      project: {
+        repositoryPath: candidate.repositoryPath,
+        limitations: [],
+        nativeSettlementLimitations: [],
+        nativeThread: null,
+        nativeThreadFailure: null,
+        shellObservation: null,
+      },
     });
     const execution = threadExecutionState(worktree.instanceId, detail);
     const session = threadSessionStateOf(detail);
@@ -2886,7 +2922,131 @@ const threadConfigurationFromDetail = (detail: ObservedThreadDetail): ThreadConf
 interface ThreadProjectLookup {
   readonly repositoryPath: string | null;
   readonly limitations: ReadonlyArray<string>;
+  readonly nativeSettlementLimitations: ReadonlyArray<string>;
+  readonly nativeThread: SynchronizedShell["threads"][number] | null;
+  readonly nativeThreadFailure: ObservationServiceError | null;
+  readonly shellObservation: Observation | null;
 }
+
+interface NativeThreadShellLookup {
+  readonly shell: SynchronizedShell | null;
+  readonly failure: ObservationServiceError | null;
+}
+
+const nativeThreadInShell = (shell: SynchronizedShell, threadId: string) =>
+  shell.threads.find((entry) => entry.threadId === threadId) ?? null;
+
+const selectNativeThreadShell = (
+  preferred: Result.Result<SynchronizedShell, ObservationServiceError>,
+  fallback: Result.Result<SynchronizedShell, ObservationServiceError>,
+  threadId: string,
+): NativeThreadShellLookup => {
+  if (Result.isSuccess(preferred) && nativeThreadInShell(preferred.success, threadId) !== null) {
+    return { shell: preferred.success, failure: null };
+  }
+  if (Result.isSuccess(fallback) && nativeThreadInShell(fallback.success, threadId) !== null) {
+    return { shell: fallback.success, failure: null };
+  }
+  if (Result.isFailure(preferred)) {
+    return {
+      shell: Result.isSuccess(fallback) ? fallback.success : null,
+      failure: preferred.failure,
+    };
+  }
+  if (Result.isFailure(fallback)) {
+    return { shell: preferred.success, failure: fallback.failure };
+  }
+  return { shell: preferred.success, failure: null };
+};
+
+const lookupNativeThreadShellInOrder = (options: {
+  readonly instanceId: string;
+  readonly threadId: string;
+  readonly preferred: (
+    instanceId: string,
+  ) => Effect.Effect<SynchronizedShell, ObservationServiceError>;
+  readonly fallback: (
+    instanceId: string,
+  ) => Effect.Effect<SynchronizedShell, ObservationServiceError>;
+}): Effect.Effect<NativeThreadShellLookup, never> =>
+  Effect.gen(function* () {
+    const { instanceId, threadId } = options;
+    const preferred = yield* Effect.result(options.preferred(instanceId));
+    if (Result.isSuccess(preferred) && nativeThreadInShell(preferred.success, threadId) !== null) {
+      return { shell: preferred.success, failure: null };
+    }
+
+    const fallback = yield* Effect.result(options.fallback(instanceId));
+    if (
+      Result.isSuccess(preferred) &&
+      Result.isSuccess(fallback) &&
+      nativeThreadInShell(preferred.success, threadId) === null &&
+      nativeThreadInShell(fallback.success, threadId) === null
+    ) {
+      const refreshedPreferred = yield* Effect.result(options.preferred(instanceId));
+      return selectNativeThreadShell(refreshedPreferred, fallback, threadId);
+    }
+
+    return selectNativeThreadShell(preferred, fallback, threadId);
+  });
+
+const lookupNativeThreadShell = (options: {
+  readonly observations: ObservationsService;
+  readonly instanceId: string;
+  readonly detail: SynchronizedThreadDetail;
+}): Effect.Effect<NativeThreadShellLookup, never> =>
+  options.detail.thread.archivedAt !== null
+    ? lookupNativeThreadShellInOrder({
+        instanceId: options.instanceId,
+        threadId: options.detail.thread.threadId,
+        preferred: (instanceId) => options.observations.archivedShell(instanceId),
+        fallback: (instanceId) => options.observations.activeShell(instanceId),
+      })
+    : lookupNativeThreadShellInOrder({
+        instanceId: options.instanceId,
+        threadId: options.detail.thread.threadId,
+        preferred: (instanceId) => options.observations.activeShell(instanceId),
+        fallback: (instanceId) => options.observations.archivedShell(instanceId),
+      });
+
+const threadProjectLookupLimitations = (options: {
+  readonly project: SynchronizedShell["projects"][number] | undefined;
+  readonly nativeThreadFailure: ObservationServiceError | null;
+}): ReadonlyArray<string> => {
+  return options.project === undefined
+    ? [
+        options.nativeThreadFailure === null
+          ? "The project repository path could not be established from the shell."
+          : `The project repository path could not be established (${options.nativeThreadFailure.message}).`,
+      ]
+    : [];
+};
+
+const nativeThreadSettlementLimitations = (options: {
+  readonly nativeThread: SynchronizedShell["threads"][number] | null;
+  readonly nativeThreadFailure: ObservationServiceError | null;
+}): ReadonlyArray<string> =>
+  options.nativeThreadFailure !== null || options.nativeThread === null
+    ? [
+        "The native thread attention state is unavailable from the shell; settlement falls back to thread detail.",
+      ]
+    : [];
+
+const threadShellObservation = (options: {
+  readonly shell: SynchronizedShell | null;
+  readonly instanceId: string;
+  readonly limitations: ReadonlyArray<string>;
+}): Observation | null => {
+  if (options.shell === null) return null;
+  return {
+    instanceId: options.instanceId,
+    observedAt: options.shell.observedAt,
+    freshness: "fresh",
+    sourceSequence: options.shell.snapshotSequence,
+    coverage: options.limitations.length === 0 ? "complete_for_query" : "partial",
+    limitations: options.limitations,
+  };
+};
 
 /**
  * Look up the thread's project in the shell that lists it: the active shell
@@ -2901,30 +3061,28 @@ const lookupThreadProject = (options: {
   readonly detail: SynchronizedThreadDetail;
 }): Effect.Effect<ThreadProjectLookup, never> =>
   Effect.gen(function* () {
-    const { observations, instanceId, detail } = options;
-    const shellResult = yield* Effect.result(
-      detail.thread.archivedAt === null
-        ? observations.activeShell(instanceId)
-        : observations.archivedShell(instanceId),
-    );
-    if (Result.isFailure(shellResult)) {
-      return {
-        repositoryPath: null,
-        limitations: [
-          `The project repository path could not be established (${shellResult.failure.message}).`,
-        ],
-      };
-    }
-    const project = shellResult.success.projects.find(
-      (entry) => entry.projectId === detail.thread.projectId,
-    );
-    if (project === undefined) {
-      return {
-        repositoryPath: null,
-        limitations: ["The project repository path could not be established from the shell."],
-      };
-    }
-    return { repositoryPath: project.repositoryPath, limitations: [] };
+    const { instanceId, detail } = options;
+    const nativeShell = yield* lookupNativeThreadShell(options);
+    const { shell, failure: nativeThreadFailure } = nativeShell;
+    const nativeThread = shell === null ? null : nativeThreadInShell(shell, detail.thread.threadId);
+    const project = shell?.projects.find((entry) => entry.projectId === detail.thread.projectId);
+    const limitations = threadProjectLookupLimitations({ project, nativeThreadFailure });
+    const nativeSettlementLimitations = nativeThreadSettlementLimitations({
+      nativeThread,
+      nativeThreadFailure,
+    });
+    return {
+      repositoryPath: project?.repositoryPath ?? null,
+      limitations,
+      nativeSettlementLimitations,
+      nativeThread,
+      nativeThreadFailure,
+      shellObservation: threadShellObservation({
+        shell,
+        instanceId,
+        limitations: [...limitations, ...nativeSettlementLimitations],
+      }),
+    };
   });
 
 const limitedHistoryLimitation = `The pinned server retained only the most recent ${THREAD_SNAPSHOT_TURN_LIMIT} user-anchored turns; earlier history is unavailable through this read.`;
@@ -2988,6 +3146,7 @@ const threadSummaryFromDetail = (options: {
   readonly instanceId: string;
   readonly detail: SynchronizedThreadDetail;
   readonly project: ThreadProjectLookup;
+  readonly includeNativeShellState?: boolean;
 }): ThreadSummary => {
   const { instanceId, detail, project } = options;
   const { thread } = detail;
@@ -3000,8 +3159,8 @@ const threadSummaryFromDetail = (options: {
     repositoryPath: project.repositoryPath,
     worktreePath: thread.worktreePath,
     latestTurnId: thread.latestTurn?.turnId ?? null,
-    settledOverride: thread.settledOverride,
-    settledAt: thread.settledAt,
+    attention:
+      options.includeNativeShellState === false ? thread : (project.nativeThread ?? thread),
   });
 };
 
@@ -3015,12 +3174,36 @@ const buildThreadState = (options: {
   readonly instanceId: string;
   readonly detail: SynchronizedThreadDetail;
   readonly project: ThreadProjectLookup;
-}): { readonly state: ThreadState; readonly frame: CapturedThreadState } => {
+  readonly includeNativeShellState?: boolean;
+}): {
+  readonly state: ThreadState;
+  readonly frame: CapturedThreadState;
+  readonly coverageLimitations: ReadonlyArray<string>;
+} => {
   const { instanceId, detail, project } = options;
   const { thread } = detail;
-  const limitations = [
-    ...(detail.limitedHistory ? [limitedHistoryLimitation] : []),
+  const historyLimitations = detail.limitedHistory ? [limitedHistoryLimitation] : [];
+  const nativeCoverageLimitations =
+    options.includeNativeShellState === false ? [] : project.nativeSettlementLimitations;
+  const detailDerivedAttentionLimitations =
+    options.includeNativeShellState === false
+      ? project.nativeThread !== null
+        ? [
+            "Thread attention fields in this wait come from thread detail; use thread_get or a settlement wait for the native shell state.",
+          ]
+        : []
+      : [];
+  const coverageLimitations = [
+    ...historyLimitations,
     ...project.limitations,
+    ...nativeCoverageLimitations,
+  ];
+  const limitations = [
+    ...historyLimitations,
+    ...project.limitations,
+    ...(options.includeNativeShellState === false
+      ? detailDerivedAttentionLimitations
+      : project.nativeSettlementLimitations),
   ];
   const state: ThreadState = {
     summary: threadSummaryFromDetail(options),
@@ -3055,7 +3238,7 @@ const buildThreadState = (options: {
     interruptionPending: state.interruptionPending,
     limitations: state.limitations,
   };
-  return { state, frame };
+  return { state, frame, coverageLimitations };
 };
 
 const assembleThreadState = (
@@ -3202,13 +3385,17 @@ const discoverThreadState = (options: {
     if (outcome.kind === "stale") return outcome.value;
     const detail = outcome.detail;
     const project = yield* lookupThreadProject({ observations, instanceId, detail });
-    const { state, frame } = buildThreadState({ instanceId, detail, project });
+    const { state, frame, coverageLimitations } = buildThreadState({
+      instanceId,
+      detail,
+      project,
+    });
     const items = pendingRequestsFromActivities(
       query.thread,
       detail.thread.activities,
       detail.limitedHistory,
     );
-    const coverage = project.limitations.length > 0 ? "partial" : "complete_for_query";
+    const coverage = coverageLimitations.length > 0 ? "partial" : "complete_for_query";
     return yield* serveThreadStatePage({
       store,
       query,
@@ -3223,6 +3410,9 @@ const discoverThreadState = (options: {
           coverage,
           limitations: state.limitations,
         }),
+        ...(project.nativeThread === null || project.shellObservation === null
+          ? []
+          : [project.shellObservation]),
       ],
       limit,
     });
@@ -3893,8 +4083,66 @@ interface ThreadWaitPoll {
   /** A terminal result ends the wait; null asks the loop to keep waiting. */
   readonly terminal: ThreadWaitToolResult | null;
   readonly state: ThreadState;
-  readonly observation: Observation;
+  readonly observations: ReadonlyArray<Observation>;
 }
+
+const isNativeSettlementCondition = (condition: ThreadCondition): boolean =>
+  condition === "settled" || condition === "unsettled";
+
+const threadWaitObservations = (input: {
+  readonly condition: ThreadCondition;
+  readonly detail: Observation;
+  readonly project: ThreadProjectLookup;
+}): ReadonlyArray<Observation> =>
+  isNativeSettlementCondition(input.condition) && input.project.shellObservation !== null
+    ? [input.detail, input.project.shellObservation]
+    : [input.detail];
+
+const nativeSettlementUnavailableResult = (
+  condition: ThreadCondition,
+  observations: ReadonlyArray<Observation>,
+): ThreadWaitToolResult =>
+  threadWaitObservationResult({
+    condition,
+    observation: "unavailable",
+    state: null,
+    observations,
+    warnings: [
+      {
+        code: "native_settlement_unavailable",
+        message:
+          "The current native thread attention state could not be established from the shell.",
+      },
+    ],
+  });
+
+const threadWaitTerminalResult = (input: {
+  readonly condition: ThreadCondition;
+  readonly outcome: ThreadWaitEvaluation["outcome"];
+  readonly state: ThreadState;
+  readonly observations: ReadonlyArray<Observation>;
+}): ThreadWaitToolResult | null => {
+  switch (input.outcome) {
+    case "met":
+      return threadWaitObservationResult({
+        condition: input.condition,
+        observation: "condition_met",
+        state: input.state,
+        observations: input.observations,
+        warnings: [],
+      });
+    case "history_gap":
+      return threadWaitObservationResult({
+        condition: input.condition,
+        observation: "history_gap",
+        state: input.state,
+        observations: input.observations,
+        warnings: [],
+      });
+    case "not_met":
+      return null;
+  }
+};
 
 /**
  * Run one bounded observation of the waited thread and evaluate the condition
@@ -3912,14 +4160,20 @@ const pollThreadWait = (options: {
 }): ThreadWaitPoll => {
   const { thread, condition, cursor, project, detail } = options;
   const { instanceId } = thread;
-  const { state, frame } = buildThreadState({ instanceId, detail, project });
+  const usesNativeSettlement = isNativeSettlementCondition(condition);
+  const { state, frame, coverageLimitations } = buildThreadState({
+    instanceId,
+    detail,
+    project,
+    includeNativeShellState: usesNativeSettlement,
+  });
   const items = pendingRequestsFromActivities(
     thread,
     detail.thread.activities,
     detail.limitedHistory,
   );
   const coverage =
-    project.limitations.length > 0 ? ("partial" as const) : ("complete_for_query" as const);
+    coverageLimitations.length > 0 ? ("partial" as const) : ("complete_for_query" as const);
   // A wait is not a paging read: the state carries every observed pending
   // request with no continuation cursor.
   const fullState = assembleThreadState(frame, {
@@ -3939,25 +4193,17 @@ const pollThreadWait = (options: {
         ? [...state.limitations, HISTORY_GAP_LIMITATION]
         : state.limitations,
   });
+  const observations = threadWaitObservations({ condition, detail: observation, project });
   const terminal =
-    evaluation.outcome === "met"
-      ? threadWaitObservationResult({
+    usesNativeSettlement && project.nativeThread === null
+      ? nativeSettlementUnavailableResult(condition, observations)
+      : threadWaitTerminalResult({
           condition,
-          observation: "condition_met",
+          outcome: evaluation.outcome,
           state: fullState,
-          observations: [observation],
-          warnings: [],
-        })
-      : evaluation.outcome === "history_gap"
-        ? threadWaitObservationResult({
-            condition,
-            observation: "history_gap",
-            state: fullState,
-            observations: [observation],
-            warnings: [],
-          })
-        : null;
-  return { terminal, state: fullState, observation };
+          observations,
+        });
+  return { terminal, state: fullState, observations };
 };
 
 /**
@@ -4121,51 +4367,50 @@ const sleepBeforeNextWaitPoll = (options: {
     return { elapsed: false };
   });
 
+const makeThreadProjectLookup = (observations: ObservationsService, instanceId: string) => {
+  let cachedProject: {
+    readonly archived: boolean;
+    readonly projectId: string;
+    readonly lookup: ThreadProjectLookup;
+  } | null = null;
+  return (detail: SynchronizedThreadDetail) =>
+    Effect.gen(function* () {
+      const archived = detail.thread.archivedAt !== null;
+      const projectId = detail.thread.projectId;
+      if (
+        cachedProject !== null &&
+        cachedProject.archived === archived &&
+        cachedProject.projectId === projectId
+      ) {
+        return cachedProject.lookup;
+      }
+      const lookup = yield* lookupThreadProject({ observations, instanceId, detail });
+      if (lookup.repositoryPath !== null) {
+        cachedProject = { archived, projectId, lookup };
+      }
+      return lookup;
+    });
+};
+
 const nextWaitPollInterval = (pollInterval: number): number =>
   Math.min(THREAD_WAIT_MAX_POLL_INTERVAL_MILLIS, pollInterval * 2);
 
-/**
- * Observe one thread until its condition is met, the deadline passes, the
- * observation becomes unavailable, or a cursor gap demands resynchronization.
- * Every synchronization is scoped: cancelling the wait interrupts only this
- * observation, releases its subscription scope, and dispatches no
- * interruption, settlement, session shutdown, or work-completion decision.
- */
 const runThreadWait = (
   options: ThreadWaitSuccessOptions,
 ): Effect.Effect<ThreadWaitToolResult, LocalStoreError | T3CodeAdapterError | ObservationError> =>
   Effect.gen(function* () {
     const { observations, thread, condition, cursor, waitMs } = options;
-    const { instanceId } = thread;
-    // The project lookup answers one shell read per observation; cache it
-    // across polls and re-resolve only when the fields it depends on change.
-    let cachedProject: {
-      readonly archived: boolean;
-      readonly projectId: string;
-      readonly lookup: ThreadProjectLookup;
-    } | null = null;
+    const { instanceId, threadId } = thread;
+    // Settlement conditions reread the shell every poll because its native
+    // attention state can change without a per-thread event.
+    const cachedProjectLookupFor = makeThreadProjectLookup(observations, instanceId);
     const projectLookupFor = (detail: SynchronizedThreadDetail) =>
-      Effect.gen(function* () {
-        const archived = detail.thread.archivedAt !== null;
-        const projectId = detail.thread.projectId;
-        if (
-          cachedProject !== null &&
-          cachedProject.archived === archived &&
-          cachedProject.projectId === projectId
-        ) {
-          return cachedProject.lookup;
-        }
-        const lookup = yield* lookupThreadProject({ observations, instanceId, detail });
-        // A degraded lookup (the repository path could not be established)
-        // stays uncached so a later poll can recover full coverage.
-        if (lookup.limitations.length === 0) {
-          cachedProject = { archived, projectId, lookup };
-        }
-        return lookup;
-      });
+      isNativeSettlementCondition(condition)
+        ? lookupThreadProject({ observations, instanceId, detail })
+        : cachedProjectLookupFor(detail);
     return yield* runObservedThreadWaitLoop({
       waitMs,
-      observe: () => observations.threadDetail(instanceId, thread.threadId),
+      observe: () => observations.threadDetail(instanceId, threadId),
       unavailable: (failure) =>
         threadWaitObservationResult({
           condition,
@@ -4177,6 +4422,9 @@ const runThreadWait = (
       poll: (detail) =>
         Effect.gen(function* () {
           const project = yield* projectLookupFor(detail);
+          if (isNativeSettlementCondition(condition) && project.nativeThreadFailure !== null) {
+            return yield* Effect.fail(project.nativeThreadFailure);
+          }
           const poll = pollThreadWait({ thread, condition, cursor, project, detail });
           return poll.terminal === null
             ? ({ kind: "pending", pending: poll } as const)
@@ -4187,7 +4435,7 @@ const runThreadWait = (
           condition,
           observation: "timed_out",
           state: poll.state,
-          observations: [poll.observation],
+          observations: poll.observations,
           warnings: [],
         }),
     });
@@ -4931,6 +5179,11 @@ const serverToolHandlers = ServerToolkit.of({
         }),
       ),
     ),
+  thread_set_settled: (input) =>
+    Effect.gen(function* () {
+      const operations = yield* Operations;
+      return yield* operationMutationResult(operations.setThreadSettled(input));
+    }),
   instance_update: (input) =>
     Effect.gen(function* () {
       const operations = yield* Operations;
@@ -5014,6 +5267,7 @@ const operationMutatorTools: ReadonlySet<string> = new Set([
   "approval_respond",
   "thread_interrupt",
   "thread_stop_session",
+  "thread_set_settled",
 ]);
 
 // fallow-ignore-next-line complexity

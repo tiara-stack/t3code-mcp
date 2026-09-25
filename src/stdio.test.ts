@@ -130,6 +130,7 @@ describe("stdio transport", () => {
               "thread_output",
               "diff_read",
               "thread_wait",
+              "thread_set_settled",
               "turn_wait",
               "input_respond",
               "operation_get",

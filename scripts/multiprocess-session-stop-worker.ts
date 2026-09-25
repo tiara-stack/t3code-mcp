@@ -67,6 +67,7 @@ const connections = InstanceConnections.layerTest({
   discoverVcsRefs: () => unsupported("VCS discovery is not used by this worker."),
   readVcsWorktreeStatus: () => unsupported("Worktree status is not used by this worker."),
   discoverVcsWorktreeRefs: () => unsupported("Worktree-ref discovery is not used by this worker."),
+  dispatchThreadSettlement: () => unsupported("Thread settlement is not used by this worker."),
   prepareThreadSessionStop: () =>
     Effect.succeed({
       dispatch: () =>
@@ -108,6 +109,9 @@ const connections = InstanceConnections.layerTest({
                 archivedAt: null,
                 settledOverride: null,
                 settledAt: null,
+                snoozedAt: null,
+                snoozedUntil: null,
+                pinnedAt: null,
                 activities: [],
                 messages: [],
                 session,

@@ -43,6 +43,7 @@ import {
   type ToolFailure,
   type WorktreeCreateInput,
   type WorktreeDiscardInput,
+  type ThreadSetSettledInput,
 } from "./domain";
 import { LocalStore, LocalStoreError, REQUEST_RECORD_UNAVAILABLE_MESSAGE } from "./local-store";
 import type {
@@ -62,6 +63,7 @@ import {
   T3CodeAdapterError,
   type DiscoveredModelOption,
   type DiscoveredProject,
+  type ShellThread,
   type ThreadCreateRequest,
   type T3CodeAdapterErrorKind,
 } from "./t3code-adapter";
@@ -243,6 +245,7 @@ const threadInterruptAdapterFailure: Record<
   incompatible_instance: { code: "incompatible_instance", retry: "change_request" },
   wire_incompatible: { code: "incompatible_instance", retry: "change_request" },
   command_rejected: { code: "upstream_failure", retry: "change_request" },
+  upstream_rejected: { code: "upstream_failure", retry: "change_request" },
   upstream_failure: { code: "upstream_failure", retry: "reconcile_first" },
   resource_not_found: { code: "resource_not_found", retry: "none" },
   unsupported_capability: { code: "unsupported_capability", retry: "change_request" },
@@ -260,6 +263,7 @@ const threadInterruptPreDispatchErrors: ReadonlySet<T3CodeAdapterErrorKind> = ne
   "resource_not_found",
   "unsupported_capability",
   "capacity",
+  "upstream_rejected",
 ]);
 
 const THREAD_INTERRUPT_BASELINE_ENDED_PREFIX = "The previously observed turn ";
@@ -279,6 +283,61 @@ class WorktreeDiscardClaimLost extends Data.TaggedError("WorktreeDiscardClaimLos
 class ThreadCreateDispatchClaimLost extends Data.TaggedError("ThreadCreateDispatchClaimLost")<{}> {}
 
 const WORKTREE_DISCARD_RECONCILIATION_INTERVAL_MILLIS = 1_000;
+
+type SettlementFailureTemplate = Omit<ToolFailure, "message">;
+
+const settlementFailures = {
+  authorization: {
+    code: "operate_denied",
+    retry: "change_request",
+    details: {},
+  },
+  incompatible_instance: { code: "incompatible_instance", retry: "change_request", details: {} },
+  wire_incompatible: { code: "incompatible_instance", retry: "change_request", details: {} },
+  identity_mismatch: { code: "identity_mismatch", retry: "reconcile_first", details: {} },
+  identity_conflict: { code: "identity_conflict", retry: "change_request", details: {} },
+  resource_not_found: { code: "resource_not_found", retry: "reconcile_first", details: {} },
+  unsupported_capability: { code: "unsupported_capability", retry: "change_request", details: {} },
+  upstream_rejected: {
+    code: "upstream_failure",
+    retry: "change_request",
+    details: { operation: "thread_set_settled" },
+  },
+  command_rejected: { code: "upstream_failure", retry: "change_request", details: {} },
+  upstream_failure: { code: "upstream_failure", retry: "reconcile_first", details: {} },
+  capacity: { code: "unavailable", retry: "safe_read", details: {} },
+  invalid_pairing_code: { code: "pairing_failed", retry: "change_request", details: {} },
+  pairing_code_used: { code: "pairing_failed", retry: "change_request", details: {} },
+  pairing_required: { code: "pairing_required", retry: "change_request", details: {} },
+} satisfies Record<
+  Exclude<T3CodeAdapterErrorKind, "transport" | "timeout">,
+  SettlementFailureTemplate
+>;
+
+const settlementFailure = (error: T3CodeAdapterError): ToolFailure =>
+  error.kind === "transport" || error.kind === "timeout"
+    ? {
+        code: "unavailable",
+        message: error.message,
+        retry: error.uncertain ? "reconcile_first" : "safe_read",
+        details: {},
+      }
+    : {
+        ...settlementFailures[error.kind],
+        message: error.message,
+        ...(error.kind === "authorization" && error.requiredScopes !== undefined
+          ? { details: { requiredScopes: [...error.requiredScopes] } }
+          : {}),
+      };
+
+const settlementObservationCanRetry = (error: ObservationServiceError): boolean => {
+  if (error instanceof ObservationError) return true;
+  if (error instanceof LocalStoreError) return error.kind === "contention";
+  if (error instanceof T3CodeAdapterError) {
+    return error.kind === "transport" || error.kind === "timeout" || error.kind === "capacity";
+  }
+  return false;
+};
 
 export interface OperationsService {
   readonly pairInstance: (
@@ -334,6 +393,9 @@ export interface OperationsService {
   ) => Effect.Effect<OperationRecord, LocalStoreError | OperationServiceError>;
   readonly stopThreadSession: (
     input: ThreadStopSessionInput,
+  ) => Effect.Effect<OperationRecord, LocalStoreError | OperationServiceError>;
+  readonly setThreadSettled: (
+    input: ThreadSetSettledInput,
   ) => Effect.Effect<OperationRecord, LocalStoreError | OperationServiceError>;
   readonly getOperation: (
     input: OperationGetInput,
@@ -826,6 +888,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
       );
       const activeRequests = new Map<string, number>();
       const threadSessionStopRecoveryLastAttemptAt = new Map<string, number>();
+      const threadSettlementRecoveryLastAttemptAt = new Map<string, number>();
       const reserveThreadSessionStopRecoveryObservation = (
         requestId: string,
         attemptAt: number,
@@ -843,6 +906,25 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           return false;
         }
         threadSessionStopRecoveryLastAttemptAt.set(requestId, attemptAt);
+        return true;
+      };
+      const reserveThreadSettlementRecoveryObservation = (
+        requestId: string,
+        attemptAt: number,
+      ): boolean => {
+        for (const [previousRequestId, lastAttemptAt] of threadSettlementRecoveryLastAttemptAt) {
+          if (attemptAt - lastAttemptAt >= LIVE_EFFECT_OBSERVATION_MILLIS) {
+            threadSettlementRecoveryLastAttemptAt.delete(previousRequestId);
+          }
+        }
+        const lastAttemptAt = threadSettlementRecoveryLastAttemptAt.get(requestId);
+        if (
+          lastAttemptAt !== undefined &&
+          attemptAt - lastAttemptAt < LIVE_EFFECT_OBSERVATION_MILLIS
+        ) {
+          return false;
+        }
+        threadSettlementRecoveryLastAttemptAt.set(requestId, attemptAt);
         return true;
       };
       let activeCapacity = 0;
@@ -905,6 +987,16 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           return true;
         });
 
+      const reserveIfInactive = (requestId: string) =>
+        Effect.sync(() => {
+          if (activeRequests.has(requestId) || activeCapacity >= MAX_OPERATION_CAPACITY) {
+            return false;
+          }
+          activeCapacity += 1;
+          activeRequests.set(requestId, 1);
+          return true;
+        });
+
       const nowIso = Effect.map(Clock.currentTimeMillis, (millis) =>
         new Date(millis).toISOString(),
       );
@@ -929,6 +1021,30 @@ export class Operations extends Context.Service<Operations, OperationsService>()
             );
           }
           return terminal(current.record) ? null : current.record.revision;
+        });
+
+      const currentSettlementObservation = (
+        requestId: string,
+      ): Effect.Effect<
+        {
+          readonly revision: number;
+          readonly intermediateState: "pending" | "outcome_unknown";
+        } | null,
+        LocalStoreError
+      > =>
+        Effect.gen(function* () {
+          const current = yield* store.getOperation(requestId);
+          if (current === null) return null;
+          switch (current.record.state) {
+            case "completed":
+            case "failed":
+            case "partial":
+              return null;
+            case "outcome_unknown":
+              return { revision: current.record.revision, intermediateState: "outcome_unknown" };
+            default:
+              return { revision: current.record.revision, intermediateState: "pending" };
+          }
         });
 
       const isPreDispatchRevisionConflict = (
@@ -1080,6 +1196,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
         wire_incompatible: { code: "incompatible_instance", retry: "change_request" },
         resource_not_found: { code: "resource_not_found", retry: "reconcile_first" },
         command_rejected: { code: "upstream_failure", retry: "change_request" },
+        upstream_rejected: { code: "upstream_failure", retry: "change_request" },
         upstream_failure: { code: "upstream_failure", retry: "change_request" },
         capacity: { code: "unavailable", retry: "safe_read" },
         unsupported_capability: { code: "unsupported_capability", retry: "change_request" },
@@ -1275,6 +1392,298 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           })),
         );
 
+      const evidenceAt = (input: {
+        readonly detail: string;
+        readonly kind: Evidence["kind"];
+        readonly sourceSequence: number | null;
+        readonly nativeEventId?: string | null;
+      }): Effect.Effect<Evidence, never> =>
+        nowIso.pipe(
+          Effect.map((observedAt) => ({
+            kind: input.kind,
+            observedAt,
+            sourceSequence: input.sourceSequence,
+            nativeEventId: input.nativeEventId ?? null,
+            detail: input.detail,
+          })),
+        );
+
+      const observeThreadSettlement = (
+        instanceId: string,
+        threadId: string,
+        dispatchSequence: number,
+        expectedOverride: "settled" | "active",
+      ) =>
+        Effect.gen(function* () {
+          const active = yield* observations.activeShell(instanceId);
+          const activeThread = active.threads.find((entry) => entry.threadId === threadId) ?? null;
+          if (
+            activeThread !== null &&
+            active.snapshotSequence >= dispatchSequence &&
+            activeThread.settledOverride === expectedOverride
+          ) {
+            return { shell: active, thread: activeThread };
+          }
+          const archived = yield* observations.archivedShell(instanceId);
+          const archivedThread =
+            archived.threads.find((entry) => entry.threadId === threadId) ?? null;
+          if (archivedThread === null) return { shell: active, thread: activeThread };
+          return {
+            shell: archived,
+            thread: archivedThread,
+          };
+        });
+
+      type NativeThreadObservation = {
+        readonly shell: { readonly snapshotSequence: number };
+        readonly thread: ShellThread | null;
+      };
+
+      type MatchingThreadSettlementObservation = {
+        readonly shell: { readonly snapshotSequence: number };
+        readonly thread: ShellThread;
+      };
+
+      type AcceptedSettlementIntent = OperationIntent & {
+        readonly threadId: string;
+        readonly settled: boolean;
+        readonly dispatchSequence: number;
+      };
+
+      const hasAcceptedSettlementIdentity = (
+        record: OperationRecord,
+        intent: OperationIntent,
+      ): intent is AcceptedSettlementIntent =>
+        record.commandId !== null &&
+        record.dispatch === "accepted" &&
+        typeof intent.threadId === "string" &&
+        typeof intent.settled === "boolean" &&
+        typeof intent.dispatchSequence === "number" &&
+        Number.isSafeInteger(intent.dispatchSequence) &&
+        intent.dispatchSequence >= 0;
+
+      const matchingSettlementObservation = (
+        observation: Result.Result<NativeThreadObservation, ObservationServiceError>,
+        dispatchSequence: number,
+        expectedOverride: "settled" | "active",
+      ): MatchingThreadSettlementObservation | null => {
+        if (Result.isFailure(observation)) return null;
+        const { shell, thread } = observation.success;
+        if (
+          thread === null ||
+          shell.snapshotSequence < dispatchSequence ||
+          thread.settledOverride !== expectedOverride
+        ) {
+          return null;
+        }
+        return { shell, thread };
+      };
+
+      const terminalSettlementObservationFailure = (
+        observation: Result.Result<NativeThreadObservation, ObservationServiceError>,
+      ): ObservationServiceError | null =>
+        Result.isFailure(observation) && !settlementObservationCanRetry(observation.failure)
+          ? observation.failure
+          : null;
+
+      const settlementSnapshotEvidence = (
+        shell: { readonly snapshotSequence: number },
+        thread: ShellThread,
+        expectedOverride: "settled" | "active",
+      ) =>
+        evidenceAt({
+          kind: "snapshot",
+          sourceSequence: shell.snapshotSequence,
+          detail: `The synchronized native thread snapshot reported settledOverride=${thread.settledOverride ?? "null"}, settledAt=${thread.settledAt ?? "null"}, pinnedAt=${thread.pinnedAt ?? "null"}, snoozedAt=${thread.snoozedAt ?? "null"}, and snoozedUntil=${thread.snoozedUntil ?? "null"}; the requested override was ${expectedOverride}.`,
+        });
+
+      const settlementObservationTimeoutDetail = (input: {
+        readonly observation: Result.Result<
+          {
+            readonly shell: { readonly snapshotSequence: number };
+            readonly thread: ShellThread | null;
+          },
+          ObservationServiceError
+        >;
+        readonly expectedOverride: "settled" | "active";
+        readonly dispatchSequence: number;
+      }): string => {
+        const latestState = Result.match(input.observation, {
+          onFailure: () => "No fresh native thread state was available.",
+          onSuccess: ({ shell, thread }) =>
+            thread === null
+              ? `No active or archived thread row was present at sequence ${shell.snapshotSequence}.`
+              : `The latest native override was ${thread.settledOverride ?? "null"} at sequence ${shell.snapshotSequence}.`,
+        });
+        return `T3Code accepted the native command at sequence ${input.dispatchSequence}, but the requested override ${input.expectedOverride} was not observed within ${LIVE_EFFECT_OBSERVATION_MILLIS} milliseconds. ${latestState} The command will not be replayed.`;
+      };
+
+      const completeThreadSettlement = (input: {
+        readonly requestId: string;
+        readonly expectedRevision: number;
+        readonly thread: ThreadSetSettledInput["thread"];
+        readonly settled: boolean;
+        readonly commandId: string;
+        readonly dispatchSequence: number;
+        readonly shell: { readonly snapshotSequence: number };
+        readonly nativeThread: ShellThread;
+        readonly intermediateState: "pending" | "outcome_unknown";
+      }): Effect.Effect<void, LocalStoreError> =>
+        Effect.gen(function* () {
+          const expectedOverride = input.settled ? "settled" : "active";
+          const intent: OperationIntent = {
+            instanceId: input.thread.instanceId,
+            threadId: input.thread.threadId,
+            settled: input.settled,
+            dispatchSequence: input.dispatchSequence,
+          };
+          const observed = yield* settlementSnapshotEvidence(
+            input.shell,
+            input.nativeThread,
+            expectedOverride,
+          );
+          const recordedObservation = yield* store.compareAndUpdateOperation(input.requestId, {
+            now: observed.observedAt,
+            expectedRevision: input.expectedRevision,
+            intent,
+            state: input.intermediateState,
+            dispatch: "accepted",
+            commandId: input.commandId,
+            target: input.thread,
+            stepPosition: 1,
+            stepState: "succeeded",
+            evidence: [observed],
+            evidenceStepPosition: 1,
+            recovery: "observe_thread",
+          });
+          if (!recordedObservation) {
+            yield* signalCompletion(input.requestId);
+            return;
+          }
+
+          const sessionResult = yield* Effect.result(
+            observations.threadDetail(input.thread.instanceId, input.thread.threadId),
+          );
+          const sessionState = Result.match(sessionResult, {
+            onFailure: () => null,
+            onSuccess: (detail) => detail.thread.session?.status ?? "unknown",
+          });
+          const sessionEvidence = yield* evidenceAt({
+            kind: Result.isSuccess(sessionResult) ? "snapshot" : "adapter_inference",
+            sourceSequence: Result.isSuccess(sessionResult)
+              ? sessionResult.success.snapshotSequence
+              : null,
+            detail: Result.isFailure(sessionResult)
+              ? `Native settlement was observed. The provider session state could not be read after settlement: ${sessionResult.failure.message}. Settlement completion does not establish session shutdown.`
+              : `Native settlement was observed. The provider session was reported as ${sessionState} at its separate snapshot. Settlement completion does not establish that the provider session has stopped.`,
+          });
+          const resolvedAt = sessionEvidence.observedAt;
+          const completed = yield* store.compareAndUpdateOperation(input.requestId, {
+            now: resolvedAt,
+            expectedRevision: input.expectedRevision + 1,
+            intent,
+            state: "completed",
+            dispatch: "accepted",
+            commandId: input.commandId,
+            target: input.thread,
+            stepPosition: 2,
+            stepState: Result.isSuccess(sessionResult) ? "succeeded" : "skipped",
+            evidence: [sessionEvidence],
+            evidenceStepPosition: 2,
+            error: null,
+            recovery: "none",
+            recoverableUntil: new Date(
+              Date.parse(resolvedAt) + OPERATION_DETAIL_RETENTION_MILLIS,
+            ).toISOString(),
+          });
+          if (!completed) {
+            yield* signalCompletion(input.requestId);
+            return;
+          }
+          threadSettlementRecoveryLastAttemptAt.delete(input.requestId);
+          yield* signalCompletion(input.requestId);
+        });
+
+      const markThreadSettlementUnknown = (input: {
+        readonly requestId: string;
+        readonly thread: ThreadSetSettledInput["thread"];
+        readonly settled: boolean;
+        readonly commandId: string;
+        readonly dispatch: OperationRecord["dispatch"];
+        readonly dispatchSequence: number | null;
+        readonly stepPosition: number;
+        readonly detail: string;
+      }): Effect.Effect<void, LocalStoreError> =>
+        Effect.gen(function* () {
+          const observed = yield* evidenceAt({
+            kind: "adapter_inference",
+            sourceSequence: input.dispatchSequence,
+            detail: input.detail,
+          });
+          const intent: OperationIntent = {
+            instanceId: input.thread.instanceId,
+            threadId: input.thread.threadId,
+            settled: input.settled,
+            dispatchSequence: input.dispatchSequence,
+          };
+          yield* store.updateOperation(input.requestId, {
+            now: observed.observedAt,
+            intent,
+            state: "outcome_unknown",
+            dispatch: input.dispatch,
+            commandId: input.commandId,
+            target: input.thread,
+            stepPosition: input.stepPosition,
+            stepState: "outcome_unknown",
+            evidence: [observed],
+            evidenceStepPosition: input.stepPosition,
+            onlyIfNonterminal: true,
+            error: {
+              code: "unavailable",
+              message: input.detail,
+              retry: "reconcile_first",
+              details: { action: "observe_thread" },
+            },
+            recovery: "observe_thread",
+          });
+          yield* signalCompletion(input.requestId);
+        });
+
+      const failThreadSettlement = (input: {
+        readonly requestId: string;
+        readonly thread?: ThreadSetSettledInput["thread"];
+        readonly commandId: string | null;
+        readonly dispatch: "not_dispatched" | "rejected";
+        readonly failure: ToolFailure;
+      }): Effect.Effect<void, LocalStoreError> =>
+        Effect.gen(function* () {
+          const observed = yield* evidenceAt({
+            kind: "rpc_result",
+            sourceSequence: null,
+            detail: `The native thread settlement request was not accepted: ${input.failure.message}`,
+          });
+          yield* store.updateOperation(input.requestId, {
+            now: observed.observedAt,
+            state: "failed",
+            dispatch: input.dispatch,
+            commandId: input.commandId,
+            ...(input.thread === undefined ? {} : { target: input.thread }),
+            stepPosition: 0,
+            stepState: "failed",
+            stepError: input.failure,
+            evidence: [observed],
+            evidenceStepPosition: 0,
+            onlyIfNonterminal: true,
+            error: input.failure,
+            recovery: "new_explicit_request",
+            recoverableUntil: new Date(
+              Date.parse(observed.observedAt) + OPERATION_DETAIL_RETENTION_MILLIS,
+            ).toISOString(),
+          });
+          threadSettlementRecoveryLastAttemptAt.delete(input.requestId);
+          yield* signalCompletion(input.requestId);
+        });
+
       const signalCompletion = (requestId: string) => {
         const signal = completionSignals.get(requestId);
         return signal === undefined
@@ -1342,7 +1751,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           return refreshed?.record ?? record;
         });
 
-      const evidenceAt = (
+      const sessionStopEvidenceAt = (
         detail: string,
         kind: Evidence["kind"],
         sourceSequence: number | null = null,
@@ -1589,13 +1998,13 @@ export class Operations extends Context.Service<Operations, OperationsService>()
         shutdownSequence: number,
       ): Effect.Effect<ThreadSessionStopStepOutcome, LocalStoreError> =>
         Effect.gen(function* () {
-          const requested = yield* evidenceAt(
+          const requested = yield* sessionStopEvidenceAt(
             "T3Code replayed the matching provider-session stop request.",
             "event",
             requestSequence,
             recovery.commandId,
           );
-          const stopped = yield* evidenceAt(
+          const stopped = yield* sessionStopEvidenceAt(
             "T3Code published the captured provider session as stopped after the matching stop request.",
             "event",
             shutdownSequence,
@@ -1671,7 +2080,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
         failure: ThreadSessionStopObservationFailure,
       ): Effect.Effect<ThreadSessionStopStepOutcome, LocalStoreError> =>
         Effect.gen(function* () {
-          const uncertain = yield* evidenceAt(
+          const uncertain = yield* sessionStopEvidenceAt(
             failure.detail,
             failure.evidenceKind,
             failure.sourceSequence,
@@ -1801,7 +2210,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
             input.thread.threadId,
           );
           const session = baseline.thread.session;
-          const captured = yield* evidenceAt(
+          const captured = yield* sessionStopEvidenceAt(
             `T3Code reported the provider session as ${session?.status ?? "absent"} before shutdown was requested.`,
             "snapshot",
             baseline.snapshotSequence,
@@ -1825,7 +2234,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           }
 
           if (session === null || session.status === "stopped") {
-            const alreadyStopped = yield* evidenceAt(
+            const alreadyStopped = yield* sessionStopEvidenceAt(
               session === null
                 ? "The fresh thread snapshot showed no provider session to stop."
                 : "The fresh thread snapshot showed that the provider session was already stopped.",
@@ -1866,7 +2275,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
               retry: "reconcile_first",
               details: {},
             };
-            const changed = yield* evidenceAt(
+            const changed = yield* sessionStopEvidenceAt(
               "A fresh preflight did not confirm the captured session identity; shutdown was not dispatched.",
               "adapter_inference",
               preflight.snapshotSequence,
@@ -1932,7 +2341,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
               }),
             );
           }
-          const dispatchStarted = yield* evidenceAt(
+          const dispatchStarted = yield* sessionStopEvidenceAt(
             "The provider-session command identity and captured session evidence were persisted before dispatch; this command will not be replayed.",
             "adapter_inference",
             baseline.snapshotSequence,
@@ -1974,7 +2383,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
             const failure = mayHaveDispatched
               ? { ...mappedFailure, retry: "reconcile_first" as const }
               : mappedFailure;
-            const failedDispatch = yield* evidenceAt(
+            const failedDispatch = yield* sessionStopEvidenceAt(
               mayHaveDispatched
                 ? "The provider-session command reply was lost or unavailable; the command will not be replayed."
                 : `T3Code did not accept the provider-session stop command: ${failure.message}`,
@@ -2007,7 +2416,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
             );
           }
 
-          const accepted = yield* evidenceAt(
+          const accepted = yield* sessionStopEvidenceAt(
             "T3Code accepted the provider-session stop command; shutdown still requires a matching session update.",
             "rpc_result",
             dispatch.success.sequence,
@@ -3004,6 +3413,23 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           return { kind: "rate_limited", record: current?.record ?? record } as const;
         });
 
+      const claimThreadSettlementRecoveryObservation = (
+        record: OperationRecord,
+      ): Effect.Effect<
+        | { readonly kind: "claimed" }
+        | { readonly kind: "rate_limited"; readonly record: OperationRecord },
+        LocalStoreError
+      > =>
+        Effect.gen(function* () {
+          const attemptAt = yield* Clock.currentTimeMillis;
+          const claimed = yield* Effect.sync(() =>
+            reserveThreadSettlementRecoveryObservation(record.requestId, attemptAt),
+          );
+          if (claimed) return { kind: "claimed" } as const;
+          const current = yield* store.getOperation(record.requestId);
+          return { kind: "rate_limited", record: current?.record ?? record } as const;
+        });
+
       const threadSessionStopReceiptIsFinal = (state: OperationRecord["state"]): boolean =>
         state === "completed" || state === "failed" || state === "partial";
 
@@ -3085,13 +3511,27 @@ export class Operations extends Context.Service<Operations, OperationsService>()
 
       const reconcile = (
         stored: StoredOperation,
-      ): Effect.Effect<OperationRecord, LocalStoreError> =>
+      ): Effect.Effect<OperationRecord, LocalStoreError> => {
+        let settlementReserved = false;
         // fallow-ignore-next-line complexity
-        Effect.gen(function* () {
+        return Effect.gen(function* () {
           const record = stored.record as OperationRecord;
           if (activeRequests.has(record.requestId)) return record;
           if (record.tool === "thread_create") {
             return yield* reconcileThreadCreation(stored, record);
+          }
+          const settlementCanRefineUnknown =
+            record.tool === "thread_set_settled" && record.state === "outcome_unknown";
+          const canRecoverUnknownOutcome =
+            record.state === "outcome_unknown" &&
+            (record.tool === "thread_stop_session" || record.tool === "worktree_discard");
+          if (
+            terminal(record) &&
+            !settlementCanRefineUnknown &&
+            record.tool !== "thread_interrupt" &&
+            !canRecoverUnknownOutcome
+          ) {
+            return record;
           }
           const previousOwner = stored.ownerProcessNonce !== processNonce;
           const lastUpdatedAt = Date.parse(record.updatedAt);
@@ -3196,6 +3636,121 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           }
           if (record.tool === "thread_stop_session") {
             return yield* reconcileThreadSessionStop(stored, previousOwner, previousOwnerStale);
+          }
+          if (record.tool === "thread_set_settled") {
+            if (previousOwner && !previousOwnerStale && !settlementCanRefineUnknown) return record;
+            const acceptedIntent = hasAcceptedSettlementIdentity(record, stored.intent)
+              ? stored.intent
+              : null;
+            if (
+              settlementCanRefineUnknown &&
+              acceptedIntent === null &&
+              record.dispatch !== "not_dispatched"
+            ) {
+              return record;
+            }
+            if (!(yield* reserveIfInactive(record.requestId))) return record;
+            settlementReserved = true;
+            if (acceptedIntent === null) {
+              if (record.dispatch === "not_dispatched") {
+                yield* failThreadSettlement({
+                  requestId: record.requestId,
+                  ...(typeof stored.intent.threadId === "string"
+                    ? {
+                        thread: {
+                          instanceId: stored.intent.instanceId,
+                          threadId: stored.intent.threadId,
+                        },
+                      }
+                    : {}),
+                  commandId: record.commandId,
+                  dispatch: "not_dispatched",
+                  failure: {
+                    code: "unavailable",
+                    message:
+                      "The native settlement command was not dispatched before recovery and will not be replayed.",
+                    retry: "safe_read",
+                    details: { action: "observe_thread" },
+                  },
+                });
+                const refreshed = yield* store.getOperation(record.requestId);
+                return refreshed?.record ?? record;
+              }
+              if (settlementCanRefineUnknown) return record;
+              const threadId = stored.intent.threadId;
+              const settled = stored.intent.settled;
+              const dispatchSequence = stored.intent.dispatchSequence;
+              yield* markThreadSettlementUnknown({
+                requestId: record.requestId,
+                thread: {
+                  instanceId: stored.intent.instanceId,
+                  threadId: typeof threadId === "string" ? threadId : "unknown",
+                },
+                settled: typeof settled === "boolean" ? settled : false,
+                commandId: record.commandId ?? "unknown",
+                dispatch: record.dispatch,
+                dispatchSequence:
+                  typeof dispatchSequence === "number" && Number.isSafeInteger(dispatchSequence)
+                    ? dispatchSequence
+                    : null,
+                stepPosition: record.dispatch === "accepted" ? 1 : 0,
+                detail:
+                  "The native settlement command may have run, but no saved dispatch sequence can be correlated with a fresh native thread snapshot. It will not be replayed.",
+              });
+              const refreshed = yield* store.getOperation(record.requestId);
+              return refreshed?.record ?? record;
+            }
+            const { threadId, settled, dispatchSequence } = acceptedIntent;
+            if (record.commandId === null) return record;
+            if (settlementCanRefineUnknown) {
+              const claim = yield* claimThreadSettlementRecoveryObservation(record);
+              if (claim.kind === "rate_limited") return claim.record;
+            }
+            const expectedOverride = settled ? "settled" : "active";
+            const observed = yield* Effect.result(
+              observeThreadSettlement(
+                stored.intent.instanceId,
+                threadId,
+                dispatchSequence,
+                expectedOverride,
+              ),
+            );
+            const matching = matchingSettlementObservation(
+              observed,
+              dispatchSequence,
+              expectedOverride,
+            );
+            if (matching !== null) {
+              yield* completeThreadSettlement({
+                requestId: record.requestId,
+                expectedRevision: record.revision,
+                thread: { instanceId: stored.intent.instanceId, threadId },
+                settled,
+                commandId: record.commandId,
+                dispatchSequence,
+                shell: matching.shell,
+                nativeThread: matching.thread,
+                intermediateState: settlementCanRefineUnknown ? "outcome_unknown" : "pending",
+              });
+              const refreshed = yield* store.getOperation(record.requestId);
+              return refreshed?.record ?? record;
+            }
+            if (settlementCanRefineUnknown) return record;
+            const detail = Result.isFailure(observed)
+              ? `A fresh native thread observation failed during recovery: ${observed.failure.message}. The command will not be replayed.`
+              : "A fresh native thread snapshot has not observed the requested settlement override after the accepted command. The command will not be replayed.";
+            yield* markThreadSettlementUnknown({
+              requestId: record.requestId,
+              thread: { instanceId: stored.intent.instanceId, threadId },
+              settled,
+              commandId: record.commandId,
+              dispatch: "accepted",
+              dispatchSequence,
+              stepPosition: 1,
+              detail,
+            });
+            const refreshed = yield* store.getOperation(record.requestId);
+            return refreshed?.record ?? record;
           }
           if (
             terminal(record) &&
@@ -3380,7 +3935,14 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           yield* signalCompletion(stored.record.requestId);
           const refreshed = yield* store.getOperation(stored.record.requestId);
           return refreshed?.record ?? record;
-        });
+        }).pipe(
+          Effect.ensuring(
+            Effect.suspend(() =>
+              settlementReserved ? release(stored.record.requestId) : Effect.void,
+            ),
+          ),
+        );
+      };
 
       const ensureInputResponseTarget = (
         stored: StoredOperation,
@@ -6471,6 +7033,204 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           Effect.asVoid,
         );
       };
+      const persistThreadSettlementDispatchStart = (
+        input: ThreadSetSettledInput,
+        commandId: string,
+      ): Effect.Effect<void, LocalStoreError> =>
+        Effect.gen(function* () {
+          const observed = yield* evidenceAt({
+            kind: "local_registration",
+            sourceSequence: null,
+            detail: `The native ${input.settled ? "settle" : "unsettle"} command identity was saved before dispatch.`,
+          });
+          yield* store.updateOperation(input.requestId, {
+            now: observed.observedAt,
+            intent: {
+              instanceId: input.thread.instanceId,
+              threadId: input.thread.threadId,
+              settled: input.settled,
+              dispatchSequence: null,
+            },
+            state: "pending",
+            dispatch: "unknown",
+            commandId,
+            target: input.thread,
+            stepPosition: 0,
+            stepState: "pending",
+            evidence: [observed],
+            evidenceStepPosition: 0,
+            recovery: "observe_thread",
+          });
+        });
+
+      const recordThreadSettlementAccepted = (
+        input: ThreadSetSettledInput,
+        commandId: string,
+        dispatchSequence: number,
+      ): Effect.Effect<void, LocalStoreError> =>
+        Effect.gen(function* () {
+          const observed = yield* evidenceAt({
+            kind: "rpc_result",
+            sourceSequence: dispatchSequence,
+            detail: `T3Code accepted the native ${input.settled ? "settle" : "unsettle"} command at sequence ${dispatchSequence}.`,
+          });
+          yield* store.updateOperation(input.requestId, {
+            now: observed.observedAt,
+            intent: {
+              instanceId: input.thread.instanceId,
+              threadId: input.thread.threadId,
+              settled: input.settled,
+              dispatchSequence,
+            },
+            state: "pending",
+            dispatch: "accepted",
+            commandId,
+            target: input.thread,
+            stepPosition: 0,
+            stepState: "succeeded",
+            evidence: [observed],
+            evidenceStepPosition: 0,
+            recovery: "observe_thread",
+          });
+        });
+
+      const handleThreadSettlementDispatchFailure = (
+        input: ThreadSetSettledInput,
+        commandId: string,
+        error: LocalStoreError | T3CodeAdapterError,
+      ): Effect.Effect<void, LocalStoreError> => {
+        if (error instanceof T3CodeAdapterError && error.uncertain) {
+          return markThreadSettlementUnknown({
+            requestId: input.requestId,
+            thread: input.thread,
+            settled: input.settled,
+            commandId,
+            dispatch: "unknown",
+            dispatchSequence: null,
+            stepPosition: 0,
+            detail: `The native settlement reply was lost or invalid (${error.message}). Its effect cannot be attributed from thread state alone, so the command will not be replayed.`,
+          });
+        }
+        return failThreadSettlement({
+          requestId: input.requestId,
+          thread: input.thread,
+          commandId,
+          dispatch:
+            error instanceof T3CodeAdapterError && error.kind === "upstream_rejected"
+              ? "rejected"
+              : "not_dispatched",
+          failure:
+            error instanceof LocalStoreError ? operationFailure(error) : settlementFailure(error),
+        });
+      };
+
+      const observeAcceptedThreadSettlement = (
+        input: ThreadSetSettledInput,
+        commandId: string,
+        dispatchSequence: number,
+      ): Effect.Effect<void, LocalStoreError> =>
+        Effect.gen(function* () {
+          const { instanceId, threadId } = input.thread;
+          const expectedOverride = input.settled ? "settled" : "active";
+          const deadline = (yield* Clock.currentTimeMillis) + LIVE_EFFECT_OBSERVATION_MILLIS;
+          let pollInterval = 100;
+          while (true) {
+            const current = yield* currentSettlementObservation(input.requestId);
+            if (current === null) return;
+            const observation = yield* Effect.result(
+              observeThreadSettlement(instanceId, threadId, dispatchSequence, expectedOverride),
+            );
+            const matched = matchingSettlementObservation(
+              observation,
+              dispatchSequence,
+              expectedOverride,
+            );
+            if (matched !== null) {
+              yield* completeThreadSettlement({
+                requestId: input.requestId,
+                expectedRevision: current.revision,
+                thread: input.thread,
+                settled: input.settled,
+                commandId,
+                dispatchSequence,
+                shell: matched.shell,
+                nativeThread: matched.thread,
+                intermediateState: current.intermediateState,
+              });
+              return;
+            }
+            const failure = terminalSettlementObservationFailure(observation);
+            if (failure !== null) {
+              yield* markThreadSettlementUnknown({
+                requestId: input.requestId,
+                thread: input.thread,
+                settled: input.settled,
+                commandId,
+                dispatch: "accepted",
+                dispatchSequence,
+                stepPosition: 1,
+                detail: `T3Code accepted the command at sequence ${dispatchSequence}, but a fresh native thread snapshot failed (${failure.message}). The command will not be replayed.`,
+              });
+              return;
+            }
+            const now = yield* Clock.currentTimeMillis;
+            if (now >= deadline) {
+              yield* markThreadSettlementUnknown({
+                requestId: input.requestId,
+                thread: input.thread,
+                settled: input.settled,
+                commandId,
+                dispatch: "accepted",
+                dispatchSequence,
+                stepPosition: 1,
+                detail: settlementObservationTimeoutDetail({
+                  observation,
+                  expectedOverride,
+                  dispatchSequence,
+                }),
+              });
+              return;
+            }
+            yield* Effect.sleep(Math.min(pollInterval, deadline - now));
+            pollInterval = Math.min(1_000, pollInterval * 2);
+          }
+        });
+
+      const executeThreadSettlement = (
+        input: ThreadSetSettledInput,
+        commandId: string,
+      ): Effect.Effect<void, never> =>
+        Effect.gen(function* () {
+          yield* persistThreadSettlementDispatchStart(input, commandId);
+          const dispatchResult = yield* Effect.result(
+            connections.dispatchThreadSettlement({
+              ...input.thread,
+              commandId,
+              settled: input.settled,
+            }),
+          );
+          if (Result.isFailure(dispatchResult)) {
+            yield* handleThreadSettlementDispatchFailure(input, commandId, dispatchResult.failure);
+            return;
+          }
+          const acceptedReceipt = yield* Effect.result(
+            recordThreadSettlementAccepted(input, commandId, dispatchResult.success.sequence),
+          );
+          if (Result.isFailure(acceptedReceipt)) {
+            yield* Effect.logError("thread settlement acceptance receipt could not be updated", {
+              requestId: input.requestId,
+              error: acceptedReceipt.failure.message,
+            });
+          }
+          yield* observeAcceptedThreadSettlement(input, commandId, dispatchResult.success.sequence);
+        }).pipe(
+          Effect.catchTag("LocalStoreError", (error) =>
+            Effect.logError("thread settlement receipt could not be updated", {
+              requestId: input.requestId,
+              error: error.message,
+            }),
+          ),
+        );
 
       type AdmitAndRunInput = {
         readonly requestId: string;
@@ -7362,6 +8122,44 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           });
         });
 
+      const setThreadSettled = (
+        input: ThreadSetSettledInput,
+      ): Effect.Effect<OperationRecord, LocalStoreError | OperationServiceError> =>
+        Effect.gen(function* () {
+          const fingerprint = yield* store.fingerprintRequest("thread_set_settled", input);
+          const existing = yield* findExistingOperation(input.requestId, fingerprint);
+          if (existing !== null) return existing;
+
+          const commandId = yield* crypto.randomUUIDv4.pipe(
+            Effect.mapError(
+              () =>
+                new LocalStoreError({
+                  kind: "storage",
+                  message:
+                    "The operation supervisor could not create a native settlement identity.",
+                }),
+            ),
+          );
+          return yield* admitAndRun({
+            requestId: input.requestId,
+            fingerprint,
+            tool: "thread_set_settled",
+            intent: {
+              instanceId: input.thread.instanceId,
+              threadId: input.thread.threadId,
+              settled: input.settled,
+              dispatchSequence: null,
+            },
+            completionMeans: "settlement_observed",
+            steps: [
+              "dispatch_native_settlement",
+              "observe_native_settlement",
+              "capture_provider_session_state",
+            ],
+            execute: executeThreadSettlement(input, commandId),
+          });
+        });
+
       return Operations.of({
         pairInstance,
         pairInstanceAgain,
@@ -7375,6 +8173,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
         respondToApproval,
         interruptThread,
         stopThreadSession,
+        setThreadSettled,
         getOperation: readOperation,
       });
     }),

@@ -58,16 +58,23 @@ const thread = (
     readonly latestTurnId: string | null;
     readonly settledOverride: "settled" | "active" | null;
     readonly settledAt: string | null;
+    readonly snoozedAt: string | null;
+    readonly snoozedUntil: string | null;
+    readonly pinnedAt: string | null;
   }> = {},
 ) => ({
   threadId,
-  projectId: overrides.projectId ?? "project-a",
-  title: overrides.title ?? `Thread ${threadId}`,
-  archivedAt: overrides.archivedAt ?? null,
-  worktreePath: overrides.worktreePath ?? null,
-  latestTurnId: overrides.latestTurnId ?? null,
-  settledOverride: overrides.settledOverride ?? null,
-  settledAt: overrides.settledAt ?? null,
+  projectId: "project-a",
+  title: `Thread ${threadId}`,
+  archivedAt: null,
+  worktreePath: null,
+  latestTurnId: null,
+  settledOverride: null,
+  settledAt: null,
+  snoozedAt: null,
+  snoozedUntil: null,
+  pinnedAt: null,
+  ...overrides,
 });
 
 const snapshotItem = (
@@ -284,6 +291,7 @@ const observationsLayer = (
         createWorktree: () => Effect.die("not used"),
         removeWorktree: () => Effect.die("not used"),
         respondToApproval: () => Effect.die("not used"),
+        dispatchThreadSettlement: () => Effect.die("not used"),
         invalidate: () => Effect.void,
       }),
     ),
@@ -464,6 +472,7 @@ describe("Observations coalescing", () => {
               createWorktree: () => Effect.die("not used"),
               removeWorktree: () => Effect.die("not used"),
               respondToApproval: () => Effect.die("not used"),
+              dispatchThreadSettlement: () => Effect.die("not used"),
               invalidate: () => Effect.void,
             }),
           ),
@@ -505,6 +514,9 @@ const threadDetailFixture = (
     readonly archivedAt: string | null;
     readonly settledOverride: "settled" | "active" | null;
     readonly settledAt: string | null;
+    readonly snoozedAt: string | null;
+    readonly snoozedUntil: string | null;
+    readonly pinnedAt: string | null;
     readonly activities: ReadonlyArray<{
       readonly activityId: string;
       readonly kind: string;
@@ -546,6 +558,9 @@ const threadDetailFixture = (
   archivedAt: null,
   settledOverride: null,
   settledAt: null,
+  snoozedAt: null,
+  snoozedUntil: null,
+  pinnedAt: null,
   activities: [],
   messages: [],
   session: null,
@@ -956,6 +971,7 @@ const threadObservationsLayer = (
         createWorktree: () => Effect.die("not used"),
         removeWorktree: () => Effect.die("not used"),
         respondToApproval: () => Effect.die("not used"),
+        dispatchThreadSettlement: () => Effect.die("not used"),
         invalidate: () => Effect.void,
       }),
     ),
@@ -1319,6 +1335,7 @@ describe("InstanceConnections observation capacity", () => {
             subscribeThread: () => Stream.die("not used"),
             respondToInput: () => Effect.die("not used"),
             interruptThread: () => Effect.die("not used"),
+            dispatchThreadSettlement: () => Effect.die("not used"),
             getArchivedShellSnapshot: () => Effect.die("not used"),
             createWorktree: () => Effect.die("not used"),
             removeWorktree: () => Effect.die("not used"),
@@ -1416,6 +1433,7 @@ describe("InstanceConnections observation capacity", () => {
           subscribeThread: () => Stream.die("not used"),
           respondToInput: () => Effect.die("not used"),
           interruptThread: () => Effect.die("not used"),
+          dispatchThreadSettlement: () => Effect.die("not used"),
           getArchivedShellSnapshot: () => Effect.die("not used"),
           createWorktree: () => Effect.die("not used"),
           removeWorktree: () => Effect.die("not used"),

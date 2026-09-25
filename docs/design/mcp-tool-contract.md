@@ -90,7 +90,7 @@ All mutation inputs include a caller-supplied `requestId`. The table omits that 
 | `worktree_inspect`    | A worktree reference; status, relevant thread references, freshness, available checks, and discard consequences.                                                                   |
 | `worktree_create`     | `instanceId`, `repositoryPath`, `startRef`, optional `newBranch`, optional `path`; create a checkout. Omitted path asks T3Code to choose the path.                                 |
 | `thread_list`         | Project or instance scope, filters including archived threads, and pagination.                                                                                                     |
-| `thread_get`          | A thread reference; compact execution, session, settlement, pending-request, configuration, and worktree state.                                                                    |
+| `thread_get`          | A thread reference; compact execution, session, native settlement, pin/snooze, pending-request, configuration, and worktree state.                                                 |
 | `thread_create`       | Project reference, `title`, checkout selection, model selection, runtime mode, and interaction mode. Create without submitting a prompt.                                           |
 | `thread_submit`       | Thread reference, `text`, submission intent, and context requirement. Starts or supplies input to execution according to verified provider behavior.                               |
 | `thread_interrupt`    | Thread reference; interrupt the execution T3Code processes at that time. Exact-turn fencing is unsupported in the baseline.                                                        |
@@ -325,6 +325,11 @@ type ThreadSummary = {
   worktree: WorktreeRef | null;
   latestTurn: TurnRef | null;
   settlement: "settled" | "unsettled" | "unknown";
+  settledOverride?: "settled" | "active" | null;
+  settledAt?: string | null;
+  snoozedAt?: string | null;
+  snoozedUntil?: string | null;
+  pinnedAt?: string | null;
 };
 type PendingRequestForm =
   | { kind: "approval"; detail: string; choices: { decision: ApprovalDecision; label: string }[] }

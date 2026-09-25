@@ -777,6 +777,8 @@ export type StoredOperation = {
 
 export interface OperationUpdate {
   readonly now: string;
+  /** Protect terminal receipts, while allowing proven non-dispatch to resolve an unknown settlement. */
+  readonly onlyIfNonterminal?: true;
   /** The minimal nonsecret intent retained after transient dispatch data is dropped. */
   readonly intent?: OperationIntent;
   readonly state?: OperationState;
@@ -5257,12 +5259,18 @@ const updateOperationWithOwnerExpectationInDatabase = (
           ) {
             return false;
           }
+          const mayFailNotDispatchedSettlement =
+            row.state === "outcome_unknown" &&
+            row.tool === "thread_set_settled" &&
+            row.dispatch === "not_dispatched" &&
+            update.state === "failed" &&
+            update.dispatch === "not_dispatched";
           if (
             update.onlyIfNonterminal === true &&
             (row.state === "completed" ||
               row.state === "failed" ||
               row.state === "partial" ||
-              row.state === "outcome_unknown")
+              (row.state === "outcome_unknown" && !mayFailNotDispatchedSettlement))
           ) {
             return false;
           }

@@ -968,6 +968,10 @@ const threadGetReferenceRuntimeShape = threadReferenceRuntimeShape(
   "unknown thread_get thread argument",
 );
 
+const threadSetSettledReferenceRuntimeShape = threadReferenceRuntimeShape(
+  "unknown thread_set_settled thread argument",
+);
+
 const threadGetReferenceJsonShape = Schema.StructWithRest(threadReferenceSchema, [
   Schema.Record(Schema.String, Schema.Never),
 ]);
@@ -1574,7 +1578,56 @@ export const ThreadInterruptInputSchema = Schema.declare<{
   },
 );
 
+const threadSetSettledFields = Schema.Struct({
+  requestId,
+  thread: threadSetSettledReferenceRuntimeShape,
+  settled: Schema.Boolean,
+});
+
+const threadSetSettledJsonFields = Schema.Struct({
+  requestId,
+  thread: threadGetReferenceJsonShape,
+  settled: Schema.Boolean,
+});
+
+const unknownThreadSetSettledField = Schema.String.check(
+  Schema.makeFilter((key) => key !== "requestId" && key !== "thread" && key !== "settled", {
+    message: "unknown thread_set_settled argument",
+  }),
+);
+
+const threadSetSettledRuntimeShape = Schema.StructWithRest(threadSetSettledFields, [
+  Schema.Record(unknownThreadSetSettledField, Schema.Never),
+]);
+
+const threadSetSettledJsonShape = Schema.StructWithRest(threadSetSettledJsonFields, [
+  Schema.Record(Schema.String, Schema.Never),
+]);
+
+/** Set the native attention state for one directly referenced thread. */
+export const ThreadSetSettledInputSchema = Schema.declare<{
+  readonly requestId: string;
+  readonly thread: ThreadReference;
+  readonly settled: boolean;
+}>(
+  (
+    input,
+  ): input is {
+    readonly requestId: string;
+    readonly thread: ThreadReference;
+    readonly settled: boolean;
+  } => Schema.is(threadSetSettledRuntimeShape)(input),
+  {
+    toCodecJson: () =>
+      Schema.link()(threadSetSettledJsonShape, {
+        decode: SchemaGetter.passthrough({ strict: false }),
+        encode: SchemaGetter.passthrough({ strict: false }),
+      } as never),
+  },
+);
+
 export type ThreadInterruptInput = typeof ThreadInterruptInputSchema.Type;
+export type ThreadSetSettledInput = typeof ThreadSetSettledInputSchema.Type;
 
 const turnWaitTurnReferenceRuntimeShape = Schema.StructWithRest(
   Schema.Struct({
@@ -2210,6 +2263,11 @@ export const ThreadSummarySchema = Schema.Struct({
   worktree: Schema.NullOr(worktreeReferenceSchema),
   latestTurn: Schema.NullOr(turnReferenceSchema),
   settlement: Schema.Literals(["settled", "unsettled", "unknown"]),
+  settledOverride: Schema.optionalKey(Schema.NullOr(Schema.Literals(["settled", "active"]))),
+  settledAt: Schema.optionalKey(Schema.NullOr(nonEmptyString)),
+  snoozedAt: Schema.optionalKey(Schema.NullOr(nonEmptyString)),
+  snoozedUntil: Schema.optionalKey(Schema.NullOr(nonEmptyString)),
+  pinnedAt: Schema.optionalKey(Schema.NullOr(nonEmptyString)),
 });
 
 export type ThreadSummary = typeof ThreadSummarySchema.Type;

@@ -2,6 +2,7 @@ import { NodeHttpServer } from "@effect/platform-node";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as RpcClientError from "effect/unstable/rpc/RpcClientError";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as HttpRouter from "effect/unstable/http/HttpRouter";
@@ -11,13 +12,16 @@ import * as Rpc from "effect/unstable/rpc/Rpc";
 import * as RpcGroup from "effect/unstable/rpc/RpcGroup";
 import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization";
 import * as RpcServer from "effect/unstable/rpc/RpcServer";
+import * as Socket from "effect/unstable/socket/Socket";
 import {
   diffReadScopeGrantFailure,
   mapOrchestrationDispatchCommandError,
   mapReviewDiffPreviewError,
+  mapSettlementDispatchCommandError,
   mapThreadInterruptDispatchError,
   requestedT3CodePairingScopes,
   T3CodeAdapter,
+  T3CodeAdapterError,
 } from "./t3code-adapter";
 
 describe("T3Code pairing scopes", () => {
@@ -194,6 +198,57 @@ describe("T3Code dispatch command errors", () => {
         message: "the command was rejected",
         uncertain: false,
       });
+      expect(
+        mapSettlementDispatchCommandError({
+          _tag: "OrchestrationCommandInvariantError",
+          commandType: "thread.settle",
+          detail: "the thread is ineligible for settlement",
+        }),
+      ).toMatchObject({
+        kind: "upstream_rejected",
+        message: expect.stringContaining("the thread is ineligible for settlement"),
+        uncertain: false,
+        status: null,
+      });
+      expect(
+        mapSettlementDispatchCommandError({
+          _tag: "OrchestrationDispatchCommandError",
+          message: "settlement command rejected",
+        }),
+      ).toMatchObject({ kind: "upstream_rejected", uncertain: false });
+      expect(
+        mapSettlementDispatchCommandError({
+          _tag: "EnvironmentAuthorizationError",
+          requiredScope: "orchestration:operate",
+        }),
+      ).toMatchObject({
+        kind: "authorization",
+        uncertain: false,
+        requiredScopes: ["orchestration:operate"],
+      });
+
+      const socketFailure = mapSettlementDispatchCommandError(
+        new RpcClientError.RpcClientError({
+          reason: new Socket.SocketOpenError({ kind: "Unknown", cause: new Error("socket") }),
+        }),
+      );
+      expect(socketFailure).toBeInstanceOf(T3CodeAdapterError);
+      expect(socketFailure).toMatchObject({ kind: "transport", uncertain: true });
+
+      const decodeFailure = mapSettlementDispatchCommandError(
+        new RpcClientError.RpcClientError({
+          reason: new RpcClientError.RpcClientDefect({
+            message: "invalid RPC frame",
+            cause: new Error("decode"),
+          }),
+        }),
+      );
+      expect(decodeFailure).toBeInstanceOf(T3CodeAdapterError);
+      expect(decodeFailure).toMatchObject({ kind: "wire_incompatible", uncertain: true });
+
+      const unexpectedTag = mapSettlementDispatchCommandError({ _tag: "constructor" });
+      expect(unexpectedTag).toBeInstanceOf(T3CodeAdapterError);
+      expect(unexpectedTag).toMatchObject({ kind: "wire_incompatible", uncertain: true });
     }),
   );
 });

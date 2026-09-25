@@ -213,6 +213,12 @@ export interface InstanceConnectionsService {
     threadId: string,
     options?: { readonly afterSequence?: number; readonly turnLimit?: number },
   ) => Stream.Stream<ThreadStreamItem, LocalStoreError | T3CodeAdapterError>;
+  readonly dispatchThreadSettlement: (input: {
+    readonly instanceId: string;
+    readonly threadId: string;
+    readonly commandId: string;
+    readonly settled: boolean;
+  }) => Effect.Effect<{ readonly sequence: number }, LocalStoreError | T3CodeAdapterError>;
   readonly readArchivedShell: (
     instanceId: string,
   ) => Effect.Effect<ObservedShellSnapshot, LocalStoreError | T3CodeAdapterError>;
@@ -1096,6 +1102,36 @@ export class InstanceConnections extends Context.Service<
             );
           });
 
+        const dispatchThreadSettlement = (input: {
+          readonly instanceId: string;
+          readonly threadId: string;
+          readonly commandId: string;
+          readonly settled: boolean;
+        }) =>
+          Effect.gen(function* () {
+            yield* requireReadableRegistration(
+              input.instanceId,
+              "The saved registration requires pairing before thread settlement can be changed.",
+            );
+            const connection = yield* acquire(input.instanceId).pipe(
+              Effect.mapError((error) =>
+                error instanceof T3CodeAdapterError
+                  ? certainConnectionAcquisitionError(error)
+                  : error,
+              ),
+            );
+            return yield* withInstanceCapacity(
+              input.instanceId,
+              adapter.dispatchThreadSettlement({
+                endpoint: connection.endpoint,
+                credential: connection.credential,
+                threadId: input.threadId,
+                commandId: input.commandId,
+                settled: input.settled,
+              }),
+            );
+          });
+
         const createWorktree = (instanceId: string, input: WorktreeCreateRequest) =>
           Effect.gen(function* () {
             // Preserve the pairing-specific failure before acquire can reuse a cached connection.
@@ -1212,6 +1248,7 @@ export class InstanceConnections extends Context.Service<
           interruptThread,
           openShellStream,
           openThreadStream,
+          dispatchThreadSettlement,
           readArchivedShell,
           respondToInput,
           respondToApproval,

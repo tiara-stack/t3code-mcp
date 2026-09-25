@@ -67,6 +67,16 @@ const unsupportedThreadInterrupt = () =>
     }),
   );
 
+const unsupportedThreadSettlement = () =>
+  Effect.fail(
+    new T3CodeAdapterError({
+      kind: "capacity",
+      message: "This test fixture does not dispatch settlements.",
+      uncertain: false,
+      status: null,
+    }),
+  );
+
 const makeDatabasePath = () => {
   const directory = mkdtempSync(join(tmpdir(), "t3code-mcp-tools-"));
   return { directory, databasePath: join(directory, "state.sqlite") };
@@ -328,6 +338,7 @@ const fakeConnections = (options?: {
           status: null,
         }),
       ),
+    dispatchThreadSettlement: unsupportedThreadSettlement,
     readArchivedShell: () =>
       Effect.fail(
         new T3CodeAdapterError({
@@ -437,6 +448,7 @@ const fakeAdapterLayer = (
         }),
       ),
     interruptThread: unsupportedThreadInterrupt,
+    dispatchThreadSettlement: unsupportedThreadSettlement,
     getArchivedShellSnapshot: () =>
       Effect.fail(
         new T3CodeAdapterError({
@@ -2725,6 +2737,7 @@ describe("instance_pair_again", () => {
             status: null,
           }),
         ),
+      dispatchThreadSettlement: unsupportedThreadSettlement,
       readArchivedShell: () =>
         Effect.fail(
           new T3CodeAdapterError({
@@ -3141,6 +3154,7 @@ describe("instance_pair_again", () => {
                 status: null,
               }),
             ),
+          dispatchThreadSettlement: unsupportedThreadSettlement,
           readArchivedShell: () =>
             Effect.fail(
               new T3CodeAdapterError({
@@ -3984,6 +3998,7 @@ const projectFixtures = (
         }),
       ),
     interruptThread: unsupportedThreadInterrupt,
+    dispatchThreadSettlement: unsupportedThreadSettlement,
     getArchivedShellSnapshot: () =>
       Effect.fail(
         new T3CodeAdapterError({
@@ -5300,6 +5315,7 @@ const modelFixtures = (
         }),
       ),
     interruptThread: unsupportedThreadInterrupt,
+    dispatchThreadSettlement: unsupportedThreadSettlement,
     getArchivedShellSnapshot: () =>
       Effect.fail(
         new T3CodeAdapterError({
@@ -5894,6 +5910,7 @@ describe("model_list", () => {
                   }),
                 ),
               interruptThread: unsupportedThreadInterrupt,
+              dispatchThreadSettlement: unsupportedThreadSettlement,
               getArchivedShellSnapshot: () =>
                 Effect.fail(
                   new T3CodeAdapterError({
@@ -6142,16 +6159,23 @@ const shellThreadFixture = (
     readonly latestTurnId: string | null;
     readonly settledOverride: "settled" | "active" | null;
     readonly settledAt: string | null;
+    readonly snoozedAt: string | null;
+    readonly snoozedUntil: string | null;
+    readonly pinnedAt: string | null;
   }> = {},
 ) => ({
   threadId,
-  projectId: overrides.projectId ?? "project-a",
-  title: overrides.title ?? `Thread ${threadId}`,
-  archivedAt: overrides.archivedAt ?? null,
-  worktreePath: overrides.worktreePath ?? null,
-  latestTurnId: overrides.latestTurnId ?? null,
-  settledOverride: overrides.settledOverride ?? null,
-  settledAt: overrides.settledAt ?? null,
+  projectId: "project-a",
+  title: `Thread ${threadId}`,
+  archivedAt: null,
+  worktreePath: null,
+  latestTurnId: null,
+  settledOverride: null,
+  settledAt: null,
+  snoozedAt: null,
+  snoozedUntil: null,
+  pinnedAt: null,
+  ...overrides,
 });
 
 const shellSnapshotItem = (
@@ -6271,6 +6295,12 @@ interface ThreadFixtureOptions {
   dispatchTurn?: (
     input: InstanceDispatchTurnInput,
   ) => Effect.Effect<{ readonly sequence: number }, T3CodeAdapterError>;
+  dispatchThreadSettlement?: (input: {
+    readonly instanceId: string;
+    readonly threadId: string;
+    readonly commandId: string;
+    readonly settled: boolean;
+  }) => Effect.Effect<{ readonly sequence: number }, T3CodeAdapterError>;
   readonly seenAcquires: Array<string>;
   readonly seenVcsRefs: Array<string>;
   readonly interruptCalls: Array<{
@@ -6504,6 +6534,17 @@ const threadConnections = (options: ThreadFixtureOptions) =>
       }
       return scripted(streamOptions);
     },
+    dispatchThreadSettlement: (input) =>
+      options.dispatchThreadSettlement === undefined
+        ? Effect.fail(
+            new T3CodeAdapterError({
+              kind: "capacity",
+              message: "The thread test connection does not dispatch settlements.",
+              uncertain: false,
+              status: null,
+            }),
+          )
+        : options.dispatchThreadSettlement(input),
     readArchivedShell: (instanceId: string) => {
       options.seenArchived.push(instanceId);
       const scripted = options.archivedShells?.[instanceId];
@@ -8518,6 +8559,9 @@ const observedThreadFixture = (
     readonly archivedAt: string | null;
     readonly settledOverride: "settled" | "active" | null;
     readonly settledAt: string | null;
+    readonly snoozedAt: string | null;
+    readonly snoozedUntil: string | null;
+    readonly pinnedAt: string | null;
     readonly activities: ReadonlyArray<{
       readonly activityId: string;
       readonly kind: string;
@@ -8559,6 +8603,9 @@ const observedThreadFixture = (
   archivedAt: null,
   settledOverride: null,
   settledAt: null,
+  snoozedAt: null,
+  snoozedUntil: null,
+  pinnedAt: null,
   activities: [],
   messages: [],
   session: null,
@@ -12794,7 +12841,9 @@ describe("thread_get", () => {
           }
         ).value;
         expect(typeof state.observationCursor).toBe("string");
-        expect(state.limitations).toEqual([]);
+        expect(state.limitations).toEqual([
+          "The native thread attention state is unavailable from the shell; settlement falls back to thread detail.",
+        ]);
         expect(value.observations).toMatchObject([
           { instanceId: "instance-a", freshness: "fresh", sourceSequence: 42 },
         ]);
@@ -12802,6 +12851,134 @@ describe("thread_get", () => {
         expect(result[0]?.encodedResult).toEqual(result[0]?.result);
       }),
     ),
+  );
+
+  it.live("falls back to the active shell when an archived shell omits the thread", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.archivedShells = {
+          "instance-a": () =>
+            Effect.succeed({
+              snapshotSequence: 42,
+              projects: [shellProjectFixture("project-a")],
+              threads: [],
+              observedAt: "2026-09-24T00:00:00.000Z",
+            }),
+        };
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(
+                43,
+                [shellProjectFixture("project-a")],
+                [shellThreadFixture("thread-a", { settledOverride: "settled" })],
+              ),
+              shellSynchronizedItem,
+            ),
+        };
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              40,
+              observedThreadFixture("thread-a", {
+                archivedAt: "2026-09-23T00:00:00.000Z",
+              }),
+            ),
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_get", {
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        const value = result[0]?.result as unknown as ThreadGetToolResultShape;
+        expect(value.result).toMatchObject({
+          kind: "ok",
+          value: { summary: { archived: true, settlement: "settled" } },
+        });
+        expect(value.observations).toContainEqual(
+          expect.objectContaining({ instanceId: "instance-a", sourceSequence: 43 }),
+        );
+      }),
+    ),
+  );
+
+  it.live("rechecks the preferred shell when active and archived snapshots both miss", () =>
+    Effect.gen(function* () {
+      for (const archived of [false, true]) {
+        const result = yield* withDatabasePath((databasePath) =>
+          Effect.gen(function* () {
+            const { options, connections } = emptyThreadFixtures();
+            let activeReads = 0;
+            let archivedReads = 0;
+            options.activeStreams = {
+              "instance-a": () => {
+                activeReads += 1;
+                const includesThread = !archived && activeReads === 2;
+                return Stream.make(
+                  shellSnapshotItem(
+                    40 + activeReads,
+                    [shellProjectFixture("project-a")],
+                    includesThread
+                      ? [shellThreadFixture("thread-a", { settledOverride: "settled" })]
+                      : [],
+                  ),
+                  shellSynchronizedItem,
+                );
+              },
+            };
+            options.archivedShells = {
+              "instance-a": () => {
+                archivedReads += 1;
+                const includesThread = archived && archivedReads === 2;
+                return Effect.succeed({
+                  snapshotSequence: 50 + archivedReads,
+                  projects: [shellProjectFixture("project-a")],
+                  threads: includesThread
+                    ? [shellThreadFixture("thread-a", { settledOverride: "settled" })]
+                    : [],
+                  observedAt: "2026-09-24T00:00:00.000Z",
+                });
+              },
+            };
+            options.threadStreams = {
+              "instance-a:thread-a": () =>
+                detailSnapshotStream(
+                  39,
+                  observedThreadFixture("thread-a", {
+                    archivedAt: archived ? "2026-09-23T00:00:00.000Z" : null,
+                    settledOverride: "active",
+                  }),
+                ),
+            };
+            const result = yield* Effect.scoped(
+              Effect.gen(function* () {
+                yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+                return yield* callTool("thread_get", {
+                  thread: { instanceId: "instance-a", threadId: "thread-a" },
+                });
+              }).pipe(Effect.provide(appLayer(databasePath, connections))),
+            );
+            return { result, activeReads, archivedReads };
+          }),
+        );
+
+        const value = result.result[0]?.result as unknown as ThreadGetToolResultShape;
+        expect(value.result).toMatchObject({
+          kind: "ok",
+          value: { summary: { settlement: "settled" } },
+        });
+        expect(value.observations).toContainEqual(
+          expect.objectContaining({ sourceSequence: archived ? 52 : 42 }),
+        );
+        expect(result.activeReads).toBe(archived ? 1 : 2);
+        expect(result.archivedReads).toBe(archived ? 2 : 1);
+      }
+    }),
   );
 
   it.live("keeps execution, session, and settlement distinct for an active turn", () =>
@@ -13012,6 +13189,7 @@ describe("thread_get", () => {
         const state = (value.result as { value: { limitations: ReadonlyArray<string> } }).value;
         expect(state.limitations).toEqual([
           "The pinned server retained only the most recent 20 user-anchored turns; earlier history is unavailable through this read.",
+          "The native thread attention state is unavailable from the shell; settlement falls back to thread detail.",
         ]);
       }),
     ),
@@ -15366,7 +15544,16 @@ describe("thread_wait", () => {
         options.activeStreams = {
           "instance-a": () =>
             Stream.make(
-              shellSnapshotItem(41, [shellProjectFixture("project-a", "/srv/project-a")], []),
+              shellSnapshotItem(
+                41,
+                [shellProjectFixture("project-a", "/srv/project-a")],
+                [
+                  shellThreadFixture("thread-a", {
+                    latestTurnId: "turn-9",
+                    settledAt: "2026-09-22T01:00:00.000Z",
+                  }),
+                ],
+              ),
               shellSynchronizedItem,
             ),
         };
@@ -15376,7 +15563,6 @@ describe("thread_wait", () => {
               42,
               observedThreadFixture("thread-a", {
                 latestTurn: { turnId: "turn-9", state: "completed" },
-                settledAt: "2026-09-22T01:00:00.000Z",
               }),
             ),
         };
@@ -15398,15 +15584,327 @@ describe("thread_wait", () => {
         });
         const state = (
           value.result as {
-            value: { state: { summary: { settlement: string } } };
+            value: {
+              state: {
+                summary: {
+                  settlement: string;
+                  settledOverride: string | null | undefined;
+                  settledAt: string | null | undefined;
+                };
+              };
+            };
           }
         ).value.state;
         expect(state.summary.settlement).toBe("settled");
+        expect(state.summary.settledOverride).toBeNull();
+        expect(state.summary.settledAt).toBe("2026-09-22T01:00:00.000Z");
         expect(value.observations).toMatchObject([
           { instanceId: "instance-a", freshness: "fresh", sourceSequence: 42 },
+          { instanceId: "instance-a", freshness: "fresh", sourceSequence: 41 },
         ]);
         expect(value.warnings).toEqual([]);
         expect(result[0]?.encodedResult).toEqual(result[0]?.result);
+      }),
+    ),
+  );
+
+  it.effect("uses the archived shell when an active shell no longer lists the thread", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(41, [shellProjectFixture("project-a")], []),
+              shellSynchronizedItem,
+            ),
+        };
+        options.archivedShells = {
+          "instance-a": () =>
+            Effect.succeed({
+              snapshotSequence: 42,
+              projects: [shellProjectFixture("project-a")],
+              threads: [
+                shellThreadFixture("thread-a", {
+                  settledOverride: "settled",
+                  settledAt: "2026-09-24T00:00:00.000Z",
+                }),
+              ],
+              observedAt: "2026-09-24T00:00:00.000Z",
+            }),
+        };
+        options.threadStreams = {
+          "instance-a:thread-a": () => detailSnapshotStream(40, observedThreadFixture("thread-a")),
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_wait", {
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+              condition: "settled",
+              waitMs: 0,
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        const value = result[0]?.result as unknown as ThreadWaitToolResultShape;
+        expect(value.result).toMatchObject({
+          kind: "ok",
+          value: { condition: "settled", observation: "condition_met" },
+        });
+        expect(value.observations).toMatchObject([
+          { freshness: "fresh", sourceSequence: 40 },
+          { freshness: "fresh", sourceSequence: 42 },
+        ]);
+      }),
+    ),
+  );
+
+  it.effect("reports a missing native thread only after both shell reads succeed", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(41, [shellProjectFixture("project-a")], []),
+              shellSynchronizedItem,
+            ),
+        };
+        options.archivedShells = {
+          "instance-a": () =>
+            Effect.succeed({
+              snapshotSequence: 42,
+              projects: [shellProjectFixture("project-a")],
+              threads: [],
+              observedAt: "2026-09-24T00:00:00.000Z",
+            }),
+        };
+        options.threadStreams = {
+          "instance-a:thread-a": () => detailSnapshotStream(40, observedThreadFixture("thread-a")),
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_wait", {
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+              condition: "settled",
+              waitMs: 0,
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        const value = result[0]?.result as unknown as ThreadWaitToolResultShape;
+        expect(value.result).toMatchObject({
+          kind: "ok",
+          value: { condition: "settled", observation: "unavailable", state: null },
+        });
+        expect(value.warnings).toMatchObject([{ code: "native_settlement_unavailable" }]);
+        expect(value.observations).toMatchObject([
+          {},
+          {
+            coverage: "partial",
+            limitations: [expect.stringContaining("native thread attention state is unavailable")],
+          },
+        ]);
+      }),
+    ),
+  );
+
+  it.effect("labels detail-derived attention in a nonsettlement wait", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(
+                41,
+                [shellProjectFixture("project-a")],
+                [shellThreadFixture("thread-a", { settledOverride: "settled" })],
+              ),
+              shellSynchronizedItem,
+            ),
+        };
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              42,
+              observedThreadFixture("thread-a", {
+                latestTurn: { turnId: "turn-9", state: "completed" },
+                settledOverride: "active",
+              }),
+            ),
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_wait", {
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+              condition: "inactive",
+              waitMs: 0,
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        const value = result[0]?.result as unknown as ThreadWaitToolResultShape;
+        expect(value.result).toMatchObject({
+          kind: "ok",
+          value: {
+            condition: "inactive",
+            observation: "condition_met",
+            state: { summary: { settlement: "unsettled", settledOverride: "active" } },
+          },
+        });
+        const state = (
+          value.result as {
+            value: {
+              state: {
+                limitations: ReadonlyArray<string>;
+                pendingRequests: { readonly coverage: string };
+              };
+            };
+          }
+        ).value.state;
+        expect(state.limitations).toContain(
+          "Thread attention fields in this wait come from thread detail; use thread_get or a settlement wait for the native shell state.",
+        );
+        expect(state.pendingRequests.coverage).toBe("complete_for_query");
+        expect(value.observations).toMatchObject([{ coverage: "complete_for_query" }]);
+      }),
+    ),
+  );
+
+  it.effect("retries a transient native shell-read failure during a settlement wait", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const waitPollOpened = yield* Deferred.make<void>();
+        const shellFailureOpened = yield* Deferred.make<void>();
+        const retryShellOpened = yield* Deferred.make<void>();
+        const shellFailure = new T3CodeAdapterError({
+          kind: "transport",
+          message: "The native settlement shell read failed temporarily.",
+          uncertain: false,
+          status: null,
+        });
+        let shellOpens = 0;
+        let threadOpens = 0;
+        options.activeStreams = {
+          "instance-a": () => {
+            shellOpens += 1;
+            if (shellOpens === 3) {
+              return Stream.unwrap(
+                Effect.gen(function* () {
+                  yield* Deferred.succeed(shellFailureOpened, undefined);
+                  return Stream.fail(shellFailure);
+                }),
+              );
+            }
+            const override = shellOpens > 3 ? "settled" : "active";
+            const snapshot = Stream.make(
+              shellSnapshotItem(
+                40 + shellOpens,
+                [shellProjectFixture("project-a")],
+                [
+                  shellThreadFixture("thread-a", {
+                    settledOverride: override,
+                    settledAt: override === "settled" ? "2026-09-24T00:00:00.000Z" : null,
+                  }),
+                ],
+              ),
+              shellSynchronizedItem,
+            );
+            return shellOpens === 4
+              ? Stream.unwrap(Effect.as(Deferred.succeed(retryShellOpened, undefined), snapshot))
+              : snapshot;
+          },
+        };
+        options.archivedShells = {
+          "instance-a": () => Effect.fail(shellFailure),
+        };
+        options.threadStreams = {
+          "instance-a:thread-a": () => {
+            threadOpens += 1;
+            const snapshot = detailSnapshotStream(
+              40 + threadOpens,
+              observedThreadFixture("thread-a"),
+            );
+            return threadOpens === 2
+              ? Stream.unwrap(Effect.as(Deferred.succeed(waitPollOpened, undefined), snapshot))
+              : snapshot;
+          },
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            yield* callTool("thread_get", {
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+            const fiber = yield* Effect.forkDetach(
+              callTool("thread_wait", {
+                thread: { instanceId: "instance-a", threadId: "thread-a" },
+                condition: "settled",
+                waitMs: 2_000,
+              }),
+            );
+            yield* Deferred.await(waitPollOpened);
+            yield* advanceUntilDone(shellFailureOpened, 1_000);
+            yield* advanceUntilDone(retryShellOpened, 1_000);
+            return yield* Fiber.join(fiber);
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        const value = result[0]?.result as unknown as ThreadWaitToolResultShape;
+        expect(value.result).toMatchObject({
+          kind: "ok",
+          value: { condition: "settled", observation: "condition_met" },
+        });
+        expect(value.warnings).toEqual([]);
+        expect(shellOpens).toBeGreaterThanOrEqual(4);
+      }),
+    ),
+  );
+
+  it.effect("preserves a first-poll native shell failure as an observation error", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const shellFailure = new T3CodeAdapterError({
+          kind: "transport",
+          message: "The first native settlement shell read failed.",
+          uncertain: false,
+          status: null,
+        });
+        options.activeStreams = {
+          "instance-a": () => Stream.fail(shellFailure),
+        };
+        options.archivedShells = {
+          "instance-a": () => Effect.fail(shellFailure),
+        };
+        options.threadStreams = {
+          "instance-a:thread-a": () => detailSnapshotStream(40, observedThreadFixture("thread-a")),
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_wait", {
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+              condition: "settled",
+              waitMs: 0,
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "error",
+            error: {
+              code: "unavailable",
+              message: "The first native settlement shell read failed.",
+            },
+          },
+        });
       }),
     ),
   );
@@ -15634,7 +16132,11 @@ describe("thread_wait", () => {
         options.activeStreams = {
           "instance-a": () =>
             Stream.make(
-              shellSnapshotItem(41, [shellProjectFixture("project-a", "/srv/project-a")], []),
+              shellSnapshotItem(
+                41,
+                [shellProjectFixture("project-a", "/srv/project-a")],
+                [shellThreadFixture("thread-a", { settledAt: "2026-09-22T01:00:00.000Z" })],
+              ),
               shellSynchronizedItem,
             ),
         };
@@ -15646,7 +16148,6 @@ describe("thread_wait", () => {
                 42,
                 observedThreadFixture("thread-a", {
                   latestTurn: { turnId: "turn-9", state: "completed" },
-                  settledAt: "2026-09-22T01:00:00.000Z",
                 }),
               );
             }
@@ -15686,11 +16187,12 @@ describe("thread_wait", () => {
         const state = (value.result as { value: { state: { summary: { settlement: string } } } })
           .value.state;
         expect(state.summary.settlement).toBe("settled");
-        expect(value.observations).toMatchObject([{ freshness: "fresh" }]);
+        expect(value.observations).toMatchObject([
+          { freshness: "fresh", sourceSequence: 42 },
+          { freshness: "fresh", sourceSequence: 41 },
+        ]);
         expect(opens).toBeGreaterThanOrEqual(3);
-        // The auxiliary project lookup runs once for the seeding read and
-        // once for the first wait poll; later polls reuse the cache.
-        expect(options.seenActive).toEqual(["instance-a", "instance-a"]);
+        expect(options.seenActive.length).toBeGreaterThan(2);
       }),
     ),
   );
@@ -15706,7 +16208,11 @@ describe("thread_wait", () => {
         options.activeStreams = {
           "instance-a": () =>
             Stream.make(
-              shellSnapshotItem(41, [shellProjectFixture("project-a", "/srv/project-a")], []),
+              shellSnapshotItem(
+                41,
+                [shellProjectFixture("project-a", "/srv/project-a")],
+                [shellThreadFixture("thread-a", { settledAt: "2026-09-22T01:00:00.000Z" })],
+              ),
               shellSynchronizedItem,
             ),
         };
@@ -15795,7 +16301,11 @@ describe("thread_wait", () => {
         options.activeStreams = {
           "instance-a": () =>
             Stream.make(
-              shellSnapshotItem(41, [shellProjectFixture("project-a", "/srv/project-a")], []),
+              shellSnapshotItem(
+                41,
+                [shellProjectFixture("project-a", "/srv/project-a")],
+                [shellThreadFixture("thread-a", { settledAt: "2026-09-22T01:00:00.000Z" })],
+              ),
               shellSynchronizedItem,
             ),
         };
@@ -15894,7 +16404,11 @@ describe("thread_wait", () => {
           options.activeStreams = {
             "instance-a": () =>
               Stream.make(
-                shellSnapshotItem(41, [shellProjectFixture("project-a", "/srv/project-a")], []),
+                shellSnapshotItem(
+                  41,
+                  [shellProjectFixture("project-a", "/srv/project-a")],
+                  [shellThreadFixture("thread-a", { settledAt: "2026-09-22T01:00:00.000Z" })],
+                ),
                 shellSynchronizedItem,
               ),
           };
@@ -19488,6 +20002,45 @@ describe("thread_interrupt", () => {
   );
 });
 
+const makeTurnEvidenceFixture = (databasePath: string) => {
+  const detail = "The thread detail snapshot published the latest turn as running.";
+  const rowBytes = new TextEncoder().encode(
+    JSON.stringify({
+      i: "instance-a",
+      t: "thread-a",
+      u: "turn-1",
+      s: "running",
+      p: false,
+      q: 1,
+      o: "2026-09-22T00:00:00.000Z",
+      d: detail,
+    }),
+  ).byteLength;
+  return {
+    layer: LocalStore.layer({ databasePath, turnEvidenceBudgetBytes: rowBytes * 2 + 1 }),
+    record: (
+      store: LocalStoreService,
+      threadId: string,
+      turnId: string,
+      sequence: number,
+      second = sequence,
+    ) =>
+      store.recordTurnEvidence({
+        turn: { instanceId: "instance-a", threadId, turnId },
+        state: "running",
+        projected: false,
+        sourceSequence: sequence,
+        observedAt: `2026-09-22T00:00:${String(second).padStart(2, "0")}.000Z`,
+        detail,
+      }),
+    turnRef: (threadId: string, turnId: string) => ({
+      instanceId: "instance-a",
+      threadId,
+      turnId,
+    }),
+  };
+};
+
 describe("turn_wait", () => {
   it.effect("meets an already-completed turn immediately with a zero budget", () =>
     withDatabasePath((databasePath) =>
@@ -20439,42 +20992,13 @@ describe("turn_wait", () => {
     () =>
       withDatabasePath((databasePath) =>
         Effect.gen(function* () {
-          const rowBytes = new TextEncoder().encode(
-            JSON.stringify({
-              i: "instance-a",
-              t: "thread-a",
-              u: "turn-1",
-              s: "running",
-              p: false,
-              q: 1,
-              o: "2026-09-22T00:00:00.000Z",
-              d: "The thread detail snapshot published the latest turn as running.",
-            }),
-          ).byteLength;
-          const layer = LocalStore.layer({
-            databasePath,
-            turnEvidenceBudgetBytes: rowBytes * 2 + 1,
-          });
+          const { layer, record, turnRef } = makeTurnEvidenceFixture(databasePath);
           yield* Effect.scoped(
             Effect.gen(function* () {
               yield* TestClock.setTime(1_000_000);
               const store = yield* LocalStore;
-              const record = (threadId: string, turnId: string, sequence: number) =>
-                store.recordTurnEvidence({
-                  turn: { instanceId: "instance-a", threadId, turnId },
-                  state: "running",
-                  projected: false,
-                  sourceSequence: sequence,
-                  observedAt: `2026-09-22T00:00:0${sequence}.000Z`,
-                  detail: "The thread detail snapshot published the latest turn as running.",
-                });
-              yield* record("thread-a", "turn-1", 1);
-              yield* record("thread-b", "turn-2", 2);
-              const turnRef = (threadId: string, turnId: string) => ({
-                instanceId: "instance-a",
-                threadId,
-                turnId,
-              });
+              yield* record(store, "thread-a", "turn-1", 1);
+              yield* record(store, "thread-b", "turn-2", 2);
 
               // An unresolved operation targeting thread-a pins its evidence.
               yield* store.admitOperation({
@@ -20493,7 +21017,7 @@ describe("turn_wait", () => {
 
               // The third row overflows the budget: the oldest unpinned row is
               // evicted, and the pinned thread-a row stays.
-              yield* record("thread-c", "turn-3", 3);
+              yield* record(store, "thread-c", "turn-3", 3);
               expect(yield* store.findTurnEvidence(turnRef("thread-a", "turn-1"))).not.toBeNull();
               expect(yield* store.findTurnEvidence(turnRef("thread-b", "turn-2"))).toBeNull();
               expect(yield* store.findTurnEvidence(turnRef("thread-c", "turn-3"))).not.toBeNull();
@@ -20509,7 +21033,7 @@ describe("turn_wait", () => {
                 now: "2026-09-22T00:00:01.000Z",
                 state: "completed",
               });
-              yield* record("thread-d", "turn-4", 4);
+              yield* record(store, "thread-d", "turn-4", 4);
               expect(yield* store.findTurnEvidence(turnRef("thread-a", "turn-1"))).toBeNull();
               expect(yield* store.findTurnEvidence(turnRef("thread-d", "turn-4"))).not.toBeNull();
             }).pipe(Effect.provide(layer)),
@@ -20521,42 +21045,13 @@ describe("turn_wait", () => {
   it.effect("pins evidence by exact turn when an unresolved operation names one", () =>
     withDatabasePath((databasePath) =>
       Effect.gen(function* () {
-        const rowBytes = new TextEncoder().encode(
-          JSON.stringify({
-            i: "instance-a",
-            t: "thread-a",
-            u: "turn-1",
-            s: "running",
-            p: false,
-            q: 1,
-            o: "2026-09-22T00:00:00.000Z",
-            d: "The thread detail snapshot published the latest turn as running.",
-          }),
-        ).byteLength;
-        const layer = LocalStore.layer({
-          databasePath,
-          turnEvidenceBudgetBytes: rowBytes * 2 + 1,
-        });
+        const { layer, record, turnRef } = makeTurnEvidenceFixture(databasePath);
         yield* Effect.scoped(
           Effect.gen(function* () {
             yield* TestClock.setTime(1_000_000);
             const store = yield* LocalStore;
-            const record = (threadId: string, turnId: string, sequence: number) =>
-              store.recordTurnEvidence({
-                turn: { instanceId: "instance-a", threadId, turnId },
-                state: "running",
-                projected: false,
-                sourceSequence: sequence,
-                observedAt: `2026-09-22T00:00:0${sequence}.000Z`,
-                detail: "The thread detail snapshot published the latest turn as running.",
-              });
-            const turnRef = (threadId: string, turnId: string) => ({
-              instanceId: "instance-a",
-              threadId,
-              turnId,
-            });
-            yield* record("thread-a", "turn-1", 1);
-            yield* record("thread-a", "turn-2", 2);
+            yield* record(store, "thread-a", "turn-1", 1);
+            yield* record(store, "thread-a", "turn-2", 2);
 
             // An unresolved operation correlated to turn-1 pins only that
             // turn: the other turns of the same thread stay evictable, so a
@@ -20581,7 +21076,7 @@ describe("turn_wait", () => {
               },
             });
 
-            yield* record("thread-b", "turn-3", 3);
+            yield* record(store, "thread-b", "turn-3", 3);
             expect(yield* store.findTurnEvidence(turnRef("thread-a", "turn-1"))).not.toBeNull();
             expect(yield* store.findTurnEvidence(turnRef("thread-a", "turn-2"))).toBeNull();
             expect(yield* store.findTurnEvidence(turnRef("thread-b", "turn-3"))).not.toBeNull();
@@ -20594,42 +21089,13 @@ describe("turn_wait", () => {
   it.effect("pins nothing thread-wide from an outcome_unknown operation without a turn", () =>
     withDatabasePath((databasePath) =>
       Effect.gen(function* () {
-        const rowBytes = new TextEncoder().encode(
-          JSON.stringify({
-            i: "instance-a",
-            t: "thread-a",
-            u: "turn-1",
-            s: "running",
-            p: false,
-            q: 1,
-            o: "2026-09-22T00:00:00.000Z",
-            d: "The thread detail snapshot published the latest turn as running.",
-          }),
-        ).byteLength;
-        const layer = LocalStore.layer({
-          databasePath,
-          turnEvidenceBudgetBytes: rowBytes * 2 + 1,
-        });
+        const { layer, record, turnRef } = makeTurnEvidenceFixture(databasePath);
         yield* Effect.scoped(
           Effect.gen(function* () {
             yield* TestClock.setTime(1_000_000);
             const store = yield* LocalStore;
-            const record = (threadId: string, turnId: string, sequence: number) =>
-              store.recordTurnEvidence({
-                turn: { instanceId: "instance-a", threadId, turnId },
-                state: "running",
-                projected: false,
-                sourceSequence: sequence,
-                observedAt: `2026-09-22T00:00:0${sequence}.000Z`,
-                detail: "The thread detail snapshot published the latest turn as running.",
-              });
-            const turnRef = (threadId: string, turnId: string) => ({
-              instanceId: "instance-a",
-              threadId,
-              turnId,
-            });
-            yield* record("thread-a", "turn-1", 1);
-            yield* record("thread-a", "turn-2", 2);
+            yield* record(store, "thread-a", "turn-1", 1);
+            yield* record(store, "thread-a", "turn-2", 2);
 
             // A terminal-to-reconciliation record with a thread-only target
             // never evaluates thread evidence again, so it pins nothing and
@@ -20649,7 +21115,7 @@ describe("turn_wait", () => {
               state: "outcome_unknown",
             });
 
-            yield* record("thread-b", "turn-3", 3);
+            yield* record(store, "thread-b", "turn-3", 3);
             expect(yield* store.findTurnEvidence(turnRef("thread-a", "turn-1"))).toBeNull();
             expect(yield* store.findTurnEvidence(turnRef("thread-a", "turn-2"))).not.toBeNull();
             expect(
@@ -20668,49 +21134,20 @@ describe("turn_wait", () => {
   it.effect("never evicts the row its own recording just wrote", () =>
     withDatabasePath((databasePath) =>
       Effect.gen(function* () {
-        const rowBytes = new TextEncoder().encode(
-          JSON.stringify({
-            i: "instance-a",
-            t: "thread-a",
-            u: "turn-1",
-            s: "running",
-            p: false,
-            q: 1,
-            o: "2026-09-22T00:00:00.000Z",
-            d: "The thread detail snapshot published the latest turn as running.",
-          }),
-        ).byteLength;
-        const layer = LocalStore.layer({
-          databasePath,
-          turnEvidenceBudgetBytes: rowBytes * 2 + 1,
-        });
+        const { layer, record, turnRef } = makeTurnEvidenceFixture(databasePath);
         yield* Effect.scoped(
           Effect.gen(function* () {
             yield* TestClock.setTime(1_000_000);
             const store = yield* LocalStore;
-            const record = (turnId: string, sequence: number, second: number) =>
-              store.recordTurnEvidence({
-                turn: { instanceId: "instance-a", threadId: "thread-a", turnId },
-                state: "running",
-                projected: false,
-                sourceSequence: sequence,
-                observedAt: `2026-09-22T00:00:${String(second).padStart(2, "0")}.000Z`,
-                detail: "The thread detail snapshot published the latest turn as running.",
-              });
-            const turnRef = (turnId: string) => ({
-              instanceId: "instance-a",
-              threadId: "thread-a",
-              turnId,
-            });
-            yield* record("turn-1", 1, 10);
-            yield* record("turn-2", 2, 20);
+            yield* record(store, "thread-a", "turn-1", 1, 10);
+            yield* record(store, "thread-a", "turn-2", 2, 20);
             // A lagging observation arrives with an older observation time:
             // its own recording must not evict it to make room, so the next
             // oldest unpinned row goes instead.
-            yield* record("turn-3", 3, 5);
-            expect(yield* store.findTurnEvidence(turnRef("turn-3"))).not.toBeNull();
-            expect(yield* store.findTurnEvidence(turnRef("turn-1"))).toBeNull();
-            expect(yield* store.findTurnEvidence(turnRef("turn-2"))).not.toBeNull();
+            yield* record(store, "thread-a", "turn-3", 3, 5);
+            expect(yield* store.findTurnEvidence(turnRef("thread-a", "turn-3"))).not.toBeNull();
+            expect(yield* store.findTurnEvidence(turnRef("thread-a", "turn-1"))).toBeNull();
+            expect(yield* store.findTurnEvidence(turnRef("thread-a", "turn-2"))).not.toBeNull();
           }).pipe(Effect.provide(layer)),
         );
       }),
@@ -20966,7 +21403,7 @@ describe("thread_stop_session", () => {
         };
         options.stopThreadSession = (input) => {
           options.sessionStopCommand = input;
-          return Effect.succeed({ sequence: 43 });
+          return Effect.succeed({ sequence: 44 });
         };
 
         const result = yield* Effect.scoped(
@@ -21597,11 +22034,19 @@ describe("thread_stop_session", () => {
             const store = yield* LocalStore;
             const before = yield* store.getOperation("stop-session-history-gap-repeat");
             historyGapSequence = 44;
+            const readsBeforeRepeated = threadReads;
             const repeated = yield* callTool("operation_get", {
               requestId: "stop-session-history-gap-repeat",
             });
             const after = yield* store.getOperation("stop-session-history-gap-repeat");
-            return { first, repeated, before, after };
+            return {
+              first,
+              repeated,
+              before,
+              after,
+              readsBeforeRepeated,
+              readsAfterRepeated: threadReads,
+            };
           }).pipe(Effect.provide(appLayer(databasePath, connections))),
         );
 
@@ -21630,6 +22075,7 @@ describe("thread_stop_session", () => {
         });
         expect(result.after?.record.revision).toBe(result.before?.record.revision);
         expect(result.after?.record.evidence).toEqual(result.before?.record.evidence);
+        expect(result.readsAfterRepeated).toBeGreaterThan(result.readsBeforeRepeated);
       }),
     ),
   );
@@ -22150,1343 +22596,1295 @@ describe("thread_stop_session", () => {
   );
 });
 
-describe("turn_wait", () => {
-  it.effect("meets an already-completed turn immediately with a zero budget", () =>
+describe("thread_set_settled", () => {
+  const encodedResult = (results: ReadonlyArray<{ readonly result?: unknown }>) => {
+    const first = results[0];
+    if (first === undefined || first.result === undefined) {
+      throw new Error("tool returned no result");
+    }
+    return first.result;
+  };
+
+  it.effect("rejects malformed and unknown arguments through the public toolkit", () =>
     withDatabasePath((databasePath) =>
       Effect.gen(function* () {
-        const { options, connections } = emptyThreadFixtures();
-        options.threadStreams = {
-          "instance-a:thread-a": () => turnWaitDetail(42, { turnId: "turn-a", state: "completed" }),
-        };
+        const validThread = { instanceId: "instance-a", threadId: "thread-a" };
+        for (const input of [
+          { requestId: "settle-1", thread: validThread, settled: "true" },
+          { requestId: "settle-1", thread: validThread, settled: true, unexpected: true },
+          {
+            requestId: "settle-1",
+            thread: { ...validThread, unexpected: true },
+            settled: true,
+          },
+        ]) {
+          const exit = yield* Effect.exit(
+            Effect.scoped(
+              callTool("thread_set_settled", input).pipe(
+                Effect.provide(appLayer(databasePath, fakeConnections())),
+              ),
+            ),
+          );
+          expect(Exit.isFailure(exit)).toBe(true);
+          if (Exit.isSuccess(exit)) return;
+          expect(String(exit.cause)).toContain("Invalid parameters for tool 'thread_set_settled'");
+        }
+      }),
+    ),
+  );
+
+  it.effect("reports pairing_required before dispatch for an unpaired registration", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const connections = InstanceConnections.layerWithAdapter(
+          fakeAdapterLayer({ current: null }),
+        );
         const result = yield* Effect.scoped(
           Effect.gen(function* () {
-            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
-            return yield* callTool("turn_wait", { turn: turnA, waitMs: 0 });
+            yield* seedProjectRegistration("instance-unpaired", "https://unpaired.test");
+            return yield* callTool("thread_set_settled", {
+              requestId: "settle-unpaired",
+              thread: { instanceId: "instance-unpaired", threadId: "unpaired-thread" },
+              settled: true,
+            });
           }).pipe(Effect.provide(appLayer(databasePath, connections))),
         );
 
-        const value = result[0]?.result as unknown as TurnWaitToolResultShape;
-        expect(value.result).toMatchObject({
-          kind: "ok",
-          value: {
-            target: turnA,
-            observation: "condition_met",
-            execution: "completed",
-            pendingRequests: [],
-          },
-        });
-        const execution = (
-          value.result as {
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
             value: {
-              evidence: ReadonlyArray<{
-                kind: string;
-                sourceSequence: number | null;
-                detail: string;
-              }>;
-            };
-          }
-        ).value;
-        expect(execution.evidence).toMatchObject([
-          { kind: "snapshot", sourceSequence: 42, nativeEventId: null },
-        ]);
-        expect(execution.evidence[0]?.detail).toContain("published the latest turn as completed");
-        expect(value.observations).toMatchObject([
-          { instanceId: "instance-a", freshness: "fresh", sourceSequence: 42 },
-        ]);
-        expect(value.warnings).toEqual([]);
-        expect(result[0]?.encodedResult).toEqual(result[0]?.result);
+              state: "failed",
+              dispatch: "not_dispatched",
+              error: { code: "pairing_required" },
+            },
+          },
+        });
       }),
     ),
   );
 
-  it.effect("answers from retained evidence after supersession without replacing the target", () =>
+  it.effect("keeps uncertain credential verification failures before dispatch certain", () =>
     withDatabasePath((databasePath) =>
       Effect.gen(function* () {
-        const { options, connections } = emptyThreadFixtures();
-        options.activeStreams = {
-          "instance-a": () =>
-            Stream.make(
-              shellSnapshotItem(41, [shellProjectFixture("project-a", "/srv/project-a")], []),
-              shellSynchronizedItem,
-            ),
-        };
-        let opens = 0;
-        options.threadStreams = {
-          "instance-a:thread-a": () => {
-            opens += 1;
-            return opens === 1
-              ? turnWaitDetail(10, { turnId: "turn-a", state: "completed" })
-              : turnWaitDetail(20, { turnId: "turn-b", state: "running" });
-          },
-        };
+        const verifyFailure = new T3CodeAdapterError({
+          kind: "transport",
+          message: "Credential verification timed out before settlement dispatch.",
+          uncertain: true,
+          status: null,
+        });
+        const connections = InstanceConnections.layerWithAdapter(
+          fakeAdapterLayer(
+            { current: null },
+            {},
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            verifyFailure,
+          ),
+        );
         const result = yield* Effect.scoped(
           Effect.gen(function* () {
             yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
-            // The seeding read retains the completed-turn evidence before a
-            // newer turn exists.
-            yield* callTool("thread_get", {
+            return yield* callTool("thread_set_settled", {
+              requestId: "settle-verification-failure",
               thread: { instanceId: "instance-a", threadId: "thread-a" },
+              settled: true,
             });
-            return yield* callTool("turn_wait", { turn: turnA, waitMs: 0 });
           }).pipe(Effect.provide(appLayer(databasePath, connections))),
         );
 
-        const value = result[0]?.result as unknown as TurnWaitToolResultShape;
-        expect(value.result).toMatchObject({
-          kind: "ok",
-          value: {
-            target: turnA,
-            observation: "condition_met",
-            execution: "completed",
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "failed",
+              dispatch: "not_dispatched",
+              error: {
+                code: "unavailable",
+                message: "Credential verification timed out before settlement dispatch.",
+                retry: "safe_read",
+              },
+            },
           },
         });
-        const outcome = (
-          value.result as { value: { evidence: ReadonlyArray<{ sourceSequence: number | null }> } }
-        ).value;
-        // The outcome came from the retained observation of turn-a, not from
-        // the newer turn-b currently running.
-        expect(outcome.evidence).toMatchObject([{ sourceSequence: 10 }]);
-        expect(value.observations).toMatchObject([
-          {
-            instanceId: "instance-a",
-            freshness: "fresh",
-            coverage: "partial",
-            limitations: [expect.stringMatching(/retained turn evidence/)],
-          },
-        ]);
       }),
     ),
   );
 
-  it.effect("reports running and times out when the turn stays active", () =>
+  it.effect("normalizes credential wire failures before settlement dispatch", () =>
     withDatabasePath((databasePath) =>
       Effect.gen(function* () {
-        const { options, connections } = emptyThreadFixtures();
-        const waitPollOpened = yield* Deferred.make<void>();
-        let opens = 0;
-        options.activeStreams = {
-          "instance-a": () =>
-            Stream.make(
-              shellSnapshotItem(41, [shellProjectFixture("project-a", "/srv/project-a")], []),
-              shellSynchronizedItem,
-            ),
-        };
-        options.threadStreams = {
-          "instance-a:thread-a": () => {
-            opens += 1;
-            if (opens === 1) return turnWaitDetail(10, { turnId: "turn-a", state: "running" });
-            return Stream.unwrap(
-              Effect.gen(function* () {
-                if (opens === 2) yield* Deferred.succeed(waitPollOpened, undefined);
-                return Stream.make({ kind: "synchronized" as const });
-              }),
-            );
-          },
-        };
+        const connections = InstanceConnections.layerWithAdapter(
+          fakeAdapterLayer(
+            { current: null },
+            {},
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            new T3CodeAdapterError({
+              kind: "wire_incompatible",
+              message: "Credential verification returned an unsupported response.",
+              uncertain: true,
+              status: null,
+            }),
+          ),
+        );
         const result = yield* Effect.scoped(
           Effect.gen(function* () {
             yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
-            // The seeding read consumes the first open; the wait's first poll
-            // then resolves the gating deferred without a clock advance.
-            yield* callTool("thread_get", {
+            return yield* callTool("thread_set_settled", {
+              requestId: "settle-verification-wire-failure",
               thread: { instanceId: "instance-a", threadId: "thread-a" },
+              settled: true,
             });
-            const fiber = yield* Effect.forkDetach(
-              callTool("turn_wait", { turn: turnA, waitMs: 250 }),
-            );
-            yield* Deferred.await(waitPollOpened);
-            yield* TestClock.adjust(Duration.millis(150));
-            yield* TestClock.adjust(Duration.millis(150));
-            return yield* Fiber.join(fiber);
           }).pipe(Effect.provide(appLayer(databasePath, connections))),
         );
 
-        const value = result[0]?.result as unknown as TurnWaitToolResultShape;
-        expect(value.result).toMatchObject({
-          kind: "ok",
-          value: { target: turnA, observation: "timed_out", execution: "running" },
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "failed",
+              dispatch: "not_dispatched",
+              error: {
+                code: "incompatible_instance",
+                retry: "change_request",
+                message: "Credential verification returned an unsupported response.",
+              },
+            },
+          },
         });
-        expect(value.observations).toMatchObject([{ freshness: "fresh" }]);
       }),
     ),
   );
 
-  it.effect("reports a history gap when a newer turn supersedes the target mid-wait", () =>
+  it.effect("preserves required scopes from settlement credential verification", () =>
     withDatabasePath((databasePath) =>
       Effect.gen(function* () {
-        const { options, connections } = emptyThreadFixtures();
-        const waitPollOpened = yield* Deferred.make<void>();
-        const supersedeOpened = yield* Deferred.make<void>();
-        let opens = 0;
-        options.activeStreams = {
-          "instance-a": () =>
-            Stream.make(
-              shellSnapshotItem(41, [shellProjectFixture("project-a", "/srv/project-a")], []),
-              shellSynchronizedItem,
-            ),
-        };
-        options.threadStreams = {
-          "instance-a:thread-a": () => {
-            opens += 1;
-            if (opens === 1) return turnWaitDetail(10, { turnId: "turn-a", state: "running" });
-            const stream = turnWaitDetail(20, { turnId: "turn-b", state: "running" });
-            return Stream.unwrap(
-              Effect.gen(function* () {
-                if (opens === 2) yield* Deferred.succeed(waitPollOpened, undefined);
-                if (opens === 3) yield* Deferred.succeed(supersedeOpened, undefined);
-                return stream;
-              }),
-            );
-          },
-        };
+        const connections = InstanceConnections.layerWithAdapter(
+          fakeAdapterLayer(
+            { current: null },
+            {},
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            new T3CodeAdapterError({
+              kind: "authorization",
+              message: "The credential lacks the orchestration:operate scope.",
+              uncertain: false,
+              status: null,
+              requiredScopes: ["orchestration:operate"],
+            }),
+          ),
+        );
         const result = yield* Effect.scoped(
           Effect.gen(function* () {
             yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
-            yield* callTool("thread_get", {
+            return yield* callTool("thread_set_settled", {
+              requestId: "settle-verification-authorization",
               thread: { instanceId: "instance-a", threadId: "thread-a" },
+              settled: true,
             });
-            const fiber = yield* Effect.forkDetach(
-              callTool("turn_wait", { turn: turnA, waitMs: 10_000 }),
-            );
-            yield* Deferred.await(waitPollOpened);
-            yield* advanceUntilDone(supersedeOpened, 3_000);
-            return yield* Fiber.join(fiber);
           }).pipe(Effect.provide(appLayer(databasePath, connections))),
         );
 
-        const value = result[0]?.result as unknown as TurnWaitToolResultShape;
-        expect(value.result).toMatchObject({
-          kind: "ok",
-          value: {
-            target: turnA,
-            observation: "history_gap",
-            execution: "outcome_unknown",
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "failed",
+              dispatch: "not_dispatched",
+              error: {
+                code: "operate_denied",
+                retry: "change_request",
+                details: { requiredScopes: ["orchestration:operate"] },
+              },
+            },
           },
         });
-        // Supersession alone never establishes completion; the gap is
-        // reported explicitly so the caller can resynchronize.
-        expect(value.observations).toMatchObject([
-          {
-            freshness: "fresh",
-            sourceSequence: 20,
-            limitations: [expect.stringMatching(/not covered by the current observation/)],
-          },
-        ]);
       }),
     ),
   );
 
-  it.effect("never establishes completion from a projected turn state", () =>
-    withDatabasePath((databasePath) =>
-      Effect.gen(function* () {
-        const { options, connections } = emptyThreadFixtures();
-        const waitPollOpened = yield* Deferred.make<void>();
-        let opens = 0;
-        options.activeStreams = {
-          "instance-a": () =>
-            Stream.make(
-              shellSnapshotItem(41, [shellProjectFixture("project-a", "/srv/project-a")], []),
-              shellSynchronizedItem,
-            ),
-        };
-        options.threadStreams = {
-          "instance-a:thread-a": () => {
-            opens += 1;
-            if (opens === 1) return turnWaitDetail(10, { turnId: "turn-a", state: "running" });
-            return Stream.unwrap(
-              Effect.gen(function* () {
-                if (opens === 2) yield* Deferred.succeed(waitPollOpened, undefined);
-                // A session transition to idle projects the still-running
-                // turn as completed; the projection cannot establish
-                // completion.
+  it.live(
+    "completes after the native override is observed and records session state separately",
+    () =>
+      withDatabasePath((databasePath) =>
+        Effect.gen(function* () {
+          const { options, connections } = emptyThreadFixtures();
+          const dispatches: Array<{
+            readonly instanceId: string;
+            readonly threadId: string;
+            readonly commandId: string;
+            readonly settled: boolean;
+          }> = [];
+          let shellReads = 0;
+          options.dispatchThreadSettlement = (input) => {
+            dispatches.push(input);
+            return Effect.succeed({ sequence: 42 });
+          };
+          options.activeStreams = {
+            "instance-a": (streamOptions) => {
+              shellReads += 1;
+              if (streamOptions?.afterSequence === undefined) {
                 return Stream.make(
-                  {
-                    kind: "session-set" as const,
-                    sequence: 11,
-                    session: {
-                      status: "idle" as const,
-                      activeTurnId: null,
-                      lastError: null,
-                      updatedAt: "2026-09-22T00:00:01.000Z",
-                    },
-                  },
-                  { kind: "synchronized" as const },
+                  shellSnapshotItem(
+                    41,
+                    [shellProjectFixture("project-a")],
+                    [shellThreadFixture("thread-a")],
+                  ),
+                  shellSynchronizedItem,
                 );
-              }),
-            );
-          },
-        };
-        const result = yield* Effect.scoped(
-          Effect.gen(function* () {
-            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
-            yield* callTool("thread_get", {
-              thread: { instanceId: "instance-a", threadId: "thread-a" },
-            });
-            const fiber = yield* Effect.forkDetach(
-              callTool("turn_wait", { turn: turnA, waitMs: 250 }),
-            );
-            yield* Deferred.await(waitPollOpened);
-            yield* TestClock.adjust(Duration.millis(150));
-            yield* TestClock.adjust(Duration.millis(150));
-            return yield* Fiber.join(fiber);
-          }).pipe(Effect.provide(appLayer(databasePath, connections))),
-        );
-
-        const value = result[0]?.result as unknown as TurnWaitToolResultShape;
-        expect(value.result).toMatchObject({
-          kind: "ok",
-          value: { target: turnA, observation: "timed_out", execution: "outcome_unknown" },
-        });
-        const outcome = (value.result as { value: { evidence: ReadonlyArray<{ detail: string }> } })
-          .value;
-        expect(outcome.evidence[0]?.detail).toContain("projected from a session transition");
-      }),
-    ),
-  );
-
-  it.effect("keeps a superseded projected outcome unknown rather than completed", () =>
-    withDatabasePath((databasePath) =>
-      Effect.gen(function* () {
-        const { options, connections } = emptyThreadFixtures();
-        let opens = 0;
-        options.threadStreams = {
-          "instance-a:thread-a": () => {
-            opens += 1;
-            if (opens === 1) return turnWaitDetail(10, { turnId: "turn-a", state: "running" });
-            if (opens === 2) {
+              }
               return Stream.make(
                 {
-                  kind: "session-set" as const,
-                  sequence: 11,
+                  kind: "thread-upserted" as const,
+                  sequence: 42,
+                  thread: shellThreadFixture("thread-a", {
+                    settledOverride: "settled",
+                    settledAt: "2026-09-23T14:00:00.000Z",
+                  }),
+                },
+                shellSynchronizedItem,
+              );
+            },
+          };
+          options.threadStreams = {
+            "instance-a:thread-a": () =>
+              detailSnapshotStream(
+                50,
+                observedThreadFixture("thread-a", {
+                  settledOverride: "settled",
+                  settledAt: "2026-09-23T14:00:00.000Z",
                   session: {
-                    status: "idle" as const,
+                    status: "running",
                     activeTurnId: null,
                     lastError: null,
-                    updatedAt: "2026-09-22T00:00:01.000Z",
+                    updatedAt: "2026-09-23T14:00:00.000Z",
                   },
-                },
-                { kind: "synchronized" as const },
-              );
-            }
-            return turnWaitDetail(20, { turnId: "turn-b", state: "running" });
-          },
-        };
-        const result = yield* Effect.scoped(
-          Effect.gen(function* () {
-            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
-            // Observe and retain the projected completion for turn-a before
-            // the newer turn supersedes it.
-            yield* callTool("thread_get", {
-              thread: { instanceId: "instance-a", threadId: "thread-a" },
-            });
-            yield* callTool("thread_get", {
-              thread: { instanceId: "instance-a", threadId: "thread-a" },
-            });
-            return yield* callTool("turn_wait", { turn: turnA, waitMs: 0 });
-          }).pipe(Effect.provide(appLayer(databasePath, connections))),
-        );
-
-        const value = result[0]?.result as unknown as TurnWaitToolResultShape;
-        expect(value.result).toMatchObject({
-          kind: "ok",
-          value: { target: turnA, observation: "history_gap", execution: "outcome_unknown" },
-        });
-      }),
-    ),
-  );
-
-  it.effect("meets interrupted and failed from supported terminal states", () =>
-    withDatabasePath((databasePath) =>
-      Effect.gen(function* () {
-        const { options, connections } = emptyThreadFixtures();
-        let opens = 0;
-        options.threadStreams = {
-          "instance-a:thread-a": () => {
-            opens += 1;
-            if (opens === 1) return turnWaitDetail(10, { turnId: "turn-a", state: "interrupted" });
-            return turnWaitDetail(20, { turnId: "turn-a", state: "error" });
-          },
-        };
-        const result = yield* Effect.scoped(
-          Effect.gen(function* () {
-            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
-            const interrupted = yield* callTool("turn_wait", { turn: turnA, waitMs: 0 });
-            const failed = yield* callTool("turn_wait", { turn: turnA, waitMs: 0 });
-            return { interrupted, failed };
-          }).pipe(Effect.provide(appLayer(databasePath, connections))),
-        );
-
-        const interrupted = result.interrupted[0]?.result as unknown as TurnWaitToolResultShape;
-        expect(interrupted.result).toMatchObject({
-          kind: "ok",
-          value: { target: turnA, observation: "condition_met", execution: "interrupted" },
-        });
-        const failed = result.failed[0]?.result as unknown as TurnWaitToolResultShape;
-        expect(failed.result).toMatchObject({
-          kind: "ok",
-          value: { target: turnA, observation: "condition_met", execution: "failed" },
-        });
-      }),
-    ),
-  );
-
-  it.effect("meets awaiting_approval only from a correlated unresolved request", () =>
-    withDatabasePath((databasePath) =>
-      Effect.gen(function* () {
-        const { options, connections } = emptyThreadFixtures();
-        options.threadStreams = {
-          "instance-a:thread-a": () =>
-            turnWaitDetail(42, { turnId: "turn-a", state: "running" }, [
-              approvalActivity("activity-1", "request-1", {
-                options: [{ decision: "accept", label: "Accept" }],
-                turnId: "turn-a",
-              }),
-              // Uncorrelated requests never establish the exact-turn outcome.
-              approvalActivity("activity-2", "request-2", {
-                options: [{ decision: "accept", label: "Accept" }],
-                turnId: null,
-              }),
-            ]),
-        };
-        const result = yield* Effect.scoped(
-          Effect.gen(function* () {
-            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
-            return yield* callTool("turn_wait", { turn: turnA, waitMs: 0 });
-          }).pipe(Effect.provide(appLayer(databasePath, connections))),
-        );
-
-        const value = result[0]?.result as unknown as TurnWaitToolResultShape;
-        expect(value.result).toMatchObject({
-          kind: "ok",
-          value: {
-            target: turnA,
-            observation: "condition_met",
-            execution: "awaiting_approval",
-            pendingRequests: [
-              {
-                activityId: "activity-1",
-                state: "pending",
-                actionable: true,
-                pendingRequestId: "request-1",
-              },
-            ],
-          },
-        });
-        const outcome = (
-          value.result as { value: { evidence: ReadonlyArray<{ nativeEventId: string | null }> } }
-        ).value;
-        expect(outcome.evidence).toMatchObject([{ nativeEventId: "activity-1" }]);
-      }),
-    ),
-  );
-
-  it.effect("never manufactures awaiting from a request whose lifecycle is unknown", () =>
-    withDatabasePath((databasePath) =>
-      Effect.gen(function* () {
-        const { options, connections } = emptyThreadFixtures();
-        options.threadStreams = {
-          "instance-a:thread-a": () =>
-            turnWaitDetail(42, { turnId: "turn-a", state: "running" }, [
-              // Turn-correlated but missing its native request identity: the
-              // lifecycle is unknown, so it cannot establish awaiting.
-              approvalActivity("activity-1", null, { turnId: "turn-a" }),
-            ]),
-        };
-        const result = yield* Effect.scoped(
-          Effect.gen(function* () {
-            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
-            return yield* callTool("turn_wait", { turn: turnA, waitMs: 0 });
-          }).pipe(Effect.provide(appLayer(databasePath, connections))),
-        );
-
-        const value = result[0]?.result as unknown as TurnWaitToolResultShape;
-        expect(value.result).toMatchObject({
-          kind: "ok",
-          value: {
-            target: turnA,
-            observation: "timed_out",
-            execution: "running",
-            pendingRequests: [
-              {
-                activityId: "activity-1",
-                state: "unknown",
-                actionable: false,
-                pendingRequestId: null,
-              },
-            ],
-          },
-        });
-      }),
-    ),
-  );
-
-  it.effect("meets awaiting_input from a correlated unresolved input request", () =>
-    withDatabasePath((databasePath) =>
-      Effect.gen(function* () {
-        const { options, connections } = emptyThreadFixtures();
-        options.threadStreams = {
-          "instance-a:thread-a": () =>
-            turnWaitDetail(42, { turnId: "turn-a", state: "running" }, [
-              inputActivity(
-                "activity-1",
-                "request-1",
-                [
-                  {
-                    id: "q1",
-                    header: "Target",
-                    question: "Which target?",
-                    options: [{ label: "staging", description: "Staging env" }],
-                    multiSelect: false,
-                  },
-                ],
-                { turnId: "turn-a" },
+                }),
               ),
+          };
+          const result = yield* Effect.scoped(
+            Effect.gen(function* () {
+              yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+              return yield* callTool("thread_set_settled", {
+                requestId: "settle-native-1",
+                thread: { instanceId: "instance-a", threadId: "thread-a" },
+                settled: true,
+              });
+            }).pipe(Effect.provide(appLayer(databasePath, connections))),
+          );
+          const repeated = yield* Effect.scoped(
+            callTool("thread_set_settled", {
+              requestId: "settle-native-1",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+              settled: true,
+            }).pipe(Effect.provide(appLayer(databasePath, connections))),
+          );
+          const conflict = yield* Effect.scoped(
+            callTool("thread_set_settled", {
+              requestId: "settle-native-1",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+              settled: false,
+            }).pipe(Effect.provide(appLayer(databasePath, connections))),
+          );
+
+          const operationResult = encodedResult(result) as {
+            readonly result: {
+              readonly kind: string;
+              readonly value: {
+                readonly state: string;
+                readonly completionMeans: string;
+                readonly target: unknown;
+                readonly evidence: ReadonlyArray<{ readonly detail: string }>;
+                readonly commandId: string | null;
+              };
+            };
+          };
+          const operation = operationResult.result.value;
+          expect(operationResult.result.kind).toBe("ok");
+          expect(operation).toMatchObject({
+            state: "completed",
+            completionMeans: "settlement_observed",
+            target: { instanceId: "instance-a", threadId: "thread-a" },
+          });
+          expect(operation.evidence.map((item) => item.detail)).toEqual(
+            expect.arrayContaining([
+              expect.stringContaining("pinnedAt=null"),
+              expect.stringContaining("snoozedUntil=null"),
+              expect.stringContaining("provider session was reported as running"),
+              expect.stringContaining("does not establish that the provider session has stopped"),
             ]),
-        };
-        const result = yield* Effect.scoped(
-          Effect.gen(function* () {
-            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
-            return yield* callTool("turn_wait", { turn: turnA, waitMs: 0 });
-          }).pipe(Effect.provide(appLayer(databasePath, connections))),
-        );
-
-        const value = result[0]?.result as unknown as TurnWaitToolResultShape;
-        expect(value.result).toMatchObject({
-          kind: "ok",
-          value: {
-            target: turnA,
-            observation: "condition_met",
-            execution: "awaiting_input",
-            pendingRequests: [
-              {
-                activityId: "activity-1",
-                state: "pending",
-                actionable: true,
-                pendingRequestId: "request-1",
-              },
-            ],
-          },
-        });
-      }),
-    ),
+          );
+          expect(dispatches).toHaveLength(1);
+          expect(dispatches[0]).toMatchObject({
+            instanceId: "instance-a",
+            threadId: "thread-a",
+            settled: true,
+          });
+          expect(dispatches[0]?.commandId).toMatch(/[0-9a-f-]{36}/);
+          const commandIdFrom = (results: ReadonlyArray<{ readonly result?: unknown }>) =>
+            (
+              encodedResult(results) as {
+                readonly result: { readonly value: { readonly commandId: string | null } };
+              }
+            ).result.value.commandId;
+          expect(commandIdFrom(repeated)).toBe(commandIdFrom(result));
+          expect(encodedResult(conflict)).toMatchObject({
+            result: { kind: "error", error: { code: "request_id_conflict" } },
+          });
+          expect(shellReads).toBe(2);
+        }),
+      ),
   );
 
-  it.effect("ignores uncorrelated and resolved requests for the exact-turn outcome", () =>
+  it.live("observes accepted settlement when the acceptance receipt write fails", () =>
     withDatabasePath((databasePath) =>
       Effect.gen(function* () {
         const { options, connections } = emptyThreadFixtures();
-        const waitPollOpened = yield* Deferred.make<void>();
-        let opens = 0;
+        let dispatches = 0;
+        let acceptanceWriteFailed = false;
+        options.dispatchThreadSettlement = () => {
+          dispatches += 1;
+          return Effect.succeed({ sequence: 42 });
+        };
         options.activeStreams = {
           "instance-a": () =>
             Stream.make(
-              shellSnapshotItem(41, [shellProjectFixture("project-a", "/srv/project-a")], []),
+              shellSnapshotItem(
+                42,
+                [shellProjectFixture("project-a")],
+                [shellThreadFixture("thread-a", { settledOverride: "settled" })],
+              ),
               shellSynchronizedItem,
             ),
         };
         options.threadStreams = {
-          "instance-a:thread-a": () => {
-            opens += 1;
-            if (opens === 1) {
-              return turnWaitDetail(10, { turnId: "turn-a", state: "running" }, [
-                // Correlated but already resolved: not awaiting.
-                approvalActivity("activity-1", "request-1", {
-                  options: [{ decision: "accept", label: "Accept" }],
-                  turnId: "turn-a",
-                }),
-                resolvedApprovalActivity("activity-2", "request-1"),
-                // Uncorrelated unresolved requests stay at thread scope.
-                inputActivity("activity-3", "request-3", [
-                  {
-                    id: "q1",
-                    header: "Target",
-                    question: "Which target?",
-                    options: [{ label: "staging", description: "Staging env" }],
-                    multiSelect: false,
-                  },
-                ]),
-              ]);
-            }
-            return Stream.unwrap(
-              Effect.gen(function* () {
-                if (opens === 2) yield* Deferred.succeed(waitPollOpened, undefined);
-                return Stream.make({ kind: "synchronized" as const });
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              50,
+              observedThreadFixture("thread-a", {
+                session: {
+                  status: "running",
+                  activeTurnId: null,
+                  lastError: null,
+                  updatedAt: "2026-09-24T00:00:00.000Z",
+                },
               }),
-            );
-          },
-        };
-        const result = yield* Effect.scoped(
-          Effect.gen(function* () {
-            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
-            yield* callTool("thread_get", {
-              thread: { instanceId: "instance-a", threadId: "thread-a" },
-            });
-            const fiber = yield* Effect.forkDetach(
-              callTool("turn_wait", { turn: turnA, waitMs: 250 }),
-            );
-            yield* Deferred.await(waitPollOpened);
-            yield* TestClock.adjust(Duration.millis(150));
-            yield* TestClock.adjust(Duration.millis(150));
-            return yield* Fiber.join(fiber);
-          }).pipe(Effect.provide(appLayer(databasePath, connections))),
-        );
-
-        const value = result[0]?.result as unknown as TurnWaitToolResultShape;
-        expect(value.result).toMatchObject({
-          kind: "ok",
-          value: {
-            target: turnA,
-            observation: "timed_out",
-            execution: "running",
-            pendingRequests: [{ activityId: "activity-1", state: "resolved", actionable: false }],
-          },
-        });
-      }),
-    ),
-  );
-
-  it.effect("meets completion restated by a replacement snapshot", () =>
-    withDatabasePath((databasePath) =>
-      Effect.gen(function* () {
-        const { options, connections } = emptyThreadFixtures();
-        const waitPollOpened = yield* Deferred.make<void>();
-        const replacementOpened = yield* Deferred.make<void>();
-        let opens = 0;
-        options.activeStreams = {
-          "instance-a": () =>
-            Stream.make(
-              shellSnapshotItem(41, [shellProjectFixture("project-a", "/srv/project-a")], []),
-              shellSynchronizedItem,
             ),
         };
-        options.threadStreams = {
-          "instance-a:thread-a": () => {
-            opens += 1;
-            if (opens === 1) return turnWaitDetail(10, { turnId: "turn-a", state: "running" });
-            const stream = turnWaitDetail(20, { turnId: "turn-a", state: "completed" });
-            return Stream.unwrap(
-              Effect.gen(function* () {
-                if (opens === 2) yield* Deferred.succeed(waitPollOpened, undefined);
-                if (opens === 3) yield* Deferred.succeed(replacementOpened, undefined);
-                return stream;
-              }),
-            );
-          },
-        };
-        const result = yield* Effect.scoped(
+        const storeLayer = Layer.effect(
+          LocalStore,
           Effect.gen(function* () {
-            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
-            yield* callTool("thread_get", {
-              thread: { instanceId: "instance-a", threadId: "thread-a" },
-            });
-            const fiber = yield* Effect.forkDetach(
-              callTool("turn_wait", { turn: turnA, waitMs: 10_000 }),
-            );
-            yield* Deferred.await(waitPollOpened);
-            yield* advanceUntilDone(replacementOpened, 3_000);
-            return yield* Fiber.join(fiber);
-          }).pipe(Effect.provide(appLayer(databasePath, connections))),
-        );
-
-        const value = result[0]?.result as unknown as TurnWaitToolResultShape;
-        expect(value.result).toMatchObject({
-          kind: "ok",
-          value: { target: turnA, observation: "condition_met", execution: "completed" },
-        });
-        expect(value.observations).toMatchObject([{ freshness: "fresh", sourceSequence: 20 }]);
-      }),
-    ),
-  );
-
-  it.effect("retries a transient mid-wait observation loss and meets completion", () =>
-    withDatabasePath((databasePath) =>
-      Effect.gen(function* () {
-        const { options, connections } = emptyThreadFixtures();
-        const waitPollOpened = yield* Deferred.make<void>();
-        const failureOpened = yield* Deferred.make<void>();
-        const replayOpened = yield* Deferred.make<void>();
-        let opens = 0;
-        options.activeStreams = {
-          "instance-a": () =>
-            Stream.make(
-              shellSnapshotItem(41, [shellProjectFixture("project-a", "/srv/project-a")], []),
-              shellSynchronizedItem,
-            ),
-        };
-        options.threadStreams = {
-          "instance-a:thread-a": () => {
-            opens += 1;
-            if (opens === 1) return turnWaitDetail(10, { turnId: "turn-a", state: "running" });
-            if (opens === 2) {
-              return Stream.unwrap(
-                Effect.gen(function* () {
-                  yield* Deferred.succeed(waitPollOpened, undefined);
-                  return Stream.make({ kind: "synchronized" as const });
-                }),
-              );
-            }
-            if (opens === 3) {
-              return Stream.unwrap(
-                Effect.gen(function* () {
-                  yield* Deferred.succeed(failureOpened, undefined);
-                  return Stream.fail(
-                    new T3CodeAdapterError({
-                      kind: "transport",
-                      message: "The transient test observation failure.",
-                      uncertain: false,
-                      status: null,
+            const store = yield* LocalStore;
+            return LocalStore.of({
+              ...store,
+              updateOperation: (requestId, update) => {
+                if (
+                  !acceptanceWriteFailed &&
+                  update.state === "pending" &&
+                  update.dispatch === "accepted" &&
+                  update.stepPosition === 0
+                ) {
+                  acceptanceWriteFailed = true;
+                  return Effect.fail(
+                    new LocalStoreError({
+                      kind: "storage",
+                      message: "The accepted settlement receipt write failed.",
                     }),
                   );
-                }),
-              );
-            }
-            return Stream.unwrap(
-              Effect.gen(function* () {
-                yield* Deferred.succeed(replayOpened, undefined);
-                return turnWaitDetail(20, { turnId: "turn-a", state: "completed" });
-              }),
-            );
-          },
-        };
+                }
+                return store.updateOperation(requestId, update);
+              },
+            });
+          }),
+        ).pipe(Layer.provide(LocalStore.layer({ databasePath })));
+        const application = serverToolkitLayer.pipe(
+          Layer.provideMerge(connections),
+          Layer.provideMerge(storeLayer),
+        );
         const result = yield* Effect.scoped(
           Effect.gen(function* () {
             yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
-            yield* callTool("thread_get", {
+            return yield* callTool("thread_set_settled", {
+              requestId: "settle-acceptance-write-failure",
               thread: { instanceId: "instance-a", threadId: "thread-a" },
+              settled: true,
             });
-            const fiber = yield* Effect.forkDetach(
-              callTool("turn_wait", { turn: turnA, waitMs: 10_000 }),
-            );
-            yield* Deferred.await(waitPollOpened);
-            yield* advanceUntilDone(failureOpened, 2_000);
-            yield* advanceUntilDone(replayOpened, 3_000);
-            return yield* Fiber.join(fiber);
-          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+          }).pipe(Effect.provide(application)),
         );
 
-        const value = result[0]?.result as unknown as TurnWaitToolResultShape;
-        expect(value.result).toMatchObject({
-          kind: "ok",
-          value: { target: turnA, observation: "condition_met", execution: "completed" },
-        });
-        expect(value.observations).toMatchObject([{ freshness: "fresh", sourceSequence: 20 }]);
+        const operation = encodedResult(result) as {
+          readonly result: {
+            readonly value: {
+              readonly state: string;
+              readonly dispatch: string;
+              readonly evidence: ReadonlyArray<{ readonly detail: string }>;
+            };
+          };
+        };
+        expect(acceptanceWriteFailed).toBe(true);
+        expect(dispatches).toBe(1);
+        expect(operation.result.value).toMatchObject({ state: "completed", dispatch: "accepted" });
+        expect(operation.result.value.evidence.map((item) => item.detail)).toEqual(
+          expect.arrayContaining([expect.stringContaining("requested override was settled")]),
+        );
       }),
     ),
   );
 
-  it.effect("ends as unavailable when the registration changes mid-wait", () =>
+  it.live("uses archived settlement when the active row does not confirm the dispatch", () =>
     withDatabasePath((databasePath) =>
       Effect.gen(function* () {
         const { options, connections } = emptyThreadFixtures();
-        const waitPollOpened = yield* Deferred.make<void>();
-        const snapshotEmitted = yield* Deferred.make<void>();
-        const gate = yield* Deferred.make<void>();
-        let opens = 0;
+        let archivedReads = 0;
+        options.dispatchThreadSettlement = () => Effect.succeed({ sequence: 42 });
         options.activeStreams = {
           "instance-a": () =>
             Stream.make(
-              shellSnapshotItem(41, [shellProjectFixture("project-a", "/srv/project-a")], []),
+              shellSnapshotItem(
+                41,
+                [shellProjectFixture("project-a")],
+                [shellThreadFixture("thread-a", { settledOverride: "active" })],
+              ),
               shellSynchronizedItem,
             ),
         };
+        options.archivedShells = {
+          "instance-a": () => {
+            archivedReads += 1;
+            return Effect.succeed({
+              snapshotSequence: 42,
+              projects: [shellProjectFixture("project-a")],
+              threads: [
+                shellThreadFixture("thread-a", {
+                  settledOverride: "settled",
+                  settledAt: "2026-09-24T00:00:00.000Z",
+                }),
+              ],
+              observedAt: "2026-09-24T00:00:00.000Z",
+            });
+          },
+        };
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              50,
+              observedThreadFixture("thread-a", {
+                session: {
+                  status: "running",
+                  activeTurnId: null,
+                  lastError: null,
+                  updatedAt: "2026-09-24T00:00:00.000Z",
+                },
+              }),
+            ),
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_set_settled", {
+              requestId: "settle-archived-confirmation",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+              settled: true,
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        const operation = encodedResult(result) as {
+          readonly result: {
+            readonly value: {
+              readonly state: string;
+              readonly evidence: ReadonlyArray<{
+                readonly detail: string;
+                readonly sourceSequence: number | null;
+              }>;
+            };
+          };
+        };
+        expect(operation.result.value.state).toBe("completed");
+        expect(archivedReads).toBe(1);
+        expect(
+          operation.result.value.evidence.some(
+            (item) =>
+              item.sourceSequence === 42 &&
+              item.detail.includes("the requested override was settled"),
+          ),
+        ).toBe(true);
+      }),
+    ),
+  );
+
+  it.live("does not overwrite a newer receipt after a stale settlement observation", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.dispatchThreadSettlement = () => Effect.succeed({ sequence: 42 });
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(
+                42,
+                [shellProjectFixture("project-a")],
+                [shellThreadFixture("thread-a", { settledOverride: "settled" })],
+              ),
+              shellSynchronizedItem,
+            ),
+        };
+        let newerReceiptWritten = false;
+        let sessionReadsAfterNewerReceipt = 0;
         options.threadStreams = {
           "instance-a:thread-a": () => {
-            opens += 1;
-            if (opens === 1) return turnWaitDetail(10, { turnId: "turn-a", state: "running" });
-            if (opens === 2) {
-              return Stream.unwrap(
-                Effect.gen(function* () {
-                  yield* Deferred.succeed(waitPollOpened, undefined);
-                  return Stream.make({ kind: "synchronized" as const });
-                }),
+            if (newerReceiptWritten) sessionReadsAfterNewerReceipt += 1;
+            return detailSnapshotStream(50, observedThreadFixture("thread-a"));
+          },
+        };
+        const storeLayer = Layer.effect(
+          LocalStore,
+          Effect.gen(function* () {
+            const store = yield* LocalStore;
+            return LocalStore.of({
+              ...store,
+              compareAndUpdateOperation: (requestId, update) => {
+                if (
+                  !newerReceiptWritten &&
+                  update.expectedRevision !== undefined &&
+                  update.stepPosition === 1 &&
+                  update.stepState === "succeeded"
+                ) {
+                  newerReceiptWritten = true;
+                  const evidence: Evidence = {
+                    kind: "snapshot",
+                    observedAt: update.now,
+                    sourceSequence: 42,
+                    nativeEventId: null,
+                    detail: "A concurrent observer already completed native settlement.",
+                  };
+                  return store
+                    .updateOperation(requestId, {
+                      now: update.now,
+                      state: "completed",
+                      dispatch: "accepted",
+                      target: { instanceId: "instance-a", threadId: "thread-a" },
+                      stepPosition: 2,
+                      stepState: "succeeded",
+                      evidence: [evidence],
+                      evidenceStepPosition: 2,
+                      error: null,
+                      recovery: "none",
+                    })
+                    .pipe(Effect.andThen(store.compareAndUpdateOperation(requestId, update)));
+                }
+                return store.compareAndUpdateOperation(requestId, update);
+              },
+            });
+          }),
+        ).pipe(Layer.provide(LocalStore.layer({ databasePath })));
+        const application = serverToolkitLayer.pipe(
+          Layer.provideMerge(connections),
+          Layer.provideMerge(storeLayer),
+        );
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_set_settled", {
+              requestId: "settle-revision-race",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+              settled: true,
+            });
+          }).pipe(Effect.provide(application)),
+        );
+
+        expect(newerReceiptWritten).toBe(true);
+        expect(sessionReadsAfterNewerReceipt).toBe(0);
+        const response = result[0]?.result;
+        if (response === undefined) throw new Error("tool returned no result");
+        const operation = (
+          response as {
+            readonly result: {
+              readonly value: {
+                readonly state: string;
+                readonly evidence: ReadonlyArray<{ readonly detail: string }>;
+              };
+            };
+          }
+        ).result.value;
+        expect(operation.state).toBe("completed");
+        expect(operation.evidence.map((item) => item.detail)).toContain(
+          "A concurrent observer already completed native settlement.",
+        );
+      }),
+    ),
+  );
+
+  it.live("uses the native unsettle command for an explicit false value", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        let dispatched = false;
+        options.dispatchThreadSettlement = (input) => {
+          dispatched = input.settled === false;
+          return Effect.succeed({ sequence: 70 });
+        };
+        options.activeStreams = {
+          "instance-a": (streamOptions) =>
+            streamOptions?.afterSequence === undefined
+              ? Stream.make(
+                  shellSnapshotItem(
+                    69,
+                    [shellProjectFixture("project-a")],
+                    [
+                      shellThreadFixture("thread-a", {
+                        settledOverride: "settled",
+                        settledAt: "2026-09-23T14:00:00.000Z",
+                      }),
+                    ],
+                  ),
+                  shellSynchronizedItem,
+                )
+              : Stream.make(
+                  {
+                    kind: "thread-upserted" as const,
+                    sequence: 70,
+                    thread: shellThreadFixture("thread-a", { settledOverride: "active" }),
+                  },
+                  shellSynchronizedItem,
+                ),
+        };
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              80,
+              observedThreadFixture("thread-a", { settledOverride: "active" }),
+            ),
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_set_settled", {
+              requestId: "unsettle-native-1",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+              settled: false,
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        expect(
+          (
+            encodedResult(result) as {
+              readonly result: { readonly value: { readonly state: string } };
+            }
+          ).result.value.state,
+        ).toBe("completed");
+        expect(dispatched).toBe(true);
+      }),
+    ),
+  );
+
+  it.live("keeps waiting when UI activity changes the requested state before it is observed", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        let shellReads = 0;
+        options.dispatchThreadSettlement = () => Effect.succeed({ sequence: 100 });
+        options.activeStreams = {
+          "instance-a": (streamOptions) => {
+            shellReads += 1;
+            if (streamOptions?.afterSequence === undefined) {
+              return Stream.make(
+                shellSnapshotItem(
+                  99,
+                  [shellProjectFixture("project-a")],
+                  [shellThreadFixture("thread-a", { settledOverride: "active" })],
+                ),
+                shellSynchronizedItem,
               );
             }
+            if (shellReads === 2) {
+              return Stream.make(
+                {
+                  kind: "thread-upserted" as const,
+                  sequence: 101,
+                  thread: shellThreadFixture("thread-a", { settledOverride: "active" }),
+                },
+                shellSynchronizedItem,
+              );
+            }
+            return Stream.make(
+              {
+                kind: "thread-upserted" as const,
+                sequence: 102,
+                thread: shellThreadFixture("thread-a", {
+                  settledOverride: "settled",
+                  settledAt: "2026-09-23T14:00:00.000Z",
+                }),
+              },
+              shellSynchronizedItem,
+            );
+          },
+        };
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              110,
+              observedThreadFixture("thread-a", { settledOverride: "settled" }),
+            ),
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_set_settled", {
+              requestId: "settle-after-ui-change",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+              settled: true,
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        expect(
+          (
+            encodedResult(result) as {
+              readonly result: { readonly value: { readonly state: string } };
+            }
+          ).result.value.state,
+        ).toBe("completed");
+        expect(shellReads).toBe(3);
+      }),
+    ),
+  );
+
+  it.effect("keeps a lost dispatch reply unknown and never replays the native command", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        let dispatches = 0;
+        options.dispatchThreadSettlement = () => {
+          dispatches += 1;
+          return Effect.fail(
+            new T3CodeAdapterError({
+              kind: "transport",
+              message: "The native settlement reply was lost.",
+              uncertain: true,
+              status: null,
+            }),
+          );
+        };
+        const results = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const input = {
+              requestId: "settle-lost-reply",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+              settled: true,
+            };
+            const first = yield* callTool("thread_set_settled", input);
+            const repeated = yield* callTool("thread_set_settled", input);
+            const recovered = yield* callTool("operation_get", { requestId: input.requestId });
+            return { first, repeated, recovered };
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        for (const result of [results.first, results.repeated]) {
+          expect(
+            (
+              encodedResult(result) as {
+                readonly result: {
+                  readonly value: { readonly state: string; readonly dispatch: string };
+                };
+              }
+            ).result.value,
+          ).toMatchObject({ state: "outcome_unknown", dispatch: "unknown" });
+        }
+        expect(
+          (
+            encodedResult(results.recovered) as {
+              readonly result: {
+                readonly value: { readonly operation: { readonly state: string } };
+              };
+            }
+          ).result.value.operation.state,
+        ).toBe("outcome_unknown");
+        expect(dispatches).toBe(1);
+      }),
+    ),
+  );
+
+  it.effect("reserves unknown settlement recovery until separate session capture completes", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const detailSnapshotEmitted = yield* Deferred.make<void>();
+        const releaseDetailSnapshot = yield* Deferred.make<void>();
+        const secondShellOpened = yield* Deferred.make<void>();
+        let shellOpens = 0;
+        options.activeStreams = {
+          "instance-a": () => {
+            shellOpens += 1;
+            const snapshot = Stream.make(
+              shellSnapshotItem(
+                43,
+                [shellProjectFixture("project-a")],
+                [
+                  shellThreadFixture("thread-a", {
+                    settledOverride: "settled",
+                    settledAt: "2026-09-23T14:00:00.000Z",
+                  }),
+                ],
+              ),
+              shellSynchronizedItem,
+            );
+            return Stream.unwrap(
+              Effect.gen(function* () {
+                if (shellOpens > 1) yield* Deferred.succeed(secondShellOpened, undefined);
+                return snapshot;
+              }),
+            );
+          },
+        };
+        options.threadStreams = {
+          "instance-a:thread-a": () => {
             return Stream.concat(
               Stream.make({
                 kind: "snapshot" as const,
                 snapshot: {
-                  snapshotSequence: 11,
+                  snapshotSequence: 44,
                   thread: observedThreadFixture("thread-a", {
-                    latestTurn: { turnId: "turn-a", state: "running" },
+                    settledOverride: "settled",
+                    settledAt: "2026-09-23T14:00:00.000Z",
+                    session: {
+                      status: "running",
+                      activeTurnId: null,
+                      lastError: null,
+                      updatedAt: "2026-09-23T14:00:00.000Z",
+                    },
                   }),
                   page: null,
                 },
               }),
               Stream.fromEffect(
                 Effect.gen(function* () {
-                  yield* Deferred.succeed(snapshotEmitted, undefined);
-                  yield* Deferred.await(gate);
+                  yield* Deferred.succeed(detailSnapshotEmitted, undefined);
+                  yield* Deferred.await(releaseDetailSnapshot);
+                  return { kind: "synchronized" as const };
                 }),
-              ).pipe(Stream.map(() => ({ kind: "synchronized" as const }))),
-            );
-          },
-        };
-        const result = yield* Effect.scoped(
-          Effect.gen(function* () {
-            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
-            yield* callTool("thread_get", {
-              thread: { instanceId: "instance-a", threadId: "thread-a" },
-            });
-            const fiber = yield* Effect.forkDetach(
-              callTool("turn_wait", { turn: turnA, waitMs: 10_000 }),
-            );
-            yield* Deferred.await(waitPollOpened);
-            yield* advanceUntilDone(snapshotEmitted, 2_000);
-            const store = yield* LocalStore;
-            yield* store.putRegistration({
-              instanceId: "instance-a",
-              alias: "Instance a renamed",
-              endpoint: "https://a.test",
-              environmentId: null,
-              connection: "connected",
-              lastObservedAt: null,
-              credential: "secret-a",
-            });
-            yield* Deferred.succeed(gate, undefined);
-            return yield* Fiber.join(fiber);
-          }).pipe(Effect.provide(appLayer(databasePath, connections))),
-        );
-
-        const value = result[0]?.result as unknown as TurnWaitToolResultShape;
-        expect(value.result).toMatchObject({
-          kind: "ok",
-          value: { target: turnA, observation: "unavailable", execution: "outcome_unknown" },
-        });
-        expect(value.observations).toEqual([]);
-        expect(value.warnings).toMatchObject([
-          { code: "observation_unavailable", message: expect.stringMatching(/changed while/) },
-        ]);
-      }),
-    ),
-  );
-
-  it.effect(
-    "cancellation releases the wait's observation scope without touching upstream work",
-    () =>
-      withDatabasePath((databasePath) =>
-        Effect.gen(function* () {
-          const { options, connections } = emptyThreadFixtures();
-          const waitPollOpened = yield* Deferred.make<void>();
-          const acquired = yield* Deferred.make<void>();
-          const released = yield* Deferred.make<void>();
-          let opens = 0;
-          options.activeStreams = {
-            "instance-a": () =>
-              Stream.make(
-                shellSnapshotItem(41, [shellProjectFixture("project-a", "/srv/project-a")], []),
-                shellSynchronizedItem,
               ),
-          };
-          options.threadStreams = {
-            "instance-a:thread-a": () => {
-              opens += 1;
-              if (opens === 1) return turnWaitDetail(10, { turnId: "turn-a", state: "running" });
-              if (opens === 2) {
-                return Stream.unwrap(
-                  Effect.gen(function* () {
-                    yield* Deferred.succeed(waitPollOpened, undefined);
-                    return Stream.make({ kind: "synchronized" as const });
-                  }),
-                );
-              }
-              if (opens === 3) {
-                // A synchronization that stays in flight until the wait is
-                // cancelled; its scope must release on interruption.
-                return Stream.unwrap(
-                  Effect.acquireRelease(Deferred.succeed(acquired, undefined), () =>
-                    Deferred.succeed(released, undefined),
-                  ).pipe(
-                    Effect.as(
-                      Stream.concat(
-                        Stream.make({
-                          kind: "snapshot" as const,
-                          snapshot: {
-                            snapshotSequence: 11,
-                            thread: observedThreadFixture("thread-a", {
-                              latestTurn: { turnId: "turn-a", state: "running" },
-                            }),
-                            page: null,
-                          },
-                        }),
-                        Stream.never,
-                      ),
-                    ),
-                  ),
-                );
-              }
-              return turnWaitDetail(12, { turnId: "turn-a", state: "running" });
-            },
-          };
-          yield* Effect.scoped(
-            Effect.gen(function* () {
-              yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
-              yield* callTool("thread_get", {
-                thread: { instanceId: "instance-a", threadId: "thread-a" },
-              });
-              const fiber = yield* Effect.forkDetach(
-                callTool("turn_wait", { turn: turnA, waitMs: 30_000 }),
-              );
-              yield* Deferred.await(waitPollOpened);
-              yield* advanceUntilDone(acquired, 3_000);
-              yield* Fiber.interrupt(fiber);
-              yield* Deferred.await(released);
-              const exit = yield* Fiber.await(fiber);
-              expect(Exit.isFailure(exit)).toBe(true);
-              // The thread stays observable for later reads; cancelling the
-              // wait dispatched nothing.
-              const read = yield* callTool("turn_wait", { turn: turnA, waitMs: 0 });
-              const value = read[0]?.result as unknown as TurnWaitToolResultShape;
-              expect(value.result).toMatchObject({ kind: "ok" });
-            }).pipe(Effect.provide(appLayer(databasePath, connections))),
-          );
-        }),
-      ),
+            );
+          },
+        };
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            const store = yield* LocalStore;
+            const request = {
+              requestId: "settle-recovery-lock",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+              settled: true,
+            } as const;
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const admittedAt = new Date(yield* Clock.currentTimeMillis).toISOString();
+            const fingerprint = yield* store.fingerprintRequest("thread_set_settled", request);
+            yield* store.admitOperation({
+              requestId: request.requestId,
+              tool: "thread_set_settled",
+              fingerprint,
+              processNonce: "previous-process",
+              admittedAt,
+              intent: {
+                instanceId: request.thread.instanceId,
+                threadId: request.thread.threadId,
+                settled: request.settled,
+                dispatchSequence: 42,
+              },
+              completionMeans: "settlement_observed",
+              steps: [
+                "dispatch_native_settlement",
+                "observe_native_settlement",
+                "capture_provider_session_state",
+              ],
+            });
+            yield* store.updateOperation(request.requestId, {
+              now: admittedAt,
+              intent: {
+                instanceId: request.thread.instanceId,
+                threadId: request.thread.threadId,
+                settled: request.settled,
+                dispatchSequence: 42,
+              },
+              state: "outcome_unknown",
+              dispatch: "accepted",
+              commandId: "settlement-command",
+              target: request.thread,
+              stepPosition: 1,
+              stepState: "outcome_unknown",
+              error: {
+                code: "unavailable",
+                message: "Settlement observation is being recovered.",
+                retry: "reconcile_first",
+                details: { action: "observe_thread" },
+              },
+              recovery: "observe_thread",
+            });
+
+            const first = yield* Effect.forkDetach(
+              callTool("operation_get", { requestId: request.requestId }),
+            );
+            const readiness = yield* Effect.race(
+              Deferred.await(detailSnapshotEmitted).pipe(Effect.as({ kind: "detail" as const })),
+              Fiber.await(first).pipe(Effect.map((exit) => ({ kind: "ended" as const, exit }))),
+            );
+            if (readiness.kind === "ended") {
+              const reason = Exit.isFailure(readiness.exit)
+                ? String(readiness.exit.cause)
+                : "the operation read completed before the detail stream opened";
+              return yield* Effect.fail(new Error(reason));
+            }
+            const duringRefinement = yield* store.getOperation(request.requestId);
+            const second = yield* Effect.forkDetach(
+              callTool("operation_get", { requestId: request.requestId }),
+            );
+            const secondProgress = yield* Effect.race(
+              Fiber.await(second).pipe(Effect.as(false)),
+              Deferred.await(secondShellOpened).pipe(Effect.as(true)),
+            );
+            yield* Effect.yieldNow;
+            yield* Deferred.succeed(releaseDetailSnapshot, undefined);
+            const secondResult = yield* Fiber.join(second);
+            const firstResult = yield* Fiber.join(first);
+            const completed = yield* store.getOperation(request.requestId);
+            return { duringRefinement, secondProgress, secondResult, firstResult, completed };
+          })
+            .pipe(
+              Effect.ensuring(
+                Deferred.succeed(releaseDetailSnapshot, undefined).pipe(Effect.asVoid),
+              ),
+            )
+            .pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result.duringRefinement?.record.state).toBe("outcome_unknown");
+        expect(result.secondProgress).toBe(false);
+        expect(
+          (
+            encodedResult(result.secondResult) as {
+              readonly result: {
+                readonly value: { readonly operation: { readonly state: string } };
+              };
+            }
+          ).result.value.operation.state,
+        ).toBe("outcome_unknown");
+        expect(
+          (
+            encodedResult(result.firstResult) as {
+              readonly result: {
+                readonly value: { readonly operation: { readonly state: string } };
+              };
+            }
+          ).result.value.operation.state,
+        ).toBe("completed");
+        expect(result.completed?.record.state).toBe("completed");
+        expect(
+          result.completed?.record.evidence.filter((item) =>
+            item.detail.includes("the requested override was settled"),
+          ),
+        ).toHaveLength(1);
+      }),
+    ),
   );
 
-  it.effect("reports a history gap after historical evidence eviction", () =>
+  it.effect("throttles repeated recovery observations for unknown settlement", () =>
     withDatabasePath((databasePath) =>
       Effect.gen(function* () {
+        const now = Date.parse("2026-09-24T14:00:00.000Z");
+        const admittedAt = new Date(now - LIVE_EFFECT_OBSERVATION_MILLIS * 2).toISOString();
+        yield* TestClock.setTime(now);
         const { options, connections } = emptyThreadFixtures();
+        let shellReads = 0;
         options.activeStreams = {
-          "instance-a": () =>
-            Stream.make(
-              shellSnapshotItem(41, [shellProjectFixture("project-a", "/srv/project-a")], []),
+          "instance-a": () => {
+            shellReads += 1;
+            return Stream.make(
+              shellSnapshotItem(
+                43,
+                [shellProjectFixture("project-a")],
+                [shellThreadFixture("thread-a", { settledOverride: "active" })],
+              ),
               shellSynchronizedItem,
-            ),
-        };
-        let opens = 0;
-        options.threadStreams = {
-          "instance-a:thread-a": () => {
-            opens += 1;
-            return opens === 1
-              ? turnWaitDetail(10, { turnId: "turn-a", state: "running" })
-              : turnWaitDetail(20, { turnId: "turn-b", state: "running" });
+            );
           },
         };
         const result = yield* Effect.scoped(
           Effect.gen(function* () {
-            yield* TestClock.setTime(1_000_000);
-            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
-            // The first read retains turn-a's evidence at the original
-            // observation time.
-            yield* callTool("thread_get", {
-              thread: { instanceId: "instance-a", threadId: "thread-a" },
-            });
             const store = yield* LocalStore;
-            const before = yield* store.findTurnEvidence(turnA);
-            expect(before).toMatchObject({ state: "running", projected: false });
-            yield* TestClock.adjust(Duration.millis(THIRTY_DAYS_MILLIS + 1));
-            // The superseding read retains turn-b's evidence past the
-            // thirty-day window, evicting turn-a's expired row.
-            yield* callTool("thread_get", {
+            const request = {
+              requestId: "settle-recovery-throttle",
               thread: { instanceId: "instance-a", threadId: "thread-a" },
+              settled: true,
+            } as const;
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const fingerprint = yield* store.fingerprintRequest("thread_set_settled", request);
+            yield* store.admitOperation({
+              requestId: request.requestId,
+              tool: "thread_set_settled",
+              fingerprint,
+              processNonce: "previous-process",
+              admittedAt,
+              intent: {
+                instanceId: request.thread.instanceId,
+                threadId: request.thread.threadId,
+                settled: request.settled,
+                dispatchSequence: 42,
+              },
+              completionMeans: "settlement_observed",
+              steps: [
+                "dispatch_native_settlement",
+                "observe_native_settlement",
+                "capture_provider_session_state",
+              ],
             });
-            const after = yield* store.findTurnEvidence(turnA);
-            expect(after).toBeNull();
-            return yield* callTool("turn_wait", { turn: turnA, waitMs: 0 });
+            yield* store.updateOperation(request.requestId, {
+              now: admittedAt,
+              state: "outcome_unknown",
+              dispatch: "accepted",
+              commandId: "settlement-command",
+              target: request.thread,
+              stepPosition: 1,
+              stepState: "outcome_unknown",
+              error: {
+                code: "unavailable",
+                message: "Settlement observation is being recovered.",
+                retry: "reconcile_first",
+                details: { action: "observe_thread" },
+              },
+              recovery: "observe_thread",
+            });
+
+            const first = yield* callTool("operation_get", { requestId: request.requestId });
+            const readsAfterFirst = shellReads;
+            const repeated = yield* callTool("operation_get", { requestId: request.requestId });
+            const readsAfterRepeated = shellReads;
+            yield* TestClock.adjust(Duration.millis(LIVE_EFFECT_OBSERVATION_MILLIS + 1));
+            const later = yield* callTool("operation_get", { requestId: request.requestId });
+            return { first, repeated, later, readsAfterFirst, readsAfterRepeated, shellReads };
           }).pipe(Effect.provide(appLayer(databasePath, connections))),
         );
 
-        const value = result[0]?.result as unknown as TurnWaitToolResultShape;
-        expect(value.result).toMatchObject({
-          kind: "ok",
-          value: { target: turnA, observation: "history_gap", execution: "outcome_unknown" },
-        });
-      }),
-    ),
-  );
-
-  it.effect(
-    "evicts oldest evidence within the budget while pinning unresolved-operation threads",
-    () =>
-      withDatabasePath((databasePath) =>
-        Effect.gen(function* () {
-          const rowBytes = new TextEncoder().encode(
-            JSON.stringify({
-              i: "instance-a",
-              t: "thread-a",
-              u: "turn-1",
-              s: "running",
-              p: false,
-              q: 1,
-              o: "2026-09-22T00:00:00.000Z",
-              d: "The thread detail snapshot published the latest turn as running.",
-            }),
-          ).byteLength;
-          const layer = LocalStore.layer({
-            databasePath,
-            turnEvidenceBudgetBytes: rowBytes * 2 + 1,
+        for (const response of [result.first, result.repeated, result.later]) {
+          expect(response[0]?.result).toMatchObject({
+            result: {
+              kind: "ok",
+              value: { operation: { state: "outcome_unknown", dispatch: "accepted" } },
+            },
           });
-          yield* Effect.scoped(
-            Effect.gen(function* () {
-              yield* TestClock.setTime(1_000_000);
-              const store = yield* LocalStore;
-              const record = (threadId: string, turnId: string, sequence: number) =>
-                store.recordTurnEvidence({
-                  turn: { instanceId: "instance-a", threadId, turnId },
-                  state: "running",
-                  projected: false,
-                  sourceSequence: sequence,
-                  observedAt: `2026-09-22T00:00:0${sequence}.000Z`,
-                  detail: "The thread detail snapshot published the latest turn as running.",
-                });
-              yield* record("thread-a", "turn-1", 1);
-              yield* record("thread-b", "turn-2", 2);
-              const turnRef = (threadId: string, turnId: string) => ({
-                instanceId: "instance-a",
-                threadId,
-                turnId,
-              });
-
-              // An unresolved operation targeting thread-a pins its evidence.
-              yield* store.admitOperation({
-                requestId: "pinning-request",
-                tool: "thread_interrupt",
-                fingerprint: "fingerprint-pinning",
-                processNonce: "process-pinning",
-                admittedAt: "2026-09-22T00:00:00.000Z",
-                intent: { instanceId: "instance-a", threadId: "thread-a" },
-                completionMeans: "interruption_observed",
-              });
-              yield* store.updateOperation("pinning-request", {
-                now: "2026-09-22T00:00:00.000Z",
-                target: { instanceId: "instance-a", threadId: "thread-a" },
-              });
-
-              // The third row overflows the budget: the oldest unpinned row is
-              // evicted, and the pinned thread-a row stays.
-              yield* record("thread-c", "turn-3", 3);
-              expect(yield* store.findTurnEvidence(turnRef("thread-a", "turn-1"))).not.toBeNull();
-              expect(yield* store.findTurnEvidence(turnRef("thread-b", "turn-2"))).toBeNull();
-              expect(yield* store.findTurnEvidence(turnRef("thread-c", "turn-3"))).not.toBeNull();
-              const pinned = yield* store.getOperation("pinning-request");
-              expect(pinned?.record.target).toEqual({
-                instanceId: "instance-a",
-                threadId: "thread-a",
-              });
-
-              // Resolving the operation removes the pin: the next retained row
-              // evicts thread-a's evidence.
-              yield* store.updateOperation("pinning-request", {
-                now: "2026-09-22T00:00:01.000Z",
-                state: "completed",
-              });
-              yield* record("thread-d", "turn-4", 4);
-              expect(yield* store.findTurnEvidence(turnRef("thread-a", "turn-1"))).toBeNull();
-              expect(yield* store.findTurnEvidence(turnRef("thread-d", "turn-4"))).not.toBeNull();
-            }).pipe(Effect.provide(layer)),
-          );
-        }),
-      ),
-  );
-
-  it.effect("pins evidence by exact turn when an unresolved operation names one", () =>
-    withDatabasePath((databasePath) =>
-      Effect.gen(function* () {
-        const rowBytes = new TextEncoder().encode(
-          JSON.stringify({
-            i: "instance-a",
-            t: "thread-a",
-            u: "turn-1",
-            s: "running",
-            p: false,
-            q: 1,
-            o: "2026-09-22T00:00:00.000Z",
-            d: "The thread detail snapshot published the latest turn as running.",
-          }),
-        ).byteLength;
-        const layer = LocalStore.layer({
-          databasePath,
-          turnEvidenceBudgetBytes: rowBytes * 2 + 1,
-        });
-        yield* Effect.scoped(
-          Effect.gen(function* () {
-            yield* TestClock.setTime(1_000_000);
-            const store = yield* LocalStore;
-            const record = (threadId: string, turnId: string, sequence: number) =>
-              store.recordTurnEvidence({
-                turn: { instanceId: "instance-a", threadId, turnId },
-                state: "running",
-                projected: false,
-                sourceSequence: sequence,
-                observedAt: `2026-09-22T00:00:0${sequence}.000Z`,
-                detail: "The thread detail snapshot published the latest turn as running.",
-              });
-            const turnRef = (threadId: string, turnId: string) => ({
-              instanceId: "instance-a",
-              threadId,
-              turnId,
-            });
-            yield* record("thread-a", "turn-1", 1);
-            yield* record("thread-a", "turn-2", 2);
-
-            // An unresolved operation correlated to turn-1 pins only that
-            // turn: the other turns of the same thread stay evictable, so a
-            // forgotten outcome_unknown record cannot pin the whole thread
-            // forever.
-            yield* store.admitOperation({
-              requestId: "turn-pinning-request",
-              tool: "thread_interrupt",
-              fingerprint: "fingerprint-turn-pinning",
-              processNonce: "process-turn-pinning",
-              admittedAt: "2026-09-22T00:00:00.000Z",
-              intent: { instanceId: "instance-a", threadId: "thread-a" },
-              completionMeans: "interruption_observed",
-            });
-            yield* store.updateOperation("turn-pinning-request", {
-              now: "2026-09-22T00:00:00.000Z",
-              target: { instanceId: "instance-a", threadId: "thread-a" },
-              correlation: {
-                kind: "established",
-                turn: turnRef("thread-a", "turn-1"),
-                evidence: [],
-              },
-            });
-
-            yield* record("thread-b", "turn-3", 3);
-            expect(yield* store.findTurnEvidence(turnRef("thread-a", "turn-1"))).not.toBeNull();
-            expect(yield* store.findTurnEvidence(turnRef("thread-a", "turn-2"))).toBeNull();
-            expect(yield* store.findTurnEvidence(turnRef("thread-b", "turn-3"))).not.toBeNull();
-          }).pipe(Effect.provide(layer)),
-        );
+        }
+        expect(result.readsAfterFirst).toBeGreaterThan(0);
+        expect(result.readsAfterRepeated).toBe(result.readsAfterFirst);
+        expect(result.shellReads).toBeGreaterThan(result.readsAfterRepeated);
       }),
     ),
   );
 
-  it.effect("pins nothing thread-wide from an outcome_unknown operation without a turn", () =>
+  it.effect("fails a recovered settlement receipt that is known not to be dispatched", () =>
     withDatabasePath((databasePath) =>
       Effect.gen(function* () {
-        const rowBytes = new TextEncoder().encode(
-          JSON.stringify({
-            i: "instance-a",
-            t: "thread-a",
-            u: "turn-1",
-            s: "running",
-            p: false,
-            q: 1,
-            o: "2026-09-22T00:00:00.000Z",
-            d: "The thread detail snapshot published the latest turn as running.",
-          }),
-        ).byteLength;
-        const layer = LocalStore.layer({
-          databasePath,
-          turnEvidenceBudgetBytes: rowBytes * 2 + 1,
-        });
-        yield* Effect.scoped(
-          Effect.gen(function* () {
-            yield* TestClock.setTime(1_000_000);
-            const store = yield* LocalStore;
-            const record = (threadId: string, turnId: string, sequence: number) =>
-              store.recordTurnEvidence({
-                turn: { instanceId: "instance-a", threadId, turnId },
-                state: "running",
-                projected: false,
-                sourceSequence: sequence,
-                observedAt: `2026-09-22T00:00:0${sequence}.000Z`,
-                detail: "The thread detail snapshot published the latest turn as running.",
-              });
-            const turnRef = (threadId: string, turnId: string) => ({
-              instanceId: "instance-a",
-              threadId,
-              turnId,
-            });
-            yield* record("thread-a", "turn-1", 1);
-            yield* record("thread-a", "turn-2", 2);
-
-            // A terminal-to-reconciliation record with a thread-only target
-            // never evaluates thread evidence again, so it pins nothing and
-            // the oldest row stays evictable.
-            yield* store.admitOperation({
-              requestId: "unknown-pinning-request",
-              tool: "thread_interrupt",
-              fingerprint: "fingerprint-unknown-pinning",
-              processNonce: "process-unknown-pinning",
-              admittedAt: "2026-09-22T00:00:00.000Z",
-              intent: { instanceId: "instance-a", threadId: "thread-a" },
-              completionMeans: "interruption_observed",
-            });
-            yield* store.updateOperation("unknown-pinning-request", {
-              now: "2026-09-22T00:00:00.000Z",
-              target: { instanceId: "instance-a", threadId: "thread-a" },
-              state: "outcome_unknown",
-            });
-
-            yield* record("thread-b", "turn-3", 3);
-            expect(yield* store.findTurnEvidence(turnRef("thread-a", "turn-1"))).toBeNull();
-            expect(yield* store.findTurnEvidence(turnRef("thread-a", "turn-2"))).not.toBeNull();
-            expect(
-              yield* store.findTurnEvidence({
-                instanceId: "instance-a",
-                threadId: "thread-b",
-                turnId: "turn-3",
-              }),
-            ).not.toBeNull();
-          }).pipe(Effect.provide(layer)),
-        );
-      }),
-    ),
-  );
-
-  it.effect("never evicts the row its own recording just wrote", () =>
-    withDatabasePath((databasePath) =>
-      Effect.gen(function* () {
-        const rowBytes = new TextEncoder().encode(
-          JSON.stringify({
-            i: "instance-a",
-            t: "thread-a",
-            u: "turn-1",
-            s: "running",
-            p: false,
-            q: 1,
-            o: "2026-09-22T00:00:00.000Z",
-            d: "The thread detail snapshot published the latest turn as running.",
-          }),
-        ).byteLength;
-        const layer = LocalStore.layer({
-          databasePath,
-          turnEvidenceBudgetBytes: rowBytes * 2 + 1,
-        });
-        yield* Effect.scoped(
-          Effect.gen(function* () {
-            yield* TestClock.setTime(1_000_000);
-            const store = yield* LocalStore;
-            const record = (turnId: string, sequence: number, second: number) =>
-              store.recordTurnEvidence({
-                turn: { instanceId: "instance-a", threadId: "thread-a", turnId },
-                state: "running",
-                projected: false,
-                sourceSequence: sequence,
-                observedAt: `2026-09-22T00:00:${String(second).padStart(2, "0")}.000Z`,
-                detail: "The thread detail snapshot published the latest turn as running.",
-              });
-            const turnRef = (turnId: string) => ({
-              instanceId: "instance-a",
-              threadId: "thread-a",
-              turnId,
-            });
-            yield* record("turn-1", 1, 10);
-            yield* record("turn-2", 2, 20);
-            // A lagging observation arrives with an older observation time:
-            // its own recording must not evict it to make room, so the next
-            // oldest unpinned row goes instead.
-            yield* record("turn-3", 3, 5);
-            expect(yield* store.findTurnEvidence(turnRef("turn-3"))).not.toBeNull();
-            expect(yield* store.findTurnEvidence(turnRef("turn-1"))).toBeNull();
-            expect(yield* store.findTurnEvidence(turnRef("turn-2"))).not.toBeNull();
-          }).pipe(Effect.provide(layer)),
-        );
-      }),
-    ),
-  );
-
-  it.effect("reads retained turn evidence after the database is reopened", () =>
-    withDatabasePath((databasePath) =>
-      Effect.gen(function* () {
-        yield* Effect.scoped(
-          Effect.gen(function* () {
-            const store = yield* LocalStore;
-            yield* store.recordTurnEvidence({
-              turn: turnA,
-              state: "completed",
-              projected: false,
-              sourceSequence: 42,
-              observedAt: "2026-09-22T00:00:00.000Z",
-              detail: "The thread detail snapshot published the latest turn as completed.",
-            });
-          }).pipe(Effect.provide(LocalStore.layer({ databasePath }))),
-        );
-        yield* Effect.scoped(
-          Effect.gen(function* () {
-            const store = yield* LocalStore;
-            const record = yield* store.findTurnEvidence(turnA);
-            expect(record).toEqual({
-              turn: turnA,
-              state: "completed",
-              projected: false,
-              sourceSequence: 42,
-              observedAt: "2026-09-22T00:00:00.000Z",
-              detail: "The thread detail snapshot published the latest turn as completed.",
-            });
-          }).pipe(Effect.provide(LocalStore.layer({ databasePath }))),
-        );
-      }),
-    ),
-  );
-
-  it.effect("fails a wait on a missing registration with a typed error", () =>
-    withDatabasePath((databasePath) =>
-      Effect.gen(function* () {
-        const { options, connections } = emptyThreadFixtures();
+        const { connections } = emptyThreadFixtures();
+        const requestId = "settle-recovery-not-dispatched";
+        const intent = {
+          instanceId: "instance-a",
+          threadId: "thread-a",
+          settled: true,
+          dispatchSequence: null,
+        };
         const result = yield* Effect.scoped(
-          callTool("turn_wait", { turn: turnA, waitMs: 0 }).pipe(
-            Effect.provide(appLayer(databasePath, connections)),
-          ),
+          Effect.gen(function* () {
+            const store = yield* LocalStore;
+            const admittedAt = "1970-01-01T00:00:00.000Z";
+            const fingerprint = yield* store.fingerprintRequest("thread_set_settled", {
+              requestId,
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+              settled: true,
+            });
+            yield* store.admitOperation({
+              requestId,
+              tool: "thread_set_settled",
+              fingerprint,
+              processNonce: "previous-process",
+              admittedAt,
+              intent,
+              completionMeans: "settlement_observed",
+              steps: [
+                "dispatch_native_settlement",
+                "observe_native_settlement",
+                "capture_provider_session_state",
+              ],
+            });
+            yield* store.updateOperation(requestId, {
+              now: admittedAt,
+              state: "outcome_unknown",
+              dispatch: "not_dispatched",
+              commandId: null,
+              target: { instanceId: "instance-a", threadId: "thread-a" },
+              stepPosition: 0,
+              stepState: "outcome_unknown",
+              error: {
+                code: "unavailable",
+                message: "The previous process stopped before dispatch was confirmed.",
+                retry: "reconcile_first",
+                details: { action: "observe_thread" },
+              },
+              recovery: "observe_thread",
+            });
+            yield* TestClock.adjust(Duration.millis(120_000));
+            return yield* callTool("operation_get", { requestId });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
         );
 
         expect(result[0]?.result).toMatchObject({
-          result: { kind: "error", error: { code: "registration_not_found" } },
-        });
-        expect(options.seenThreads).toEqual([]);
-      }),
-    ),
-  );
-
-  it.effect("rejects out-of-range wait budgets and unknown arguments before dispatch", () =>
-    withDatabasePath((databasePath) =>
-      Effect.gen(function* () {
-        const { options, connections } = emptyThreadFixtures();
-        for (const input of [
-          { turn: turnA, waitMs: 30_001 },
-          { turn: turnA, unexpected: true },
-        ]) {
-          const exit = yield* Effect.exit(
-            Effect.scoped(
-              callTool("turn_wait", input).pipe(
-                Effect.provide(appLayer(databasePath, connections)),
-              ),
-            ),
-          );
-          expect(Exit.isFailure(exit)).toBe(true);
-          if (Exit.isSuccess(exit)) return;
-          expect(String(exit.cause)).toContain("Invalid parameters for tool 'turn_wait'");
-        }
-        expect(options.seenThreads).toEqual([]);
-      }),
-    ),
-  );
-
-  it.live("observes a live turn outcome across real time", () =>
-    withDatabasePath((databasePath) =>
-      Effect.gen(function* () {
-        const { options, connections } = emptyThreadFixtures();
-        let opens = 0;
-        let completed = false;
-        options.threadStreams = {
-          "instance-a:thread-a": () => {
-            opens += 1;
-            if (opens === 1) return turnWaitDetail(10, { turnId: "turn-a", state: "running" });
-            if (!completed) return Stream.make({ kind: "synchronized" as const });
-            return turnWaitDetail(11, { turnId: "turn-a", state: "completed" });
+          result: {
+            kind: "ok",
+            value: {
+              operation: {
+                state: "failed",
+                dispatch: "not_dispatched",
+                recovery: "new_explicit_request",
+                error: { code: "unavailable", retry: "safe_read" },
+              },
+            },
           },
-        };
-        const result = yield* Effect.scoped(
+        });
+      }),
+    ),
+  );
+
+  it.effect("does not fail an unknown settlement whose stored dispatch may have run", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const requestId = "settle-unknown-dispatch-guard";
+        const admittedAt = "1970-01-01T00:00:00.000Z";
+        const record = yield* Effect.scoped(
           Effect.gen(function* () {
-            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
-            const fiber = yield* Effect.forkDetach(
-              callTool("turn_wait", { turn: turnA, waitMs: 2_000 }),
-            );
-            yield* Effect.sleep(Duration.millis(150));
-            completed = true;
-            return yield* Fiber.join(fiber);
-          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+            const store = yield* LocalStore;
+            const request = {
+              requestId,
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+              settled: true,
+            } as const;
+            const fingerprint = yield* store.fingerprintRequest("thread_set_settled", request);
+            yield* store.admitOperation({
+              requestId,
+              tool: "thread_set_settled",
+              fingerprint,
+              processNonce: "previous-process",
+              admittedAt,
+              intent: {
+                instanceId: request.thread.instanceId,
+                threadId: request.thread.threadId,
+                settled: request.settled,
+                dispatchSequence: 42,
+              },
+              completionMeans: "settlement_observed",
+              steps: [
+                "dispatch_native_settlement",
+                "observe_native_settlement",
+                "capture_provider_session_state",
+              ],
+            });
+            yield* store.updateOperation(requestId, {
+              now: admittedAt,
+              state: "outcome_unknown",
+              dispatch: "accepted",
+              commandId: "settlement-command",
+              target: request.thread,
+              stepPosition: 1,
+              stepState: "outcome_unknown",
+              error: {
+                code: "unavailable",
+                message: "The settlement command may have run.",
+                retry: "reconcile_first",
+                details: { action: "observe_thread" },
+              },
+              recovery: "observe_thread",
+            });
+            yield* store.updateOperation(requestId, {
+              now: "1970-01-01T00:00:01.000Z",
+              onlyIfNonterminal: true,
+              state: "failed",
+              dispatch: "not_dispatched",
+              commandId: null,
+            });
+            const current = yield* store.getOperation(requestId);
+            return current?.record ?? null;
+          }).pipe(Effect.provide(LocalStore.layer({ databasePath }))),
         );
 
-        const value = result[0]?.result as unknown as TurnWaitToolResultShape;
-        expect(value.result).toMatchObject({
-          kind: "ok",
-          value: { target: turnA, observation: "condition_met", execution: "completed" },
+        expect(record).toMatchObject({
+          state: "outcome_unknown",
+          dispatch: "accepted",
+          commandId: "settlement-command",
         });
-        expect(value.observations).toMatchObject([{ freshness: "fresh", sourceSequence: 11 }]);
+      }),
+    ),
+  );
+
+  it.effect("preserves native eligibility and operation-authorization failures", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.dispatchThreadSettlement = ({ threadId }) =>
+          Effect.fail(
+            new T3CodeAdapterError({
+              kind: threadId === "busy-thread" ? "upstream_rejected" : "authorization",
+              message:
+                threadId === "busy-thread"
+                  ? "The native settle command rejected an active thread."
+                  : "The T3Code credential lacks the orchestration:operate scope.",
+              uncertain: false,
+              status: null,
+            }),
+          );
+        const results = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const busy = yield* callTool("thread_set_settled", {
+              requestId: "settle-busy",
+              thread: { instanceId: "instance-a", threadId: "busy-thread" },
+              settled: true,
+            });
+            const denied = yield* callTool("thread_set_settled", {
+              requestId: "settle-denied",
+              thread: { instanceId: "instance-a", threadId: "denied-thread" },
+              settled: true,
+            });
+            return { busy, denied };
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        expect(results.busy[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "failed",
+              dispatch: "rejected",
+              error: {
+                code: "upstream_failure",
+                message: "The native settle command rejected an active thread.",
+              },
+            },
+          },
+        });
+        expect(results.denied[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "failed",
+              dispatch: "not_dispatched",
+              error: {
+                code: "operate_denied",
+                message: "The T3Code credential lacks the orchestration:operate scope.",
+              },
+            },
+          },
+        });
       }),
     ),
   );

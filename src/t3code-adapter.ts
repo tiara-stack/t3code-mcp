@@ -121,6 +121,9 @@ const ThreadShellWireSchema = Schema.Struct({
   archivedAt: Schema.optionalKey(Schema.NullOr(Schema.String)),
   settledOverride: Schema.optionalKey(Schema.NullOr(Schema.Literals(["settled", "active"]))),
   settledAt: Schema.optionalKey(Schema.NullOr(Schema.String)),
+  snoozedAt: Schema.optionalKey(Schema.NullOr(Schema.String)),
+  snoozedUntil: Schema.optionalKey(Schema.NullOr(Schema.String)),
+  pinnedAt: Schema.optionalKey(Schema.NullOr(Schema.String)),
 });
 
 const ShellSnapshotWireSchema = Schema.Struct({
@@ -228,6 +231,9 @@ const ThreadDetailWireSchema = Schema.Struct({
   archivedAt: Schema.optionalKey(Schema.NullOr(Schema.String)),
   settledOverride: Schema.optionalKey(Schema.NullOr(Schema.Literals(["settled", "active"]))),
   settledAt: Schema.optionalKey(Schema.NullOr(Schema.String)),
+  snoozedAt: Schema.optionalKey(Schema.NullOr(Schema.String)),
+  snoozedUntil: Schema.optionalKey(Schema.NullOr(Schema.String)),
+  pinnedAt: Schema.optionalKey(Schema.NullOr(Schema.String)),
   messages: Schema.Array(ThreadMessageWireSchema),
   activities: Schema.Array(ThreadActivityWireSchema),
   session: Schema.NullOr(ThreadSessionWireSchema),
@@ -777,6 +783,17 @@ const DispatchCommandRpc = Rpc.make("orchestration.dispatchCommand", {
     ThreadInterruptCommandWireSchema,
     ThreadSessionStopCommandWireSchema,
     ThreadCreateCommandWireSchema,
+    Schema.Struct({
+      type: Schema.Literal("thread.settle"),
+      commandId: trimmedNonEmptyWireString,
+      threadId: trimmedNonEmptyWireString,
+    }),
+    Schema.Struct({
+      type: Schema.Literal("thread.unsettle"),
+      commandId: trimmedNonEmptyWireString,
+      threadId: trimmedNonEmptyWireString,
+      reason: Schema.Literal("user"),
+    }),
   ]),
   success: DispatchResultWireSchema,
   error: Schema.Union([
@@ -1270,6 +1287,70 @@ const worktreeRemoveError = (error: unknown): T3CodeAdapterError => {
   );
 };
 
+type KnownDispatchFailureTag =
+  | "EnvironmentAuthorizationError"
+  | "OrchestrationDispatchCommandError"
+  | "OrchestrationCommandInvariantError";
+
+const knownDispatchFailureMappers: Record<
+  KnownDispatchFailureTag,
+  (cause: unknown) => T3CodeAdapterError | null
+> = {
+  EnvironmentAuthorizationError: (cause) => {
+    if (!Predicate.hasProperty(cause, "requiredScope")) return null;
+    return new T3CodeAdapterError({
+      kind: "authorization",
+      message: `The T3Code credential lacks the required ${String(cause.requiredScope)} scope.`,
+      uncertain: false,
+      status: null,
+      requiredScopes: [String(cause.requiredScope)],
+    });
+  },
+  OrchestrationDispatchCommandError: (cause) => {
+    if (!Predicate.hasProperty(cause, "message") || typeof cause.message !== "string") return null;
+    return new T3CodeAdapterError({
+      kind: "upstream_rejected",
+      message: cause.message,
+      uncertain: false,
+      status: null,
+    });
+  },
+  OrchestrationCommandInvariantError: (cause) =>
+    new T3CodeAdapterError({
+      kind: "upstream_rejected",
+      message:
+        Predicate.hasProperty(cause, "detail") && typeof cause.detail === "string"
+          ? `T3Code rejected the native settlement command because it violated a server invariant: ${cause.detail}`
+          : "T3Code rejected the native settlement command because it violated a server invariant.",
+      uncertain: false,
+      status: null,
+    }),
+};
+
+const mapKnownDispatchFailure = (cause: unknown): T3CodeAdapterError | null => {
+  if (!Predicate.hasProperty(cause, "_tag") || typeof cause._tag !== "string") return null;
+  if (!Object.hasOwn(knownDispatchFailureMappers, cause._tag)) return null;
+  return knownDispatchFailureMappers[cause._tag as KnownDispatchFailureTag](cause);
+};
+
+const uncertainDispatchError = (error: T3CodeAdapterError): T3CodeAdapterError =>
+  error.kind === "transport" || error.kind === "timeout" || error.kind === "wire_incompatible"
+    ? new T3CodeAdapterError({
+        kind: error.kind,
+        message: error.message,
+        uncertain: true,
+        status: error.status,
+      })
+    : error;
+
+export const mapSettlementDispatchCommandError = (error: unknown): T3CodeAdapterError => {
+  if (error instanceof T3CodeAdapterError) return error;
+  const cause = error instanceof RpcClientError.RpcClientError ? error.reason : error;
+  return (
+    mapKnownDispatchFailure(cause) ?? uncertainDispatchError(mapAuthenticatedChannelError(error))
+  );
+};
+
 const mapShellStreamError = (error: unknown): T3CodeAdapterError => {
   const mapped = mapOrchestrationReadError("The T3Code shell observation stream failed.")(error);
   return mapped instanceof T3CodeAdapterError ? mapped : mapAuthenticatedChannelError(mapped);
@@ -1418,6 +1499,7 @@ export type T3CodeAdapterErrorKind =
   | "unsupported_capability"
   | "command_rejected"
   | "resource_not_found"
+  | "upstream_rejected"
   | "capacity";
 
 export class T3CodeAdapterError extends Data.TaggedError("T3CodeAdapterError")<{
@@ -1577,6 +1659,9 @@ export interface ShellThread {
   readonly latestTurnId: string | null;
   readonly settledOverride: "settled" | "active" | null;
   readonly settledAt: string | null;
+  readonly snoozedAt: string | null;
+  readonly snoozedUntil: string | null;
+  readonly pinnedAt: string | null;
 }
 
 export interface ObservedThreadActivity {
@@ -1635,6 +1720,9 @@ export interface ObservedThreadDetail {
   readonly archivedAt: string | null;
   readonly settledOverride: "settled" | "active" | null;
   readonly settledAt: string | null;
+  readonly snoozedAt: string | null;
+  readonly snoozedUntil: string | null;
+  readonly pinnedAt: string | null;
   readonly activities: ReadonlyArray<ObservedThreadActivity>;
   readonly messages: ReadonlyArray<ObservedThreadMessage>;
   readonly session: ObservedThreadSession | null;
@@ -1874,6 +1962,13 @@ export interface T3CodeAdapterService {
     readonly afterSequence?: number;
     readonly turnLimit?: number;
   }) => Stream.Stream<ThreadStreamItem, T3CodeAdapterError>;
+  readonly dispatchThreadSettlement: (input: {
+    readonly endpoint: string;
+    readonly credential: string;
+    readonly threadId: string;
+    readonly commandId: string;
+    readonly settled: boolean;
+  }) => Effect.Effect<{ readonly sequence: number }, T3CodeAdapterError>;
   readonly getArchivedShellSnapshot: (input: {
     readonly endpoint: string;
     readonly credential: string;
@@ -2222,15 +2317,20 @@ const discoveredProjectFromWire = (
         },
 });
 
+const nullable = <Value>(value: Value | null | undefined): Value | null => value ?? null;
+
 const shellThreadFromWire = (thread: typeof ThreadShellWireSchema.Type): ShellThread => ({
   threadId: thread.id,
   projectId: thread.projectId,
   title: thread.title,
-  archivedAt: thread.archivedAt ?? null,
-  worktreePath: thread.worktreePath ?? null,
-  latestTurnId: thread.latestTurn?.turnId ?? null,
-  settledOverride: thread.settledOverride ?? null,
-  settledAt: thread.settledAt ?? null,
+  archivedAt: nullable(thread.archivedAt),
+  worktreePath: nullable(thread.worktreePath),
+  latestTurnId: nullable(thread.latestTurn?.turnId),
+  settledOverride: nullable(thread.settledOverride),
+  settledAt: nullable(thread.settledAt),
+  snoozedAt: nullable(thread.snoozedAt),
+  snoozedUntil: nullable(thread.snoozedUntil),
+  pinnedAt: nullable(thread.pinnedAt),
 });
 
 const shellSnapshotFromWire = (snapshot: typeof ShellSnapshotWireSchema.Type): ShellSnapshot => ({
@@ -2324,9 +2424,12 @@ const observedThreadDetailFromWire = (
     thread.latestTurn === null
       ? null
       : { turnId: thread.latestTurn.turnId, state: thread.latestTurn.state },
-  archivedAt: thread.archivedAt ?? null,
-  settledOverride: thread.settledOverride ?? null,
-  settledAt: thread.settledAt ?? null,
+  archivedAt: nullable(thread.archivedAt),
+  settledOverride: nullable(thread.settledOverride),
+  settledAt: nullable(thread.settledAt),
+  snoozedAt: nullable(thread.snoozedAt),
+  snoozedUntil: nullable(thread.snoozedUntil),
+  pinnedAt: nullable(thread.pinnedAt),
   activities: thread.activities.map(observedThreadActivityFromWire),
   messages: thread.messages.map(observedThreadMessageFromWire),
   session: thread.session === null ? null : observedThreadSessionFromWire(thread.session),
@@ -2805,7 +2908,11 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
        * them only around `RpcClient.make` finalizes the socket scope before
        * the first request or pull and the channel hangs.
        */
-      const authenticatedRpcChannel = (endpoint: string, credential: string) =>
+      const authenticatedRpcChannel = (
+        endpoint: string,
+        credential: string,
+        onWebSocketOpen?: () => void,
+      ) =>
         Effect.gen(function* () {
           const ticket = yield* json(
             HttpClientRequest.post(endpointUrl(endpoint, "/api/auth/websocket-ticket")).pipe(
@@ -2819,8 +2926,13 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
             Socket.WebSocketConstructor,
             Effect.gen(function* () {
               const makeWebSocket = yield* Socket.WebSocketConstructor;
-              return (url: string, options?: Socket.WebSocketConstructorOptions) =>
-                boundedWebSocket(makeWebSocket(url, options));
+              return (url: string, options?: Socket.WebSocketConstructorOptions) => {
+                const websocket = makeWebSocket(url, options);
+                if (onWebSocketOpen !== undefined) {
+                  websocket.addEventListener("open", onWebSocketOpen, { once: true });
+                }
+                return boundedWebSocket(websocket);
+              };
             }),
           ).pipe(Layer.provide(NodeSocket.layerWebSocketConstructorWS));
           const socketLayer = Socket.layerWebSocket(websocketUrl(endpoint, ticket.ticket), {
@@ -2833,13 +2945,22 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
           );
         });
 
+      type RpcTimeoutOptions =
+        | boolean
+        | {
+            readonly timeoutIsUncertain?: boolean;
+            readonly uncertainOnTimeout?: boolean;
+            readonly uncertainOnWireIncompatible?: boolean;
+          };
+
+      const timeoutIsUncertain = (options: RpcTimeoutOptions | undefined): boolean =>
+        typeof options === "boolean"
+          ? options
+          : (options?.timeoutIsUncertain ?? options?.uncertainOnTimeout ?? false);
+
       const withRpcChannelBoundaries = <A, R>(
         effect: Effect.Effect<A, unknown, R>,
-        options?: {
-          readonly timeoutIsUncertain?: boolean;
-          readonly uncertainOnTimeout?: boolean;
-          readonly uncertainOnWireIncompatible?: boolean;
-        },
+        options?: RpcTimeoutOptions,
       ): Effect.Effect<A, T3CodeAdapterError, R> =>
         effect.pipe(
           Effect.timeoutOrElse({
@@ -2849,14 +2970,16 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
                 new T3CodeAdapterError({
                   kind: "timeout",
                   message: "The authenticated T3Code RPC request timed out.",
-                  uncertain: options?.timeoutIsUncertain ?? options?.uncertainOnTimeout ?? false,
+                  uncertain: timeoutIsUncertain(options),
                   status: null,
                 }),
               ),
           }),
           Effect.mapError((error: unknown) => {
             const mapped = mapAuthenticatedChannelError(error);
-            return options?.uncertainOnWireIncompatible && mapped.kind === "wire_incompatible"
+            const uncertainOnWireIncompatible =
+              typeof options === "object" && options.uncertainOnWireIncompatible;
+            return uncertainOnWireIncompatible && mapped.kind === "wire_incompatible"
               ? new T3CodeAdapterError({
                   kind: mapped.kind,
                   message: mapped.message,
@@ -2871,22 +2994,21 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
         endpoint: string,
         credential: string,
         use: (client: AdapterRpcClient) => Effect.Effect<A, unknown>,
-        options?: {
-          readonly timeoutIsUncertain?: boolean;
-          readonly uncertainOnTimeout?: boolean;
-          readonly uncertainOnWireIncompatible?: boolean;
-        },
+        options?: RpcTimeoutOptions,
+        onWebSocketOpen?: () => void,
       ): Effect.Effect<A, T3CodeAdapterError> =>
-        Effect.flatMap(authenticatedRpcChannel(endpoint, credential), (protocolLayer) =>
-          withRpcChannelBoundaries(
-            Effect.scoped(
-              Effect.gen(function* () {
-                const client = yield* RpcClient.make(AdapterRpcGroup);
-                return yield* use(client);
-              }).pipe(Effect.provide(protocolLayer)),
+        withRpcChannelBoundaries(
+          Effect.scoped(
+            Effect.flatMap(
+              authenticatedRpcChannel(endpoint, credential, onWebSocketOpen),
+              (protocolLayer) =>
+                Effect.gen(function* () {
+                  const client = yield* RpcClient.make(AdapterRpcGroup);
+                  return yield* use(client);
+                }).pipe(Effect.provide(protocolLayer)),
             ),
-            options,
           ),
+          options,
         );
 
       const verifyEnvironmentSession = (input: {
@@ -3344,6 +3466,53 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
           }),
         );
 
+      const dispatchThreadSettlement = (input: {
+        readonly endpoint: string;
+        readonly credential: string;
+        readonly threadId: string;
+        readonly commandId: string;
+        readonly settled: boolean;
+      }): Effect.Effect<{ readonly sequence: number }, T3CodeAdapterError> => {
+        let webSocketOpened = false;
+        return withCapacity(
+          withAuthenticatedRpc(
+            input.endpoint,
+            input.credential,
+            (client) => {
+              return client["orchestration.dispatchCommand"](
+                input.settled
+                  ? {
+                      type: "thread.settle",
+                      commandId: input.commandId,
+                      threadId: input.threadId,
+                    }
+                  : {
+                      type: "thread.unsettle",
+                      commandId: input.commandId,
+                      threadId: input.threadId,
+                      reason: "user",
+                    },
+              ).pipe(Effect.mapError(mapSettlementDispatchCommandError));
+            },
+            true,
+            () => {
+              webSocketOpened = true;
+            },
+          ).pipe(
+            Effect.mapError((error) =>
+              !webSocketOpened && error.uncertain
+                ? new T3CodeAdapterError({
+                    kind: error.kind,
+                    message: error.message,
+                    uncertain: false,
+                    status: error.status,
+                  })
+                : error,
+            ),
+          ),
+        );
+      };
+
       const loadProviderModels = (input: {
         readonly endpoint: string;
         readonly credential: string;
@@ -3666,6 +3835,7 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
         stopThreadSession,
         subscribeShell,
         subscribeThread,
+        dispatchThreadSettlement,
         getArchivedShellSnapshot,
         respondToInput,
         createWorktree,
