@@ -117,6 +117,7 @@ describe("stdio transport", () => {
               "instance_remove",
               "worktree_create",
               "thread_interrupt",
+              "thread_create",
               "project_list",
               "model_list",
               "worktree_list",

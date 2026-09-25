@@ -82,7 +82,7 @@ import {
 } from "./domain";
 import type { InstanceListPage, InstanceSummary } from "./domain";
 import { databaseDirectory, LocalStoreConfig, normalizeLocalStoreConfig } from "./config";
-import { makeBoundedJitteredRetrySchedule } from "./retry-schedule";
+import { jitteredExponential } from "./retry-schedules";
 import type { LocalStoreConfigValue } from "./config";
 import {
   MIGRATION_NAME,
@@ -1030,6 +1030,13 @@ export interface LocalStoreService {
     requestId: string,
     update: OperationCompareAndUpdateInput,
   ) => Effect.Effect<boolean, LocalStoreError>;
+  readonly compareAndSetThreadCreateOperation: (
+    requestId: string,
+    ownerProcessNonce: string,
+    expectedState: OperationState,
+    expectedDispatch: OperationRecord["dispatch"],
+    update: OperationUpdate,
+  ) => Effect.Effect<boolean, LocalStoreError>;
   readonly inspectRegistration: (
     instanceId: string,
   ) => Effect.Effect<RegistrationInspection, LocalStoreError>;
@@ -1461,6 +1468,24 @@ export class LocalStore extends Context.Service<LocalStore, LocalStoreService>()
             verifySchemaForOperation,
           );
 
+        const compareAndSetThreadCreateOperation = (
+          requestId: string,
+          ownerProcessNonce: string,
+          expectedState: OperationState,
+          expectedDispatch: OperationRecord["dispatch"],
+          update: OperationUpdate,
+        ) =>
+          compareAndSetOperationInDatabase(
+            sql,
+            requestId,
+            "thread_create",
+            ownerProcessNonce,
+            expectedState,
+            expectedDispatch,
+            update,
+            verifySchemaForOperation,
+          );
+
         const inspectRegistration = (instanceId: string) =>
           inspectRegistrationInDatabase(sql, instanceId, verifySchemaForOperation);
 
@@ -1516,6 +1541,7 @@ export class LocalStore extends Context.Service<LocalStore, LocalStoreService>()
           updateOperation,
           compareAndUpdateOperation,
           compareAndSetOperationDispatch,
+          compareAndSetThreadCreateOperation,
           inspectRegistration,
           removeRegistration,
           recordTurnEvidence,
@@ -1617,7 +1643,12 @@ const initializeDatabase = Effect.gen(function* () {
   ),
 );
 
-const startupRetrySchedule = makeBoundedJitteredRetrySchedule(5_000);
+const startupRetrySchedule = jitteredExponential({
+  initialDelay: "25 millis",
+  minimumDelayMillis: 25,
+  maximumDelayMillis: 250,
+  maxElapsed: "5 seconds",
+});
 
 const storageRetrySchedule = startupRetrySchedule;
 
@@ -5167,7 +5198,13 @@ const updateOperationWithOwnerExpectationInDatabase = (
   requestId: string,
   update: GuardedOperationUpdate,
   verify: SchemaVerifier,
-  expectation?: OperationDispatchExpectation,
+  expectation?: {
+    readonly tool?: string;
+    readonly ownerProcessNonce: string;
+    readonly state: OperationState;
+    readonly dispatch?: OperationRecord["dispatch"];
+    readonly revision?: number;
+  },
 ): Effect.Effect<boolean, LocalStoreError> =>
   retryStorage(
     Effect.gen(function* () {
@@ -5212,10 +5249,10 @@ const updateOperationWithOwnerExpectationInDatabase = (
           }
           if (
             expectation !== undefined &&
-            (row.tool !== expectation.tool ||
+            ((expectation.tool !== undefined && row.tool !== expectation.tool) ||
               row.owner_process_nonce !== expectation.ownerProcessNonce ||
               row.state !== expectation.state ||
-              row.dispatch !== expectation.dispatch ||
+              (expectation.dispatch !== undefined && row.dispatch !== expectation.dispatch) ||
               (expectation.revision !== undefined && Number(row.revision) !== expectation.revision))
           ) {
             return false;
@@ -5336,6 +5373,23 @@ const updateOperationInDatabase = (
   verify: SchemaVerifier,
 ): Effect.Effect<void, LocalStoreError> =>
   updateOperationWithOwnerExpectationInDatabase(sql, requestId, update, verify).pipe(Effect.asVoid);
+
+const compareAndSetOperationInDatabase = (
+  sql: SqlClient.SqlClient,
+  requestId: string,
+  tool: string,
+  ownerProcessNonce: string,
+  expectedState: OperationState,
+  expectedDispatch: OperationRecord["dispatch"],
+  update: OperationUpdate,
+  verify: SchemaVerifier,
+): Effect.Effect<boolean, LocalStoreError> =>
+  updateOperationWithOwnerExpectationInDatabase(sql, requestId, update, verify, {
+    tool,
+    ownerProcessNonce,
+    state: expectedState,
+    dispatch: expectedDispatch,
+  });
 
 const compareAndSetOperationDispatchInDatabase = (
   sql: SqlClient.SqlClient,

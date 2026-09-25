@@ -126,6 +126,7 @@ const startServer = async (databasePath: string): Promise<Server> => {
       "instance_remove",
       "worktree_create",
       "thread_interrupt",
+      "thread_create",
       "project_list",
       "model_list",
       "worktree_list",
@@ -388,7 +389,7 @@ describe("shared SQLite worktree inspection captures", () => {
           });
         }),
       ),
-    30_000,
+    60_000,
   );
 });
 
@@ -1568,6 +1569,212 @@ describe("shared SQLite mutation admission", () => {
         }),
       ),
     60000,
+  );
+});
+
+describe("shared SQLite thread-create recovery", () => {
+  it.live(
+    "observes a prior thread-create attempt across MCP processes without replaying it",
+    () =>
+      withServers("t3code-mcp-thread-create-recovery-", ({ databasePath, servers }) =>
+        Effect.gen(function* () {
+          const request = {
+            requestId: "thread-create-cross-process",
+            project: { instanceId: "thread-instance", projectId: "project-a" },
+            title: "Recover the existing native thread",
+            checkout: { kind: "project_root" as const },
+            model: {
+              kind: "explicit" as const,
+              selection: { providerInstanceId: "provider-a", model: "model-a" },
+            },
+            runtimeMode: "approval-required" as const,
+            interactionMode: "default" as const,
+          };
+          const oldAt = new Date(Date.now() - LIVE_EFFECT_OBSERVATION_MILLIS - 1_000).toISOString();
+          const thread = { instanceId: "thread-instance", threadId: "native-thread-cross-process" };
+          const intent = {
+            instanceId: thread.instanceId,
+            projectId: request.project.projectId,
+            threadId: thread.threadId,
+            title: request.title,
+            repositoryPath: "/srv/project-a",
+            branch: null,
+            worktreePath: null,
+            modelSelection: request.model.selection,
+            runtimeMode: request.runtimeMode,
+            interactionMode: request.interactionMode,
+          };
+          yield* seed(databasePath, [{ instanceId: thread.instanceId }]);
+          yield* Effect.scoped(
+            Effect.gen(function* () {
+              const store = yield* LocalStore;
+              const fingerprint = yield* store.fingerprintRequest("thread_create", request);
+              yield* store.admitOperation({
+                requestId: request.requestId,
+                tool: "thread_create",
+                fingerprint,
+                processNonce: "previous-mcp-process",
+                admittedAt: oldAt,
+                intent,
+                target: thread,
+                commandId: "native-command-cross-process",
+                completionMeans: "thread_created",
+                steps: ["dispatch_thread_create", "observe_created_thread"],
+              });
+              yield* store.updateOperation(request.requestId, {
+                now: oldAt,
+                intent,
+                state: "pending",
+                dispatch: "unknown",
+                target: thread,
+                stepPosition: 0,
+                stepState: "pending",
+                recovery: "observe_operation",
+              });
+            }).pipe(Effect.provide(LocalStore.layer({ databasePath }))),
+          );
+
+          const first = yield* Effect.promise(() => startServer(databasePath));
+          servers.add(first);
+          const lookup = yield* Effect.promise(() =>
+            call(first, 3, "operation_get", { requestId: request.requestId }),
+          );
+          expect(lookup.result?.structuredContent).toMatchObject({
+            result: {
+              kind: "ok",
+              value: {
+                operation: {
+                  tool: "thread_create",
+                  state: "outcome_unknown",
+                  dispatch: "unknown",
+                  target: thread,
+                  commandId: "native-command-cross-process",
+                },
+              },
+            },
+          });
+
+          const second = yield* Effect.promise(() => startServer(databasePath));
+          servers.add(second);
+          const replay = yield* Effect.promise(() => call(second, 3, "thread_create", request));
+          expect(replay.result?.isError).toBe(true);
+          expect(replay.result?.structuredContent).toMatchObject({
+            result: {
+              kind: "ok",
+              value: {
+                state: "outcome_unknown",
+                dispatch: "unknown",
+                target: thread,
+                commandId: "native-command-cross-process",
+              },
+            },
+          });
+
+          const final = yield* Effect.promise(() =>
+            call(second, 4, "operation_get", { requestId: request.requestId }),
+          );
+          expect(final.result?.structuredContent).toMatchObject({
+            result: {
+              kind: "ok",
+              value: {
+                operation: {
+                  state: "outcome_unknown",
+                  dispatch: "unknown",
+                  target: thread,
+                  commandId: "native-command-cross-process",
+                },
+              },
+            },
+          });
+        }),
+      ),
+    60_000,
+  );
+
+  it.live(
+    "keeps a prior thread-create attempt pending after a recent pipeline update",
+    () =>
+      withServers("t3code-mcp-thread-create-recent-update-", ({ databasePath, servers }) =>
+        Effect.gen(function* () {
+          const request = {
+            requestId: "thread-create-recent-cross-process-update",
+            project: { instanceId: "thread-instance", projectId: "project-a" },
+            title: "Keep recent pipeline progress",
+            checkout: { kind: "project_root" as const },
+            model: {
+              kind: "explicit" as const,
+              selection: { providerInstanceId: "provider-a", model: "model-a" },
+            },
+            runtimeMode: "approval-required" as const,
+            interactionMode: "default" as const,
+          };
+          const oldAt = new Date(Date.now() - LIVE_EFFECT_OBSERVATION_MILLIS - 1_000).toISOString();
+          const updatedAt = new Date().toISOString();
+          const thread = { instanceId: "thread-instance", threadId: "native-thread-recent-update" };
+          const intent = {
+            instanceId: thread.instanceId,
+            projectId: request.project.projectId,
+            threadId: thread.threadId,
+            title: request.title,
+            repositoryPath: "/srv/project-a",
+            branch: null,
+            worktreePath: null,
+            modelSelection: request.model.selection,
+            runtimeMode: request.runtimeMode,
+            interactionMode: request.interactionMode,
+          };
+          yield* seed(databasePath, [{ instanceId: thread.instanceId }]);
+          yield* Effect.scoped(
+            Effect.gen(function* () {
+              const store = yield* LocalStore;
+              const fingerprint = yield* store.fingerprintRequest("thread_create", request);
+              yield* store.admitOperation({
+                requestId: request.requestId,
+                tool: "thread_create",
+                fingerprint,
+                processNonce: "previous-mcp-process",
+                admittedAt: oldAt,
+                intent,
+                target: thread,
+                commandId: "native-command-recent-update",
+                completionMeans: "thread_created",
+                steps: ["dispatch_thread_create", "observe_created_thread"],
+              });
+              yield* store.updateOperation(request.requestId, {
+                now: updatedAt,
+                intent,
+                state: "pending",
+                dispatch: "unknown",
+                target: thread,
+                stepPosition: 0,
+                stepState: "pending",
+                recovery: "observe_operation",
+              });
+            }).pipe(Effect.provide(LocalStore.layer({ databasePath }))),
+          );
+
+          const server = yield* Effect.promise(() => startServer(databasePath));
+          servers.add(server);
+          const lookup = yield* Effect.promise(() =>
+            call(server, 3, "operation_get", { requestId: request.requestId }),
+          );
+          expect(lookup.result?.structuredContent).toMatchObject({
+            result: {
+              kind: "ok",
+              value: {
+                operation: {
+                  tool: "thread_create",
+                  state: "pending",
+                  dispatch: "unknown",
+                  target: thread,
+                  commandId: "native-command-recent-update",
+                },
+              },
+            },
+          });
+        }),
+      ),
+    60_000,
   );
 });
 

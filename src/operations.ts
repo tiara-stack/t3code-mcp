@@ -8,6 +8,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Match from "effect/Match";
+import * as Predicate from "effect/Predicate";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import {
@@ -15,7 +16,10 @@ import {
   MAX_OPERATION_WAIT_MILLIS,
   MAX_THREAD_WAIT_MILLIS,
   LIVE_EFFECT_OBSERVATION_MILLIS,
+  InteractionModeSchema,
+  ModelSelectionSchema,
   OPERATION_DETAIL_RETENTION_MILLIS,
+  RuntimeModeSchema,
   STAGED_PAIRING_RETENTION_MILLIS,
   type ApprovalRespondInput,
   type Evidence,
@@ -31,6 +35,11 @@ import {
   type PendingRequest,
   type ThreadInterruptInput,
   type ThreadStopSessionInput,
+  type ModelSelection,
+  type ThreadCreateInput,
+  type ThreadConfiguration,
+  type RuntimeMode,
+  type InteractionMode,
   type ToolFailure,
   type WorktreeCreateInput,
   type WorktreeDiscardInput,
@@ -44,7 +53,18 @@ import type {
   StoredOperation,
 } from "./local-store";
 import { InstanceConnections } from "./instance-connections";
-import type { DiscoveredVcsWorktreeRefs, InstanceConnection } from "./instance-connections";
+import type {
+  DiscoveredVcsWorktreeRefs,
+  InstanceConnection,
+  InstanceConnectionsService,
+} from "./instance-connections";
+import {
+  T3CodeAdapterError,
+  type DiscoveredModelOption,
+  type DiscoveredProject,
+  type ThreadCreateRequest,
+  type T3CodeAdapterErrorKind,
+} from "./t3code-adapter";
 import {
   ObservationError,
   Observations,
@@ -54,9 +74,9 @@ import {
   type ThreadSessionShutdownObservation,
   type ThreadSessionShutdownTarget,
 } from "./observations";
-import { T3CodeAdapterError, type T3CodeAdapterErrorKind } from "./t3code-adapter";
 import { validateObservedInputResponse } from "./pending-requests";
 import { adapterErrorFailure, observationErrorFailure } from "./tool-failure";
+import { readVerifiedWorktreeCheckout } from "./worktree-checkout";
 
 const ThreadSessionStopRecoverySchema = Schema.Struct({
   instanceId: Schema.NonEmptyString,
@@ -186,6 +206,10 @@ export type WorktreeDiscardCheck = () => Effect.Effect<
   LocalStoreError | T3CodeAdapterError | ObservationError
 >;
 
+export class ThreadCreateError extends Data.TaggedError("ThreadCreateError")<{
+  readonly failure: ToolFailure;
+}> {}
+
 class ApprovalDispatchClaimLost extends Data.TaggedError("ApprovalDispatchClaimLost")<{}> {}
 
 const inputResponseAuthorizationFailure = (error: T3CodeAdapterError): ToolFailure => {
@@ -252,6 +276,7 @@ const isThreadInterruptBaselineEndedDetail = (detail: string): boolean =>
   detail.endsWith(THREAD_INTERRUPT_BASELINE_ENDED_SUFFIX);
 
 class WorktreeDiscardClaimLost extends Data.TaggedError("WorktreeDiscardClaimLost")<{}> {}
+class ThreadCreateDispatchClaimLost extends Data.TaggedError("ThreadCreateDispatchClaimLost")<{}> {}
 
 const WORKTREE_DISCARD_RECONCILIATION_INTERVAL_MILLIS = 1_000;
 
@@ -284,6 +309,16 @@ export interface OperationsService {
     OperationRecord,
     LocalStoreError | OperationServiceError | T3CodeAdapterError | ObservationError
   >;
+  readonly createThread: (
+    input: ThreadCreateInput,
+  ) => Effect.Effect<
+    OperationRecord,
+    | LocalStoreError
+    | OperationServiceError
+    | ThreadCreateError
+    | T3CodeAdapterError
+    | ObservationError
+  >;
   readonly respondToApproval: (
     input: ApprovalRespondInput,
     observeRequest: Effect.Effect<
@@ -304,6 +339,439 @@ export interface OperationsService {
     input: OperationGetInput,
   ) => Effect.Effect<OperationGetValue, LocalStoreError>;
 }
+
+interface ResolvedThreadCreatePlan {
+  readonly repositoryPath: string;
+  readonly branch: string | null;
+  readonly worktreePath: string | null;
+  readonly modelSelection: ModelSelection;
+}
+
+interface ThreadCreateIntent extends OperationIntent, ResolvedThreadCreatePlan {
+  readonly projectId: string;
+  readonly threadId: string;
+  readonly title: string;
+  readonly runtimeMode: RuntimeMode;
+  readonly interactionMode: InteractionMode;
+}
+
+const ThreadCreateIntentSchema = Schema.Struct({
+  instanceId: Schema.NonEmptyString,
+  projectId: Schema.NonEmptyString,
+  threadId: Schema.NonEmptyString,
+  title: Schema.NonEmptyString,
+  repositoryPath: Schema.NonEmptyString,
+  branch: Schema.NullOr(Schema.NonEmptyString),
+  worktreePath: Schema.NullOr(Schema.NonEmptyString),
+  modelSelection: ModelSelectionSchema,
+  runtimeMode: RuntimeModeSchema,
+  interactionMode: InteractionModeSchema,
+});
+
+const threadCreateError = (
+  code: ToolFailure["code"],
+  message: string,
+  retry: ToolFailure["retry"],
+  details: ToolFailure["details"] = {},
+): ThreadCreateError => new ThreadCreateError({ failure: { code, message, retry, details } });
+
+const sameModelSelection = (left: ModelSelection, right: ModelSelection): boolean => {
+  const optionEntries = (selection: ModelSelection) =>
+    (selection.options ?? [])
+      .map((option) => [option.id, typeof option.value, String(option.value)] as const)
+      .sort(([leftId], [rightId]) => leftId.localeCompare(rightId));
+  return (
+    left.providerInstanceId === right.providerInstanceId &&
+    left.model === right.model &&
+    JSON.stringify(optionEntries(left)) === JSON.stringify(optionEntries(right))
+  );
+};
+
+const sameThreadCreatePlan = (
+  left: ResolvedThreadCreatePlan,
+  right: ResolvedThreadCreatePlan,
+): boolean =>
+  left.repositoryPath === right.repositoryPath &&
+  left.branch === right.branch &&
+  left.worktreePath === right.worktreePath &&
+  sameModelSelection(left.modelSelection, right.modelSelection);
+
+const threadCreateConfiguration = (intent: ThreadCreateIntent): ThreadConfiguration => ({
+  model: intent.modelSelection,
+  runtimeMode: intent.runtimeMode,
+  interactionMode: intent.interactionMode,
+});
+
+const threadCreateUnknownFailure: ToolFailure = {
+  code: "unavailable",
+  message:
+    "The thread creation outcome is unknown; inspect the operation and target instance before making a new request.",
+  retry: "reconcile_first",
+  details: {},
+};
+
+const THREAD_CREATE_IDENTITY_MISMATCH_DETAIL =
+  "The observed thread identity, checkout association, or settings differ from the request.";
+const THREAD_CREATE_RECONCILIATION_MIN_INTERVAL_MILLIS = 1_000;
+
+const threadCreateObservationIsRecent = (options: {
+  readonly record: OperationRecord;
+  readonly hasTimedOut: boolean;
+  readonly now: number;
+  readonly lastObservationAt: ReadonlyMap<string, number>;
+}): boolean => {
+  if (options.record.state !== "pending" && options.record.state !== "outcome_unknown") {
+    return false;
+  }
+  if (options.record.state === "pending" && options.hasTimedOut) return false;
+  const lastObservationAt = options.lastObservationAt.get(options.record.requestId);
+  return (
+    lastObservationAt !== undefined &&
+    options.now >= lastObservationAt &&
+    options.now - lastObservationAt < THREAD_CREATE_RECONCILIATION_MIN_INTERVAL_MILLIS
+  );
+};
+
+const threadCreateObservationAlreadyRecorded = (
+  record: OperationRecord,
+  dispatch: "accepted" | "unknown",
+  observation: Evidence,
+): boolean =>
+  (record.state === "pending" || record.state === "outcome_unknown") &&
+  dispatch === record.dispatch &&
+  record.evidence.some((item) => item.detail === observation.detail);
+
+const threadCreatePendingTransition = (
+  record: OperationRecord,
+  observation: Evidence,
+): Pick<OperationUpdate, "state" | "stepState" | "stepError" | "error" | "recoverableUntil"> => {
+  const remainsUnknown = record.state === "outcome_unknown";
+  return remainsUnknown
+    ? {
+        state: "outcome_unknown",
+        stepState: "outcome_unknown",
+        stepError: threadCreateUnknownFailure,
+        error: threadCreateUnknownFailure,
+        recoverableUntil: null,
+      }
+    : {
+        state: "pending",
+        stepState: "pending",
+        stepError: null,
+        error: null,
+        recoverableUntil: new Date(
+          Date.parse(observation.observedAt) + OPERATION_DETAIL_RETENTION_MILLIS,
+        ).toISOString(),
+      };
+};
+
+const threadCreateFailureTransition = (
+  error: LocalStoreError | T3CodeAdapterError | ObservationError | ThreadCreateError,
+  dispatchStarted: boolean,
+  now: string,
+) => {
+  const failure = threadCreateFailure(error);
+  const knownFailure = (dispatch: "not_dispatched" | "rejected") => ({
+    failure,
+    state: "failed" as const,
+    dispatch,
+    stepState: "failed" as const,
+    recovery: "new_explicit_request" as const,
+    recoverableUntil: new Date(Date.parse(now) + OPERATION_DETAIL_RETENTION_MILLIS).toISOString(),
+    detail: "Thread creation failed before T3Code confirmed an effect.",
+  });
+  if (!dispatchStarted) return knownFailure("not_dispatched");
+  const adapterRejected = Match.value(error).pipe(
+    Match.tag("T3CodeAdapterError", (adapterError) => !adapterError.uncertain),
+    Match.orElse(() => false),
+  );
+  if (adapterRejected) {
+    return knownFailure("rejected");
+  }
+  return {
+    failure,
+    state: "outcome_unknown" as const,
+    dispatch: "unknown" as const,
+    stepState: "outcome_unknown" as const,
+    recovery: "observe_operation" as const,
+    recoverableUntil: null,
+    detail:
+      "Thread creation may have reached T3Code, but no authoritative command reply was received; it will not be replayed.",
+  };
+};
+
+const threadCreateIntentFromStored = (stored: StoredOperation): ThreadCreateIntent | null =>
+  Schema.is(ThreadCreateIntentSchema)(stored.intent) ? (stored.intent as ThreadCreateIntent) : null;
+
+const threadCreateStoreFailurePolicy: Partial<
+  Record<LocalStoreError["kind"], Pick<ToolFailure, "code" | "retry">>
+> = {
+  invalid_argument: { code: "invalid_argument", retry: "change_request" },
+  identity_conflict: { code: "identity_conflict", retry: "change_request" },
+  identity_mismatch: { code: "identity_mismatch", retry: "reconcile_first" },
+  registration_not_found: { code: "registration_not_found", retry: "none" },
+  registration_removed: { code: "stale_state", retry: "reconcile_first" },
+  request_id_conflict: { code: "request_id_conflict", retry: "change_request" },
+  request_record_unavailable: { code: "request_record_unavailable", retry: "reconcile_first" },
+  revision_conflict: { code: "stale_state", retry: "reconcile_first" },
+};
+
+const threadCreateObservationFailurePolicy: Partial<
+  Record<ObservationError["kind"], Pick<ToolFailure, "code" | "retry" | "details">>
+> = {
+  uncheckable_target: {
+    code: "uncheckable_target",
+    retry: "change_request",
+    details: {},
+  },
+  ambiguous_target: {
+    code: "uncheckable_target",
+    retry: "change_request",
+    details: {},
+  },
+  repository_mismatch: {
+    code: "uncheckable_target",
+    retry: "change_request",
+    details: {},
+  },
+  boundary_missing: {
+    code: "uncheckable_target",
+    retry: "change_request",
+    details: {},
+  },
+  stale_generation: { code: "stale_state", retry: "reconcile_first", details: {} },
+};
+
+const threadCreateStoreFailure = (error: LocalStoreError): ToolFailure => ({
+  ...threadCreateStoreFailurePolicy[error.kind],
+  code: threadCreateStoreFailurePolicy[error.kind]?.code ?? "unavailable",
+  retry: threadCreateStoreFailurePolicy[error.kind]?.retry ?? "reconcile_first",
+  message: error.message,
+  details: {},
+});
+
+const threadCreateObservationFailure = (error: ObservationError): ToolFailure => ({
+  ...threadCreateObservationFailurePolicy[error.kind],
+  code: threadCreateObservationFailurePolicy[error.kind]?.code ?? "unavailable",
+  retry: threadCreateObservationFailurePolicy[error.kind]?.retry ?? "safe_read",
+  message: error.message,
+  details: threadCreateObservationFailurePolicy[error.kind]?.details ?? {
+    action: "retry_observation",
+  },
+});
+
+const threadCreateFailure = (
+  error: LocalStoreError | T3CodeAdapterError | ObservationError | ThreadCreateError,
+): ToolFailure =>
+  Match.value(error).pipe(
+    Match.tag("ThreadCreateError", (createError) => createError.failure),
+    Match.tag("LocalStoreError", threadCreateStoreFailure),
+    Match.tag("T3CodeAdapterError", (adapterError) =>
+      adapterErrorFailure(adapterError, "thread_create"),
+    ),
+    Match.tag("ObservationError", threadCreateObservationFailure),
+    Match.exhaustive,
+  );
+
+const modelOptionValueSupported = (descriptor: DiscoveredModelOption, value: string | boolean) =>
+  Match.value(descriptor).pipe(
+    Match.when(
+      { kind: "select" },
+      (selected) => typeof value === "string" && selected.values.includes(value),
+    ),
+    Match.when({ kind: "boolean" }, () => typeof value === "boolean"),
+    Match.exhaustive,
+  );
+
+const resolveDiscoveredModelOptions = (
+  requested: ModelSelection,
+  available: ReadonlyArray<DiscoveredModelOption>,
+): Effect.Effect<
+  ReadonlyArray<{ readonly id: string; readonly value: string | boolean }>,
+  ThreadCreateError
+> =>
+  Effect.gen(function* () {
+    const invalid = (message: string) =>
+      threadCreateError("unsupported_capability", message, "change_request");
+    const descriptors = new Map(available.map((option) => [option.id, option]));
+    if (descriptors.size !== available.length) {
+      return yield* Effect.fail(invalid("The provider advertised duplicate model option IDs."));
+    }
+    const requestedOptions = requested.options ?? [];
+    const supplied = new Map(requestedOptions.map((option) => [option.id, option.value]));
+    if (supplied.size !== requestedOptions.length) {
+      return yield* Effect.fail(invalid("The requested model repeats an option ID."));
+    }
+    const unsupported = [...supplied].find(([id, value]) => {
+      const descriptor = descriptors.get(id);
+      return descriptor === undefined || !modelOptionValueSupported(descriptor, value);
+    });
+    if (unsupported !== undefined) {
+      const [id] = unsupported;
+      const descriptor = descriptors.get(id);
+      return yield* Effect.fail(
+        invalid(
+          descriptor === undefined
+            ? `The selected model does not support option ${id}.`
+            : `The selected model does not support the requested value for option ${id}.`,
+        ),
+      );
+    }
+    const invalidDefault = available.find(
+      (descriptor) =>
+        descriptor.defaultValue !== null &&
+        !modelOptionValueSupported(descriptor, descriptor.defaultValue),
+    );
+    if (invalidDefault !== undefined) {
+      return yield* Effect.fail(
+        invalid(`The provider advertised an invalid default for option ${invalidDefault.id}.`),
+      );
+    }
+    return available
+      .flatMap((descriptor) => {
+        const value = supplied.get(descriptor.id) ?? descriptor.defaultValue;
+        return value === null ? [] : [{ id: descriptor.id, value }];
+      })
+      .sort((left, right) => left.id.localeCompare(right.id));
+  });
+
+const modelSelectionWithDiscoveredOptions = (options: {
+  readonly requested: ModelSelection;
+  readonly available: ReadonlyArray<DiscoveredModelOption>;
+}): Effect.Effect<ModelSelection, ThreadCreateError> =>
+  Effect.map(
+    resolveDiscoveredModelOptions(options.requested, options.available),
+    (effectiveOptions) => ({
+      providerInstanceId: options.requested.providerInstanceId,
+      model: options.requested.model,
+      ...(effectiveOptions.length === 0 ? {} : { options: effectiveOptions }),
+    }),
+  );
+
+const resolveThreadModelSelection = (
+  input: ThreadCreateInput,
+  project: DiscoveredProject,
+  connections: InstanceConnectionsService,
+): Effect.Effect<ModelSelection, LocalStoreError | T3CodeAdapterError | ThreadCreateError> =>
+  Effect.gen(function* () {
+    const requestedModel = Match.value(input.model).pipe(
+      Match.when({ kind: "explicit" }, ({ selection }) => selection),
+      Match.when({ kind: "project_default" }, () => project.defaultModel),
+      Match.exhaustive,
+    );
+    if (requestedModel === null) {
+      return yield* Effect.fail(
+        threadCreateError(
+          "configuration_required",
+          "The project has no default model; choose an available model explicitly.",
+          "change_request",
+        ),
+      );
+    }
+
+    const discoveredModels = yield* connections.discoverModels(input.project.instanceId);
+    const providers = discoveredModels.providers.filter(
+      (provider) => provider.providerInstanceId === requestedModel.providerInstanceId,
+    );
+    if (providers.length !== 1 || providers[0] === undefined) {
+      return yield* Effect.fail(
+        threadCreateError(
+          "unsupported_capability",
+          "The selected provider is not present in the fresh model discovery.",
+          "change_request",
+        ),
+      );
+    }
+    const provider = providers[0];
+    if (provider.availability !== "available") {
+      return yield* Effect.fail(
+        threadCreateError(
+          "unsupported_capability",
+          provider.unavailableReason ?? "The selected provider is unavailable.",
+          "change_request",
+        ),
+      );
+    }
+    const models = provider.models.filter((model) => model.slug === requestedModel.model);
+    if (models.length !== 1 || models[0] === undefined) {
+      return yield* Effect.fail(
+        threadCreateError(
+          "unsupported_capability",
+          "The selected model is not present in the fresh provider model discovery.",
+          "change_request",
+        ),
+      );
+    }
+    return yield* modelSelectionWithDiscoveredOptions({
+      requested: requestedModel,
+      available: models[0].options,
+    });
+  });
+
+const resolveThreadCheckout = (
+  input: ThreadCreateInput,
+  project: DiscoveredProject,
+  connections: InstanceConnectionsService,
+): Effect.Effect<
+  Pick<ResolvedThreadCreatePlan, "repositoryPath" | "branch" | "worktreePath">,
+  LocalStoreError | T3CodeAdapterError | ObservationError
+> =>
+  Match.value(input.checkout).pipe(
+    Match.when({ kind: "project_root" }, () =>
+      Effect.succeed({ repositoryPath: project.repositoryPath, branch: null, worktreePath: null }),
+    ),
+    Match.when({ kind: "worktree" }, ({ worktree }) =>
+      Effect.gen(function* () {
+        if (worktree.repositoryPath !== project.repositoryPath) {
+          return yield* Effect.fail(
+            new ObservationError({
+              kind: "repository_mismatch",
+              message:
+                "The selected worktree repository path does not match the discovered project root.",
+            }),
+          );
+        }
+        const checkout = yield* readVerifiedWorktreeCheckout({ connections, worktree });
+        return {
+          repositoryPath: project.repositoryPath,
+          branch: checkout.branch,
+          worktreePath: worktree.worktreePath,
+        };
+      }),
+    ),
+    Match.exhaustive,
+  );
+
+const resolveThreadCreatePlan = (
+  input: ThreadCreateInput,
+  connections: InstanceConnectionsService,
+): Effect.Effect<
+  ResolvedThreadCreatePlan,
+  LocalStoreError | T3CodeAdapterError | ObservationError | ThreadCreateError
+> =>
+  Effect.gen(function* () {
+    const discoveredProjects = yield* connections.discoverProjects(input.project.instanceId);
+    const projectMatches = discoveredProjects.projects.filter(
+      (project) => project.projectId === input.project.projectId,
+    );
+    if (projectMatches.length !== 1 || projectMatches[0] === undefined) {
+      return yield* Effect.fail(
+        threadCreateError(
+          "resource_not_found",
+          "The selected project is missing or ambiguous in a fresh T3Code project snapshot.",
+          "reconcile_first",
+        ),
+      );
+    }
+    const project = projectMatches[0];
+    const modelSelection = yield* resolveThreadModelSelection(input, project, connections);
+    const checkout = yield* resolveThreadCheckout(input, project, connections);
+
+    return {
+      ...checkout,
+      modelSelection,
+    };
+  });
 
 const validateObservedApproval = (
   input: ApprovalRespondInput,
@@ -408,6 +876,17 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           });
           return true;
         });
+
+      const threadCreateLastObservationAt = new Map<string, number>();
+
+      const rememberThreadCreateObservation = (requestId: string, observedAt: number) => {
+        threadCreateLastObservationAt.delete(requestId);
+        if (threadCreateLastObservationAt.size >= MAX_OPERATION_CAPACITY) {
+          const oldest = threadCreateLastObservationAt.keys().next().value;
+          if (oldest !== undefined) threadCreateLastObservationAt.delete(oldest);
+        }
+        threadCreateLastObservationAt.set(requestId, observedAt);
+      };
 
       const release = (requestId: string) =>
         Effect.sync(() => {
@@ -2611,6 +3090,9 @@ export class Operations extends Context.Service<Operations, OperationsService>()
         Effect.gen(function* () {
           const record = stored.record as OperationRecord;
           if (activeRequests.has(record.requestId)) return record;
+          if (record.tool === "thread_create") {
+            return yield* reconcileThreadCreation(stored, record);
+          }
           const previousOwner = stored.ownerProcessNonce !== processNonce;
           const lastUpdatedAt = Date.parse(record.updatedAt);
           const previousOwnerStale =
@@ -5117,6 +5599,717 @@ export class Operations extends Context.Service<Operations, OperationsService>()
         );
       };
 
+      const observeThreadCreateDetail = (
+        requestId: string,
+        intent: ThreadCreateIntent,
+      ): Effect.Effect<
+        Result.Result<
+          SynchronizedThreadDetail,
+          LocalStoreError | T3CodeAdapterError | ObservationError
+        >
+      > =>
+        Effect.gen(function* () {
+          rememberThreadCreateObservation(requestId, yield* Clock.currentTimeMillis);
+          const observed = yield* Effect.result(
+            observations.threadDetail(intent.instanceId, intent.threadId),
+          );
+          rememberThreadCreateObservation(requestId, yield* Clock.currentTimeMillis);
+          return observed;
+        });
+
+      const threadCreationMatches = (
+        intent: ThreadCreateIntent,
+        detail: SynchronizedThreadDetail,
+      ): boolean =>
+        detail.thread.threadId === intent.threadId &&
+        detail.thread.projectId === intent.projectId &&
+        detail.thread.branch === intent.branch &&
+        detail.thread.worktreePath === intent.worktreePath &&
+        sameModelSelection(intent.modelSelection, detail.thread.modelSelection) &&
+        detail.thread.runtimeMode === intent.runtimeMode &&
+        detail.thread.interactionMode === intent.interactionMode;
+
+      const finishThreadCreation = (
+        stored: StoredOperation,
+        record: OperationRecord,
+        intent: ThreadCreateIntent,
+        detail: SynchronizedThreadDetail,
+      ): Effect.Effect<OperationRecord, LocalStoreError> =>
+        // fallow-ignore-next-line complexity
+        Effect.gen(function* () {
+          if (record.state === "completed") {
+            threadCreateLastObservationAt.delete(stored.record.requestId);
+            return record;
+          }
+          const observed: Evidence = {
+            kind: "snapshot",
+            observedAt: detail.observedAt,
+            sourceSequence: detail.threadSequence ?? detail.snapshotSequence,
+            nativeEventId: intent.threadId,
+            detail:
+              "A fresh native thread detail confirmed the intended thread and its selected project checkout association.",
+          };
+          const updated = yield* store.compareAndSetThreadCreateOperation(
+            stored.record.requestId,
+            stored.ownerProcessNonce,
+            record.state,
+            record.dispatch,
+            {
+              now: observed.observedAt,
+              state: "completed",
+              dispatch: "accepted",
+              target: { instanceId: intent.instanceId, threadId: intent.threadId },
+              created: {
+                thread: { instanceId: intent.instanceId, threadId: intent.threadId },
+                threadConfiguration: threadCreateConfiguration(intent),
+              },
+              stepPosition: 1,
+              stepState: "succeeded",
+              evidence: [observed],
+              evidenceStepPosition: 1,
+              error: null,
+              recovery: "none",
+              recoverableUntil: new Date(
+                Date.parse(observed.observedAt) + OPERATION_DETAIL_RETENTION_MILLIS,
+              ).toISOString(),
+            },
+          );
+          const current = yield* store.getOperation(stored.record.requestId);
+          const latest = current?.record ?? record;
+          if (updated || (terminal(latest) && latest.state !== "outcome_unknown")) {
+            threadCreateLastObservationAt.delete(stored.record.requestId);
+          }
+          if (!updated) return latest;
+          yield* signalCompletion(stored.record.requestId);
+          const refreshed = current ?? (yield* store.getOperation(stored.record.requestId));
+          if (refreshed !== null) return refreshed.record;
+          return record;
+        });
+
+      const recordThreadCreationPending = (
+        stored: StoredOperation,
+        record: OperationRecord,
+        dispatch: "accepted" | "unknown",
+        observation: Evidence,
+      ): Effect.Effect<OperationRecord, LocalStoreError> =>
+        Effect.gen(function* () {
+          if (threadCreateObservationAlreadyRecorded(record, dispatch, observation)) {
+            return record;
+          }
+          const updated = yield* store.compareAndSetThreadCreateOperation(
+            stored.record.requestId,
+            stored.ownerProcessNonce,
+            record.state,
+            record.dispatch,
+            {
+              now: observation.observedAt,
+              intent: stored.intent,
+              ...threadCreatePendingTransition(record, observation),
+              dispatch,
+              target: record.target,
+              stepPosition: 1,
+              evidence: [observation],
+              evidenceStepPosition: 1,
+              recovery: "observe_operation",
+            },
+          );
+          const refreshed = yield* store.getOperation(stored.record.requestId);
+          if (!updated) return refreshed?.record ?? record;
+          return refreshed?.record ?? record;
+        });
+
+      const markThreadCreationUnknown = (
+        stored: StoredOperation,
+        record: OperationRecord,
+        detail: string,
+      ): Effect.Effect<OperationRecord, LocalStoreError> => {
+        if (
+          record.state === "outcome_unknown" &&
+          record.evidence.some((item) => item.detail === detail)
+        ) {
+          return Effect.succeed(record);
+        }
+        return evidence(detail, "adapter_inference").pipe(
+          Effect.flatMap((observed) =>
+            Effect.gen(function* () {
+              const updated = yield* store.compareAndSetThreadCreateOperation(
+                stored.record.requestId,
+                stored.ownerProcessNonce,
+                record.state,
+                record.dispatch,
+                {
+                  now: observed.observedAt,
+                  intent: stored.intent,
+                  state: "outcome_unknown",
+                  dispatch: record.dispatch === "accepted" ? "accepted" : "unknown",
+                  target: record.target,
+                  stepPosition: 1,
+                  stepState: "outcome_unknown",
+                  stepError: threadCreateUnknownFailure,
+                  evidence: [observed],
+                  evidenceStepPosition: 1,
+                  error: threadCreateUnknownFailure,
+                  recovery: "observe_operation",
+                  recoverableUntil: null,
+                },
+              );
+              const refreshed = yield* store.getOperation(stored.record.requestId);
+              if (!updated) return refreshed?.record ?? record;
+              yield* signalCompletion(stored.record.requestId);
+              return refreshed?.record ?? record;
+            }),
+          ),
+        );
+      };
+
+      const markThreadCreationNotDispatched = (
+        stored: StoredOperation,
+        record: OperationRecord,
+      ): Effect.Effect<OperationRecord, LocalStoreError> => {
+        if (record.state === "failed") {
+          threadCreateLastObservationAt.delete(stored.record.requestId);
+          return Effect.succeed(record);
+        }
+        return evidence(
+          "A previous process stopped before the thread-create dispatch boundary; no native thread command was sent.",
+          "adapter_inference",
+        ).pipe(
+          Effect.flatMap((observed) => {
+            const failure: ToolFailure = {
+              code: "unavailable",
+              message:
+                "Thread creation was not dispatched. Submit a new explicit request; this operation will not be replayed.",
+              retry: "change_request",
+              details: { action: "new_explicit_request" },
+            };
+            return Effect.gen(function* () {
+              const updated = yield* store.compareAndSetThreadCreateOperation(
+                stored.record.requestId,
+                stored.ownerProcessNonce,
+                record.state,
+                record.dispatch,
+                {
+                  now: observed.observedAt,
+                  intent: stored.intent,
+                  state: "failed",
+                  dispatch: "not_dispatched",
+                  stepPosition: 0,
+                  stepState: "failed",
+                  stepError: failure,
+                  evidence: [observed],
+                  evidenceStepPosition: null,
+                  error: failure,
+                  recovery: "new_explicit_request",
+                  recoverableUntil: new Date(
+                    Date.parse(observed.observedAt) + OPERATION_DETAIL_RETENTION_MILLIS,
+                  ).toISOString(),
+                },
+              );
+              const refreshed = yield* store.getOperation(stored.record.requestId);
+              const latest = refreshed?.record ?? record;
+              if (updated || (terminal(latest) && latest.state !== "outcome_unknown")) {
+                threadCreateLastObservationAt.delete(stored.record.requestId);
+              }
+              if (!updated) return latest;
+              yield* signalCompletion(stored.record.requestId);
+              return latest;
+            });
+          }),
+        );
+      };
+
+      const reconcileThreadCreationObservation = (
+        stored: StoredOperation,
+        record: OperationRecord,
+        intent: ThreadCreateIntent,
+        hasTimedOut: boolean,
+      ): Effect.Effect<OperationRecord, LocalStoreError> =>
+        Effect.gen(function* () {
+          const observed = yield* observeThreadCreateDetail(stored.record.requestId, intent);
+          if (Result.isSuccess(observed) && threadCreationMatches(intent, observed.success)) {
+            return yield* finishThreadCreation(stored, record, intent, observed.success);
+          }
+          const detail = Result.isFailure(observed)
+            ? `Recovery could not obtain fresh detail for the intended thread (${observed.failure.message}).`
+            : THREAD_CREATE_IDENTITY_MISMATCH_DETAIL;
+          if (hasTimedOut) {
+            return yield* markThreadCreationUnknown(stored, record, detail);
+          }
+          const evidence: Evidence = Result.isSuccess(observed)
+            ? {
+                kind: "snapshot",
+                observedAt: observed.success.observedAt,
+                sourceSequence:
+                  observed.success.threadSequence ?? observed.success.snapshotSequence,
+                nativeEventId: intent.threadId,
+                detail,
+              }
+            : {
+                kind: "adapter_inference",
+                observedAt: yield* nowIso,
+                sourceSequence: null,
+                nativeEventId: intent.threadId,
+                detail,
+              };
+          return yield* recordThreadCreationPending(
+            stored,
+            record,
+            record.dispatch === "accepted" ? "accepted" : "unknown",
+            evidence,
+          );
+        });
+
+      const threadCreationTargetMatches = (
+        record: OperationRecord,
+        intent: ThreadCreateIntent,
+      ): boolean => {
+        const target = record.target;
+        return (
+          target !== null &&
+          Predicate.hasProperty(target, "threadId") &&
+          target.instanceId === intent.instanceId &&
+          target.threadId === intent.threadId
+        );
+      };
+
+      const recoverableThreadCreationIntent = (
+        stored: StoredOperation,
+        record: OperationRecord,
+      ):
+        | { readonly kind: "ready"; readonly intent: ThreadCreateIntent }
+        | { readonly kind: "invalid"; readonly detail: string } => {
+        const intent = threadCreateIntentFromStored(stored);
+        if (intent === null) {
+          return {
+            kind: "invalid",
+            detail:
+              "The persisted thread-create intent could not be decoded; no mutation will be replayed.",
+          };
+        }
+        if (!threadCreationTargetMatches(record, intent)) {
+          return {
+            kind: "invalid",
+            detail:
+              "The persisted thread-create target does not match its admitted intent; no mutation will be replayed.",
+          };
+        }
+        return { kind: "ready", intent };
+      };
+
+      const threadCreationObservationExpired = (
+        record: OperationRecord,
+        previousOwner: boolean,
+      ): Effect.Effect<boolean> =>
+        Effect.map(Clock.currentTimeMillis, (now) => {
+          const lastUpdatedAt = Date.parse(previousOwner ? record.updatedAt : record.admittedAt);
+          return (
+            Number.isFinite(lastUpdatedAt) && now - lastUpdatedAt >= LIVE_EFFECT_OBSERVATION_MILLIS
+          );
+        });
+
+      const reconcileUndispatchedThreadCreation = (
+        stored: StoredOperation,
+        record: OperationRecord,
+        hasTimedOut: boolean,
+      ): Effect.Effect<OperationRecord, LocalStoreError> =>
+        hasTimedOut ? markThreadCreationNotDispatched(stored, record) : Effect.succeed(record);
+
+      const reconcileThreadCreation = (
+        stored: StoredOperation,
+        record: OperationRecord,
+      ): Effect.Effect<OperationRecord, LocalStoreError> =>
+        Effect.gen(function* () {
+          if (terminal(record) && record.state !== "outcome_unknown") {
+            threadCreateLastObservationAt.delete(record.requestId);
+            return record;
+          }
+          const previousOwner = stored.ownerProcessNonce !== processNonce;
+          const hasTimedOut = yield* threadCreationObservationExpired(record, previousOwner);
+          if (previousOwner && !hasTimedOut) return record;
+          if (record.dispatch === "not_dispatched") {
+            return yield* reconcileUndispatchedThreadCreation(stored, record, hasTimedOut);
+          }
+          const intent = recoverableThreadCreationIntent(stored, record);
+          return yield* Match.value(intent).pipe(
+            Match.when({ kind: "invalid" }, (invalidIntent) =>
+              hasTimedOut
+                ? markThreadCreationUnknown(stored, record, invalidIntent.detail)
+                : Effect.succeed(record),
+            ),
+            Match.when({ kind: "ready" }, (readyIntent) =>
+              Effect.gen(function* () {
+                const now = yield* Clock.currentTimeMillis;
+                if (
+                  threadCreateObservationIsRecent({
+                    record,
+                    hasTimedOut,
+                    now,
+                    lastObservationAt: threadCreateLastObservationAt,
+                  })
+                ) {
+                  return record;
+                }
+                return yield* reconcileThreadCreationObservation(
+                  stored,
+                  record,
+                  readyIntent.intent,
+                  hasTimedOut,
+                );
+              }),
+            ),
+            Match.exhaustive,
+          );
+        });
+
+      const recordAcceptedThreadCreateFailure = (
+        stored: StoredOperation,
+        intent: ThreadCreateIntent,
+      ): Effect.Effect<void, LocalStoreError> =>
+        Effect.gen(function* () {
+          const current = yield* store.getOperation(stored.record.requestId);
+          if (current === null || current.record.state === "completed") return;
+          const observed: Evidence = {
+            kind: "adapter_inference",
+            observedAt: yield* nowIso,
+            sourceSequence: null,
+            nativeEventId: intent.threadId,
+            detail:
+              "T3Code accepted thread creation, but local receipt persistence or observation failed; recovery will inspect the intended thread without redispatching.",
+          };
+          yield* recordThreadCreationPending(current, current.record, "accepted", observed);
+        });
+
+      const recordUnacceptedThreadCreateFailure = (
+        requestId: string,
+        intent: ThreadCreateIntent,
+        error:
+          | LocalStoreError
+          | T3CodeAdapterError
+          | ObservationError
+          | ThreadCreateError
+          | ThreadCreateDispatchClaimLost,
+        dispatchStarted: boolean,
+      ): Effect.Effect<void, LocalStoreError> =>
+        Effect.gen(function* () {
+          if (error instanceof ThreadCreateDispatchClaimLost) return;
+          const stored = yield* store.getOperation(requestId);
+          if (
+            stored === null ||
+            stored.ownerProcessNonce !== processNonce ||
+            terminal(stored.record)
+          ) {
+            return;
+          }
+          const now = yield* nowIso;
+          const outcome = threadCreateFailureTransition(error, dispatchStarted, now);
+          const updated = yield* store.compareAndSetThreadCreateOperation(
+            requestId,
+            processNonce,
+            stored.record.state,
+            stored.record.dispatch,
+            {
+              now,
+              intent,
+              target: { instanceId: intent.instanceId, threadId: intent.threadId },
+              state: outcome.state,
+              dispatch: outcome.dispatch,
+              stepPosition: 0,
+              stepState: outcome.stepState,
+              stepError: outcome.failure,
+              evidence: [
+                {
+                  kind: "adapter_inference",
+                  observedAt: now,
+                  sourceSequence: null,
+                  nativeEventId: intent.threadId,
+                  detail: outcome.detail,
+                },
+              ],
+              evidenceStepPosition: 0,
+              error: outcome.failure,
+              recovery: outcome.recovery,
+              recoverableUntil: outcome.recoverableUntil,
+            },
+          );
+          if (outcome.state === "failed") threadCreateLastObservationAt.delete(requestId);
+          if (updated) yield* signalCompletion(requestId);
+        });
+
+      const recordThreadCreateFailure = (
+        requestId: string,
+        intent: ThreadCreateIntent,
+        error:
+          | LocalStoreError
+          | T3CodeAdapterError
+          | ObservationError
+          | ThreadCreateError
+          | ThreadCreateDispatchClaimLost,
+        dispatchStarted: boolean,
+        dispatchAccepted: boolean,
+      ): Effect.Effect<void, never> =>
+        Effect.gen(function* () {
+          const current = yield* store.getOperation(requestId);
+          if (
+            error instanceof ThreadCreateDispatchClaimLost ||
+            current === null ||
+            current.record.state === "completed" ||
+            current.record.state === "failed" ||
+            current.record.state === "partial" ||
+            current.record.state === "outcome_unknown"
+          ) {
+            return;
+          }
+          if (dispatchAccepted && current !== null) {
+            yield* recordAcceptedThreadCreateFailure(current, intent);
+            return;
+          }
+          yield* recordUnacceptedThreadCreateFailure(requestId, intent, error, dispatchStarted);
+        }).pipe(
+          Effect.catch(() => Effect.void),
+          Effect.asVoid,
+        );
+
+      const claimThreadCreateExecution = (
+        input: ThreadCreateInput,
+        intent: ThreadCreateIntent,
+      ): Effect.Effect<boolean, LocalStoreError> =>
+        Effect.gen(function* () {
+          const started = yield* evidence(
+            "Thread-create admission and its resolved settings were committed; this process owns the single native command attempt.",
+            "adapter_inference",
+          );
+          return yield* store.compareAndSetThreadCreateOperation(
+            input.requestId,
+            processNonce,
+            "admitted",
+            "not_dispatched",
+            {
+              now: started.observedAt,
+              state: "pending",
+              target: { instanceId: intent.instanceId, threadId: intent.threadId },
+              intent,
+              stepPosition: 0,
+              stepState: "pending",
+              evidence: [started],
+              evidenceStepPosition: null,
+              recovery: "observe_operation",
+            },
+          );
+        });
+
+      const markThreadCreateDispatchStarted = (
+        requestId: string,
+        dispatchState: { started: boolean },
+      ): Effect.Effect<void, LocalStoreError | ThreadCreateDispatchClaimLost> =>
+        Effect.gen(function* () {
+          const now = yield* nowIso;
+          const marker = yield* evidence(
+            "The exact thread.create command identity and resolved configuration are persisted before its native dispatch.",
+            "adapter_inference",
+          );
+          const claimed = yield* store.compareAndSetThreadCreateOperation(
+            requestId,
+            processNonce,
+            "pending",
+            "not_dispatched",
+            {
+              now,
+              state: "pending",
+              dispatch: "unknown",
+              stepPosition: 0,
+              stepState: "pending",
+              evidence: [marker],
+              evidenceStepPosition: 0,
+              recovery: "observe_operation",
+            },
+          );
+          if (!claimed) return yield* Effect.fail(new ThreadCreateDispatchClaimLost());
+          dispatchState.started = true;
+        });
+
+      const prepareThreadCreateRequest = (
+        input: ThreadCreateInput,
+        intent: ThreadCreateIntent,
+        commandId: string,
+        initialPlan: ResolvedThreadCreatePlan,
+        dispatchState: { started: boolean },
+      ): Effect.Effect<
+        ThreadCreateRequest & {
+          readonly onDispatch: Effect.Effect<
+            void,
+            LocalStoreError | ThreadCreateDispatchClaimLost,
+            never
+          >;
+        },
+        LocalStoreError | T3CodeAdapterError | ObservationError | ThreadCreateError
+      > =>
+        Effect.gen(function* () {
+          const refreshedPlan = yield* resolveThreadCreatePlan(input, connections);
+          if (!sameThreadCreatePlan(initialPlan, refreshedPlan)) {
+            return yield* Effect.fail(
+              threadCreateError(
+                "stale_state",
+                "The selected project settings or checkout changed before thread creation could be dispatched.",
+                "reconcile_first",
+              ),
+            );
+          }
+          return {
+            commandId,
+            threadId: intent.threadId,
+            projectId: intent.projectId,
+            title: intent.title,
+            modelSelection: {
+              providerInstanceId: intent.modelSelection.providerInstanceId,
+              model: intent.modelSelection.model,
+              ...(intent.modelSelection.options === undefined
+                ? {}
+                : { options: intent.modelSelection.options.map((option) => ({ ...option })) }),
+            },
+            runtimeMode: intent.runtimeMode,
+            interactionMode: intent.interactionMode,
+            branch: intent.branch,
+            worktreePath: intent.worktreePath,
+            createdAt: yield* nowIso,
+            onDispatch: markThreadCreateDispatchStarted(input.requestId, dispatchState),
+          };
+        });
+
+      const recordThreadCreateCommandAccepted = (
+        requestId: string,
+        intent: ThreadCreateIntent,
+        commandId: string,
+        sequence: number,
+      ): Effect.Effect<StoredOperation, LocalStoreError> =>
+        Effect.gen(function* () {
+          const accepted: Evidence = {
+            kind: "rpc_result",
+            observedAt: yield* nowIso,
+            sourceSequence: sequence,
+            nativeEventId: commandId,
+            detail:
+              "T3Code accepted the native thread.create command; completion still requires fresh observation of the intended thread and checkout association.",
+          };
+          yield* store.compareAndSetThreadCreateOperation(
+            requestId,
+            processNonce,
+            "pending",
+            "unknown",
+            {
+              now: accepted.observedAt,
+              state: "pending",
+              dispatch: "accepted",
+              target: { instanceId: intent.instanceId, threadId: intent.threadId },
+              stepPosition: 0,
+              stepState: "succeeded",
+              evidence: [accepted],
+              evidenceStepPosition: 0,
+              error: null,
+              recovery: "observe_operation",
+            },
+          );
+          const current = yield* store.getOperation(requestId);
+          if (current === null) {
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: "request_record_unavailable",
+                message: "The pending thread-create receipt is unavailable.",
+              }),
+            );
+          }
+          return current;
+        });
+
+      const observeThreadCreateResult = (
+        stored: StoredOperation,
+        intent: ThreadCreateIntent,
+      ): Effect.Effect<void, LocalStoreError> =>
+        Effect.gen(function* () {
+          const record = stored.record;
+          if (
+            record.state === "completed" ||
+            record.state === "failed" ||
+            record.state === "partial"
+          ) {
+            return;
+          }
+          const observed = yield* observeThreadCreateDetail(stored.record.requestId, intent);
+          if (Result.isSuccess(observed) && threadCreationMatches(intent, observed.success)) {
+            yield* finishThreadCreation(stored, record, intent, observed.success);
+            return;
+          }
+          const observation: Evidence = Result.isSuccess(observed)
+            ? {
+                kind: "snapshot",
+                observedAt: observed.success.observedAt,
+                sourceSequence:
+                  observed.success.threadSequence ?? observed.success.snapshotSequence,
+                nativeEventId: intent.threadId,
+                detail: THREAD_CREATE_IDENTITY_MISMATCH_DETAIL,
+              }
+            : {
+                kind: "adapter_inference",
+                observedAt: yield* nowIso,
+                sourceSequence: null,
+                nativeEventId: intent.threadId,
+                detail: `T3Code accepted thread creation, but fresh detail could not establish the target association (${observed.failure.message}).`,
+              };
+          yield* recordThreadCreationPending(
+            stored,
+            record,
+            record.dispatch === "accepted" ? "accepted" : "unknown",
+            observation,
+          );
+        });
+
+      const executeThreadCreate = (
+        input: ThreadCreateInput,
+        intent: ThreadCreateIntent,
+        commandId: string,
+        initialPlan: ResolvedThreadCreatePlan,
+      ): Effect.Effect<void, never> => {
+        const dispatchState = { started: false, accepted: false };
+        return Effect.gen(function* () {
+          const claimed = yield* claimThreadCreateExecution(input, intent);
+          if (!claimed) return;
+          const request = yield* prepareThreadCreateRequest(
+            input,
+            intent,
+            commandId,
+            initialPlan,
+            dispatchState,
+          );
+          const response = yield* connections.createThread(intent.instanceId, request);
+          dispatchState.accepted = true;
+          const stored = yield* recordThreadCreateCommandAccepted(
+            input.requestId,
+            intent,
+            commandId,
+            response.sequence,
+          );
+          yield* observeThreadCreateResult(stored, intent);
+        }).pipe(
+          Effect.catch(
+            (
+              error:
+                | LocalStoreError
+                | T3CodeAdapterError
+                | ObservationError
+                | ThreadCreateError
+                | ThreadCreateDispatchClaimLost,
+            ) =>
+              recordThreadCreateFailure(
+                input.requestId,
+                intent,
+                error,
+                dispatchState.started,
+                dispatchState.accepted,
+              ),
+          ),
+          Effect.asVoid,
+        );
+      };
+
       const executeApprovalResponse = (
         input: ApprovalRespondInput,
         commandId: string,
@@ -6001,6 +7194,65 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           });
         });
 
+      const createThread = (
+        input: ThreadCreateInput,
+      ): Effect.Effect<
+        OperationRecord,
+        | LocalStoreError
+        | OperationServiceError
+        | ThreadCreateError
+        | T3CodeAdapterError
+        | ObservationError
+      > =>
+        Effect.gen(function* () {
+          const fingerprint = yield* store.fingerprintRequest("thread_create", input);
+          const existing = yield* findExistingOperation(input.requestId, fingerprint);
+          if (existing !== null) return existing;
+
+          const plan = yield* resolveThreadCreatePlan(input, connections);
+          const commandId = yield* crypto.randomUUIDv4.pipe(
+            Effect.mapError(
+              () =>
+                new LocalStoreError({
+                  kind: "storage",
+                  message: "The operation supervisor could not create a thread command identity.",
+                }),
+            ),
+          );
+          const threadId = yield* crypto.randomUUIDv4.pipe(
+            Effect.mapError(
+              () =>
+                new LocalStoreError({
+                  kind: "storage",
+                  message: "The operation supervisor could not create a native thread identity.",
+                }),
+            ),
+          );
+          const intent: ThreadCreateIntent = {
+            instanceId: input.project.instanceId,
+            projectId: input.project.projectId,
+            threadId,
+            title: input.title,
+            repositoryPath: plan.repositoryPath,
+            branch: plan.branch,
+            worktreePath: plan.worktreePath,
+            modelSelection: plan.modelSelection,
+            runtimeMode: input.runtimeMode,
+            interactionMode: input.interactionMode,
+          };
+          return yield* admitAndRun({
+            requestId: input.requestId,
+            fingerprint,
+            tool: "thread_create",
+            intent,
+            target: { instanceId: intent.instanceId, threadId },
+            commandId,
+            completionMeans: "thread_created",
+            steps: ["dispatch_thread_create", "observe_created_thread"],
+            execute: executeThreadCreate(input, intent, commandId, plan),
+          });
+        });
+
       const admitApprovalResponse = (
         input: ApprovalRespondInput,
         fingerprint: string,
@@ -6119,6 +7371,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
         submitThread,
         createWorktree,
         discardWorktree,
+        createThread,
         respondToApproval,
         interruptThread,
         stopThreadSession,

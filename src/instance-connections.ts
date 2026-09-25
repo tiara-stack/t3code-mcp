@@ -35,6 +35,7 @@ import {
   type VcsDiffPreview,
   type VerifiedInstance,
   type CreatedWorktree,
+  type ThreadCreateRequest,
   type WorktreeCreateRequest,
 } from "./t3code-adapter";
 
@@ -157,6 +158,10 @@ export interface InstanceConnectionsService {
     expectedRegistration: Pick<InstanceConnection, "revision" | "environmentId">,
     onDispatchStart: () => void,
   ) => Effect.Effect<void, LocalStoreError | T3CodeAdapterError>;
+  readonly createThread: <E>(
+    instanceId: string,
+    input: ThreadCreateRequest & { readonly onDispatch: Effect.Effect<void, E, never> },
+  ) => Effect.Effect<{ readonly sequence: number }, LocalStoreError | T3CodeAdapterError | E>;
   /**
    * Read the VCS refs for one repository path on the target instance, keeping
    * only refs that report a worktree checkout. A missing registration or an
@@ -247,6 +252,7 @@ export class InstanceConnections extends Context.Service<
       | "interruptThread"
       | "prepareThreadSessionStop"
       | "removeWorktree"
+      | "createThread"
     > &
       Partial<
         Pick<
@@ -257,6 +263,7 @@ export class InstanceConnections extends Context.Service<
           | "interruptThread"
           | "prepareThreadSessionStop"
           | "removeWorktree"
+          | "createThread"
         >
       >,
   ): Layer.Layer<InstanceConnections> =>
@@ -327,6 +334,17 @@ export class InstanceConnections extends Context.Service<
             new T3CodeAdapterError({
               kind: "capacity",
               message: "The test connection does not support worktree removal.",
+              uncertain: false,
+              status: null,
+            }),
+          )),
+      createThread:
+        service.createThread ??
+        (() =>
+          Effect.fail(
+            new T3CodeAdapterError({
+              kind: "capacity",
+              message: "The test connection does not support thread creation.",
               uncertain: false,
               status: null,
             }),
@@ -1111,7 +1129,6 @@ export class InstanceConnections extends Context.Service<
               }),
             );
           });
-
         const removeWorktree = (
           worktree: WorktreeReference,
           expectedRegistration: Pick<InstanceConnection, "revision" | "environmentId">,
@@ -1154,6 +1171,26 @@ export class InstanceConnections extends Context.Service<
               }),
             );
           });
+
+        const createThread = <E>(
+          instanceId: string,
+          input: ThreadCreateRequest & { readonly onDispatch: Effect.Effect<void, E, never> },
+        ) =>
+          Effect.gen(function* () {
+            yield* requireReadableRegistration(
+              instanceId,
+              "The saved registration requires pairing before threads can be created.",
+            );
+            const connection = yield* acquire(instanceId);
+            return yield* withInstanceCapacity(
+              instanceId,
+              adapter.createThread({
+                endpoint: connection.endpoint,
+                credential: connection.credential,
+                ...input,
+              }),
+            );
+          });
         return InstanceConnections.of({
           exchangePairingCode,
           verifyCredential,
@@ -1167,6 +1204,7 @@ export class InstanceConnections extends Context.Service<
           createWorktree,
           prepareThreadSessionStop,
           removeWorktree,
+          createThread,
           discoverVcsRefs,
           readVcsWorktreeStatus,
           readVcsWorktreeDiffPreview,

@@ -5,6 +5,7 @@ import * as Effect from "effect/Effect";
 import * as Clock from "effect/Clock";
 import * as Result from "effect/Result";
 import * as Layer from "effect/Layer";
+import * as Match from "effect/Match";
 import * as McpSchema from "effect/unstable/ai/McpSchema";
 import * as McpServer from "effect/unstable/ai/McpServer";
 import * as Option from "effect/Option";
@@ -17,6 +18,7 @@ import {
   ApprovalRespondInputSchema,
   DiffReadInputSchema,
   DiffReadToolResultSchema,
+  ThreadCreateInputSchema,
   InstanceRemoveInputSchema,
   InstanceListInputSchema,
   InstanceGetInputSchema,
@@ -42,6 +44,7 @@ import {
   type PendingRequest,
   type ThreadCondition,
   type ThreadConfiguration,
+  type ThreadCreateInput,
   type ThreadGetCaptureQuery,
   type ThreadObservationCursor,
   type ThreadOutputCaptureFrame,
@@ -136,14 +139,18 @@ import {
   type TurnEvidenceRecord,
   type WorktreeCaptureMetadata,
 } from "./local-store";
-import { OperationServiceError, Operations, type WorktreeDiscardEligibility } from "./operations";
+import {
+  OperationServiceError,
+  Operations,
+  ThreadCreateError,
+  type WorktreeDiscardEligibility,
+} from "./operations";
 import {
   InstanceConnections,
   type DiscoveredModels,
   type DiscoveredProjects,
   type DiscoveredVcsRefs,
   type InstanceConnectionsService,
-  type DiscoveredVcsWorktreeRefs,
   type ObservedVcsWorktreeStatus,
   type ObservedVcsDiffPreview,
 } from "./instance-connections";
@@ -162,7 +169,13 @@ import {
 } from "./t3code-adapter";
 import { pendingRequestsFromActivities } from "./pending-requests";
 import { adapterErrorFailure, observationErrorFailure } from "./tool-failure";
-import { makeBoundedJitteredRetrySchedule } from "./retry-schedule";
+import {
+  readVerifiedWorktreeCheckout,
+  retryWorktreeInspectionCapacity,
+  verifyCompleteWorktreeRefInventory,
+  worktreeRefForPath,
+  WORKTREE_INSPECTION_BOUND_MILLIS,
+} from "./worktree-checkout";
 
 const withToolHints = <
   Name extends string,
@@ -515,6 +528,20 @@ export const ThreadInterruptTool = asRegistrationMutation(
 );
 
 // fallow-ignore-next-line unused-export
+export const ThreadCreateTool = Tool.make("thread_create", {
+  description:
+    "Create an unstarted thread on a discovered project using a verified project-root or existing worktree checkout and explicit effective settings. This does not create a worktree or submit a prompt.",
+  parameters: ThreadCreateInputSchema,
+  success: OperationToolResultSchema,
+})
+  .addDependency(LocalStore)
+  .addDependency(Operations)
+  .annotate(Tool.Readonly, false)
+  .annotate(Tool.Destructive, false)
+  .annotate(Tool.Idempotent, false)
+  .annotate(Tool.OpenWorld, true);
+
+// fallow-ignore-next-line unused-export
 export const OperationGetTool = Tool.make("operation_get", {
   description: "Recover an admitted mutation receipt by request ID.",
   parameters: OperationGetInputSchema,
@@ -547,6 +574,7 @@ export const ServerToolkit = Toolkit.make(
   InstanceRemoveTool,
   WorktreeCreateTool,
   ThreadInterruptTool,
+  ThreadCreateTool,
   ProjectListTool,
   ModelListTool,
   WorktreeListTool,
@@ -602,12 +630,27 @@ const operationServiceFailures = {
 
 // fallow-ignore-next-line complexity
 const toToolFailure = (
-  error: LocalStoreError | OperationServiceError | T3CodeAdapterError | ObservationError,
+  error:
+    | LocalStoreError
+    | OperationServiceError
+    | ThreadCreateError
+    | T3CodeAdapterError
+    | ObservationError,
+  adapterErrorContext: Parameters<typeof adapterErrorFailure>[1] = "read",
+) =>
+  Match.value(error).pipe(
+    Match.tag("ThreadCreateError", (createError) => createError.failure),
+    Match.tag("T3CodeAdapterError", (adapterError) =>
+      adapterErrorFailure(adapterError, adapterErrorContext),
+    ),
+    Match.orElse(toToolFailureWithoutThreadCreate),
+  );
+
+// fallow-ignore-next-line complexity
+const toToolFailureWithoutThreadCreate = (
+  error: LocalStoreError | OperationServiceError | ObservationError,
 ) => {
   if (error instanceof ObservationError) return observationErrorFailure(error);
-  if (error instanceof T3CodeAdapterError) {
-    return adapterErrorFailure(error, "read");
-  }
   if (error instanceof OperationServiceError) {
     const failure = operationServiceFailures[error.kind];
     return makeToolFailure(error.message, failure.code, failure.retry, failure.details);
@@ -656,11 +699,64 @@ const toToolFailure = (
   }
 };
 
+type OperationObservation = {
+  readonly instanceId: string;
+  readonly observedAt: string;
+  readonly freshness: "fresh";
+  readonly sourceSequence: number | null;
+  readonly coverage: "complete_for_query";
+  readonly limitations: ReadonlyArray<string>;
+};
+
+const operationObservations = (
+  operation: OperationRecord,
+  observedAt: string,
+): ReadonlyArray<OperationObservation> =>
+  Match.value(operation).pipe(
+    Match.when({ tool: "thread_create", state: "completed" }, (completedCreation) => {
+      const evidence = [...completedCreation.evidence]
+        .reverse()
+        .find((item) => item.kind === "snapshot");
+      return evidence === undefined || completedCreation.target === null
+        ? []
+        : [
+            {
+              instanceId: completedCreation.target.instanceId,
+              observedAt: evidence.observedAt,
+              freshness: "fresh" as const,
+              sourceSequence: evidence.sourceSequence,
+              coverage: "complete_for_query" as const,
+              limitations: [],
+            },
+          ];
+    }),
+    Match.when({ tool: "thread_create" }, () => []),
+    Match.orElse((otherOperation) =>
+      otherOperation.target === null
+        ? []
+        : [
+            {
+              instanceId: otherOperation.target.instanceId,
+              observedAt,
+              freshness: "fresh" as const,
+              sourceSequence: null,
+              coverage: "complete_for_query" as const,
+              limitations: [],
+            },
+          ],
+    ),
+  );
+
 const operationMutationResult = (
   operation: Effect.Effect<
     OperationRecord,
-    LocalStoreError | OperationServiceError | T3CodeAdapterError | ObservationError
+    | LocalStoreError
+    | OperationServiceError
+    | ThreadCreateError
+    | T3CodeAdapterError
+    | ObservationError
   >,
+  adapterErrorContext: Parameters<typeof adapterErrorFailure>[1] = "read",
 ): Effect.Effect<
   | {
       readonly result: { readonly kind: "ok"; readonly value: OperationRecord };
@@ -668,7 +764,7 @@ const operationMutationResult = (
         readonly instanceId: string;
         readonly observedAt: string;
         readonly freshness: "fresh";
-        readonly sourceSequence: null;
+        readonly sourceSequence: number | null;
         readonly coverage: "complete_for_query";
         readonly limitations: ReadonlyArray<string>;
       }>;
@@ -686,26 +782,21 @@ const operationMutationResult = (
     const observedAt = new Date(yield* Clock.currentTimeMillis).toISOString();
     return {
       result: { kind: "ok" as const, value },
-      observations:
-        value.target === null
-          ? []
-          : [
-              {
-                instanceId: value.target.instanceId,
-                observedAt,
-                freshness: "fresh" as const,
-                sourceSequence: null,
-                coverage: "complete_for_query" as const,
-                limitations: [],
-              },
-            ],
+      observations: operationObservations(value, observedAt),
       warnings: [],
     };
   }).pipe(
     Effect.catch(
-      (error: LocalStoreError | OperationServiceError | T3CodeAdapterError | ObservationError) =>
+      (
+        error:
+          | LocalStoreError
+          | OperationServiceError
+          | ThreadCreateError
+          | T3CodeAdapterError
+          | ObservationError,
+      ) =>
         Effect.succeed({
-          result: { kind: "error" as const, error: toToolFailure(error) },
+          result: { kind: "error" as const, error: toToolFailure(error, adapterErrorContext) },
           observations: [],
           warnings: [],
         }),
@@ -1826,11 +1917,6 @@ const discoverWorktreePage = (options: {
   });
 
 const MAX_WORKTREE_INSPECTION_REFERENCES = 128;
-const WORKTREE_INSPECTION_BOUND_MILLIS = 60_000;
-const worktreeInspectionCapacityRetrySchedule = makeBoundedJitteredRetrySchedule(
-  WORKTREE_INSPECTION_BOUND_MILLIS,
-);
-
 const withWorktreeInspectionBound = <A, E, R>(
   effect: Effect.Effect<A, E, R>,
   activity: string,
@@ -1847,14 +1933,6 @@ const withWorktreeInspectionBound = <A, E, R>(
         ),
     }),
   );
-
-const retryWorktreeInspectionCapacity = <A>(
-  effect: Effect.Effect<A, LocalStoreError | T3CodeAdapterError | ObservationError>,
-): Effect.Effect<A, LocalStoreError | T3CodeAdapterError | ObservationError> =>
-  Effect.retry(effect, {
-    schedule: worktreeInspectionCapacityRetrySchedule,
-    while: (error) => error instanceof T3CodeAdapterError && error.kind === "capacity",
-  });
 
 interface WorktreeReferenceCandidate {
   readonly summary: ThreadSummary;
@@ -2214,162 +2292,6 @@ const readWorktreeReferenceInventory = (options: {
     });
   });
 
-const vcsStatusObservation = (
-  instanceId: string,
-  status: ObservedVcsWorktreeStatus,
-): Observation => ({
-  instanceId,
-  observedAt: status.observedAt,
-  freshness: "fresh",
-  sourceSequence: null,
-  coverage: "complete_for_query",
-  limitations: [...status.limitations],
-});
-
-const vcsRefsObservation = (instanceId: string, refs: DiscoveredVcsWorktreeRefs): Observation => ({
-  instanceId,
-  observedAt: refs.observedAt,
-  freshness: refs.truncated ? "unknown" : "fresh",
-  sourceSequence: null,
-  coverage: refs.truncated ? "partial" : "complete_for_query",
-  limitations: [...refs.limitations],
-});
-
-const verifyCompleteVcsRefInventory = (
-  refs: DiscoveredVcsWorktreeRefs,
-): Effect.Effect<void, T3CodeAdapterError | ObservationError> => {
-  if (!refs.isRepo) {
-    return Effect.fail(
-      new T3CodeAdapterError({
-        kind: "resource_not_found",
-        message: "The repository path does not resolve to a local repository.",
-        uncertain: false,
-        status: null,
-      }),
-    );
-  }
-  if (refs.pageLimitExceeded === true) {
-    return Effect.fail(
-      new ObservationError({
-        kind: "uncheckable_target",
-        message:
-          refs.limitations[0] ?? "The complete VCS ref inventory exceeds its supported page bound.",
-      }),
-    );
-  }
-  if (refs.truncated || refs.limitations.length > 0) {
-    return Effect.fail(
-      new ObservationError({
-        kind: "boundary_missing",
-        message: refs.limitations[0] ?? "The complete VCS ref inventory could not be established.",
-      }),
-    );
-  }
-  return Effect.void;
-};
-
-const worktreeRefForPath = (
-  refs: DiscoveredVcsWorktreeRefs,
-  worktreePath: string,
-): Effect.Effect<DiscoveredVcsWorktreeRefs["refs"][number], ObservationError> => {
-  const matches = refs.refs.filter((ref) => ref.worktreePath === worktreePath);
-  if (matches.length === 1 && matches[0] !== undefined) return Effect.succeed(matches[0]);
-  return Effect.fail(
-    new ObservationError({
-      kind: matches.length === 0 ? "uncheckable_target" : "ambiguous_target",
-      message:
-        matches.length === 0
-          ? "The supplied path is not attached to a verifiable local VCS ref in the supplied repository."
-          : "The supplied worktree path maps to more than one VCS ref.",
-    }),
-  );
-};
-
-const verifyWorktreeVcsIdentity = (options: {
-  readonly worktree: WorktreeInspectionQuery["worktree"];
-  readonly status: ObservedVcsWorktreeStatus;
-  readonly refs: DiscoveredVcsWorktreeRefs;
-}): Effect.Effect<string, T3CodeAdapterError | ObservationError> =>
-  Effect.gen(function* () {
-    const { worktree, status, refs } = options;
-    if (!status.isRepo) {
-      return yield* Effect.fail(
-        new T3CodeAdapterError({
-          kind: "resource_not_found",
-          message: "The worktree path does not resolve to a repository-backed checkout.",
-          uncertain: false,
-          status: null,
-        }),
-      );
-    }
-    yield* verifyCompleteVcsRefInventory(refs);
-    if (worktree.worktreePath === worktree.repositoryPath) {
-      return yield* Effect.fail(
-        new ObservationError({
-          kind: "uncheckable_target",
-          message:
-            "The supplied worktree path is the repository root; discard consequences apply only to linked worktrees.",
-        }),
-      );
-    }
-    const ref = yield* worktreeRefForPath(refs, worktree.worktreePath);
-    if (status.branch === null || status.branch !== ref.branch) {
-      return yield* Effect.fail(
-        new ObservationError({
-          kind: "stale_generation",
-          message: "The worktree branch changed while its target identity was being checked.",
-        }),
-      );
-    }
-    return ref.branch;
-  });
-
-const readWorktreeVcsEvidence = (options: {
-  readonly connections: InstanceConnectionsService;
-  readonly worktree: WorktreeInspectionQuery["worktree"];
-}): Effect.Effect<
-  {
-    readonly branch: string;
-    readonly status: ObservedVcsWorktreeStatus;
-    readonly refs: DiscoveredVcsWorktreeRefs;
-    readonly observations: ReadonlyArray<Observation>;
-  },
-  LocalStoreError | T3CodeAdapterError | ObservationError
-> =>
-  Effect.gen(function* () {
-    const [status, refs] = yield* Effect.all(
-      [
-        retryWorktreeInspectionCapacity(
-          options.connections.readVcsWorktreeStatus(
-            options.worktree.instanceId,
-            options.worktree.worktreePath,
-          ),
-        ),
-        retryWorktreeInspectionCapacity(
-          options.connections.discoverVcsWorktreeRefs(
-            options.worktree.instanceId,
-            options.worktree.repositoryPath,
-          ),
-        ),
-      ],
-      { concurrency: "unbounded" },
-    );
-    const branch = yield* verifyWorktreeVcsIdentity({
-      worktree: options.worktree,
-      status,
-      refs,
-    });
-    return {
-      branch,
-      status,
-      refs,
-      observations: [
-        vcsStatusObservation(options.worktree.instanceId, status),
-        vcsRefsObservation(options.worktree.instanceId, refs),
-      ],
-    };
-  });
-
 const checkOrphanWorktree = (options: {
   readonly connections: InstanceConnectionsService;
   readonly observations: ObservationsService;
@@ -2382,7 +2304,10 @@ const checkOrphanWorktree = (options: {
     const registrationBefore = yield* retryWorktreeInspectionCapacity(
       options.connections.acquire(options.worktree.instanceId),
     );
-    const vcs = yield* readWorktreeVcsEvidence(options);
+    const vcs = yield* readVerifiedWorktreeCheckout({
+      connections: options.connections,
+      worktree: options.worktree,
+    });
     const references = yield* readWorktreeReferenceInventory({
       observations: options.observations,
       worktree: options.worktree,
@@ -2780,7 +2705,7 @@ const inspectWorktreeFresh = (options: {
   const inspection = Effect.gen(function* () {
     const { store, connections, observations, query, limit } = options;
     const worktree = query.worktree;
-    const initialVcs = yield* readWorktreeVcsEvidence({ connections, worktree });
+    const initialVcs = yield* readVerifiedWorktreeCheckout({ connections, worktree });
     const initialReferences = yield* readWorktreeReferenceInventory({ observations, worktree });
     const records = yield* inspectWorktreeThreads({
       observations,
@@ -2791,7 +2716,7 @@ const inspectWorktreeFresh = (options: {
     yield* assertSameWorktreeReferenceInventory(initialReferences, finalReferences);
     yield* assertWorktreeThreadsUnchanged({ worktree, references: finalReferences, records });
 
-    const finalVcs = yield* readWorktreeVcsEvidence({ connections, worktree });
+    const finalVcs = yield* readVerifiedWorktreeCheckout({ connections, worktree });
     yield* assertSameWorktreeBranch(initialVcs.branch, finalVcs.branch);
     yield* assertWorktreeThreadBranchesMatch(records, finalVcs.branch);
 
@@ -3813,7 +3738,7 @@ const readFreshDiffRead = (options: {
           query.source.worktree.instanceId,
           query.source.worktree.repositoryPath,
         );
-        yield* verifyCompleteVcsRefInventory(refs);
+        yield* verifyCompleteWorktreeRefInventory(refs);
         yield* worktreeRefForPath(refs, query.source.worktree.worktreePath);
       }),
     );
@@ -4211,7 +4136,7 @@ const runThreadWait = (
 ): Effect.Effect<ThreadWaitToolResult, LocalStoreError | T3CodeAdapterError | ObservationError> =>
   Effect.gen(function* () {
     const { observations, thread, condition, cursor, waitMs } = options;
-    const { instanceId, threadId } = thread;
+    const { instanceId } = thread;
     // The project lookup answers one shell read per observation; cache it
     // across polls and re-resolve only when the fields it depends on change.
     let cachedProject: {
@@ -4240,7 +4165,7 @@ const runThreadWait = (
       });
     return yield* runObservedThreadWaitLoop({
       waitMs,
-      observe: () => observations.threadDetail(instanceId, threadId),
+      observe: () => observations.threadDetail(instanceId, thread.threadId),
       unavailable: (failure) =>
         threadWaitObservationResult({
           condition,
@@ -5036,6 +4961,11 @@ const serverToolHandlers = ServerToolkit.of({
       const operations = yield* Operations;
       return yield* operationMutationResult(operations.respondToInput(input));
     }),
+  thread_create: (input: ThreadCreateInput) =>
+    Effect.gen(function* () {
+      const operations = yield* Operations;
+      return yield* operationMutationResult(operations.createThread(input), "thread_create");
+    }),
   operation_get: (input) =>
     Effect.gen(function* () {
       const operations = yield* Operations;
@@ -5043,19 +4973,7 @@ const serverToolHandlers = ServerToolkit.of({
       const observedAt = new Date(yield* Clock.currentTimeMillis).toISOString();
       return {
         result: { kind: "ok" as const, value },
-        observations:
-          value.operation.target === null
-            ? []
-            : [
-                {
-                  instanceId: value.operation.target.instanceId,
-                  observedAt,
-                  freshness: "fresh" as const,
-                  sourceSequence: null,
-                  coverage: "complete_for_query" as const,
-                  limitations: [],
-                },
-              ],
+        observations: operationObservations(value.operation, observedAt),
         warnings: [],
       };
     }).pipe(
@@ -5092,6 +5010,7 @@ const operationMutatorTools: ReadonlySet<string> = new Set([
   "worktree_create",
   "thread_submit",
   "worktree_discard",
+  "thread_create",
   "approval_respond",
   "thread_interrupt",
   "thread_stop_session",

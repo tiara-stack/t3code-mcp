@@ -17,6 +17,8 @@ import { DatabaseSync } from "node:sqlite";
 import { LocalStore, LocalStoreError, type LocalStoreService } from "./local-store";
 import {
   InstanceConnections,
+  type DiscoveredModels,
+  type DiscoveredProjects,
   type DiscoveredVcsRefs,
   type InstanceConnectionsService,
   type DiscoveredVcsWorktreeRefs,
@@ -34,15 +36,22 @@ import {
   type PairingExchangeInput,
   type ShellStreamItem,
   type T3CodeAdapterService,
+  type ThreadCreateRequest,
   type ThreadStreamItem,
 } from "./t3code-adapter";
 import {
   encodeThreadObservationCursor,
   LIVE_EFFECT_OBSERVATION_MILLIS,
+  ThreadCreateInputSchema,
   WorktreeCreateInputSchema,
   type Evidence,
 } from "./domain";
-import type { ApprovalResponseCommand, ThreadListPage, WorktreeListPage } from "./domain";
+import type {
+  ApprovalResponseCommand,
+  ModelSelection,
+  ThreadListPage,
+  WorktreeListPage,
+} from "./domain";
 import { ServerToolkit, serverToolkitLayer } from "./tools";
 
 const THIRTY_DAYS_MILLIS = 30 * 24 * 60 * 60 * 1000;
@@ -330,6 +339,7 @@ const fakeConnections = (options?: {
       ),
     createWorktree: () => Effect.die("not used"),
     removeWorktree: () => Effect.die("not used"),
+    createThread: () => Effect.die("not used"),
     respondToApproval: failApprovalResponse,
     invalidate: () => Effect.void,
   });
@@ -355,6 +365,15 @@ const fakeAdapterLayer = (
   ) => Effect.Effect<DispatchTurnResult, T3CodeAdapterError>,
   verificationFailure?: T3CodeAdapterError,
   removeWorktree: T3CodeAdapterService["removeWorktree"] = () => Effect.die("not used"),
+  createThread: T3CodeAdapterService["createThread"] = () =>
+    Effect.fail(
+      new T3CodeAdapterError({
+        kind: "capacity",
+        message: "The test adapter does not support thread creation.",
+        uncertain: false,
+        status: null,
+      }),
+    ),
 ) =>
   T3CodeAdapter.layerTest({
     exchangePairingCode: () =>
@@ -436,6 +455,7 @@ const fakeAdapterLayer = (
         : ({ cwd }) => Effect.succeed(worktreeRefListing(`${cwd}/.worktrees/feature`))),
     createWorktree,
     removeWorktree,
+    createThread,
     respondToApproval: failApprovalResponse,
     listVcsRefs: () =>
       Effect.fail(
@@ -3975,6 +3995,7 @@ const projectFixtures = (
       ),
     respondToInput: () => Effect.die("not used"),
     createWorktree: () => Effect.die("not used"),
+    createThread: () => Effect.die("not used"),
     respondToApproval: failApprovalResponse,
     listVcsRefs: () =>
       Effect.fail(
@@ -4015,6 +4036,80 @@ describe("WorktreeCreateInputSchema", () => {
     expect(Schema.is(WorktreeCreateInputSchema)({ ...input, unrecognized: true })).toBe(false);
     expect(Schema.is(WorktreeCreateInputSchema)({ ...input, startRef: " " })).toBe(false);
     expect(Schema.is(WorktreeCreateInputSchema)({ ...input, path: "" })).toBe(false);
+  });
+});
+
+describe("ThreadCreateInputSchema", () => {
+  it("accepts explicit and project-default models with strict same-instance checkouts", () => {
+    const base = {
+      requestId: "thread-create-schema",
+      project: { instanceId: "instance-a", projectId: "project-a" },
+      title: "A verified thread",
+      checkout: { kind: "project_root" as const },
+      model: { kind: "project_default" as const },
+      runtimeMode: "approval-required" as const,
+      interactionMode: "default" as const,
+    };
+    const explicit = {
+      ...base,
+      checkout: {
+        kind: "worktree" as const,
+        worktree: {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/project",
+          worktreePath: "/srv/worktrees/feature",
+        },
+      },
+      model: {
+        kind: "explicit" as const,
+        selection: {
+          providerInstanceId: "provider-a",
+          model: "model-a",
+          options: [{ id: "reasoning", value: "high" }],
+        },
+      },
+    };
+
+    expect(Schema.is(ThreadCreateInputSchema)(base)).toBe(true);
+    expect(Schema.is(ThreadCreateInputSchema)(explicit)).toBe(true);
+    expect(Schema.is(ThreadCreateInputSchema)({ ...base, unexpected: true })).toBe(false);
+    expect(Schema.is(ThreadCreateInputSchema)({ ...base, title: " A verified thread" })).toBe(
+      false,
+    );
+    expect(
+      Schema.is(ThreadCreateInputSchema)({
+        ...base,
+        project: { ...base.project, projectId: " project-a " },
+      }),
+    ).toBe(false);
+    expect(
+      Schema.is(ThreadCreateInputSchema)({
+        ...explicit,
+        checkout: {
+          ...explicit.checkout,
+          worktree: { ...explicit.checkout.worktree, hostPath: "/host/path" },
+        },
+      }),
+    ).toBe(false);
+    expect(
+      Schema.is(ThreadCreateInputSchema)({
+        ...explicit,
+        checkout: {
+          ...explicit.checkout,
+          worktree: { ...explicit.checkout.worktree, worktreePath: "/srv/worktrees/feature " },
+        },
+      }),
+    ).toBe(false);
+    expect(
+      Schema.is(ThreadCreateInputSchema)({
+        ...explicit,
+        checkout: {
+          ...explicit.checkout,
+          worktree: { ...explicit.checkout.worktree, instanceId: "instance-b" },
+        },
+      }),
+    ).toBe(false);
+    expect(Schema.is(ThreadCreateInputSchema)({ ...base, runtimeMode: "inherit" })).toBe(false);
   });
 });
 
@@ -5216,6 +5311,7 @@ const modelFixtures = (
       ),
     respondToInput: () => Effect.die("not used"),
     createWorktree: () => Effect.die("not used"),
+    createThread: () => Effect.die("not used"),
     respondToApproval: failApprovalResponse,
     listVcsRefs: () =>
       Effect.fail(
@@ -5809,6 +5905,7 @@ describe("model_list", () => {
                 ),
               respondToInput: () => Effect.die("not used"),
               createWorktree: () => Effect.die("not used"),
+              createThread: () => Effect.die("not used"),
               respondToApproval: failApprovalResponse,
               listVcsRefs: () =>
                 Effect.fail(
@@ -6081,6 +6178,21 @@ interface ThreadFixtureOptions {
     readonly commandId: string;
     readonly createdAt: string;
   }) => Effect.Effect<{ readonly sequence: number }, T3CodeAdapterError>;
+  projectDiscovery?: (
+    instanceId: string,
+  ) => Effect.Effect<DiscoveredProjects, LocalStoreError | T3CodeAdapterError>;
+  modelDiscovery?: (
+    instanceId: string,
+  ) => Effect.Effect<DiscoveredModels, LocalStoreError | T3CodeAdapterError>;
+  threadStream?: (
+    instanceId: string,
+    threadId: string,
+    options?: { readonly afterSequence?: number; readonly turnLimit?: number },
+  ) => Stream.Stream<ThreadStreamItem, LocalStoreError | T3CodeAdapterError>;
+  threadCreate?: <E>(
+    instanceId: string,
+    input: ThreadCreateRequest & { readonly onDispatch: Effect.Effect<void, E, never> },
+  ) => Effect.Effect<{ readonly sequence: number }, LocalStoreError | T3CodeAdapterError | E>;
   activeStreams?: Readonly<
     Record<
       string,
@@ -6262,24 +6374,28 @@ const threadConnections = (options: ThreadFixtureOptions) =>
           status: null,
         }),
       ),
-    discoverProjects: () =>
-      Effect.fail(
-        new T3CodeAdapterError({
-          kind: "capacity",
-          message: "The thread test connection does not discover projects.",
-          uncertain: false,
-          status: null,
-        }),
-      ),
-    discoverModels: () =>
-      Effect.fail(
-        new T3CodeAdapterError({
-          kind: "capacity",
-          message: "The thread test connection does not discover models.",
-          uncertain: false,
-          status: null,
-        }),
-      ),
+    discoverProjects: (instanceId: string) =>
+      options.projectDiscovery === undefined
+        ? Effect.fail(
+            new T3CodeAdapterError({
+              kind: "capacity",
+              message: "The thread test connection does not discover projects.",
+              uncertain: false,
+              status: null,
+            }),
+          )
+        : options.projectDiscovery(instanceId),
+    discoverModels: (instanceId: string) =>
+      options.modelDiscovery === undefined
+        ? Effect.fail(
+            new T3CodeAdapterError({
+              kind: "capacity",
+              message: "The thread test connection does not discover models.",
+              uncertain: false,
+              status: null,
+            }),
+          )
+        : options.modelDiscovery(instanceId),
     prepareThreadSessionStop: (instanceId) =>
       Effect.succeed({
         dispatch: (input) =>
@@ -6373,6 +6489,8 @@ const threadConnections = (options: ThreadFixtureOptions) =>
     ) => {
       const key = `${instanceId}:${threadId}`;
       options.seenThreads.push(key);
+      const dynamic = options.threadStream?.(instanceId, threadId, streamOptions);
+      if (dynamic !== undefined) return dynamic;
       const scripted = options.threadStreams?.[key];
       if (scripted === undefined) {
         return Stream.fail(
@@ -6432,6 +6550,20 @@ const threadConnections = (options: ThreadFixtureOptions) =>
         return options.removeWorktree!(worktree, expectedRegistration);
       });
     },
+    createThread: <E>(
+      instanceId: string,
+      input: ThreadCreateRequest & { readonly onDispatch: Effect.Effect<void, E, never> },
+    ) =>
+      options.threadCreate === undefined
+        ? Effect.fail(
+            new T3CodeAdapterError({
+              kind: "capacity",
+              message: "The thread test connection does not create threads.",
+              uncertain: false,
+              status: null,
+            }),
+          )
+        : options.threadCreate(instanceId, input),
     respondToApproval: <E>(
       input: ApprovalResponseCommand & {
         readonly instanceId: string;
@@ -8354,12 +8486,27 @@ type ThreadGetToolResultShape = {
   readonly warnings: ReadonlyArray<{ readonly code: string }>;
 };
 
+type ThreadCreateReceiptResultShape = {
+  readonly result: {
+    readonly kind: "ok" | "error";
+    readonly value: {
+      readonly state: string;
+      readonly dispatch: string;
+      readonly evidence: ReadonlyArray<{ readonly detail: string }>;
+    };
+  };
+};
+
 const observedThreadFixture = (
   threadId: string,
   overrides: Partial<{
     readonly projectId: string;
     readonly title: string;
-    readonly modelSelection: { readonly providerInstanceId: string; readonly model: string };
+    readonly modelSelection: {
+      readonly providerInstanceId: string;
+      readonly model: string;
+      readonly options?: ReadonlyArray<{ readonly id: string; readonly value: string | boolean }>;
+    };
     readonly runtimeMode: "approval-required" | "auto-accept-edits" | "auto" | "full-access";
     readonly interactionMode: "default" | "plan";
     readonly branch: string | null;
@@ -8434,6 +8581,1028 @@ const detailSnapshotStream = (
     },
     { kind: "synchronized" as const },
   );
+
+const threadCreateFixtures = (defaultModel: ModelSelection | null = null) => {
+  const { options, connections } = emptyThreadFixtures();
+  const commands: Array<ThreadCreateRequest> = [];
+  options.projectDiscovery = () =>
+    Effect.succeed({
+      snapshotSequence: 1,
+      projects: [
+        {
+          projectId: "project-a",
+          title: "Project A",
+          repositoryPath: "/srv/project-a",
+          defaultModel,
+        },
+      ],
+      observedAt: "2026-09-24T03:00:00.000Z",
+    });
+  options.modelDiscovery = () =>
+    Effect.succeed({
+      providers: [
+        {
+          providerInstanceId: "provider-a",
+          providerName: "Provider A",
+          availability: "available",
+          unavailableReason: null,
+          models: [
+            {
+              slug: "model-a",
+              displayName: "Model A",
+              options: [
+                { kind: "select", id: "effort", values: ["low", "high"], defaultValue: "high" },
+                { kind: "boolean", id: "verbose", defaultValue: true },
+              ],
+            },
+            { slug: "model-b", displayName: "Model B", options: [] },
+          ],
+        },
+      ],
+      limitations: [],
+      observedAt: "2026-09-24T03:00:00.000Z",
+    });
+  options.threadCreate = (_instanceId, input) =>
+    Effect.gen(function* () {
+      yield* input.onDispatch;
+      const { onDispatch: _onDispatch, ...command } = input;
+      commands.push(command);
+      return { sequence: 42 };
+    });
+  options.threadStream = (_instanceId, threadId) => {
+    const command = commands.at(-1);
+    if (command === undefined) {
+      return Stream.fail(
+        new T3CodeAdapterError({
+          kind: "resource_not_found",
+          message: "No thread has been created in this fixture.",
+          uncertain: false,
+          status: null,
+        }),
+      );
+    }
+    return detailSnapshotStream(
+      43,
+      observedThreadFixture(threadId, {
+        projectId: command.projectId,
+        title: command.title,
+        modelSelection: {
+          providerInstanceId: command.modelSelection.providerInstanceId,
+          model: command.modelSelection.model,
+          ...(command.modelSelection.options === undefined
+            ? {}
+            : { options: command.modelSelection.options.map((option) => ({ ...option })) }),
+        },
+        runtimeMode: command.runtimeMode,
+        interactionMode: command.interactionMode,
+        branch: command.branch,
+        worktreePath: command.worktreePath,
+      }),
+    );
+  };
+  return { options, connections, commands };
+};
+
+describe("thread_create", () => {
+  it.live("rejects an environment identity mismatch before native dispatch", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        let createThreadCalls = 0;
+        const adapter = fakeAdapterLayer(
+          { current: null },
+          {},
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          () => {
+            createThreadCalls += 1;
+            return Effect.succeed({ sequence: 1 });
+          },
+        );
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            const store = yield* LocalStore;
+            yield* store.putRegistration({
+              instanceId: "instance-a",
+              alias: "Instance instance-a",
+              endpoint: "https://a.test",
+              environmentId: "environment-old",
+              connection: "connected",
+              lastObservedAt: "2026-09-24T03:00:00.000Z",
+              credential: "secret-a",
+            });
+            return yield* callTool("thread_create", {
+              requestId: "thread-create-environment-mismatch",
+              project: { instanceId: "instance-a", projectId: "project-a" },
+              title: "Reject the replaced environment",
+              checkout: { kind: "project_root" },
+              model: {
+                kind: "explicit",
+                selection: { providerInstanceId: "provider-a", model: "model-a" },
+              },
+              runtimeMode: "approval-required",
+              interactionMode: "default",
+            });
+          }).pipe(
+            Effect.provide(appLayer(databasePath, InstanceConnections.layerWithAdapter(adapter))),
+          ),
+        );
+
+        expect(createThreadCalls).toBe(0);
+        expect(result[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "identity_mismatch" } },
+        });
+      }),
+    ),
+  );
+
+  it.live("reports read and operate denials from required scopes", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const fixtures = threadCreateFixtures();
+        let requiredScopes: ReadonlyArray<string> = ["orchestration:read"];
+        fixtures.options.modelDiscovery = () =>
+          Effect.fail(
+            new T3CodeAdapterError({
+              kind: "authorization",
+              message: "The credential lacks a required orchestration scope.",
+              uncertain: false,
+              status: null,
+              requiredScopes,
+            }),
+          );
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const readDenied = yield* callTool("thread_create", {
+              requestId: "thread-create-read-denied",
+              project: { instanceId: "instance-a", projectId: "project-a" },
+              title: "Read denied",
+              checkout: { kind: "project_root" },
+              model: {
+                kind: "explicit",
+                selection: { providerInstanceId: "provider-a", model: "model-a" },
+              },
+              runtimeMode: "approval-required",
+              interactionMode: "default",
+            });
+            requiredScopes = ["orchestration:operate"];
+            const operateDenied = yield* callTool("thread_create", {
+              requestId: "thread-create-operate-denied",
+              project: { instanceId: "instance-a", projectId: "project-a" },
+              title: "Operate denied",
+              checkout: { kind: "project_root" },
+              model: {
+                kind: "explicit",
+                selection: { providerInstanceId: "provider-a", model: "model-a" },
+              },
+              runtimeMode: "approval-required",
+              interactionMode: "default",
+            });
+            return { readDenied, operateDenied };
+          }).pipe(Effect.provide(appLayer(databasePath, fixtures.connections))),
+        );
+
+        expect(fixtures.commands).toHaveLength(0);
+        expect(result.readDenied[0]?.result).toMatchObject({
+          result: {
+            kind: "error",
+            error: {
+              code: "read_denied",
+              retry: "change_request",
+              details: { requiredScopes: ["orchestration:read"] },
+            },
+          },
+        });
+        expect(result.operateDenied[0]?.result).toMatchObject({
+          result: {
+            kind: "error",
+            error: {
+              code: "operate_denied",
+              retry: "change_request",
+              details: { requiredScopes: ["orchestration:operate"] },
+            },
+          },
+        });
+      }),
+    ),
+  );
+
+  it.live(
+    "does not complete when the observed native thread reports different settings",
+    () =>
+      withDatabasePath((databasePath) =>
+        Effect.gen(function* () {
+          const fixtures = threadCreateFixtures();
+          fixtures.options.threadStream = (_instanceId, threadId) => {
+            const command = fixtures.commands[0];
+            if (command === undefined) throw new Error("thread_create sent no command");
+            return detailSnapshotStream(
+              43,
+              observedThreadFixture(threadId, {
+                projectId: command.projectId,
+                modelSelection: { providerInstanceId: "provider-a", model: "wrong-model" },
+                runtimeMode: "full-access",
+                interactionMode: "plan",
+                branch: command.branch,
+                worktreePath: command.worktreePath,
+              }),
+            );
+          };
+          const result = yield* Effect.scoped(
+            Effect.gen(function* () {
+              yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+              return yield* callTool("thread_create", {
+                requestId: "thread-create-observed-settings-mismatch",
+                project: { instanceId: "instance-a", projectId: "project-a" },
+                title: "Check observed settings",
+                checkout: { kind: "project_root" },
+                model: {
+                  kind: "explicit",
+                  selection: { providerInstanceId: "provider-a", model: "model-a" },
+                },
+                runtimeMode: "approval-required",
+                interactionMode: "default",
+              });
+            }).pipe(Effect.provide(appLayer(databasePath, fixtures.connections))),
+          );
+
+          expect(fixtures.commands).toHaveLength(1);
+          const toolResult = result[0]?.result as ThreadCreateReceiptResultShape | undefined;
+          expect(toolResult?.result.kind).toBe("ok");
+          expect(toolResult?.result.value.state).toBe("pending");
+          expect(toolResult?.result.value.dispatch).toBe("accepted");
+          expect(
+            toolResult?.result.value.evidence.some((item) =>
+              item.detail.includes("settings differ from the request"),
+            ),
+          ).toBe(true);
+        }),
+      ),
+    40_000,
+  );
+
+  it.live(
+    "does not complete when the observed native thread identity differs",
+    () =>
+      withDatabasePath((databasePath) =>
+        Effect.gen(function* () {
+          const fixtures = threadCreateFixtures();
+          fixtures.options.threadStream = (_instanceId, threadId) => {
+            const command = fixtures.commands[0];
+            if (command === undefined) throw new Error("thread_create sent no command");
+            return detailSnapshotStream(
+              43,
+              observedThreadFixture(`${threadId}-unexpected`, {
+                projectId: command.projectId,
+                modelSelection: {
+                  providerInstanceId: command.modelSelection.providerInstanceId,
+                  model: command.modelSelection.model,
+                  ...(command.modelSelection.options === undefined
+                    ? {}
+                    : { options: command.modelSelection.options.map((option) => ({ ...option })) }),
+                },
+                runtimeMode: command.runtimeMode,
+                interactionMode: command.interactionMode,
+                branch: command.branch,
+                worktreePath: command.worktreePath,
+              }),
+            );
+          };
+          const result = yield* Effect.scoped(
+            Effect.gen(function* () {
+              yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+              return yield* callTool("thread_create", {
+                requestId: "thread-create-observed-identity-mismatch",
+                project: { instanceId: "instance-a", projectId: "project-a" },
+                title: "Check observed identity",
+                checkout: { kind: "project_root" },
+                model: {
+                  kind: "explicit",
+                  selection: { providerInstanceId: "provider-a", model: "model-a" },
+                },
+                runtimeMode: "approval-required",
+                interactionMode: "default",
+              });
+            }).pipe(Effect.provide(appLayer(databasePath, fixtures.connections))),
+          );
+
+          expect(fixtures.commands).toHaveLength(1);
+          const toolResult = result[0]?.result as ThreadCreateReceiptResultShape | undefined;
+          expect(toolResult?.result.kind).toBe("ok");
+          expect(toolResult?.result.value.state).toBe("pending");
+          expect(toolResult?.result.value.dispatch).toBe("accepted");
+          expect(
+            toolResult?.result.value.evidence.some((item) =>
+              item.detail.includes("thread identity"),
+            ),
+          ).toBe(true);
+        }),
+      ),
+    40_000,
+  );
+
+  it.live("resolves project defaults and stores effective settings in a stable receipt", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const fixtures = threadCreateFixtures({
+          providerInstanceId: "provider-a",
+          model: "model-a",
+          options: [{ id: "effort", value: "low" }],
+        });
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const request = {
+              requestId: "thread-create-default",
+              project: { instanceId: "instance-a", projectId: "project-a" },
+              title: "Prepare the patch",
+              checkout: { kind: "project_root" as const },
+              model: { kind: "project_default" as const },
+              runtimeMode: "approval-required" as const,
+              interactionMode: "plan" as const,
+            };
+            const first = yield* callTool("thread_create", request);
+            fixtures.options.threadStream = (_instanceId, threadId) => {
+              const command = fixtures.commands[0];
+              if (command === undefined) throw new Error("thread_create sent no command");
+              return detailSnapshotStream(
+                44,
+                observedThreadFixture(threadId, {
+                  projectId: command.projectId,
+                  title: "Renamed by the UI after creation",
+                  modelSelection: { providerInstanceId: "provider-a", model: "ui-selected-model" },
+                  runtimeMode: "full-access",
+                  interactionMode: "default",
+                  branch: command.branch,
+                  worktreePath: command.worktreePath,
+                }),
+              );
+            };
+            const replay = yield* callTool("thread_create", request);
+            return { first, replay };
+          }).pipe(Effect.provide(appLayer(databasePath, fixtures.connections))),
+        );
+
+        expect(fixtures.commands).toHaveLength(1);
+        expect(fixtures.commands[0]).toMatchObject({
+          projectId: "project-a",
+          title: "Prepare the patch",
+          modelSelection: {
+            providerInstanceId: "provider-a",
+            model: "model-a",
+            options: [
+              { id: "effort", value: "low" },
+              { id: "verbose", value: true },
+            ],
+          },
+          runtimeMode: "approval-required",
+          interactionMode: "plan",
+          branch: null,
+          worktreePath: null,
+        });
+        expect(result.first[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              tool: "thread_create",
+              state: "completed",
+              dispatch: "accepted",
+              completionMeans: "thread_created",
+              created: {
+                thread: { instanceId: "instance-a" },
+                threadConfiguration: {
+                  model: {
+                    providerInstanceId: "provider-a",
+                    model: "model-a",
+                    options: [
+                      { id: "effort", value: "low" },
+                      { id: "verbose", value: true },
+                    ],
+                  },
+                  runtimeMode: "approval-required",
+                  interactionMode: "plan",
+                },
+              },
+            },
+          },
+        });
+        expect(result.replay[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              requestId: "thread-create-default",
+              state: "completed",
+              created: {
+                threadConfiguration: {
+                  model: { model: "model-a" },
+                  runtimeMode: "approval-required",
+                  interactionMode: "plan",
+                },
+              },
+            },
+          },
+        });
+      }),
+    ),
+  );
+
+  it.live("validates an existing worktree and never creates one as part of thread creation", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const fixtures = threadCreateFixtures();
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/project-a",
+          worktreePath: "/srv/worktrees/feature-a",
+        };
+        fixtures.options.vcsStatuses = {
+          [JSON.stringify(["instance-a", worktree.worktreePath])]: {
+            isRepo: true,
+            branch: "feature/a",
+            hasWorkingTreeChanges: false,
+            changedFiles: 0,
+            stagedFiles: null,
+            untrackedFiles: null,
+            hasUpstream: false,
+            ahead: null,
+            behind: null,
+            limitations: [],
+            observedAt: "2026-09-24T03:00:00.000Z",
+          },
+        };
+        fixtures.options.vcsRefs = {
+          [JSON.stringify(["instance-a", worktree.repositoryPath])]: {
+            isRepo: true,
+            refs: [{ branch: "feature/a", worktreePath: worktree.worktreePath }],
+            limitations: [],
+            truncated: false,
+            observedAt: "2026-09-24T03:00:00.000Z",
+          },
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_create", {
+              requestId: "thread-create-worktree",
+              project: { instanceId: "instance-a", projectId: "project-a" },
+              title: "Use the existing checkout",
+              checkout: { kind: "worktree", worktree },
+              model: {
+                kind: "explicit",
+                selection: {
+                  providerInstanceId: "provider-a",
+                  model: "model-a",
+                  options: [
+                    { id: "effort", value: "high" },
+                    { id: "verbose", value: false },
+                  ],
+                },
+              },
+              runtimeMode: "approval-required",
+              interactionMode: "default",
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, fixtures.connections))),
+        );
+
+        expect(fixtures.commands).toHaveLength(1);
+        expect(fixtures.commands[0]).toMatchObject({
+          branch: "feature/a",
+          worktreePath: worktree.worktreePath,
+        });
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "completed",
+              created: {
+                threadConfiguration: {
+                  model: {
+                    options: [
+                      { id: "effort", value: "high" },
+                      { id: "verbose", value: false },
+                    ],
+                  },
+                },
+              },
+            },
+          },
+        });
+      }),
+    ),
+  );
+
+  it.live("returns configuration_required without dispatch when the project has no default", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const fixtures = threadCreateFixtures(null);
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_create", {
+              requestId: "thread-create-no-default",
+              project: { instanceId: "instance-a", projectId: "project-a" },
+              title: "Need a model",
+              checkout: { kind: "project_root" },
+              model: { kind: "project_default" },
+              runtimeMode: "approval-required",
+              interactionMode: "default",
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, fixtures.connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "configuration_required" } },
+        });
+        expect(fixtures.commands).toHaveLength(0);
+      }),
+    ),
+  );
+
+  it.live("rejects unsupported options and cross-instance checkouts before dispatch", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const fixtures = threadCreateFixtures();
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const unsupported = yield* callTool("thread_create", {
+              requestId: "thread-create-bad-option",
+              project: { instanceId: "instance-a", projectId: "project-a" },
+              title: "Unsupported option",
+              checkout: { kind: "project_root" },
+              model: {
+                kind: "explicit",
+                selection: {
+                  providerInstanceId: "provider-a",
+                  model: "model-a",
+                  options: [{ id: "temperature", value: "warm" }],
+                },
+              },
+              runtimeMode: "approval-required",
+              interactionMode: "default",
+            });
+            const crossInstance = yield* Effect.exit(
+              callTool("thread_create", {
+                requestId: "thread-create-cross-instance",
+                project: { instanceId: "instance-a", projectId: "project-a" },
+                title: "Cross-instance checkout",
+                checkout: {
+                  kind: "worktree",
+                  worktree: {
+                    instanceId: "instance-b",
+                    repositoryPath: "/srv/project-a",
+                    worktreePath: "/srv/worktrees/other-instance",
+                  },
+                },
+                model: { kind: "project_default" },
+                runtimeMode: "approval-required",
+                interactionMode: "default",
+              }),
+            );
+            return { unsupported, crossInstance };
+          }).pipe(Effect.provide(appLayer(databasePath, fixtures.connections))),
+        );
+
+        expect(result.unsupported[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "unsupported_capability" } },
+        });
+        expect(Exit.isFailure(result.crossInstance)).toBe(true);
+        expect(String(result.crossInstance)).toContain(
+          "Invalid parameters for tool 'thread_create'",
+        );
+        expect(fixtures.commands).toHaveLength(0);
+      }),
+    ),
+  );
+
+  it.live(
+    "does not redispatch after a lost reply and recovers from the native thread observation",
+    () =>
+      withDatabasePath((databasePath) =>
+        Effect.gen(function* () {
+          const fixtures = threadCreateFixtures();
+          fixtures.options.threadCreate = (_instanceId, input) =>
+            Effect.gen(function* () {
+              yield* input.onDispatch;
+              const { onDispatch: _onDispatch, ...command } = input;
+              fixtures.commands.push(command);
+              return yield* Effect.fail(
+                new T3CodeAdapterError({
+                  kind: "transport",
+                  message: "The T3Code reply was lost after dispatch.",
+                  uncertain: true,
+                  status: null,
+                }),
+              );
+            });
+          const result = yield* Effect.scoped(
+            Effect.gen(function* () {
+              yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+              const request = {
+                requestId: "thread-create-lost-reply",
+                project: { instanceId: "instance-a", projectId: "project-a" },
+                title: "Recover this thread",
+                checkout: { kind: "project_root" as const },
+                model: {
+                  kind: "explicit" as const,
+                  selection: { providerInstanceId: "provider-a", model: "model-a" },
+                },
+                runtimeMode: "approval-required" as const,
+                interactionMode: "default" as const,
+              };
+              const first = yield* callTool("thread_create", request);
+              const recovered = yield* callTool("thread_create", request);
+              return { first, recovered };
+            }).pipe(Effect.provide(appLayer(databasePath, fixtures.connections))),
+          );
+
+          expect(fixtures.commands).toHaveLength(1);
+          expect(result.first[0]?.result).toMatchObject({
+            result: { kind: "ok", value: { state: "outcome_unknown", dispatch: "unknown" } },
+          });
+          expect(result.recovered[0]?.result).toMatchObject({
+            result: {
+              kind: "ok",
+              value: {
+                state: "completed",
+                dispatch: "accepted",
+                created: {
+                  thread: { instanceId: "instance-a" },
+                  threadConfiguration: { runtimeMode: "approval-required" },
+                },
+              },
+            },
+          });
+        }),
+      ),
+  );
+
+  it.live(
+    "throttles repeat observations for recently observed outcome_unknown receipts",
+    () =>
+      withDatabasePath((databasePath) =>
+        Effect.gen(function* () {
+          const fixtures = threadCreateFixtures();
+          fixtures.options.threadCreate = (_instanceId, input) =>
+            Effect.gen(function* () {
+              yield* input.onDispatch;
+              const { onDispatch: _onDispatch, ...command } = input;
+              fixtures.commands.push(command);
+              return yield* Effect.fail(
+                new T3CodeAdapterError({
+                  kind: "transport",
+                  message: "The T3Code reply was lost after dispatch.",
+                  uncertain: true,
+                  status: null,
+                }),
+              );
+            });
+          fixtures.options.threadStream = (_instanceId, threadId) =>
+            detailSnapshotStream(
+              44,
+              observedThreadFixture(threadId, {
+                projectId: "project-changed-in-the-native-snapshot",
+              }),
+            );
+          const result = yield* Effect.scoped(
+            Effect.gen(function* () {
+              yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+              const store = yield* LocalStore;
+              const requestId = "thread-create-throttled-reconcile";
+              const request = {
+                requestId,
+                project: { instanceId: "instance-a", projectId: "project-a" },
+                title: "Throttle recovery observations",
+                checkout: { kind: "project_root" as const },
+                model: {
+                  kind: "explicit" as const,
+                  selection: { providerInstanceId: "provider-a", model: "model-a" },
+                },
+                runtimeMode: "approval-required" as const,
+                interactionMode: "default" as const,
+              };
+              const created = yield* callTool("thread_create", request);
+              const firstObservation = yield* callTool("operation_get", { requestId });
+              const afterFirst = yield* store.getOperation(requestId);
+              const secondObservation = yield* callTool("operation_get", { requestId });
+              const afterSecond = yield* store.getOperation(requestId);
+              const streamsAfterSecond = fixtures.options.seenThreads.length;
+              yield* Effect.sleep("1250 millis");
+              const thirdObservation = yield* callTool("operation_get", { requestId });
+              const afterThird = yield* store.getOperation(requestId);
+              return {
+                created,
+                firstObservation,
+                secondObservation,
+                thirdObservation,
+                afterFirst,
+                afterSecond,
+                afterThird,
+                streamsAfterSecond,
+              };
+            }).pipe(Effect.provide(appLayer(databasePath, fixtures.connections))),
+          );
+
+          expect(fixtures.commands).toHaveLength(1);
+          expect(fixtures.options.seenThreads).toHaveLength(result.streamsAfterSecond + 1);
+          expect(result.created[0]?.result).toMatchObject({
+            result: { kind: "ok", value: { state: "outcome_unknown", dispatch: "unknown" } },
+          });
+          expect(result.firstObservation[0]?.result).toMatchObject({
+            result: { kind: "ok", value: { operation: { state: "outcome_unknown" } } },
+          });
+          expect(result.secondObservation[0]?.result).toMatchObject({
+            result: { kind: "ok", value: { operation: { state: "outcome_unknown" } } },
+          });
+          expect(result.afterSecond?.record.revision).toBe(result.afterFirst?.record.revision);
+          expect(result.thirdObservation[0]?.result).toMatchObject({
+            result: { kind: "ok", value: { operation: { state: "outcome_unknown" } } },
+          });
+          expect(result.afterThird?.record.revision).toBe(result.afterSecond?.record.revision);
+        }),
+      ),
+    40_000,
+  );
+
+  it.live("maps rejected thread creation to a new explicit request", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const fixtures = threadCreateFixtures();
+        fixtures.options.threadCreate = (_instanceId, input) =>
+          Effect.gen(function* () {
+            yield* input.onDispatch;
+            const { onDispatch: _onDispatch, ...command } = input;
+            fixtures.commands.push(command);
+            return yield* Effect.fail(
+              new T3CodeAdapterError({
+                kind: "command_rejected",
+                message: "The selected provider rejected this thread configuration.",
+                uncertain: false,
+                status: null,
+              }),
+            );
+          });
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_create", {
+              requestId: "thread-create-rejected",
+              project: { instanceId: "instance-a", projectId: "project-a" },
+              title: "Handle upstream rejection",
+              checkout: { kind: "project_root" },
+              model: {
+                kind: "explicit",
+                selection: { providerInstanceId: "provider-a", model: "model-a" },
+              },
+              runtimeMode: "approval-required",
+              interactionMode: "default",
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, fixtures.connections))),
+        );
+
+        expect(fixtures.commands).toHaveLength(1);
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "failed",
+              dispatch: "rejected",
+              recovery: "new_explicit_request",
+              error: {
+                code: "upstream_failure",
+                retry: "change_request",
+                details: { action: "new_explicit_request" },
+              },
+            },
+          },
+        });
+      }),
+    ),
+  );
+
+  it.live(
+    "does not revise a pending receipt for the same association mismatch",
+    () =>
+      withDatabasePath((databasePath) =>
+        Effect.gen(function* () {
+          const fixtures = threadCreateFixtures();
+          fixtures.options.threadStream = (_instanceId, threadId) =>
+            detailSnapshotStream(
+              44,
+              observedThreadFixture(threadId, {
+                projectId: "project-changed-in-the-native-snapshot",
+              }),
+            );
+          const result = yield* Effect.scoped(
+            Effect.gen(function* () {
+              yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+              const store = yield* LocalStore;
+              const request = {
+                requestId: "thread-create-repeat-observation",
+                project: { instanceId: "instance-a", projectId: "project-a" },
+                title: "Wait for the native snapshot",
+                checkout: { kind: "project_root" as const },
+                model: {
+                  kind: "explicit" as const,
+                  selection: { providerInstanceId: "provider-a", model: "model-a" },
+                },
+                runtimeMode: "approval-required" as const,
+                interactionMode: "default" as const,
+              };
+              const first = yield* callTool("thread_create", request);
+              const firstStored = yield* store.getOperation(request.requestId);
+              const firstObservation = yield* callTool("operation_get", {
+                requestId: request.requestId,
+              });
+              const secondStored = yield* store.getOperation(request.requestId);
+              const secondObservation = yield* callTool("operation_get", {
+                requestId: request.requestId,
+              });
+              const thirdStored = yield* store.getOperation(request.requestId);
+              const streamsBeforeTimeout = fixtures.options.seenThreads.length;
+              const database = new DatabaseSync(databasePath);
+              database
+                .prepare("UPDATE operations SET admitted_at = ? WHERE request_id = ?")
+                .run(
+                  new Date(Date.now() - LIVE_EFFECT_OBSERVATION_MILLIS - 1).toISOString(),
+                  request.requestId,
+                );
+              database.close();
+              const expiredPendingObservation = yield* callTool("operation_get", {
+                requestId: request.requestId,
+              });
+              const expiredPendingStored = yield* store.getOperation(request.requestId);
+              const unknownObservation = yield* callTool("operation_get", {
+                requestId: request.requestId,
+              });
+              const unknownStored = yield* store.getOperation(request.requestId);
+              return {
+                first,
+                firstStored,
+                firstObservation,
+                secondObservation,
+                secondStored,
+                thirdStored,
+                streamsBeforeTimeout,
+                expiredPendingObservation,
+                expiredPendingStored,
+                unknownObservation,
+                unknownStored,
+              };
+            }).pipe(Effect.provide(appLayer(databasePath, fixtures.connections))),
+          );
+
+          expect(fixtures.commands).toHaveLength(1);
+          expect(fixtures.options.seenThreads).toHaveLength(result.streamsBeforeTimeout + 1);
+          expect(result.first[0]?.result).toMatchObject({
+            result: { kind: "ok", value: { state: "pending", dispatch: "accepted" } },
+          });
+          expect(result.secondStored?.record.revision).toBe(result.firstStored?.record.revision);
+          expect(result.firstObservation[0]?.result).toMatchObject({
+            result: { kind: "ok", value: { operation: { state: "pending" } } },
+          });
+          expect(result.secondObservation[0]?.result).toMatchObject({
+            result: { kind: "ok", value: { operation: { state: "pending" } } },
+          });
+          expect(result.thirdStored?.record.revision).toBe(result.secondStored?.record.revision);
+          expect(result.expiredPendingObservation[0]?.result).toMatchObject({
+            result: { kind: "ok", value: { operation: { state: "outcome_unknown" } } },
+          });
+          expect(result.expiredPendingStored?.record.state).toBe("outcome_unknown");
+          expect(result.unknownObservation[0]?.result).toMatchObject({
+            result: { kind: "ok", value: { operation: { state: "outcome_unknown" } } },
+          });
+          expect(result.unknownStored?.record.revision).toBe(
+            result.expiredPendingStored?.record.revision,
+          );
+        }),
+      ),
+    40_000,
+  );
+
+  it.live(
+    "refuses native dispatch after another process changes the admitted operation state",
+    () =>
+      withDatabasePath((databasePath) =>
+        Effect.gen(function* () {
+          const fixtures = threadCreateFixtures();
+          const requestId = "thread-create-dispatch-cas-lost";
+          let storeForRace: typeof LocalStore.Service | null = null;
+          fixtures.options.threadCreate = (_instanceId, input) =>
+            Effect.gen(function* () {
+              const store = storeForRace;
+              if (store === null) return yield* Effect.die("missing race fixture");
+              const current = yield* store.getOperation(requestId);
+              if (current === null) throw new Error("thread-create admission is missing");
+              yield* store.updateOperation(requestId, {
+                now: current.record.updatedAt,
+                state: "outcome_unknown",
+                dispatch: "unknown",
+                stepPosition: 0,
+                stepState: "outcome_unknown",
+                error: {
+                  code: "unavailable",
+                  message: "A competing process observed the operation.",
+                  retry: "reconcile_first",
+                  details: {},
+                },
+                recovery: "observe_operation",
+              });
+              yield* input.onDispatch;
+              const { onDispatch: _onDispatch, ...command } = input;
+              fixtures.commands.push(command);
+              return { sequence: 43 };
+            });
+          const result = yield* Effect.scoped(
+            Effect.gen(function* () {
+              yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+              storeForRace = yield* LocalStore;
+              return yield* callTool("thread_create", {
+                requestId,
+                project: { instanceId: "instance-a", projectId: "project-a" },
+                title: "Respect the operation state",
+                checkout: { kind: "project_root" },
+                model: {
+                  kind: "explicit",
+                  selection: { providerInstanceId: "provider-a", model: "model-a" },
+                },
+                runtimeMode: "approval-required",
+                interactionMode: "default",
+              });
+            }).pipe(Effect.provide(appLayer(databasePath, fixtures.connections))),
+          );
+
+          expect(fixtures.commands).toHaveLength(0);
+          expect(result[0]?.result).toMatchObject({
+            result: {
+              kind: "ok",
+              value: { state: "outcome_unknown", dispatch: "unknown" },
+            },
+          });
+        }),
+      ),
+  );
+
+  it.live("rejects a project-default change that races preflight before dispatch", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const fixtures = threadCreateFixtures({
+          providerInstanceId: "provider-a",
+          model: "model-a",
+        });
+        let projectReads = 0;
+        fixtures.options.projectDiscovery = () => {
+          projectReads += 1;
+          return Effect.succeed({
+            snapshotSequence: projectReads,
+            projects: [
+              {
+                projectId: "project-a",
+                title: "Project A",
+                repositoryPath: "/srv/project-a",
+                defaultModel:
+                  projectReads < 2
+                    ? { providerInstanceId: "provider-a", model: "model-a" }
+                    : { providerInstanceId: "provider-a", model: "model-b" },
+              },
+            ],
+            observedAt: "2026-09-24T03:00:00.000Z",
+          });
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_create", {
+              requestId: "thread-create-ui-settings-race",
+              project: { instanceId: "instance-a", projectId: "project-a" },
+              title: "Reject stale default",
+              checkout: { kind: "project_root" },
+              model: { kind: "project_default" },
+              runtimeMode: "approval-required",
+              interactionMode: "default",
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, fixtures.connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "failed",
+              dispatch: "not_dispatched",
+              error: { code: "stale_state" },
+            },
+          },
+        });
+        expect(fixtures.commands).toHaveLength(0);
+      }),
+    ),
+  );
+});
 
 describe("worktree_discard", () => {
   const configureWorktree = (

@@ -1,6 +1,7 @@
 import * as Schema from "effect/Schema";
 import * as SchemaGetter from "effect/SchemaGetter";
 import * as Encoding from "effect/Encoding";
+import * as Match from "effect/Match";
 import * as Result from "effect/Result";
 
 const nonEmptyString = Schema.NonEmptyString;
@@ -1885,10 +1886,45 @@ const operationTargetSchema = Schema.NullOr(
   ]),
 );
 
+const modelOptionSchema = Schema.Struct({
+  id: nonEmptyString,
+  value: Schema.Union([Schema.String, Schema.Boolean]),
+});
+
+export const ModelSelectionSchema = Schema.Struct({
+  providerInstanceId: nonEmptyString,
+  model: nonEmptyString,
+  options: Schema.optionalKey(Schema.Array(modelOptionSchema)),
+});
+
+export type ModelSelection = typeof ModelSelectionSchema.Type;
+
+export const RuntimeModeSchema = Schema.Literals([
+  "approval-required",
+  "auto-accept-edits",
+  "auto",
+  "full-access",
+]);
+
+export type RuntimeMode = typeof RuntimeModeSchema.Type;
+
+export const InteractionModeSchema = Schema.Literals(["default", "plan"]);
+
+export type InteractionMode = typeof InteractionModeSchema.Type;
+
+// fallow-ignore-next-line unused-export
+export const ThreadConfigurationSchema = Schema.Struct({
+  model: ModelSelectionSchema,
+  runtimeMode: RuntimeModeSchema,
+  interactionMode: InteractionModeSchema,
+});
+
+export type ThreadConfiguration = typeof ThreadConfigurationSchema.Type;
+
 const operationCreatedSchema = Schema.Struct({
   instanceId: Schema.optionalKey(nonEmptyString),
   thread: Schema.optionalKey(threadReferenceSchema),
-  threadConfiguration: Schema.optionalKey(Schema.JsonObject),
+  threadConfiguration: Schema.optionalKey(ThreadConfigurationSchema),
   worktree: Schema.optionalKey(worktreeReferenceSchema),
 });
 
@@ -2004,20 +2040,6 @@ const OperationGetValueSchema = Schema.Struct({
 });
 
 export const OperationGetToolResultSchema = toolResultFields(OperationGetValueSchema);
-
-const modelOptionSchema = Schema.Struct({
-  id: nonEmptyString,
-  value: Schema.Union([Schema.String, Schema.Boolean]),
-});
-
-// fallow-ignore-next-line unused-export
-export const ModelSelectionSchema = Schema.Struct({
-  providerInstanceId: nonEmptyString,
-  model: nonEmptyString,
-  options: Schema.optionalKey(Schema.Array(modelOptionSchema)),
-});
-
-export type ModelSelection = typeof ModelSelectionSchema.Type;
 
 export const ProjectSummarySchema = Schema.Struct({
   project: projectReferenceSchema,
@@ -2381,35 +2403,259 @@ export const MAX_PENDING_REQUEST_OPTIONS = 64;
 export const MAX_PENDING_REQUEST_FORM_BYTES = 32 * 1024;
 export const MAX_PENDING_INPUT_ANSWERS_BYTES = 64 * 1024;
 
-/**
- * The windowed thread snapshot always requests the pinned server's supported
- * turn window while retaining pending-request information; older turns beyond
- * the window are reported as limited history instead of silent truncation.
- */
+export type ThreadCreateInput = {
+  readonly requestId: string;
+  readonly project: ProjectReference;
+  readonly title: string;
+  readonly checkout:
+    | { readonly kind: "project_root" }
+    | { readonly kind: "worktree"; readonly worktree: WorktreeReference };
+  readonly model:
+    | { readonly kind: "explicit"; readonly selection: ModelSelection }
+    | { readonly kind: "project_default" };
+  readonly runtimeMode: RuntimeMode;
+  readonly interactionMode: InteractionMode;
+};
 
-// fallow-ignore-next-line unused-export
-export const RuntimeModeSchema = Schema.Literals([
-  "approval-required",
-  "auto-accept-edits",
-  "auto",
-  "full-access",
+const threadCreateTrimmedNonEmptyString = Schema.String.check(
+  Schema.makeFilter((value) => value.length > 0 && value.trim() === value, {
+    message: "expected a trimmed non-empty string",
+  }),
+);
+
+const unknownThreadCreateProjectField = Schema.String.check(
+  Schema.makeFilter((key) => key !== "instanceId" && key !== "projectId", {
+    message: "unknown thread_create project argument",
+  }),
+);
+
+const threadCreateProjectRuntimeShape = Schema.StructWithRest(
+  Schema.Struct({
+    instanceId: nonEmptyString,
+    projectId: threadCreateTrimmedNonEmptyString,
+  }),
+  [Schema.Record(unknownThreadCreateProjectField, Schema.Never)],
+);
+
+const threadCreateProjectJsonShape = Schema.StructWithRest(
+  Schema.Struct({
+    instanceId: nonEmptyString,
+    projectId: threadCreateTrimmedNonEmptyString,
+  }),
+  [Schema.Record(Schema.String, Schema.Never)],
+);
+
+const unknownThreadCreateWorktreeField = Schema.String.check(
+  Schema.makeFilter(
+    (key) => key !== "instanceId" && key !== "repositoryPath" && key !== "worktreePath",
+    { message: "unknown thread_create worktree argument" },
+  ),
+);
+
+const threadCreateWorktreeRuntimeShape = Schema.StructWithRest(
+  Schema.Struct({
+    instanceId: nonEmptyString,
+    repositoryPath: threadCreateTrimmedNonEmptyString,
+    worktreePath: threadCreateTrimmedNonEmptyString,
+  }),
+  [Schema.Record(unknownThreadCreateWorktreeField, Schema.Never)],
+);
+
+const threadCreateWorktreeJsonShape = Schema.StructWithRest(
+  Schema.Struct({
+    instanceId: nonEmptyString,
+    repositoryPath: threadCreateTrimmedNonEmptyString,
+    worktreePath: threadCreateTrimmedNonEmptyString,
+  }),
+  [Schema.Record(Schema.String, Schema.Never)],
+);
+
+const unknownThreadCreateCheckoutField = Schema.String.check(
+  Schema.makeFilter((key) => key !== "kind" && key !== "worktree", {
+    message: "unknown thread_create checkout argument",
+  }),
+);
+
+const unknownThreadCreateRootCheckoutField = Schema.String.check(
+  Schema.makeFilter((key) => key !== "kind", {
+    message: "unknown thread_create project_root checkout argument",
+  }),
+);
+
+const threadCreateCheckoutRuntimeShape = Schema.Union([
+  Schema.StructWithRest(Schema.Struct({ kind: Schema.Literal("project_root") }), [
+    Schema.Record(unknownThreadCreateRootCheckoutField, Schema.Never),
+  ]),
+  Schema.StructWithRest(
+    Schema.Struct({
+      kind: Schema.Literal("worktree"),
+      worktree: threadCreateWorktreeRuntimeShape,
+    }),
+    [Schema.Record(unknownThreadCreateCheckoutField, Schema.Never)],
+  ),
 ]);
 
-export type RuntimeMode = typeof RuntimeModeSchema.Type;
+const threadCreateCheckoutJsonShape = Schema.Union([
+  Schema.StructWithRest(Schema.Struct({ kind: Schema.Literal("project_root") }), [
+    Schema.Record(Schema.String, Schema.Never),
+  ]),
+  Schema.StructWithRest(
+    Schema.Struct({
+      kind: Schema.Literal("worktree"),
+      worktree: threadCreateWorktreeJsonShape,
+    }),
+    [Schema.Record(Schema.String, Schema.Never)],
+  ),
+]);
 
-// fallow-ignore-next-line unused-export
-export const InteractionModeSchema = Schema.Literals(["default", "plan"]);
+const unknownThreadCreateOptionField = Schema.String.check(
+  Schema.makeFilter((key) => key !== "id" && key !== "value", {
+    message: "unknown thread_create model option argument",
+  }),
+);
 
-export type InteractionMode = typeof InteractionModeSchema.Type;
+const threadCreateModelOptionFields = Schema.Struct({
+  id: threadCreateTrimmedNonEmptyString,
+  value: Schema.Union([Schema.String, Schema.Boolean]),
+});
 
-// fallow-ignore-next-line unused-export
-export const ThreadConfigurationSchema = Schema.Struct({
-  model: ModelSelectionSchema,
+const threadCreateModelOptionRuntimeShape = Schema.StructWithRest(threadCreateModelOptionFields, [
+  Schema.Record(unknownThreadCreateOptionField, Schema.Never),
+]);
+
+const threadCreateModelOptionJsonShape = Schema.StructWithRest(threadCreateModelOptionFields, [
+  Schema.Record(Schema.String, Schema.Never),
+]);
+
+const unknownThreadCreateSelectionField = Schema.String.check(
+  Schema.makeFilter((key) => key !== "providerInstanceId" && key !== "model" && key !== "options", {
+    message: "unknown thread_create model selection argument",
+  }),
+);
+
+const threadCreateModelSelectionFields = Schema.Struct({
+  providerInstanceId: threadCreateTrimmedNonEmptyString,
+  model: threadCreateTrimmedNonEmptyString,
+  options: Schema.optionalKey(Schema.Array(threadCreateModelOptionRuntimeShape)),
+});
+
+const threadCreateModelSelectionRuntimeShape = Schema.StructWithRest(
+  threadCreateModelSelectionFields,
+  [Schema.Record(unknownThreadCreateSelectionField, Schema.Never)],
+);
+
+const threadCreateModelSelectionJsonShape = Schema.StructWithRest(
+  Schema.Struct({
+    providerInstanceId: threadCreateTrimmedNonEmptyString,
+    model: threadCreateTrimmedNonEmptyString,
+    options: Schema.optionalKey(Schema.Array(threadCreateModelOptionJsonShape)),
+  }),
+  [Schema.Record(Schema.String, Schema.Never)],
+);
+
+const unknownThreadCreateModelField = Schema.String.check(
+  Schema.makeFilter((key) => key !== "kind" && key !== "selection", {
+    message: "unknown thread_create model argument",
+  }),
+);
+
+const unknownThreadCreateProjectDefaultModelField = Schema.String.check(
+  Schema.makeFilter((key) => key !== "kind", {
+    message: "unknown thread_create project_default model argument",
+  }),
+);
+
+const threadCreateModelRuntimeShape = Schema.Union([
+  Schema.StructWithRest(
+    Schema.Struct({
+      kind: Schema.Literal("explicit"),
+      selection: threadCreateModelSelectionRuntimeShape,
+    }),
+    [Schema.Record(unknownThreadCreateModelField, Schema.Never)],
+  ),
+  Schema.StructWithRest(Schema.Struct({ kind: Schema.Literal("project_default") }), [
+    Schema.Record(unknownThreadCreateProjectDefaultModelField, Schema.Never),
+  ]),
+]);
+
+const threadCreateModelJsonShape = Schema.Union([
+  Schema.StructWithRest(
+    Schema.Struct({
+      kind: Schema.Literal("explicit"),
+      selection: threadCreateModelSelectionJsonShape,
+    }),
+    [Schema.Record(Schema.String, Schema.Never)],
+  ),
+  Schema.StructWithRest(Schema.Struct({ kind: Schema.Literal("project_default") }), [
+    Schema.Record(Schema.String, Schema.Never),
+  ]),
+]);
+
+const threadCreateFields = Schema.Struct({
+  requestId,
+  project: threadCreateProjectRuntimeShape,
+  title: threadCreateTrimmedNonEmptyString,
+  checkout: threadCreateCheckoutRuntimeShape,
+  model: threadCreateModelRuntimeShape,
   runtimeMode: RuntimeModeSchema,
   interactionMode: InteractionModeSchema,
 });
 
-export type ThreadConfiguration = typeof ThreadConfigurationSchema.Type;
+const threadCreateJsonShape = Schema.StructWithRest(
+  Schema.Struct({
+    requestId,
+    project: threadCreateProjectJsonShape,
+    title: threadCreateTrimmedNonEmptyString,
+    checkout: threadCreateCheckoutJsonShape,
+    model: threadCreateModelJsonShape,
+    runtimeMode: RuntimeModeSchema,
+    interactionMode: InteractionModeSchema,
+  }),
+  [Schema.Record(Schema.String, Schema.Never)],
+);
+
+const unknownThreadCreateField = Schema.String.check(
+  Schema.makeFilter(
+    (key) =>
+      key !== "requestId" &&
+      key !== "project" &&
+      key !== "title" &&
+      key !== "checkout" &&
+      key !== "model" &&
+      key !== "runtimeMode" &&
+      key !== "interactionMode",
+    { message: "unknown thread_create argument" },
+  ),
+);
+
+const threadCreateRuntimeShape = Schema.StructWithRest(threadCreateFields, [
+  Schema.Record(unknownThreadCreateField, Schema.Never),
+]);
+
+/**
+ * Strict public input for creating an unstarted thread. Worktree checkouts
+ * must be qualified by the same instance as their project before dispatch.
+ */
+export const ThreadCreateInputSchema = Schema.declare<ThreadCreateInput>(
+  (input): input is ThreadCreateInput => {
+    if (!Schema.is(threadCreateRuntimeShape)(input)) return false;
+    return Match.type<ThreadCreateInput["checkout"]>().pipe(
+      Match.when({ kind: "project_root" }, () => true),
+      Match.when(
+        { kind: "worktree" },
+        ({ worktree }) => worktree.instanceId === input.project.instanceId,
+      ),
+      Match.exhaustive,
+    )(input.checkout);
+  },
+  {
+    toCodecJson: () =>
+      Schema.link()(threadCreateJsonShape, {
+        decode: SchemaGetter.passthrough({ strict: false }),
+        encode: SchemaGetter.passthrough({ strict: false }),
+      } as never),
+  },
+);
 
 export const ApprovalDecisionSchema = Schema.Literals([
   "accept",

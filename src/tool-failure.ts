@@ -5,7 +5,13 @@ import { T3CodeAdapterError, type T3CodeAdapterErrorKind } from "./t3code-adapte
 type AdapterFailureMapping = Pick<ToolFailure, "code" | "retry" | "details"> & {
   readonly message?: string;
 };
-type AdapterFailureContext = "read" | "pairing" | "worktree" | "approval" | "thread_stop";
+type AdapterFailureContext =
+  | "read"
+  | "pairing"
+  | "worktree"
+  | "approval"
+  | "thread_stop"
+  | "thread_create";
 type AdapterFailurePolicy =
   | AdapterFailureMapping
   | ((error: T3CodeAdapterError) => AdapterFailureMapping);
@@ -210,12 +216,25 @@ const threadStopOverrides = {
   },
 } satisfies Partial<Record<T3CodeAdapterErrorKind, AdapterFailurePolicy>>;
 
+const threadCreateOverrides = {
+  command_rejected: {
+    code: "upstream_failure",
+    message: "The T3Code instance rejected the thread creation command.",
+    retry: "change_request",
+    details: { action: "new_explicit_request" },
+  },
+  authorization: worktreeAuthorizationFailure,
+  transport: reconcileFirstUnavailable,
+  timeout: reconcileFirstUnavailable,
+} satisfies Partial<Record<T3CodeAdapterErrorKind, AdapterFailurePolicy>>;
+
 const adapterFailureMappings = {
   read: sharedAdapterFailures,
   pairing: { ...sharedAdapterFailures, ...pairingOverrides },
   worktree: { ...sharedAdapterFailures, ...worktreeOverrides },
   approval: { ...sharedAdapterFailures, ...approvalOverrides },
   thread_stop: { ...sharedAdapterFailures, ...threadStopOverrides },
+  thread_create: { ...sharedAdapterFailures, ...threadCreateOverrides },
 } satisfies Record<AdapterFailureContext, Record<T3CodeAdapterErrorKind, AdapterFailurePolicy>>;
 
 const observationFailureMappings = {

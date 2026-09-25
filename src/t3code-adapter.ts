@@ -424,6 +424,21 @@ const ApprovalResponseCommandWireSchema = Schema.Struct({
   decision: ApprovalDecisionSchema,
   createdAt: Schema.String,
 });
+
+const ThreadCreateCommandWireSchema = Schema.Struct({
+  type: Schema.Literal("thread.create"),
+  commandId: trimmedNonEmptyWireString,
+  threadId: trimmedNonEmptyWireString,
+  projectId: trimmedNonEmptyWireString,
+  title: trimmedNonEmptyWireString,
+  modelSelection: ModelSelectionWireSchema,
+  runtimeMode: runtimeModeWireSchema,
+  interactionMode: Schema.Literals(["default", "plan"]),
+  branch: Schema.NullOr(trimmedNonEmptyWireString),
+  worktreePath: Schema.NullOr(trimmedNonEmptyWireString),
+  createdAt: Schema.String,
+});
+
 const OrchestrationDispatchCommandErrorWireSchema = Schema.Struct({
   _tag: Schema.Literal("OrchestrationDispatchCommandError"),
   message: Schema.String,
@@ -761,6 +776,7 @@ const DispatchCommandRpc = Rpc.make("orchestration.dispatchCommand", {
     ApprovalResponseCommandWireSchema,
     ThreadInterruptCommandWireSchema,
     ThreadSessionStopCommandWireSchema,
+    ThreadCreateCommandWireSchema,
   ]),
   success: DispatchResultWireSchema,
   error: Schema.Union([
@@ -1085,41 +1101,78 @@ const mapAuthenticatedChannelError = (error: unknown): T3CodeAdapterError => {
   });
 };
 
-const mapDispatchCommandError = (error: unknown): T3CodeAdapterError => {
-  if (error instanceof T3CodeAdapterError) return error;
-  const reason = error instanceof RpcClientError.RpcClientError ? error.reason : error;
-  const authorizationError = mapAuthorizationError(reason);
-  if (authorizationError !== null) return authorizationError;
-  if (
-    Predicate.hasProperty(reason, "_tag") &&
-    reason._tag === "OrchestrationDispatchCommandError"
-  ) {
-    return new T3CodeAdapterError({
-      kind: "command_rejected",
-      message: "The T3Code instance rejected the dispatch command.",
-      uncertain: false,
-      status: null,
-    });
-  }
-  if (
-    Predicate.hasProperty(reason, "_tag") &&
-    reason._tag === "OrchestrationCommandInvariantError"
-  ) {
-    return new T3CodeAdapterError({
-      kind: "upstream_failure",
-      message: "T3Code rejected the submission command before accepting it.",
-      uncertain: false,
-      status: null,
-    });
-  }
-  if (error instanceof RpcClientError.RpcClientError) {
-    const mapped = mapAuthenticatedChannelError(error);
+type DispatchCommandName = "approval response" | "thread creation";
+
+const dispatchCommandReasonError = (
+  reason: unknown,
+  commandName?: DispatchCommandName,
+): T3CodeAdapterError | null => {
+  if (!Predicate.hasProperty(reason, "_tag")) return null;
+  return Match.value(String(reason._tag)).pipe(
+    Match.when(
+      "OrchestrationDispatchCommandError",
+      () =>
+        new T3CodeAdapterError({
+          kind: "command_rejected",
+          message:
+            commandName === undefined
+              ? "The T3Code instance rejected the dispatch command."
+              : `The T3Code instance rejected the ${commandName} command.`,
+          uncertain: false,
+          status: null,
+        }),
+    ),
+    Match.when(
+      "OrchestrationCommandInvariantError",
+      () =>
+        new T3CodeAdapterError({
+          kind: "upstream_failure",
+          message:
+            commandName === undefined
+              ? "T3Code rejected the submission command before accepting it."
+              : `T3Code rejected the ${commandName} before accepting it.`,
+          uncertain: false,
+          status: null,
+        }),
+    ),
+    Match.orElse(() => null),
+  );
+};
+
+const mapDispatchCommandChannelError = (
+  error: unknown,
+  commandName?: DispatchCommandName,
+): T3CodeAdapterError => {
+  const mapped = mapAuthenticatedChannelError(error);
+  if (commandName === undefined) {
     return new T3CodeAdapterError({
       kind: mapped.kind,
       message: mapped.message,
       uncertain: true,
       status: mapped.status,
     });
+  }
+  if (mapped.kind !== "wire_incompatible") return mapped;
+  return new T3CodeAdapterError({
+    kind: "transport",
+    message: `The T3Code ${commandName} reply could not be interpreted; its outcome is unknown.`,
+    uncertain: true,
+    status: null,
+  });
+};
+
+const mapDispatchCommandError = (
+  error: unknown,
+  commandName?: DispatchCommandName,
+): T3CodeAdapterError => {
+  if (error instanceof T3CodeAdapterError) return error;
+  const reason = error instanceof RpcClientError.RpcClientError ? error.reason : error;
+  const authorizationError = mapAuthorizationError(reason);
+  if (authorizationError !== null) return authorizationError;
+  const commandError = dispatchCommandReasonError(reason, commandName);
+  if (commandError !== null) return commandError;
+  if (error instanceof RpcClientError.RpcClientError || commandName !== undefined) {
+    return mapDispatchCommandChannelError(error, commandName);
   }
   return new T3CodeAdapterError({
     kind: "upstream_failure",
@@ -1215,36 +1268,6 @@ const worktreeRemoveError = (error: unknown): T3CodeAdapterError => {
       });
     }),
   );
-};
-
-const mapApprovalDispatchError = (
-  error: unknown,
-): T3CodeAdapterError | RpcClientError.RpcClientError => {
-  if (error instanceof T3CodeAdapterError) return error;
-  const reason = error instanceof RpcClientError.RpcClientError ? error.reason : error;
-  if (Predicate.hasProperty(reason, "_tag")) {
-    if (reason._tag === "OrchestrationDispatchCommandError") {
-      return new T3CodeAdapterError({
-        kind: "command_rejected",
-        message: "The T3Code instance rejected the approval response command.",
-        uncertain: false,
-        status: null,
-      });
-    }
-    if (reason._tag === "EnvironmentAuthorizationError") {
-      return mapOrchestrationReadError("The T3Code credential lacks the required operate scope.")(
-        reason,
-      );
-    }
-  }
-  const mapped = mapAuthenticatedChannelError(error);
-  if (mapped.kind !== "wire_incompatible") return mapped;
-  return new T3CodeAdapterError({
-    kind: "transport",
-    message: "The T3Code approval response reply could not be interpreted; its outcome is unknown.",
-    uncertain: true,
-    status: null,
-  });
 };
 
 const mapShellStreamError = (error: unknown): T3CodeAdapterError => {
@@ -1498,6 +1521,19 @@ export interface WorktreeCreateRequest {
 export interface CreatedWorktree {
   readonly path: string;
   readonly refName: string;
+}
+
+export interface ThreadCreateRequest {
+  readonly commandId: string;
+  readonly threadId: string;
+  readonly projectId: string;
+  readonly title: string;
+  readonly modelSelection: DiscoveredModelSelection;
+  readonly runtimeMode: "approval-required" | "auto-accept-edits" | "auto" | "full-access";
+  readonly interactionMode: "default" | "plan";
+  readonly branch: string | null;
+  readonly worktreePath: string | null;
+  readonly createdAt: string;
 }
 
 export interface StagedPairingToken {
@@ -1861,6 +1897,11 @@ export interface T3CodeAdapterService {
     readonly repositoryPath: string;
     readonly worktreePath: string;
   }) => Effect.Effect<void, T3CodeAdapterError>;
+  readonly createThread: <E>(
+    input: { readonly endpoint: string; readonly credential: string } & ThreadCreateRequest & {
+        readonly onDispatch: Effect.Effect<void, E, never>;
+      },
+  ) => Effect.Effect<{ readonly sequence: number }, T3CodeAdapterError | E>;
   readonly respondToApproval: <E>(
     input: ApprovalResponseCommand & {
       readonly endpoint: string;
@@ -2489,8 +2530,8 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
   "t3code-mcp/T3CodeAdapter",
 ) {
   static readonly layerTest = (
-    service: Omit<T3CodeAdapterService, "dispatchTurn"> &
-      Partial<Pick<T3CodeAdapterService, "dispatchTurn">>,
+    service: Omit<T3CodeAdapterService, "dispatchTurn" | "interruptThread" | "createThread"> &
+      Partial<Pick<T3CodeAdapterService, "dispatchTurn" | "interruptThread" | "createThread">>,
   ): Layer.Layer<T3CodeAdapter> =>
     Layer.succeed(T3CodeAdapter, {
       ...service,
@@ -2501,6 +2542,28 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
             new T3CodeAdapterError({
               kind: "capacity",
               message: "The test adapter does not support dispatch.",
+              uncertain: false,
+              status: null,
+            }),
+          )),
+      interruptThread:
+        service.interruptThread ??
+        (() =>
+          Effect.fail(
+            new T3CodeAdapterError({
+              kind: "capacity",
+              message: "The test adapter does not support thread interruption.",
+              uncertain: false,
+              status: null,
+            }),
+          )),
+      createThread:
+        service.createThread ??
+        (() =>
+          Effect.fail(
+            new T3CodeAdapterError({
+              kind: "capacity",
+              message: "The test adapter does not support thread creation.",
               uncertain: false,
               status: null,
             }),
@@ -3078,6 +3141,83 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
           ),
         ).pipe(Effect.mapError(worktreeRemoveError));
 
+      const dispatchCommandWithPreflight = <E>(input: {
+        readonly endpoint: string;
+        readonly credential: string;
+        readonly onDispatch: Effect.Effect<void, E, never>;
+        readonly commandName: DispatchCommandName;
+        readonly dispatch: (
+          client: AdapterRpcClient,
+        ) => Effect.Effect<{ readonly sequence: number }, unknown>;
+      }): Effect.Effect<{ readonly sequence: number }, T3CodeAdapterError | E> =>
+        Effect.flatMap(
+          withCapacity(
+            withAuthenticatedRpc(
+              input.endpoint,
+              input.credential,
+              (client) =>
+                Effect.gen(function* () {
+                  yield* client["server.probe"]({}).pipe(
+                    Effect.mapError(mapAuthenticatedChannelError),
+                  );
+                  const dispatchGate = yield* Effect.result(input.onDispatch);
+                  if (Result.isFailure(dispatchGate)) {
+                    return { _tag: "pre_dispatch_failed" as const, error: dispatchGate.failure };
+                  }
+                  const response = yield* input
+                    .dispatch(client)
+                    .pipe(
+                      Effect.mapError((error) => mapDispatchCommandError(error, input.commandName)),
+                    );
+                  return { _tag: "accepted" as const, response };
+                }),
+              { uncertainOnTimeout: true },
+            ),
+          ),
+          (result) =>
+            Match.value(result).pipe(
+              Match.discriminator("_tag")("pre_dispatch_failed", (failed) =>
+                Effect.fail(failed.error),
+              ),
+              Match.discriminator("_tag")("accepted", (accepted) =>
+                Effect.succeed(accepted.response),
+              ),
+              Match.exhaustive,
+            ),
+        );
+
+      const createThread = <E>(
+        input: { readonly endpoint: string; readonly credential: string } & ThreadCreateRequest & {
+            readonly onDispatch: Effect.Effect<void, E, never>;
+          },
+      ): Effect.Effect<{ readonly sequence: number }, T3CodeAdapterError | E> =>
+        dispatchCommandWithPreflight({
+          endpoint: input.endpoint,
+          credential: input.credential,
+          onDispatch: input.onDispatch,
+          commandName: "thread creation",
+          dispatch: (client) =>
+            client["orchestration.dispatchCommand"]({
+              type: "thread.create",
+              commandId: input.commandId,
+              threadId: input.threadId,
+              projectId: input.projectId,
+              title: input.title,
+              modelSelection: {
+                instanceId: input.modelSelection.providerInstanceId,
+                model: input.modelSelection.model,
+                ...(input.modelSelection.options === undefined
+                  ? {}
+                  : { options: input.modelSelection.options.map((option) => ({ ...option })) }),
+              },
+              runtimeMode: input.runtimeMode,
+              interactionMode: input.interactionMode,
+              branch: input.branch,
+              worktreePath: input.worktreePath,
+              createdAt: input.createdAt,
+            }),
+        });
+
       /**
        * Open one authenticated streaming RPC subscription. The shared
        * adapter capacity permit is held for the whole stream lifetime; the
@@ -3409,38 +3549,21 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
           readonly onDispatch: Effect.Effect<void, E, never>;
         },
       ): Effect.Effect<{ readonly sequence: number }, T3CodeAdapterError | E> =>
-        Effect.flatMap(
-          withCapacity(
-            withAuthenticatedRpc(
-              input.endpoint,
-              input.credential,
-              (client) =>
-                Effect.gen(function* () {
-                  yield* client["server.probe"]({}).pipe(
-                    Effect.mapError(mapAuthenticatedChannelError),
-                  );
-                  const dispatchGate = yield* Effect.result(input.onDispatch);
-                  if (Result.isFailure(dispatchGate)) {
-                    return { _tag: "pre_dispatch_failed" as const, error: dispatchGate.failure };
-                  }
-                  const response = yield* client["orchestration.dispatchCommand"]({
-                    type: "thread.approval.respond",
-                    commandId: input.commandId,
-                    threadId: input.threadId,
-                    requestId: input.pendingRequestId,
-                    decision: input.decision,
-                    createdAt: input.createdAt,
-                  }).pipe(Effect.mapError(mapApprovalDispatchError));
-                  return { _tag: "accepted" as const, response };
-                }),
-              { uncertainOnTimeout: true },
-            ),
-          ),
-          (result) =>
-            result._tag === "pre_dispatch_failed"
-              ? Effect.fail(result.error)
-              : Effect.succeed(result.response),
-        );
+        dispatchCommandWithPreflight({
+          endpoint: input.endpoint,
+          credential: input.credential,
+          onDispatch: input.onDispatch,
+          commandName: "approval response",
+          dispatch: (client) =>
+            client["orchestration.dispatchCommand"]({
+              type: "thread.approval.respond",
+              commandId: input.commandId,
+              threadId: input.threadId,
+              requestId: input.pendingRequestId,
+              decision: input.decision,
+              createdAt: input.createdAt,
+            }),
+        });
 
       const stopThreadSession = (input: {
         readonly endpoint: string;
@@ -3547,6 +3670,7 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
         respondToInput,
         createWorktree,
         removeWorktree,
+        createThread,
         respondToApproval,
         listVcsRefs,
       });

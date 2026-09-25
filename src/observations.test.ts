@@ -1322,6 +1322,7 @@ describe("InstanceConnections observation capacity", () => {
             getArchivedShellSnapshot: () => Effect.die("not used"),
             createWorktree: () => Effect.die("not used"),
             removeWorktree: () => Effect.die("not used"),
+            createThread: () => Effect.die("not used"),
             respondToApproval: () => Effect.die("not used"),
             listVcsRefs: () => Effect.die("not used"),
           };
@@ -1418,6 +1419,7 @@ describe("InstanceConnections observation capacity", () => {
           getArchivedShellSnapshot: () => Effect.die("not used"),
           createWorktree: () => Effect.die("not used"),
           removeWorktree: () => Effect.die("not used"),
+          createThread: () => Effect.die("not used"),
           respondToApproval: () => Effect.die("not used"),
           listVcsRefs: () => Effect.die("not used"),
         };
