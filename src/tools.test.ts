@@ -46,6 +46,7 @@ import {
   LIVE_EFFECT_OBSERVATION_MILLIS,
   ThreadCreateInputSchema,
   WorktreeCreateInputSchema,
+  unknownModelCapabilities,
   type Evidence,
 } from "./domain";
 import type {
@@ -1704,6 +1705,8 @@ describe("InstanceConnections.dispatchTurn", () => {
               commandId: "command-a",
               messageId: "message-a",
               text: "safe test prompt",
+              intent: "provider_default",
+              context: "thread_default",
               runtimeMode: "auto",
               interactionMode: "default",
               createdAt: "2026-09-23T09:00:00.000Z",
@@ -1717,6 +1720,10 @@ describe("InstanceConnections.dispatchTurn", () => {
 
         expect(result).toEqual({ receipt: { sequence: 19 }, dispatchStarted: true });
         expect(dispatches[0]?.expectedEnvironmentId).toBe("environment-a");
+        expect(dispatches[0]).toMatchObject({
+          intent: "provider_default",
+          context: "thread_default",
+        });
       }),
     ),
   );
@@ -5689,12 +5696,18 @@ const fixtureProviders = (): ReadonlyArray<DiscoveredProvider> => [
       {
         slug: "model-a1",
         displayName: "Model A1",
+        capabilities: unknownModelCapabilities(),
         options: [
           { kind: "select", id: "effort", values: ["low", "high"], defaultValue: "high" },
           { kind: "boolean", id: "verbose", defaultValue: true },
         ],
       },
-      { slug: "model-a2", displayName: "Model A2", options: [] },
+      {
+        slug: "model-a2",
+        displayName: "Model A2",
+        capabilities: unknownModelCapabilities(),
+        options: [],
+      },
     ],
   },
   {
@@ -5702,26 +5715,18 @@ const fixtureProviders = (): ReadonlyArray<DiscoveredProvider> => [
     providerName: "Provider B",
     availability: "unavailable",
     unavailableReason: "The provider driver is not installed.",
-    models: [{ slug: "model-b1", displayName: "Model B1", options: [] }],
+    models: [
+      {
+        slug: "model-b1",
+        displayName: "Model B1",
+        capabilities: unknownModelCapabilities(),
+        options: [],
+      },
+    ],
   },
 ];
 
-const unknownModelCapabilityEntries = [
-  {
-    name: "steer_current",
-    support: "unknown",
-    reason:
-      "The pinned T3Code 0.0.38 server configuration does not advertise this conditional guarantee for the provider/model.",
-    limitations: ["Capability support has not been verified for this provider/model."],
-  },
-  {
-    name: "resume_retained",
-    support: "unknown",
-    reason:
-      "The pinned T3Code 0.0.38 server configuration does not advertise this conditional guarantee for the provider/model.",
-    limitations: ["Capability support has not been verified for this provider/model."],
-  },
-];
+const unknownModelCapabilityEntries = unknownModelCapabilities();
 
 describe("model_list", () => {
   it.live(
@@ -5906,7 +5911,14 @@ describe("model_list", () => {
             providerName: "Shared Provider",
             availability: "available",
             unavailableReason: null,
-            models: [{ slug: model, displayName: model, options: [] }],
+            models: [
+              {
+                slug: model,
+                displayName: model,
+                capabilities: unknownModelCapabilities(),
+                options: [],
+              },
+            ],
           },
         ];
         const layer = appLayer(
@@ -5976,9 +5988,24 @@ describe("model_list", () => {
             availability: "available",
             unavailableReason: null,
             models: [
-              { slug: "model-1", displayName: "Model 1", options: [] },
-              { slug: "model-2", displayName: "Model 2", options: [] },
-              { slug: "model-3", displayName: "Model 3", options: [] },
+              {
+                slug: "model-1",
+                displayName: "Model 1",
+                capabilities: unknownModelCapabilities(),
+                options: [],
+              },
+              {
+                slug: "model-2",
+                displayName: "Model 2",
+                capabilities: unknownModelCapabilities(),
+                options: [],
+              },
+              {
+                slug: "model-3",
+                displayName: "Model 3",
+                capabilities: unknownModelCapabilities(),
+                options: [],
+              },
             ],
           },
         ];
@@ -6358,6 +6385,7 @@ describe("model listing wire decode", () => {
                 {
                   slug: "gpt-5",
                   displayName: "GPT-5",
+                  capabilities: unknownModelCapabilityEntries,
                   options: [
                     {
                       kind: "select",
@@ -6374,7 +6402,12 @@ describe("model listing wire decode", () => {
                     { kind: "boolean", id: "verbose", defaultValue: false },
                   ],
                 },
-                { slug: "gpt-5-mini", displayName: "GPT-5 Mini", options: [] },
+                {
+                  slug: "gpt-5-mini",
+                  displayName: "GPT-5 Mini",
+                  capabilities: unknownModelCapabilityEntries,
+                  options: [],
+                },
               ],
             },
             {
@@ -6382,7 +6415,14 @@ describe("model listing wire decode", () => {
               providerName: "claudeAgent",
               availability: "available",
               unavailableReason: null,
-              models: [{ slug: "claude", displayName: "Claude", options: [] }],
+              models: [
+                {
+                  slug: "claude",
+                  displayName: "Claude",
+                  capabilities: unknownModelCapabilityEntries,
+                  options: [],
+                },
+              ],
             },
           ],
           limitations: [],
@@ -6452,6 +6492,7 @@ describe("model listing wire decode", () => {
               {
                 slug: "model-a",
                 displayName: "Model A",
+                capabilities: unknownModelCapabilityEntries,
                 options: [{ kind: "select", id: "effort", values: ["low"], defaultValue: "low" }],
               },
             ],
@@ -8995,12 +9036,18 @@ const threadCreateFixtures = (defaultModel: ModelSelection | null = null) => {
             {
               slug: "model-a",
               displayName: "Model A",
+              capabilities: unknownModelCapabilities(),
               options: [
                 { kind: "select", id: "effort", values: ["low", "high"], defaultValue: "high" },
                 { kind: "boolean", id: "verbose", defaultValue: true },
               ],
             },
-            { slug: "model-b", displayName: "Model B", options: [] },
+            {
+              slug: "model-b",
+              displayName: "Model B",
+              capabilities: unknownModelCapabilities(),
+              options: [],
+            },
           ],
         },
       ],
@@ -17163,10 +17210,46 @@ describe("thread_submit", () => {
     ),
   );
 
-  it.live("rejects unsupported intent and context before observing or dispatching", () =>
+  it.live("refuses every requested guarantee when fresh provider capabilities are unknown", () =>
     withDatabasePath((databasePath) =>
       Effect.gen(function* () {
         const { options, connections } = emptyThreadFixtures();
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              72,
+              observedThreadFixture("thread-a", {
+                latestTurn: { turnId: "active-turn", state: "running" },
+                session: {
+                  status: "running",
+                  activeTurnId: "active-turn",
+                  lastError: null,
+                  updatedAt: "2026-09-23T09:00:00.000Z",
+                },
+              }),
+            ),
+        };
+        options.modelDiscovery = () =>
+          Effect.succeed({
+            providers: [
+              {
+                providerInstanceId: "provider-a",
+                providerName: "Provider A",
+                availability: "available",
+                unavailableReason: null,
+                models: [
+                  {
+                    slug: "model-a",
+                    displayName: "Model A",
+                    capabilities: unknownModelCapabilities(),
+                    options: [],
+                  },
+                ],
+              },
+            ],
+            limitations: [],
+            observedAt: "2026-09-23T09:00:00.000Z",
+          });
         let dispatches = 0;
         options.dispatchTurn = () =>
           Effect.sync(() => {
@@ -17175,6 +17258,7 @@ describe("thread_submit", () => {
           });
         const result = yield* Effect.scoped(
           Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
             const steering = yield* callTool("thread_submit", {
               requestId: "unsupported-steering",
               thread: { instanceId: "instance-a", threadId: "thread-a" },
@@ -17189,7 +17273,14 @@ describe("thread_submit", () => {
               intent: "provider_default",
               context: "require_retained",
             });
-            return { steering, retained };
+            const both = yield* callTool("thread_submit", {
+              requestId: "unsupported-both-guarantees",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+              text: "continue this active turn with retained context",
+              intent: "steer_current",
+              context: "require_retained",
+            });
+            return { steering, retained, both };
           }).pipe(Effect.provide(appLayer(databasePath, connections))),
         );
 
@@ -17199,7 +17290,288 @@ describe("thread_submit", () => {
         expect(result.retained[0]?.result).toMatchObject({
           result: { kind: "error", error: { code: "unsupported_capability" } },
         });
-        expect(options.seenThreads).toEqual([]);
+        expect(result.both[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "unsupported_capability" } },
+        });
+        expect(JSON.stringify(result.steering)).toContain("support: unknown");
+        expect(JSON.stringify(result.retained)).toContain("resume_retained");
+        expect(options.seenThreads).toHaveLength(3);
+        expect(dispatches).toBe(0);
+      }),
+    ),
+  );
+
+  it.live("refuses retained-context requests for providers that can silently start fresh", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              74,
+              observedThreadFixture("thread-a", {
+                session: {
+                  status: "ready",
+                  activeTurnId: null,
+                  lastError: "The previous provider session was lost.",
+                  updatedAt: "2026-09-23T09:00:00.000Z",
+                },
+              }),
+            ),
+        };
+        const capabilities = unknownModelCapabilities().map((capability) =>
+          capability.name === "resume_retained"
+            ? {
+                ...capability,
+                support: "unsupported" as const,
+                reason: "This provider can silently start a fresh session after resume fails.",
+              }
+            : capability,
+        );
+        options.modelDiscovery = () =>
+          Effect.succeed({
+            providers: [
+              {
+                providerInstanceId: "provider-a",
+                providerName: "Provider A",
+                availability: "available",
+                unavailableReason: null,
+                models: [{ slug: "model-a", displayName: "Model A", capabilities, options: [] }],
+              },
+            ],
+            limitations: [],
+            observedAt: "2026-09-23T09:00:00.000Z",
+          });
+        let dispatches = 0;
+        options.dispatchTurn = () =>
+          Effect.sync(() => {
+            dispatches += 1;
+            return { sequence: 75 };
+          });
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_submit", {
+              requestId: "submit-silent-resume-fallback",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+              text: "continue only with retained provider context",
+              intent: "provider_default",
+              context: "require_retained",
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "unsupported_capability" } },
+        });
+        expect(JSON.stringify(result[0]?.result)).toContain("silently start a fresh session");
+        expect(dispatches).toBe(0);
+      }),
+    ),
+  );
+
+  it.live(
+    "revalidates the active turn before dispatch and keeps the admitted request distinct",
+    () =>
+      withDatabasePath((databasePath) =>
+        Effect.gen(function* () {
+          const { options, connections } = emptyThreadFixtures();
+          let detailReads = 0;
+          options.threadStream = () => {
+            detailReads += 1;
+            const thread =
+              detailReads === 1
+                ? observedThreadFixture("thread-a", {
+                    latestTurn: { turnId: "turn-before-change", state: "running" },
+                    session: {
+                      status: "running",
+                      activeTurnId: "turn-before-change",
+                      lastError: null,
+                      updatedAt: "2026-09-23T09:00:00.000Z",
+                    },
+                  })
+                : observedThreadFixture("thread-a", {
+                    latestTurn: { turnId: "replacement-turn", state: "running" },
+                    session: {
+                      status: "running",
+                      activeTurnId: "turn-before-change",
+                      lastError: null,
+                      updatedAt: "2026-09-23T09:00:01.000Z",
+                    },
+                  });
+            return detailSnapshotStream(90 + detailReads, thread);
+          };
+          options.modelDiscovery = () =>
+            Effect.succeed({
+              providers: [
+                {
+                  providerInstanceId: "provider-a",
+                  providerName: "Provider A",
+                  availability: "available",
+                  unavailableReason: null,
+                  models: [
+                    {
+                      slug: "model-a",
+                      displayName: "Model A",
+                      capabilities: unknownModelCapabilities().map((capability) =>
+                        capability.name === "steer_current"
+                          ? {
+                              ...capability,
+                              support: "supported" as const,
+                              reason: "Test guarantee.",
+                            }
+                          : capability,
+                      ),
+                      options: [],
+                    },
+                  ],
+                },
+              ],
+              limitations: [],
+              observedAt: "2026-09-23T09:00:00.000Z",
+            });
+          let dispatches = 0;
+          options.dispatchTurn = () =>
+            Effect.sync(() => {
+              dispatches += 1;
+              return { sequence: 91 };
+            });
+
+          const result = yield* Effect.scoped(
+            Effect.gen(function* () {
+              yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+              const submission = yield* callTool("thread_submit", {
+                requestId: "submit-turn-changed-before-dispatch",
+                thread: { instanceId: "instance-a", threadId: "thread-a" },
+                text: "steer the current turn",
+                intent: "steer_current",
+                context: "thread_default",
+              });
+              const store = yield* LocalStore;
+              return {
+                submission,
+                durable: yield* store.getOperation("submit-turn-changed-before-dispatch"),
+              };
+            }).pipe(Effect.provide(appLayer(databasePath, connections))),
+          );
+
+          expect(result.submission[0]?.result).toMatchObject({
+            result: {
+              kind: "ok",
+              value: {
+                state: "failed",
+                dispatch: "not_dispatched",
+                error: { code: "unsupported_capability" },
+              },
+            },
+          });
+          expect(JSON.stringify(result.submission[0]?.result)).toContain(
+            "no current active turn to steer",
+          );
+          expect(result.durable?.intent).toMatchObject({
+            submissionIntent: "steer_current",
+            context: "thread_default",
+          });
+          expect(dispatches).toBe(0);
+        }),
+      ),
+  );
+
+  it.live("rechecks provider guarantees after admission and refuses before native dispatch", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              94,
+              observedThreadFixture("thread-a", {
+                latestTurn: { turnId: "active-turn", state: "running" },
+                session: {
+                  status: "running",
+                  activeTurnId: "active-turn",
+                  lastError: null,
+                  updatedAt: "2026-09-23T09:00:00.000Z",
+                },
+              }),
+            ),
+        };
+        let capabilityReads = 0;
+        options.modelDiscovery = () => {
+          capabilityReads += 1;
+          return Effect.succeed({
+            providers: [
+              {
+                providerInstanceId: "provider-a",
+                providerName: "Provider A",
+                availability: "available",
+                unavailableReason: null,
+                models: [
+                  {
+                    slug: "model-a",
+                    displayName: "Model A",
+                    capabilities:
+                      capabilityReads === 1
+                        ? unknownModelCapabilities().map((capability) =>
+                            capability.name === "steer_current"
+                              ? {
+                                  ...capability,
+                                  support: "supported" as const,
+                                  reason: "Verified during initial validation.",
+                                }
+                              : capability,
+                          )
+                        : unknownModelCapabilities(),
+                    options: [],
+                  },
+                ],
+              },
+            ],
+            limitations: [],
+            observedAt: `2026-09-23T09:00:0${capabilityReads}.000Z`,
+          });
+        };
+        let dispatches = 0;
+        options.dispatchTurn = () =>
+          Effect.sync(() => {
+            dispatches += 1;
+            return { sequence: 95 };
+          });
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const submission = yield* callTool("thread_submit", {
+              requestId: "submit-capability-changed-before-dispatch",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+              text: "steer the current turn",
+              intent: "steer_current",
+              context: "thread_default",
+            });
+            const store = yield* LocalStore;
+            return {
+              submission,
+              durable: yield* store.getOperation("submit-capability-changed-before-dispatch"),
+            };
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(capabilityReads).toBe(2);
+        expect(result.submission[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "failed",
+              dispatch: "not_dispatched",
+              error: { code: "unsupported_capability" },
+            },
+          },
+        });
+        expect(result.durable?.intent).toMatchObject({
+          submissionIntent: "steer_current",
+          context: "thread_default",
+        });
         expect(dispatches).toBe(0);
       }),
     ),
@@ -17263,7 +17635,14 @@ describe("thread_submit", () => {
               const receipt = yield* callTool("operation_get", {
                 requestId: "submit-active-thread",
               });
-              return { first, duplicate, conflict, receipt };
+              const store = yield* LocalStore;
+              return {
+                first,
+                duplicate,
+                conflict,
+                receipt,
+                durable: yield* store.getOperation("submit-active-thread"),
+              };
             }).pipe(Effect.provide(appLayer(databasePath, connections))),
           );
 
@@ -17298,12 +17677,18 @@ describe("thread_submit", () => {
               value: { operation: { requestId: "submit-active-thread", state: "completed" } },
             },
           });
+          expect(result.durable?.intent).toMatchObject({
+            submissionIntent: "provider_default",
+            context: "thread_default",
+          });
           expect(JSON.stringify(result.receipt)).not.toContain(prompt);
           expect(dispatched).toHaveLength(1);
           expect(dispatched[0]).toMatchObject({
             instanceId: "instance-a",
             threadId: "thread-a",
             text: prompt,
+            intent: "provider_default",
+            context: "thread_default",
             runtimeMode: "auto",
             interactionMode: "plan",
           });
@@ -17328,20 +17713,25 @@ describe("thread_submit", () => {
       Effect.gen(function* () {
         const { options, connections } = emptyThreadFixtures();
         const prompt = "secret prompt after a lost acknowledgement";
+        const distinctPrompt = "new explicit request after uncertain recovery";
+        const dispatchedTexts: Array<string> = [];
         let dispatches = 0;
         options.threadStreams = {
           "instance-a:thread-a": () => detailSnapshotStream(81, observedThreadFixture("thread-a")),
         };
-        options.dispatchTurn = () => {
+        options.dispatchTurn = (input) => {
           dispatches += 1;
-          return Effect.fail(
-            new T3CodeAdapterError({
-              kind: "transport",
-              message: "The test connection dropped after dispatch.",
-              uncertain: true,
-              status: null,
-            }),
-          );
+          dispatchedTexts.push(input.text);
+          return input.text === prompt
+            ? Effect.fail(
+                new T3CodeAdapterError({
+                  kind: "transport",
+                  message: "The test connection dropped after dispatch.",
+                  uncertain: true,
+                  status: null,
+                }),
+              )
+            : Effect.succeed({ sequence: 82 });
         };
 
         const result = yield* Effect.scoped(
@@ -17361,8 +17751,18 @@ describe("thread_submit", () => {
               intent: "provider_default",
               context: "thread_default",
             });
+            const distinct = yield* callTool("thread_submit", {
+              requestId: "submit-after-uncertain-recovery",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+              text: distinctPrompt,
+              intent: "provider_default",
+              context: "thread_default",
+            });
             const lookup = yield* callTool("operation_get", { requestId: "submit-lost-ack" });
-            return { first, duplicate, lookup };
+            const distinctLookup = yield* callTool("operation_get", {
+              requestId: "submit-after-uncertain-recovery",
+            });
+            return { first, duplicate, distinct, lookup, distinctLookup };
           }).pipe(Effect.provide(appLayer(databasePath, connections))),
         );
 
@@ -17381,14 +17781,94 @@ describe("thread_submit", () => {
         expect(result.duplicate[0]?.result).toMatchObject({
           result: { kind: "ok", value: { state: "outcome_unknown" } },
         });
+        expect(result.distinct[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "completed",
+              dispatch: "accepted",
+              correlation: { kind: "unestablished" },
+            },
+          },
+        });
         expect(result.lookup[0]?.result).toMatchObject({
           result: {
             kind: "ok",
             value: { operation: { requestId: "submit-lost-ack", state: "outcome_unknown" } },
           },
         });
+        expect(result.distinctLookup[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              operation: { requestId: "submit-after-uncertain-recovery", state: "completed" },
+            },
+          },
+        });
         expect(JSON.stringify(result)).not.toContain(prompt);
-        expect(dispatches).toBe(1);
+        expect(JSON.stringify(result)).not.toContain(distinctPrompt);
+        expect(dispatchedTexts).toEqual([prompt, distinctPrompt]);
+        expect(dispatches).toBe(2);
+      }),
+    ),
+  );
+
+  it.live("accepts a new provider-default submission while the previous turn is interrupted", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              83,
+              observedThreadFixture("thread-a", {
+                latestTurn: { turnId: "interrupted-turn", state: "interrupted" },
+                session: {
+                  status: "interrupted",
+                  activeTurnId: null,
+                  lastError: "Execution was interrupted.",
+                  updatedAt: "2026-09-23T09:00:00.000Z",
+                },
+              }),
+            ),
+        };
+        const dispatched: Array<InstanceDispatchTurnInput> = [];
+        options.dispatchTurn = (input) =>
+          Effect.sync(() => {
+            dispatched.push(input);
+            return { sequence: 84 };
+          });
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_submit", {
+              requestId: "submit-after-interruption",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+              text: "continue with a new explicit submission",
+              intent: "provider_default",
+              context: "thread_default",
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "completed",
+              dispatch: "accepted",
+              completionMeans: "submission_accepted",
+              correlation: { kind: "unestablished" },
+            },
+          },
+        });
+        expect(dispatched).toHaveLength(1);
+        expect(dispatched[0]).toMatchObject({
+          intent: "provider_default",
+          context: "thread_default",
+        });
+        expect(JSON.stringify(result[0]?.result)).not.toContain("resumed");
       }),
     ),
   );

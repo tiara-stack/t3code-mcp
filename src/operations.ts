@@ -31,6 +31,7 @@ import {
   type OperationGetInput,
   type OperationGetValue,
   type OperationRecord,
+  type Capability,
   type ThreadSubmitInput,
   type PendingRequest,
   type ThreadInterruptInput,
@@ -55,6 +56,7 @@ import type {
 } from "./local-store";
 import { InstanceConnections } from "./instance-connections";
 import type {
+  DiscoveredModels,
   DiscoveredVcsWorktreeRefs,
   InstanceConnection,
   InstanceConnectionsService,
@@ -357,7 +359,10 @@ export interface OperationsService {
   ) => Effect.Effect<OperationRecord, LocalStoreError | OperationServiceError>;
   readonly submitThread: (
     input: ThreadSubmitInput,
-  ) => Effect.Effect<OperationRecord, LocalStoreError | OperationServiceError>;
+  ) => Effect.Effect<
+    OperationRecord,
+    LocalStoreError | OperationServiceError | ObservationServiceError
+  >;
   readonly createWorktree: (
     input: WorktreeCreateInput,
   ) => Effect.Effect<OperationRecord, LocalStoreError | OperationServiceError>;
@@ -446,6 +451,88 @@ const sameModelSelection = (left: ModelSelection, right: ModelSelection): boolea
     left.providerInstanceId === right.providerInstanceId &&
     left.model === right.model &&
     JSON.stringify(optionEntries(left)) === JSON.stringify(optionEntries(right))
+  );
+};
+
+type SubmissionGuarantee = Extract<Capability["name"], "steer_current" | "resume_retained">;
+
+const requiredSubmissionGuarantees = (
+  input: ThreadSubmitInput,
+): ReadonlyArray<SubmissionGuarantee> => [
+  ...(input.intent === "steer_current" ? ["steer_current" as const] : []),
+  ...(input.context === "require_retained" ? ["resume_retained" as const] : []),
+];
+
+const submissionNeedsCapabilityCheck = (input: ThreadSubmitInput): boolean =>
+  requiredSubmissionGuarantees(input).length > 0;
+
+const activeSessionTurnId = (
+  session: SynchronizedThreadDetail["thread"]["session"],
+): string | null => {
+  if (session === null || (session.status !== "starting" && session.status !== "running")) {
+    return null;
+  }
+  return session.activeTurnId;
+};
+
+const activeSubmissionTurnId = (thread: SynchronizedThreadDetail["thread"]): string | null => {
+  const sessionTurnId = activeSessionTurnId(thread.session);
+  if (thread.latestTurn === null) return sessionTurnId;
+  if (thread.latestTurn.state !== "running" || sessionTurnId !== thread.latestTurn.turnId) {
+    return null;
+  }
+  return thread.latestTurn.turnId;
+};
+
+const exactlyOne = <Value>(values: ReadonlyArray<Value>): Value | undefined =>
+  values.length === 1 ? values[0] : undefined;
+
+const submissionGuaranteeRefusal = (
+  name: SubmissionGuarantee,
+  selected: string,
+  support: string,
+  detail: string,
+): OperationServiceError =>
+  new OperationServiceError({
+    kind: "unsupported",
+    message: `Cannot guarantee ${name} for ${selected} (support: ${support}). ${detail} The request was not dispatched.`,
+  });
+
+const unavailableSubmissionProviderRefusal = (input: {
+  readonly provider: DiscoveredModels["providers"][number] | undefined;
+  readonly name: SubmissionGuarantee;
+  readonly selected: string;
+}): OperationServiceError | null => {
+  if (input.provider?.availability === "available") return null;
+  const detail =
+    input.provider?.unavailableReason ??
+    (input.provider === undefined
+      ? "The selected provider was not uniquely present in fresh model discovery."
+      : "The selected provider is unavailable.");
+  return submissionGuaranteeRefusal(input.name, input.selected, "unknown", detail);
+};
+
+const selectedSubmissionCapability = (
+  model: DiscoveredModels["providers"][number]["models"][number] | undefined,
+  name: SubmissionGuarantee,
+) => exactlyOne(model?.capabilities.filter((entry) => entry.name === name) ?? []);
+
+const submissionCapabilityRefusal = (input: {
+  readonly provider: DiscoveredModels["providers"][number] | undefined;
+  readonly model: DiscoveredModels["providers"][number]["models"][number] | undefined;
+  readonly name: SubmissionGuarantee;
+  readonly selected: string;
+}): OperationServiceError | null => {
+  const providerRefusal = unavailableSubmissionProviderRefusal(input);
+  if (providerRefusal !== null) return providerRefusal;
+  const capability = selectedSubmissionCapability(input.model, input.name);
+  if (capability?.support === "supported") return null;
+  return submissionGuaranteeRefusal(
+    input.name,
+    input.selected,
+    capability?.support ?? "unknown",
+    capability?.reason ??
+      "The selected provider/model did not provide a unique verified capability entry.",
   );
 };
 
@@ -1023,6 +1110,41 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           return terminal(current.record) ? null : current.record.revision;
         });
 
+      const validateSubmissionGuarantees = (
+        input: ThreadSubmitInput,
+        thread: SynchronizedThreadDetail["thread"],
+      ): Effect.Effect<void, LocalStoreError | T3CodeAdapterError | OperationServiceError> => {
+        const required = requiredSubmissionGuarantees(input);
+        if (required.length === 0) return Effect.void;
+        if (required.includes("steer_current") && activeSubmissionTurnId(thread) === null) {
+          return Effect.fail(
+            new OperationServiceError({
+              kind: "unsupported",
+              message:
+                "The observed thread has no current active turn to steer; the request was not dispatched.",
+            }),
+          );
+        }
+
+        return Effect.gen(function* () {
+          const discovered = yield* connections.discoverModels(input.thread.instanceId);
+          const provider = exactlyOne(
+            discovered.providers.filter(
+              (entry) => entry.providerInstanceId === thread.modelSelection.providerInstanceId,
+            ),
+          );
+          const model = exactlyOne(
+            provider?.models.filter((entry) => entry.slug === thread.modelSelection.model) ?? [],
+          );
+          const selected = `${thread.modelSelection.providerInstanceId}/${thread.modelSelection.model}`;
+
+          for (const name of required) {
+            const refusal = submissionCapabilityRefusal({ provider, model, name, selected });
+            if (refusal !== null) return yield* Effect.fail(refusal);
+          }
+        });
+      };
+
       const currentSettlementObservation = (
         requestId: string,
       ): Effect.Effect<
@@ -1048,7 +1170,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
         });
 
       const isPreDispatchRevisionConflict = (
-        error: LocalStoreError | T3CodeAdapterError | ObservationError,
+        error: LocalStoreError | T3CodeAdapterError | ObservationError | OperationServiceError,
         dispatchStarted: boolean,
         accepted: boolean,
       ): boolean =>
@@ -1068,6 +1190,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
         readonly active: boolean;
         readonly commandId: string;
         readonly messageId: string;
+        readonly stepPosition: number;
         readonly sequence: number;
         readonly onAccepted: (receipt: AcceptedSubmissionReceipt) => void;
       }): Effect.Effect<void, LocalStoreError> =>
@@ -1099,10 +1222,10 @@ export class Operations extends Context.Service<Operations, OperationsService>()
               reason:
                 "T3Code acknowledged the command and message IDs but did not return a turn ID correlated to this submitted message.",
             },
-            stepPosition: 0,
+            stepPosition: input.stepPosition,
             stepState: "succeeded",
             evidence: [acceptedEvidence],
-            evidenceStepPosition: 0,
+            evidenceStepPosition: input.stepPosition,
             error: null,
             recovery: "none",
             recoverableUntil: new Date(
@@ -1203,9 +1326,17 @@ export class Operations extends Context.Service<Operations, OperationsService>()
       };
 
       const submissionFailure = (
-        error: LocalStoreError | T3CodeAdapterError | ObservationError,
+        error: LocalStoreError | T3CodeAdapterError | ObservationError | OperationServiceError,
         outcomeUnknown: boolean,
       ): ToolFailure => {
+        if (error instanceof OperationServiceError) {
+          return {
+            code: error.kind === "unsupported" ? "unsupported_capability" : "unavailable",
+            message: error.message,
+            retry: error.kind === "unsupported" ? "change_request" : "reconcile_first",
+            details: {},
+          };
+        }
         if (error instanceof ObservationError) {
           return {
             code: "unavailable",
@@ -5360,6 +5491,8 @@ export class Operations extends Context.Service<Operations, OperationsService>()
         let commandId: string | null = null;
         let messageId: string | null = null;
         let intent: OperationIntent | null = null;
+        let stepPosition = 0;
+        const dispatchStepPosition = submissionNeedsCapabilityCheck(input) ? 1 : 0;
 
         // fallow-ignore-next-line complexity
         return Effect.gen(function* () {
@@ -5373,6 +5506,8 @@ export class Operations extends Context.Service<Operations, OperationsService>()
             return;
           }
           const thread = observed.thread;
+          yield* validateSubmissionGuarantees(input, thread);
+          stepPosition = dispatchStepPosition;
           commandId = yield* crypto.randomUUIDv4.pipe(
             Effect.mapError(
               () =>
@@ -5444,10 +5579,10 @@ export class Operations extends Context.Service<Operations, OperationsService>()
               reason:
                 "The native dispatch acknowledgement does not include a turn correlated to this message.",
             },
-            stepPosition: 0,
+            stepPosition,
             stepState: "pending",
             evidence: [observationEvidence, dispatchMarker],
-            evidenceStepPosition: 0,
+            evidenceStepPosition: stepPosition,
             recovery: "observe_operation",
           });
           if (!prepared) {
@@ -5460,6 +5595,8 @@ export class Operations extends Context.Service<Operations, OperationsService>()
             commandId,
             messageId,
             text: input.text,
+            intent: input.intent,
+            context: input.context,
             runtimeMode: thread.runtimeMode,
             interactionMode: thread.interactionMode,
             createdAt: dispatchMarker.observedAt,
@@ -5472,91 +5609,100 @@ export class Operations extends Context.Service<Operations, OperationsService>()
             active,
             commandId,
             messageId,
+            stepPosition,
             sequence: accepted.sequence,
             onAccepted: (receipt) => {
               acceptedReceipt = receipt;
             },
           });
         }).pipe(
-          Effect.catch((error: LocalStoreError | T3CodeAdapterError | ObservationError) =>
-            nowIso.pipe(
-              // fallow-ignore-next-line complexity
-              Effect.flatMap((now) => {
-                const accepted = acceptedReceipt;
-                if (isPreDispatchRevisionConflict(error, dispatchStarted, accepted !== null)) {
-                  return signalCompletion(input.requestId);
-                }
-                const outcomeUnknown =
-                  accepted === null &&
-                  dispatchStarted &&
-                  (!(error instanceof T3CodeAdapterError) || error.uncertain);
-                const failure = accepted === null ? submissionFailure(error, outcomeUnknown) : null;
-                return store
-                  .updateOperation(input.requestId, {
-                    now,
-                    ...(intent === null ? {} : { intent }),
-                    state:
-                      accepted !== null
-                        ? "completed"
-                        : outcomeUnknown
-                          ? "outcome_unknown"
-                          : "failed",
-                    dispatch:
-                      accepted !== null
-                        ? "accepted"
-                        : dispatchStarted
-                          ? outcomeUnknown
-                            ? "unknown"
-                            : "rejected"
-                          : "not_dispatched",
-                    ...(commandId === null ? {} : { commandId }),
-                    ...(messageId === null ? {} : { messageId }),
-                    target: input.thread,
-                    correlation: {
-                      kind: "unestablished",
-                      reason:
-                        accepted === null
-                          ? "No accepted native response established a turn correlated to this message."
-                          : "T3Code acknowledged the command and message IDs but did not return a turn ID correlated to this submitted message.",
-                    },
-                    stepPosition: 0,
-                    stepState:
-                      accepted !== null
-                        ? "succeeded"
-                        : outcomeUnknown
-                          ? "outcome_unknown"
-                          : "failed",
-                    ...(accepted === null
-                      ? {}
-                      : {
-                          evidence: [{ ...accepted.evidence, sourceSequence: accepted.sequence }],
-                          evidenceStepPosition: 0,
-                        }),
-                    stepError: failure,
-                    error: failure,
-                    recovery:
-                      accepted !== null
-                        ? "none"
-                        : outcomeUnknown
-                          ? "observe_operation"
-                          : "new_explicit_request",
-                    recoverableUntil:
-                      accepted !== null
-                        ? new Date(
-                            Date.parse(accepted.acceptedAt) + OPERATION_DETAIL_RETENTION_MILLIS,
-                          ).toISOString()
-                        : outcomeUnknown
-                          ? null
-                          : new Date(
-                              Date.parse(now) + OPERATION_DETAIL_RETENTION_MILLIS,
-                            ).toISOString(),
-                  })
-                  .pipe(
-                    Effect.andThen(signalCompletion(input.requestId)),
-                    Effect.catch(() => Effect.void),
-                  );
-              }),
-            ),
+          Effect.catch(
+            (
+              error:
+                | LocalStoreError
+                | T3CodeAdapterError
+                | ObservationError
+                | OperationServiceError,
+            ) =>
+              nowIso.pipe(
+                // fallow-ignore-next-line complexity
+                Effect.flatMap((now) => {
+                  const accepted = acceptedReceipt;
+                  if (isPreDispatchRevisionConflict(error, dispatchStarted, accepted !== null)) {
+                    return signalCompletion(input.requestId);
+                  }
+                  const outcomeUnknown =
+                    accepted === null &&
+                    dispatchStarted &&
+                    (!(error instanceof T3CodeAdapterError) || error.uncertain);
+                  const failure =
+                    accepted === null ? submissionFailure(error, outcomeUnknown) : null;
+                  return store
+                    .updateOperation(input.requestId, {
+                      now,
+                      ...(intent === null ? {} : { intent }),
+                      state:
+                        accepted !== null
+                          ? "completed"
+                          : outcomeUnknown
+                            ? "outcome_unknown"
+                            : "failed",
+                      dispatch:
+                        accepted !== null
+                          ? "accepted"
+                          : dispatchStarted
+                            ? outcomeUnknown
+                              ? "unknown"
+                              : "rejected"
+                            : "not_dispatched",
+                      ...(commandId === null ? {} : { commandId }),
+                      ...(messageId === null ? {} : { messageId }),
+                      target: input.thread,
+                      correlation: {
+                        kind: "unestablished",
+                        reason:
+                          accepted === null
+                            ? "No accepted native response established a turn correlated to this message."
+                            : "T3Code acknowledged the command and message IDs but did not return a turn ID correlated to this submitted message.",
+                      },
+                      stepPosition,
+                      stepState:
+                        accepted !== null
+                          ? "succeeded"
+                          : outcomeUnknown
+                            ? "outcome_unknown"
+                            : "failed",
+                      ...(accepted === null
+                        ? {}
+                        : {
+                            evidence: [{ ...accepted.evidence, sourceSequence: accepted.sequence }],
+                            evidenceStepPosition: stepPosition,
+                          }),
+                      stepError: failure,
+                      error: failure,
+                      recovery:
+                        accepted !== null
+                          ? "none"
+                          : outcomeUnknown
+                            ? "observe_operation"
+                            : "new_explicit_request",
+                      recoverableUntil:
+                        accepted !== null
+                          ? new Date(
+                              Date.parse(accepted.acceptedAt) + OPERATION_DETAIL_RETENTION_MILLIS,
+                            ).toISOString()
+                          : outcomeUnknown
+                            ? null
+                            : new Date(
+                                Date.parse(now) + OPERATION_DETAIL_RETENTION_MILLIS,
+                              ).toISOString(),
+                    })
+                    .pipe(
+                      Effect.andThen(signalCompletion(input.requestId)),
+                      Effect.catch(() => Effect.void),
+                    );
+                }),
+              ),
           ),
           Effect.asVoid,
         );
@@ -7851,22 +7997,24 @@ export class Operations extends Context.Service<Operations, OperationsService>()
 
       const submitThread = (
         input: ThreadSubmitInput,
-      ): Effect.Effect<OperationRecord, LocalStoreError | OperationServiceError> =>
+      ): Effect.Effect<
+        OperationRecord,
+        LocalStoreError | OperationServiceError | ObservationServiceError
+      > =>
         Effect.gen(function* () {
           const fingerprint = yield* store.fingerprintRequest("thread_submit", input);
           const existing = yield* findExistingOperation(input.requestId, fingerprint);
           if (existing !== null) return existing;
 
-          if (input.intent !== "provider_default" || input.context !== "thread_default") {
-            return yield* Effect.fail(
-              new OperationServiceError({
-                kind: "unsupported",
-                message:
-                  "thread_submit currently supports only provider_default intent with thread_default context.",
-              }),
+          if (submissionNeedsCapabilityCheck(input)) {
+            const observed = yield* observations.threadDetail(
+              input.thread.instanceId,
+              input.thread.threadId,
             );
+            yield* validateSubmissionGuarantees(input, observed.thread);
           }
 
+          const dispatchStepPosition = submissionNeedsCapabilityCheck(input) ? 1 : 0;
           return yield* admitAndRun({
             requestId: input.requestId,
             fingerprint,
@@ -7879,7 +8027,10 @@ export class Operations extends Context.Service<Operations, OperationsService>()
             },
             completionMeans: "submission_accepted",
             target: input.thread,
-            steps: ["dispatch_provider_default_turn_start"],
+            steps:
+              dispatchStepPosition === 0
+                ? ["dispatch_provider_default_turn_start"]
+                : ["revalidate_submission_guarantees", "dispatch_thread_turn_start"],
             execute: executeSubmit(input),
           });
         });

@@ -72,7 +72,6 @@ import {
   staleDiffReadLimitation,
   staleThreadReadLimitation,
   staleWorktreeReadLimitation,
-  unknownModelCapabilities,
   MAX_SERIALIZED_RESULT_BYTES,
   ModelListInputSchema,
   ModelListToolResultSchema,
@@ -448,7 +447,7 @@ const asDurableMutation = <
 export const ThreadSubmitTool = asDurableMutation(
   Tool.make("thread_submit", {
     description:
-      "Submit text to an existing thread using its current provider and configuration. The receipt confirms T3Code accepted the turn-start command, not provider execution or when active-thread input will be consumed.",
+      "Submit text to an existing thread using explicit provider-default or guaranteed-steering intent and thread-default or retained-context requirement. Requested guarantees are checked against the fresh selected provider/model capability and refused when they are unknown or unsupported. The receipt confirms T3Code accepted the turn-start command, not provider execution, active-input consumption timing, or a correlated native turn.",
     parameters: ThreadSubmitInputSchema,
     success: OperationToolResultSchema,
   }),
@@ -1052,7 +1051,7 @@ const healthyModelItems = (
           displayName: model.displayName,
           availability: provider.availability,
           unavailableReason: provider.unavailableReason,
-          capabilities: unknownModelCapabilities(),
+          capabilities: model.capabilities,
           options: model.options,
         })),
   );

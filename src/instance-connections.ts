@@ -114,6 +114,8 @@ export interface InstanceDispatchTurnInput {
   readonly commandId: string;
   readonly messageId: string;
   readonly text: string;
+  readonly intent: "provider_default" | "steer_current";
+  readonly context: "thread_default" | "require_retained";
   readonly runtimeMode: RuntimeMode;
   readonly interactionMode: InteractionMode;
   readonly createdAt: string;
@@ -1179,6 +1181,8 @@ export class InstanceConnections extends Context.Service<
                 commandId: input.commandId,
                 messageId: input.messageId,
                 text: input.text,
+                intent: input.intent,
+                context: input.context,
                 runtimeMode: input.runtimeMode,
                 interactionMode: input.interactionMode,
                 createdAt: input.createdAt,
