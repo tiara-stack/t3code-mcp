@@ -127,6 +127,13 @@ export type PreparedThreadSessionStop = {
   }) => Effect.Effect<{ readonly sequence: number }, T3CodeAdapterError>;
 };
 
+export type PreparedThreadDelete = {
+  readonly dispatch: (input: {
+    readonly threadId: string;
+    readonly commandId: string;
+  }) => Effect.Effect<{ readonly sequence: number }, T3CodeAdapterError>;
+};
+
 export interface InstanceInspection {
   readonly details: InstanceDetails;
   readonly observedAt: string;
@@ -173,6 +180,9 @@ export interface InstanceConnectionsService {
     instanceId: string,
     input: ThreadCreateRequest & { readonly onDispatch: Effect.Effect<void, E, never> },
   ) => Effect.Effect<{ readonly sequence: number }, LocalStoreError | T3CodeAdapterError | E>;
+  readonly prepareThreadDelete: (
+    instanceId: string,
+  ) => Effect.Effect<PreparedThreadDelete, LocalStoreError | T3CodeAdapterError>;
   /**
    * Read the VCS refs for one repository path on the target instance, keeping
    * only refs that report a worktree checkout. A missing registration or an
@@ -254,6 +264,72 @@ export interface InstanceConnectionsService {
   readonly invalidate: (instanceId: string) => Effect.Effect<void>;
 }
 
+type InstanceConnectionsTestOverrides = Pick<
+  InstanceConnectionsService,
+  | "readVcsWorktreeDiffPreview"
+  | "readThreadHistoryDiff"
+  | "respondToInput"
+  | "dispatchTurn"
+  | "interruptThread"
+  | "prepareThreadSessionStop"
+  | "removeWorktree"
+  | "createThread"
+  | "prepareThreadDelete"
+  | "dispatchThreadSettlement"
+>;
+
+const testConnectionCapacityError = (message: string) =>
+  new T3CodeAdapterError({ kind: "capacity", message, uncertain: false, status: null });
+
+const instanceConnectionsTestDefaults: InstanceConnectionsTestOverrides = {
+  readVcsWorktreeDiffPreview: () =>
+    Effect.fail(
+      testConnectionCapacityError("The test connection does not support VCS diff reads."),
+    ),
+  readThreadHistoryDiff: () =>
+    Effect.fail(
+      testConnectionCapacityError("The test connection does not support thread-history diffs."),
+    ),
+  respondToInput: () =>
+    Effect.fail(
+      testConnectionCapacityError("The test connection does not support input responses."),
+    ),
+  dispatchTurn: () =>
+    Effect.fail(testConnectionCapacityError("The test connection does not support dispatch.")),
+  interruptThread: () =>
+    Effect.fail(
+      testConnectionCapacityError("The test connection does not support thread interruption."),
+    ),
+  prepareThreadSessionStop: () =>
+    Effect.succeed({
+      dispatch: () =>
+        Effect.fail(
+          testConnectionCapacityError(
+            "The test connection does not support provider-session shutdown.",
+          ),
+        ),
+    }),
+  removeWorktree: () =>
+    Effect.fail(
+      testConnectionCapacityError("The test connection does not support worktree removal."),
+    ),
+  createThread: () =>
+    Effect.fail(
+      testConnectionCapacityError("The test connection does not support thread creation."),
+    ),
+  prepareThreadDelete: () =>
+    Effect.succeed({
+      dispatch: () =>
+        Effect.fail(
+          testConnectionCapacityError("The test connection does not support thread deletion."),
+        ),
+    }),
+  dispatchThreadSettlement: () =>
+    Effect.fail(
+      testConnectionCapacityError("The test connection does not support thread settlement."),
+    ),
+};
+
 /**
  * Owns the application-facing connection lifecycle independently from the
  * adapter's pinned wire implementation. Pairing deliberately returns a
@@ -265,125 +341,10 @@ export class InstanceConnections extends Context.Service<
   InstanceConnectionsService
 >()("t3code-mcp/InstanceConnections") {
   static readonly layerTest = (
-    service: Omit<
-      InstanceConnectionsService,
-      | "readVcsWorktreeDiffPreview"
-      | "readThreadHistoryDiff"
-      | "respondToInput"
-      | "dispatchTurn"
-      | "interruptThread"
-      | "prepareThreadSessionStop"
-      | "removeWorktree"
-      | "createThread"
-    > &
-      Partial<
-        Pick<
-          InstanceConnectionsService,
-          | "readVcsWorktreeDiffPreview"
-          | "readThreadHistoryDiff"
-          | "respondToInput"
-          | "dispatchTurn"
-          | "interruptThread"
-          | "prepareThreadSessionStop"
-          | "removeWorktree"
-          | "createThread"
-        >
-      >,
+    service: Omit<InstanceConnectionsService, keyof InstanceConnectionsTestOverrides> &
+      Partial<InstanceConnectionsTestOverrides>,
   ): Layer.Layer<InstanceConnections> =>
-    Layer.succeed(InstanceConnections, {
-      ...service,
-      readVcsWorktreeDiffPreview:
-        service.readVcsWorktreeDiffPreview ??
-        (() =>
-          Effect.fail(
-            new T3CodeAdapterError({
-              kind: "capacity",
-              message: "The test connection does not support VCS diff reads.",
-              uncertain: false,
-              status: null,
-            }),
-          )),
-      readThreadHistoryDiff:
-        service.readThreadHistoryDiff ??
-        (() =>
-          Effect.fail(
-            new T3CodeAdapterError({
-              kind: "capacity",
-              message: "The test connection does not support thread-history diffs.",
-              uncertain: false,
-              status: null,
-            }),
-          )),
-      respondToInput:
-        service.respondToInput ??
-        (() =>
-          Effect.fail(
-            new T3CodeAdapterError({
-              kind: "capacity",
-              message: "The test connection does not support input responses.",
-              uncertain: false,
-              status: null,
-            }),
-          )),
-      dispatchTurn:
-        service.dispatchTurn ??
-        (() =>
-          Effect.fail(
-            new T3CodeAdapterError({
-              kind: "capacity",
-              message: "The test connection does not support dispatch.",
-              uncertain: false,
-              status: null,
-            }),
-          )),
-      interruptThread:
-        service.interruptThread ??
-        (() =>
-          Effect.fail(
-            new T3CodeAdapterError({
-              kind: "capacity",
-              message: "The test connection does not support thread interruption.",
-              uncertain: false,
-              status: null,
-            }),
-          )),
-      prepareThreadSessionStop:
-        service.prepareThreadSessionStop ??
-        (() =>
-          Effect.succeed({
-            dispatch: () =>
-              Effect.fail(
-                new T3CodeAdapterError({
-                  kind: "capacity",
-                  message: "The test connection does not support provider-session shutdown.",
-                  uncertain: false,
-                  status: null,
-                }),
-              ),
-          })),
-      removeWorktree:
-        service.removeWorktree ??
-        (() =>
-          Effect.fail(
-            new T3CodeAdapterError({
-              kind: "capacity",
-              message: "The test connection does not support worktree removal.",
-              uncertain: false,
-              status: null,
-            }),
-          )),
-      createThread:
-        service.createThread ??
-        (() =>
-          Effect.fail(
-            new T3CodeAdapterError({
-              kind: "capacity",
-              message: "The test connection does not support thread creation.",
-              uncertain: false,
-              status: null,
-            }),
-          )),
-    });
+    Layer.succeed(InstanceConnections, { ...instanceConnectionsTestDefaults, ...service });
 
   static readonly layerWithAdapter = (adapterLayer: Layer.Layer<T3CodeAdapter>) =>
     Layer.effect(
@@ -598,6 +559,33 @@ export class InstanceConnections extends Context.Service<
                   }),
                 ),
             } satisfies PreparedThreadSessionStop;
+          });
+
+        const prepareThreadDelete = (
+          instanceId: string,
+        ): Effect.Effect<PreparedThreadDelete, LocalStoreError | T3CodeAdapterError> =>
+          Effect.gen(function* () {
+            yield* requireReadableRegistration(
+              instanceId,
+              "The saved registration requires pairing before threads can be removed.",
+            );
+            const connection = yield* acquire(instanceId).pipe(
+              Effect.catchTag("T3CodeAdapterError", (error) =>
+                Effect.fail(certainConnectionAcquisitionError(error)),
+              ),
+            );
+            return {
+              dispatch: (input) =>
+                withInstanceCapacity(
+                  instanceId,
+                  adapter.deleteThread({
+                    endpoint: connection.endpoint,
+                    credential: connection.credential,
+                    threadId: input.threadId,
+                    commandId: input.commandId,
+                  }),
+                ),
+            } satisfies PreparedThreadDelete;
           });
 
         const discoverVcsRefs = (
@@ -1326,6 +1314,7 @@ export class InstanceConnections extends Context.Service<
           prepareThreadSessionStop,
           removeWorktree,
           createThread,
+          prepareThreadDelete,
           discoverVcsRefs,
           readVcsWorktreeStatus,
           readVcsWorktreeDiffPreview,

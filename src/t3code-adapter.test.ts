@@ -1,5 +1,6 @@
 import { NodeHttpServer } from "@effect/platform-node";
 import { describe, expect, it } from "@effect/vitest";
+import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
@@ -110,10 +111,17 @@ const GetFullThreadDiffFixtureRpc = Rpc.make("orchestration.getFullThreadDiff", 
   error: Schema.Unknown,
 });
 
+const ThreadDeleteFixtureRpc = Rpc.make("orchestration.dispatchCommand", {
+  payload: Schema.Unknown,
+  success: Schema.Struct({ sequence: Schema.Int }),
+  error: Schema.Unknown,
+});
+
 const ThreadSubscriptionFixtureGroup = RpcGroup.make(
   ThreadSubscriptionFixtureRpc,
   GetTurnDiffFixtureRpc,
   GetFullThreadDiffFixtureRpc,
+  ThreadDeleteFixtureRpc,
 );
 
 const threadMessageSentFrame = {
@@ -130,74 +138,111 @@ const threadMessageSentFrame = {
   },
 };
 
-const pinnedT3CodeFixtureServer = HttpRouter.serve(
-  Layer.mergeAll(
-    HttpRouter.add(
-      "GET",
-      "/.well-known/t3/environment",
-      HttpServerResponse.json({
-        environmentId: "fixture-environment",
-        label: "T3Code 0.0.38 fixture",
-        platform: { os: "linux", arch: "x64" },
-        serverVersion: "0.0.38",
-        capabilities: {},
-      }),
-    ),
-    HttpRouter.add(
-      "GET",
-      "/api/auth/session",
-      HttpServerResponse.json({
-        authenticated: true,
-        auth: {
-          policy: "fixture",
-          bootstrapMethods: [],
-          sessionMethods: [],
-          sessionCookieName: "fixture-session",
-        },
-        scopes: ["orchestration:read", "orchestration:operate"],
-      }),
-    ),
-    HttpRouter.add(
-      "POST",
-      "/api/auth/websocket-ticket",
-      HttpServerResponse.json({ ticket: "fixture-ticket", expiresAt: "2026-09-25T00:00:00.000Z" }),
-    ),
-    RpcServer.layerHttp({
-      group: ThreadSubscriptionFixtureGroup,
-      path: "/ws",
-      protocol: "websocket",
-    }).pipe(
-      Layer.provide(
-        ThreadSubscriptionFixtureGroup.toLayer({
-          "orchestration.subscribeThread": () => Stream.make(threadMessageSentFrame),
-          "orchestration.getTurnDiff": (input) =>
-            Effect.succeed({
-              threadId: input.threadId,
-              fromTurnCount: input.fromTurnCount,
-              toTurnCount: input.toTurnCount,
-              diff: `${input.ignoreWhitespace ? "ignore" : "include"}:range`,
-            }),
-          "orchestration.getFullThreadDiff": (input) =>
-            input.threadId === "missing-thread" && input.toTurnCount > 0
-              ? Effect.fail({
-                  _tag: "OrchestrationGetFullThreadDiffError",
-                  message: "the thread history is unavailable",
-                })
-              : Effect.succeed({
+interface ThreadDeleteDispatchStateService {
+  lastDispatchedCommand: unknown;
+  nextDispatchFailure: unknown;
+}
+
+class ThreadDeleteDispatchState extends Context.Service<
+  ThreadDeleteDispatchState,
+  ThreadDeleteDispatchStateService
+>()("t3code-mcp/T3CodeAdapterTestDispatchState") {}
+
+const pinnedT3CodeFixtureServer = Layer.unwrap(
+  Effect.gen(function* () {
+    const dispatchState = yield* ThreadDeleteDispatchState;
+    return HttpRouter.serve(
+      Layer.mergeAll(
+        HttpRouter.add(
+          "GET",
+          "/.well-known/t3/environment",
+          HttpServerResponse.json({
+            environmentId: "fixture-environment",
+            label: "T3Code 0.0.38 fixture",
+            platform: { os: "linux", arch: "x64" },
+            serverVersion: "0.0.38",
+            capabilities: {},
+          }),
+        ),
+        HttpRouter.add(
+          "GET",
+          "/api/auth/session",
+          HttpServerResponse.json({
+            authenticated: true,
+            auth: {
+              policy: "fixture",
+              bootstrapMethods: [],
+              sessionMethods: [],
+              sessionCookieName: "fixture-session",
+            },
+            scopes: ["orchestration:read", "orchestration:operate"],
+          }),
+        ),
+        HttpRouter.add(
+          "POST",
+          "/api/auth/websocket-ticket",
+          HttpServerResponse.json({
+            ticket: "fixture-ticket",
+            expiresAt: "2026-09-25T00:00:00.000Z",
+          }),
+        ),
+        RpcServer.layerHttp({
+          group: ThreadSubscriptionFixtureGroup,
+          path: "/ws",
+          protocol: "websocket",
+        }).pipe(
+          Layer.provide(
+            ThreadSubscriptionFixtureGroup.toLayer({
+              "orchestration.subscribeThread": () => Stream.make(threadMessageSentFrame),
+              "orchestration.getTurnDiff": (input) =>
+                Effect.succeed({
                   threadId: input.threadId,
-                  fromTurnCount: 0,
+                  fromTurnCount: input.fromTurnCount,
                   toTurnCount: input.toTurnCount,
-                  diff:
-                    input.toTurnCount === 0
-                      ? ""
-                      : `${input.ignoreWhitespace ? "ignore" : "include"}:through`,
+                  diff: `${input.ignoreWhitespace ? "ignore" : "include"}:range`,
                 }),
-        }),
-      ),
-    ),
-  ).pipe(Layer.provide(HttpRouter.layer), Layer.provide(RpcSerialization.layerJson)),
-  { disableLogger: true, disableListenLog: true },
-).pipe(Layer.provideMerge(NodeHttpServer.layerTest));
+              "orchestration.getFullThreadDiff": (input) =>
+                input.threadId === "missing-thread" && input.toTurnCount > 0
+                  ? Effect.fail({
+                      _tag: "OrchestrationGetFullThreadDiffError",
+                      message: "the thread history is unavailable",
+                    })
+                  : Effect.succeed({
+                      threadId: input.threadId,
+                      fromTurnCount: 0,
+                      toTurnCount: input.toTurnCount,
+                      diff:
+                        input.toTurnCount === 0
+                          ? ""
+                          : `${input.ignoreWhitespace ? "ignore" : "include"}:through`,
+                    }),
+              "orchestration.dispatchCommand": (command) =>
+                Effect.suspend(() => {
+                  if (dispatchState.nextDispatchFailure !== null) {
+                    const failure = dispatchState.nextDispatchFailure;
+                    dispatchState.nextDispatchFailure = null;
+                    return Effect.fail(failure);
+                  }
+                  return Effect.sync(() => {
+                    dispatchState.lastDispatchedCommand = command;
+                    return { sequence: 51 };
+                  });
+                }),
+            }),
+          ),
+        ),
+      ).pipe(Layer.provide(HttpRouter.layer), Layer.provide(RpcSerialization.layerJson)),
+      { disableLogger: true, disableListenLog: true },
+    ).pipe(Layer.provideMerge(NodeHttpServer.layerTest));
+  }),
+).pipe(
+  Layer.provideMerge(
+    Layer.sync(ThreadDeleteDispatchState, () => ({
+      lastDispatchedCommand: null,
+      nextDispatchFailure: null,
+    })),
+  ),
+);
 
 const pinnedT3CodeFixtureAdapter = T3CodeAdapter.layer.pipe(
   Layer.provideMerge(pinnedT3CodeFixtureServer),
@@ -299,6 +344,61 @@ describe("T3Code native thread-history diffs", () => {
         expect(unavailableError.value).toMatchObject({
           kind: "upstream_failure",
           uncertain: false,
+        });
+      }).pipe(Effect.provide(pinnedT3CodeFixtureAdapter)),
+    ),
+  );
+});
+
+describe("T3Code thread deletion dispatch", () => {
+  it.live("sends only the thread.delete command and returns its sequence", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* HttpServer.HttpServer;
+        const adapter = yield* T3CodeAdapter;
+        const dispatchState = yield* ThreadDeleteDispatchState;
+        const receipt = yield* adapter.deleteThread({
+          endpoint: HttpServer.formatAddress(server.address),
+          credential: "fixture-credential",
+          threadId: "fixture-thread",
+          commandId: "fixture-delete-command",
+        });
+
+        expect(receipt).toEqual({ sequence: 51 });
+        expect(dispatchState.lastDispatchedCommand).toEqual({
+          type: "thread.delete",
+          commandId: "fixture-delete-command",
+          threadId: "fixture-thread",
+        });
+      }).pipe(Effect.provide(pinnedT3CodeFixtureAdapter)),
+    ),
+  );
+
+  it.live("maps an unrecognized native deletion rejection as a certain command failure", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* HttpServer.HttpServer;
+        const adapter = yield* T3CodeAdapter;
+        const dispatchState = yield* ThreadDeleteDispatchState;
+        dispatchState.nextDispatchFailure = {
+          _tag: "FutureOrchestrationDispatchError",
+          message: "the future native rejection",
+        };
+        const failure = yield* Effect.flip(
+          adapter.deleteThread({
+            endpoint: HttpServer.formatAddress(server.address),
+            credential: "fixture-credential",
+            threadId: "fixture-thread",
+            commandId: "fixture-delete-command",
+          }),
+        );
+
+        expect(failure).toMatchObject({
+          kind: "command_rejected",
+          message:
+            "The T3Code instance rejected the thread deletion command: the future native rejection",
+          uncertain: false,
+          status: null,
         });
       }).pipe(Effect.provide(pinnedT3CodeFixtureAdapter)),
     ),

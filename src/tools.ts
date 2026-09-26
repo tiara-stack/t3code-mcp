@@ -92,6 +92,7 @@ import {
   ThreadSubmitInputSchema,
   ThreadInterruptInputSchema,
   ThreadStopSessionInputSchema,
+  ThreadRemoveInputSchema,
   ThreadWaitInputSchema,
   ThreadWaitToolResultSchema,
   ThreadSetSettledInputSchema,
@@ -580,6 +581,17 @@ export const ThreadStopSessionTool = asDurableMutation(
   { destructive: true, openWorld: true },
 );
 
+// fallow-ignore-next-line unused-export
+export const ThreadRemoveTool = asDurableMutation(
+  Tool.make("thread_remove", {
+    description:
+      "Remove one thread after fresh checks confirm it is inactive and has no unresolved requests. If an idle provider session exists, deletion proceeds only after a stopped-session update for the captured session is observed. The associated worktree and branch are retained. Reusing a request ID reads the original per-step receipt and never repeats deletion.",
+    parameters: ThreadRemoveInputSchema,
+    success: OperationToolResultSchema,
+  }),
+  { destructive: true, openWorld: true },
+);
+
 export const ServerToolkit = Toolkit.make(
   InstanceListTool,
   InstanceGetTool,
@@ -607,6 +619,7 @@ export const ServerToolkit = Toolkit.make(
   InputRespondTool,
   OperationGetTool,
   ThreadStopSessionTool,
+  ThreadRemoveTool,
 );
 
 const makeToolFailure = (
@@ -4439,19 +4452,19 @@ const observeForWait = <Value, Unavailable>(options: {
     }
   });
 
-type WaitPollOutcome<Result, Pending> =
-  | { readonly kind: "result"; readonly result: Result }
+type WaitPollOutcome<Outcome, Pending> =
+  | { readonly kind: "result"; readonly result: Outcome }
   | { readonly kind: "pending"; readonly pending: Pending };
 
-const runObservedThreadWaitLoop = <Result, Pending>(options: {
+const runObservedThreadWaitLoop = <Outcome, Pending>(options: {
   readonly waitMs: number;
   readonly observe: () => Effect.Effect<SynchronizedThreadDetail, WaitObservationError>;
-  readonly unavailable: (failure: WaitObservationError) => Result;
+  readonly unavailable: (failure: WaitObservationError) => Outcome;
   readonly poll: (
     detail: SynchronizedThreadDetail,
-  ) => Effect.Effect<WaitPollOutcome<Result, Pending>, WaitObservationError>;
-  readonly timedOut: (pending: Pending) => Result;
-}): Effect.Effect<Result, WaitObservationError> =>
+  ) => Effect.Effect<WaitPollOutcome<Outcome, Pending>, WaitObservationError>;
+  readonly timedOut: (pending: Pending) => Outcome;
+}): Effect.Effect<Outcome, WaitObservationError> =>
   Effect.gen(function* () {
     const startedAt = yield* Clock.currentTimeMillis;
     const deadline = startedAt + options.waitMs;
@@ -5335,6 +5348,11 @@ const serverToolHandlers = ServerToolkit.of({
       const operations = yield* Operations;
       return yield* operationMutationResult(operations.stopThreadSession(input));
     }),
+  thread_remove: (input) =>
+    Effect.gen(function* () {
+      const operations = yield* Operations;
+      return yield* operationMutationResult(operations.removeThread(input));
+    }),
   instance_pair: (input) =>
     Effect.gen(function* () {
       const operations = yield* Operations;
@@ -5409,6 +5427,7 @@ const operationMutatorTools: ReadonlySet<string> = new Set([
   "thread_interrupt",
   "thread_stop_session",
   "thread_set_settled",
+  "thread_remove",
 ]);
 
 // fallow-ignore-next-line complexity

@@ -980,10 +980,6 @@ const threadInterruptReferenceRuntimeShape = threadReferenceRuntimeShape(
   "unknown thread_interrupt thread argument",
 );
 
-const threadStopSessionReferenceRuntimeShape = threadReferenceRuntimeShape(
-  "unknown thread_stop_session thread argument",
-);
-
 const threadGetFields = Schema.Struct({
   thread: threadGetReferenceRuntimeShape,
   cursor: Schema.optionalKey(nonEmptyString),
@@ -1045,51 +1041,56 @@ export const ThreadGetInputSchema = Schema.declare<{
 
 export type ThreadGetInput = typeof ThreadGetInputSchema.Type;
 
-const threadStopSessionFields = Schema.Struct({
-  requestId,
-  thread: threadStopSessionReferenceRuntimeShape,
-});
-
-const threadStopSessionJsonFields = Schema.Struct({
-  requestId,
-  thread: threadGetReferenceJsonShape,
-});
-
-const unknownThreadStopSessionField = Schema.String.check(
-  Schema.makeFilter((key) => key !== "requestId" && key !== "thread", {
-    message: "unknown thread_stop_session argument",
-  }),
-);
-
-const threadStopSessionRuntimeShape = Schema.StructWithRest(threadStopSessionFields, [
-  Schema.Record(unknownThreadStopSessionField, Schema.Never),
-]);
-
-const threadStopSessionJsonShape = Schema.StructWithRest(threadStopSessionJsonFields, [
-  Schema.Record(Schema.String, Schema.Never),
-]);
+const threadMutationInputSchema = (tool: "thread_stop_session" | "thread_remove") => {
+  const runtimeShape = Schema.StructWithRest(
+    Schema.Struct({
+      requestId,
+      thread: threadReferenceRuntimeShape(`unknown ${tool} thread argument`),
+    }),
+    [
+      Schema.Record(
+        Schema.String.check(
+          Schema.makeFilter((key) => key !== "requestId" && key !== "thread", {
+            message: `unknown ${tool} argument`,
+          }),
+        ),
+        Schema.Never,
+      ),
+    ],
+  );
+  const jsonShape = Schema.StructWithRest(
+    Schema.Struct({ requestId, thread: threadGetReferenceJsonShape }),
+    [Schema.Record(Schema.String, Schema.Never)],
+  );
+  return Schema.declare<{
+    readonly requestId: string;
+    readonly thread: ThreadReference;
+  }>(
+    (input): input is { readonly requestId: string; readonly thread: ThreadReference } =>
+      Schema.is(runtimeShape)(input),
+    {
+      toCodecJson: () =>
+        Schema.link()(jsonShape, {
+          decode: SchemaGetter.passthrough({ strict: false }),
+          encode: SchemaGetter.passthrough({ strict: false }),
+        } as never),
+    },
+  );
+};
 
 /**
  * A provider-session shutdown request names a direct thread reference and
  * durable mutation request ID. Provider-native session identities remain
  * internal to the adapter and recovery record.
  */
-export const ThreadStopSessionInputSchema = Schema.declare<{
-  readonly requestId: string;
-  readonly thread: ThreadReference;
-}>(
-  (input): input is { readonly requestId: string; readonly thread: ThreadReference } =>
-    Schema.is(threadStopSessionRuntimeShape)(input),
-  {
-    toCodecJson: () =>
-      Schema.link()(threadStopSessionJsonShape, {
-        decode: SchemaGetter.passthrough({ strict: false }),
-        encode: SchemaGetter.passthrough({ strict: false }),
-      } as never),
-  },
-);
+export const ThreadStopSessionInputSchema = threadMutationInputSchema("thread_stop_session");
 
 export type ThreadStopSessionInput = typeof ThreadStopSessionInputSchema.Type;
+
+/** Thread removal is a durable mutation that preserves the associated worktree. */
+export const ThreadRemoveInputSchema = threadMutationInputSchema("thread_remove");
+
+export type ThreadRemoveInput = typeof ThreadRemoveInputSchema.Type;
 
 const outputByteBudget = Schema.Int.check(
   Schema.isBetween({ minimum: THREAD_OUTPUT_MIN_MAX_BYTES, maximum: THREAD_OUTPUT_MAX_MAX_BYTES }),

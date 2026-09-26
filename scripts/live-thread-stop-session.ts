@@ -10,173 +10,34 @@
  * Usage:
  *   T3CODE_MCP_LIVE_PAIRING_TOKEN=<token> pnpm exec tsx scripts/live-thread-stop-session.ts <endpoint>
  */
-import { NodeCrypto, NodeHttpClient, NodeRuntime, NodeSocket } from "@effect/platform-node";
+import { NodeFileSystem, NodeRuntime } from "@effect/platform-node";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
-import * as Layer from "effect/Layer";
-import * as Rpc from "effect/unstable/rpc/Rpc";
-import * as RpcClient from "effect/unstable/rpc/RpcClient";
-import * as RpcGroup from "effect/unstable/rpc/RpcGroup";
-import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization";
-import * as Schema from "effect/Schema";
-import * as Socket from "effect/unstable/socket/Socket";
 import * as Stream from "effect/Stream";
-import * as HttpClient from "effect/unstable/http/HttpClient";
-import * as HttpClientRequest from "effect/unstable/http/HttpClientRequest";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import * as Exit from "effect/Exit";
 import * as Cause from "effect/Cause";
-import { LocalStore } from "../src/local-store";
 import { InstanceConnections } from "../src/instance-connections";
-import { ServerToolkit, serverToolkitLayer } from "../src/tools";
+import {
+  dispatchFixture,
+  firstResult,
+  pairLiveCheckInstance,
+  requireOk,
+} from "./live-check-support";
 import type { ThreadStreamItem } from "../src/t3code-adapter";
-
-const FixtureDispatchRpc = Rpc.make("orchestration.dispatchCommand", {
-  payload: Schema.Unknown,
-  success: Schema.Struct({ sequence: Schema.Int }),
-  error: Schema.Struct({ _tag: Schema.String, message: Schema.String }),
-});
-const FixtureRpcGroup = RpcGroup.make(FixtureDispatchRpc);
-
-const WebSocketTicketWireSchema = Schema.Struct({
-  ticket: Schema.NonEmptyString,
-  expiresAt: Schema.String,
-});
-
-const endpointUrl = (endpoint: string, path: string): string => {
-  const base = new URL(endpoint);
-  const prefix = base.pathname.replace(/\/+$/, "");
-  base.pathname = `${prefix}${path.startsWith("/") ? path : `/${path}`}` || "/";
-  base.search = "";
-  base.hash = "";
-  return base.toString();
-};
-
-const websocketUrl = (endpoint: string, ticket: string): string => {
-  const url = new URL(endpoint);
-  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-  const prefix = url.pathname.replace(/\/+$/, "");
-  url.pathname = `${prefix}/ws`;
-  url.searchParams.set("wsTicket", ticket);
-  url.hash = "";
-  return url.toString();
-};
-
-const fixturePlatformLayer = Layer.mergeAll(
-  NodeHttpClient.layerUndici,
-  NodeCrypto.layer,
-  NodeSocket.layerWebSocketConstructorWS,
-);
-
-const dispatchFixture = (input: {
-  readonly endpoint: string;
-  readonly credential: string;
-  readonly command: Record<string, unknown>;
-}) =>
-  Effect.gen(function* () {
-    const http = yield* HttpClient.HttpClient;
-    const response = yield* http.execute(
-      HttpClientRequest.post(endpointUrl(input.endpoint, "/api/auth/websocket-ticket")).pipe(
-        HttpClientRequest.bearerToken(input.credential),
-      ),
-    );
-    const ticket = yield* Schema.decodeUnknownEffect(WebSocketTicketWireSchema)(
-      yield* response.json,
-    ).pipe(Effect.orDie);
-    const socketLayer = Socket.layerWebSocket(websocketUrl(input.endpoint, ticket.ticket));
-    return yield* RpcClient.make(FixtureRpcGroup).pipe(
-      Effect.flatMap((client) => client["orchestration.dispatchCommand"](input.command)),
-      Effect.scoped,
-      Effect.provide(
-        RpcClient.layerProtocolSocket({ retryTransientErrors: false }).pipe(
-          Layer.provide(RpcSerialization.layerJson),
-          Layer.provide(socketLayer),
-        ),
-      ),
-    );
-  }).pipe(Effect.provide(fixturePlatformLayer));
-
-const appLayer = (databasePath: string) =>
-  serverToolkitLayer.pipe(
-    Layer.provideMerge(InstanceConnections.layer),
-    Layer.provideMerge(LocalStore.layer({ databasePath })),
-  );
-
-type ToolResult = {
-  readonly result:
-    | { readonly kind: "ok"; readonly value: any }
-    | {
-        readonly kind: "error";
-        readonly error: { readonly code: string; readonly message: string };
-      };
-};
 
 type StopRequestEvent = Extract<ThreadStreamItem, { readonly kind: "session-stop-requested" }>;
 type StoppedSessionEvent = Extract<ThreadStreamItem, { readonly kind: "session-set" }>;
 
-const firstResult = (name: string, input: unknown) =>
-  Effect.gen(function* () {
-    const toolkit = yield* ServerToolkit;
-    const stream = yield* toolkit.handle(name as never, input as never);
-    const results = yield* Stream.runCollect(stream);
-    const first = results[0] as { readonly result?: unknown } | undefined;
-    if (first?.result === undefined) throw new Error(`tool ${name} returned no result`);
-    return first.result as ToolResult;
-  });
-
-const requireOk = (label: string, result: ToolResult) => {
-  if (result.result.kind !== "ok") {
-    throw new Error(`${label} failed: ${JSON.stringify(result.result)}`);
-  }
-  return result.result.value;
-};
-
 const main = Effect.gen(function* () {
-  const [endpoint, pairingToken] = yield* Effect.sync(() => {
-    const endpointArg = process.argv[2];
-    const token = process.env.T3CODE_MCP_LIVE_PAIRING_TOKEN;
-    if (endpointArg === undefined || token === undefined || token.length === 0) {
-      throw new Error(
-        "usage: T3CODE_MCP_LIVE_PAIRING_TOKEN=<token> pnpm exec tsx scripts/live-thread-stop-session.ts <endpoint>",
-      );
-    }
-    return [endpointArg, token] as const;
+  const { endpoint, staged, run } = yield* pairLiveCheckInstance({
+    endpointArgument: process.argv[2],
+    pairingToken: process.env.T3CODE_MCP_LIVE_PAIRING_TOKEN,
+    usage:
+      "usage: T3CODE_MCP_LIVE_PAIRING_TOKEN=<token> pnpm exec tsx scripts/live-thread-stop-session.ts <endpoint>",
+    directoryPrefix: "t3code-mcp-live-session-stop-",
   });
-  const directory = mkdtempSync(join(tmpdir(), "t3code-mcp-live-session-stop-"));
-  yield* Effect.addFinalizer(() =>
-    Effect.sync(() => rmSync(directory, { recursive: true, force: true })),
-  );
-  const context = yield* Layer.build(appLayer(join(directory, "state.sqlite")));
-  const run = <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.provide(effect, context);
-
-  const staged = yield* run(
-    Effect.gen(function* () {
-      const connections = yield* InstanceConnections;
-      return yield* connections.pair({ endpoint, pairingCode: pairingToken });
-    }),
-  );
-  if (staged.serverVersion !== "0.0.38") {
-    throw new Error(`expected pinned T3Code 0.0.38, got ${staged.serverVersion}`);
-  }
-  yield* run(
-    Effect.gen(function* () {
-      const store = yield* LocalStore;
-      yield* store.putRegistration({
-        instanceId: "live-check",
-        alias: "live-check",
-        endpoint,
-        environmentId: staged.environmentId,
-        connection: "connected",
-        lastObservedAt: new Date().toISOString(),
-        credential: staged.credential,
-      });
-    }),
-  );
-  console.log(`PASS pair: authenticated to disposable T3Code ${staged.serverVersion}`);
 
   const projects = requireOk(
     "project_list",
@@ -186,8 +47,7 @@ const main = Effect.gen(function* () {
   ) as { readonly items: ReadonlyArray<{ readonly project: { readonly projectId: string } }> };
   const projectId = projects.items[0]?.project.projectId;
   if (projectId === undefined) {
-    console.log("UNAVAILABLE: add one disposable project to the pinned server before running");
-    return;
+    throw new Error("UNAVAILABLE: add one disposable project to the pinned server before running");
   }
 
   const runId = globalThis.crypto.randomUUID().slice(0, 8);
@@ -215,8 +75,7 @@ const main = Effect.gen(function* () {
     }),
   );
   if (Exit.isFailure(created)) {
-    console.log(`UNAVAILABLE: fixture thread creation failed: ${Cause.pretty(created.cause)}`);
-    return;
+    throw new Error(`UNAVAILABLE: fixture thread creation failed: ${Cause.pretty(created.cause)}`);
   }
 
   const missing = requireOk(
@@ -238,7 +97,7 @@ const main = Effect.gen(function* () {
   const stopEvidence = yield* run(
     Effect.gen(function* () {
       const value = yield* InstanceConnections;
-      const synchronized = yield* Deferred.make<void>();
+      const synchronized = yield* Deferred.make<void, Error>();
       const shutdown = yield* Deferred.make<
         {
           readonly request: StopRequestEvent;
@@ -248,6 +107,11 @@ const main = Effect.gen(function* () {
       >();
       let synchronizedOnce = false;
       let matchingRequest: StopRequestEvent | null = null;
+      const signalStreamFailure = (message: string) =>
+        Effect.gen(function* () {
+          yield* Deferred.fail(synchronized, new Error(message));
+          yield* Deferred.fail(shutdown, new Error(message));
+        });
       const stream = value.openThreadStream("live-check", threadId);
       const subscriber = yield* Stream.runForEach(stream, (item) =>
         Effect.gen(function* () {
@@ -275,7 +139,17 @@ const main = Effect.gen(function* () {
             yield* Deferred.succeed(shutdown, { request: matchingRequest, stopped: item });
           }
         }),
-      ).pipe(Effect.forkScoped);
+      ).pipe(
+        Effect.catch((error) =>
+          signalStreamFailure(`T3Code thread event stream failed: ${String(error)}`).pipe(
+            Effect.andThen(Effect.fail(error)),
+          ),
+        ),
+        Effect.andThen(
+          signalStreamFailure("T3Code thread event stream ended before shutdown evidence arrived"),
+        ),
+        Effect.forkScoped,
+      );
       yield* Deferred.await(synchronized).pipe(
         Effect.timeoutOrElse({
           duration: Duration.seconds(10),
@@ -349,4 +223,4 @@ const main = Effect.gen(function* () {
   );
 });
 
-NodeRuntime.runMain(Effect.scoped(main));
+NodeRuntime.runMain(Effect.scoped(main).pipe(Effect.provide(NodeFileSystem.layer)));

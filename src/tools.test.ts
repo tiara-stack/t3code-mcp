@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { LocalStore, LocalStoreError, type LocalStoreService } from "./local-store";
+import { adapterErrorFailure } from "./tool-failure";
 import {
   InstanceConnections,
   type DiscoveredModels,
@@ -6555,6 +6556,17 @@ interface ThreadFixtureOptions {
     instanceId: string,
     input: ThreadCreateRequest & { readonly onDispatch: Effect.Effect<void, E, never> },
   ) => Effect.Effect<{ readonly sequence: number }, LocalStoreError | T3CodeAdapterError | E>;
+  deleteThread?: (input: {
+    readonly instanceId: string;
+    readonly threadId: string;
+    readonly commandId: string;
+  }) => Effect.Effect<{ readonly sequence: number }, T3CodeAdapterError>;
+  beforeThreadDeletePreparation?: (instanceId: string) => void;
+  readonly threadDeleteCalls: Array<{
+    readonly instanceId: string;
+    readonly threadId: string;
+    readonly commandId: string;
+  }>;
   activeStreams?: Readonly<
     Record<
       string,
@@ -6777,6 +6789,26 @@ const threadConnections = (options: ThreadFixtureOptions) =>
             }),
           ),
       }),
+    prepareThreadDelete: (instanceId) =>
+      Effect.sync(() => {
+        options.beforeThreadDeletePreparation?.(instanceId);
+        return {
+          dispatch: (input) => {
+            options.threadDeleteCalls.push({ instanceId, ...input });
+            return (
+              options.deleteThread?.({ instanceId, ...input }) ??
+              Effect.fail(
+                new T3CodeAdapterError({
+                  kind: "capacity",
+                  message: "The thread test connection does not delete threads.",
+                  uncertain: false,
+                  status: null,
+                }),
+              )
+            );
+          },
+        };
+      }),
     discoverVcsRefs: (instanceId: string, repositoryPath: string) => {
       options.seenVcsRefs.push(`${instanceId}:${repositoryPath}`);
       const scripted = options.vcsRefStreams?.[instanceId];
@@ -6976,6 +7008,7 @@ const emptyThreadFixtures = () => {
     seenAcquires: [],
     seenVcsRefs: [],
     interruptCalls: [],
+    threadDeleteCalls: [],
   };
   return {
     options,
@@ -8915,6 +8948,7 @@ const observedThreadFixture = (
       readonly createdAt: string;
     }>;
     readonly session: {
+      readonly providerInstanceId?: string | null;
       readonly status:
         | "idle"
         | "starting"
@@ -9902,11 +9936,11 @@ describe("thread_create", () => {
               fixtures.commands.push(command);
               return { sequence: 43 };
             });
-          const result = yield* Effect.scoped(
+          const results = yield* Effect.scoped(
             Effect.gen(function* () {
               yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
               storeForRace = yield* LocalStore;
-              return yield* callTool("thread_create", {
+              const created = yield* callTool("thread_create", {
                 requestId,
                 project: { instanceId: "instance-a", projectId: "project-a" },
                 title: "Respect the operation state",
@@ -9918,14 +9952,22 @@ describe("thread_create", () => {
                 runtimeMode: "approval-required",
                 interactionMode: "default",
               });
+              const observed = yield* callTool("operation_get", { requestId });
+              return { created, observed };
             }).pipe(Effect.provide(appLayer(databasePath, fixtures.connections))),
           );
 
           expect(fixtures.commands).toHaveLength(0);
-          expect(result[0]?.result).toMatchObject({
+          expect(results.created[0]?.result).toMatchObject({
             result: {
               kind: "ok",
-              value: { state: "outcome_unknown", dispatch: "unknown" },
+              value: { dispatch: "unknown" },
+            },
+          });
+          expect(results.observed[0]?.result).toMatchObject({
+            result: {
+              kind: "ok",
+              value: { operation: { state: "outcome_unknown", dispatch: "unknown" } },
             },
           });
         }),
@@ -21602,6 +21644,1558 @@ describe("turn_wait", () => {
         expect(value.observations).toMatchObject([{ freshness: "fresh", sourceSequence: 11 }]);
       }),
     ),
+  );
+});
+
+describe("thread_remove", () => {
+  const configureIdleSessionRemoval = (
+    options: ThreadFixtureOptions,
+    afterStop: "stopped" | "replacement" | "activity",
+    streamShape: "standard" | "interleaved_detail" = "standard",
+  ): (() => boolean) => {
+    const worktreePath = "/srv/project-a/.worktrees/feature";
+    let threadPresent = true;
+    let activeReads = 0;
+    let archivedReads = 0;
+    let initialDetailEmitted = false;
+    let stopEventsEmitted = false;
+    const originalSession = {
+      providerInstanceId: "provider-session-a",
+      status: "ready" as const,
+      activeTurnId: null,
+      lastError: null,
+      updatedAt: "2026-09-24T00:00:00.000Z",
+    };
+    options.activeStreams = {
+      "instance-a": () => {
+        activeReads += 1;
+        return Stream.make(
+          shellSnapshotItem(
+            100 + activeReads,
+            [shellProjectFixture("project-a")],
+            threadPresent ? [shellThreadFixture("thread-a", { worktreePath })] : [],
+          ),
+          shellSynchronizedItem,
+        );
+      },
+    };
+    options.archivedShells = {
+      "instance-a": () => {
+        archivedReads += 1;
+        return Effect.succeed({
+          snapshotSequence: 200 + archivedReads,
+          projects: [shellProjectFixture("project-a")],
+          threads: [],
+          observedAt: "2026-09-24T00:00:00.000Z",
+        });
+      },
+    };
+    options.stopThreadSession = (command) => {
+      options.sessionStopCommand = command;
+      return Effect.succeed({ sequence: 42 });
+    };
+    options.threadStreams = {
+      "instance-a:thread-a": () => {
+        if (!initialDetailEmitted) {
+          initialDetailEmitted = true;
+          return detailSnapshotStream(
+            40,
+            observedThreadFixture("thread-a", {
+              projectId: "project-a",
+              worktreePath,
+              latestTurn: { turnId: "turn-a", state: "completed" },
+              session: originalSession,
+            }),
+          );
+        }
+        const command = options.sessionStopCommand;
+        if (command === undefined) return Stream.make({ kind: "synchronized" as const });
+        const stoppedSession = {
+          ...originalSession,
+          status: "stopped" as const,
+          updatedAt: command.createdAt,
+        };
+        if (!stopEventsEmitted) {
+          stopEventsEmitted = true;
+          return Stream.make(
+            {
+              kind: "session-stop-requested" as const,
+              sequence: 42,
+              threadId: "thread-a",
+              commandId: command.commandId,
+              createdAt: command.createdAt,
+            },
+            ...(streamShape === "interleaved_detail"
+              ? [{ kind: "detail-event" as const, sequence: 43 }]
+              : []),
+            { kind: "session-set" as const, sequence: 44, session: stoppedSession },
+            { kind: "synchronized" as const },
+          );
+        }
+        if (afterStop === "replacement") {
+          return detailSnapshotStream(
+            45,
+            observedThreadFixture("thread-a", {
+              projectId: "project-a",
+              worktreePath,
+              latestTurn: { turnId: "turn-a", state: "completed" },
+              session: {
+                ...stoppedSession,
+                providerInstanceId: "provider-session-b",
+                status: "ready",
+                updatedAt: "2026-09-24T00:01:00.000Z",
+              },
+            }),
+          );
+        }
+        return detailSnapshotStream(
+          45,
+          observedThreadFixture("thread-a", {
+            projectId: "project-a",
+            worktreePath,
+            latestTurn:
+              afterStop === "activity"
+                ? { turnId: "turn-b", state: "running" }
+                : { turnId: "turn-a", state: "completed" },
+            session: stoppedSession,
+          }),
+        );
+      },
+    };
+    options.deleteThread = () => {
+      threadPresent = false;
+      return Effect.succeed({ sequence: 50 });
+    };
+    return () => threadPresent;
+  };
+
+  it.live("refuses active work without dispatching an interruption or deletion", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(
+                11,
+                [shellProjectFixture("project-a")],
+                [
+                  shellThreadFixture("thread-a", {
+                    latestTurnId: "turn-a",
+                    worktreePath: "/srv/project-a/.worktrees/feature",
+                  }),
+                ],
+              ),
+              shellSynchronizedItem,
+            ),
+        };
+        options.archivedShells = {
+          "instance-a": () =>
+            Effect.succeed({
+              snapshotSequence: 11,
+              projects: [shellProjectFixture("project-a")],
+              threads: [],
+              observedAt: "2026-09-24T00:00:00.000Z",
+            }),
+        };
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              11,
+              observedThreadFixture("thread-a", {
+                projectId: "project-a",
+                worktreePath: "/srv/project-a/.worktrees/feature",
+                latestTurn: { turnId: "turn-a", state: "completed" },
+                session: {
+                  status: "ready",
+                  activeTurnId: "turn-a",
+                  lastError: null,
+                  updatedAt: "2026-09-24T00:00:00.000Z",
+                },
+              }),
+            ),
+        };
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_remove", {
+              requestId: "remove-active-thread",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              requestId: "remove-active-thread",
+              tool: "thread_remove",
+              state: "failed",
+              dispatch: "not_dispatched",
+              error: { code: "active_execution" },
+              steps: [
+                { name: "check_thread_state", state: "failed" },
+                { name: "recheck_before_provider_session_stop", state: "skipped" },
+                { name: "capture_provider_session", state: "skipped" },
+                { name: "dispatch_provider_session_stop", state: "skipped" },
+                { name: "observe_provider_session_shutdown", state: "skipped" },
+                { name: "recheck_before_thread_deletion", state: "skipped" },
+                { name: "dispatch_thread_deletion", state: "skipped" },
+                { name: "observe_thread_absence", state: "skipped" },
+              ],
+            },
+          },
+        });
+        expect(options.interruptCalls).toEqual([]);
+        expect(options.threadDeleteCalls).toEqual([]);
+        expect(options.sessionStopCommand).toBeUndefined();
+        expect(options.seenThreads).toContain("instance-a:thread-a");
+      }),
+    ),
+  );
+
+  it.live("removes an inactive thread and confirms absence while retaining its worktree", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktreePath = "/srv/project-a/.worktrees/feature";
+        let threadPresent = true;
+        let deletionAccepted = false;
+        let activeReadsAfterDelete = 0;
+        let archivedReadsAfterDelete = 0;
+        let activeReads = 0;
+        let archivedReads = 0;
+        let detailReads = 0;
+        options.activeStreams = {
+          "instance-a": () => {
+            activeReads += 1;
+            const snapshotSequence = deletionAccepted
+              ? activeReadsAfterDelete++ === 0
+                ? 499
+                : 501 + activeReadsAfterDelete
+              : 100 + activeReads;
+            return Stream.make(
+              shellSnapshotItem(
+                snapshotSequence,
+                [shellProjectFixture("project-a")],
+                [
+                  ...(threadPresent ? [shellThreadFixture("thread-a", { worktreePath })] : []),
+                  shellThreadFixture("thread-sharing-worktree", { worktreePath }),
+                ],
+              ),
+              shellSynchronizedItem,
+            );
+          },
+        };
+        options.archivedShells = {
+          "instance-a": () => {
+            archivedReads += 1;
+            const snapshotSequence = deletionAccepted
+              ? 500 + archivedReadsAfterDelete++
+              : 200 + archivedReads;
+            return Effect.succeed({
+              snapshotSequence,
+              projects: [shellProjectFixture("project-a")],
+              threads: [],
+              observedAt: "2026-09-24T00:00:00.000Z",
+            });
+          },
+        };
+        options.threadStreams = {
+          "instance-a:thread-a": () => {
+            detailReads += 1;
+            return detailSnapshotStream(
+              300 + detailReads,
+              observedThreadFixture("thread-a", {
+                projectId: "project-a",
+                worktreePath,
+                latestTurn: null,
+                session: null,
+              }),
+            );
+          },
+        };
+        options.deleteThread = (_command) => {
+          deletionAccepted = true;
+          threadPresent = false;
+          return Effect.succeed({ sequence: 500 });
+        };
+
+        const results = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const removed = yield* callTool("thread_remove", {
+              requestId: "remove-inactive-thread",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+            const recovered = yield* callTool("operation_get", {
+              requestId: "remove-inactive-thread",
+            });
+            return { removed, recovered };
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(results.removed[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              requestId: "remove-inactive-thread",
+              tool: "thread_remove",
+              state: "completed",
+              completionMeans: "thread_absent",
+              dispatch: "accepted",
+              steps: [
+                { name: "check_thread_state", state: "succeeded" },
+                { name: "recheck_before_provider_session_stop", state: "succeeded" },
+                { name: "capture_provider_session", state: "succeeded" },
+                { name: "dispatch_provider_session_stop", state: "skipped" },
+                { name: "observe_provider_session_shutdown", state: "already_absent" },
+                { name: "recheck_before_thread_deletion", state: "succeeded" },
+                { name: "dispatch_thread_deletion", state: "succeeded" },
+                { name: "observe_thread_absence", state: "succeeded" },
+              ],
+            },
+          },
+        });
+        expect(results.recovered[0]?.result).toMatchObject({
+          result: { kind: "ok", value: { operation: { state: "completed" } } },
+        });
+        expect(options.threadDeleteCalls).toHaveLength(1);
+        expect(options.threadDeleteCalls[0]).toMatchObject({
+          instanceId: "instance-a",
+          threadId: "thread-a",
+          commandId: expect.any(String),
+        });
+        expect(options.seenVcsRefs).toEqual([]);
+        expect(threadPresent).toBe(false);
+      }),
+    ),
+  );
+
+  it.live("stops and observes an idle provider session within the removal receipt", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const threadPresent = configureIdleSessionRemoval(options, "stopped", "interleaved_detail");
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_remove", {
+              requestId: "remove-session-thread",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "completed",
+              dispatch: "accepted",
+              steps: [
+                { name: "check_thread_state", state: "succeeded" },
+                { name: "recheck_before_provider_session_stop", state: "succeeded" },
+                { name: "capture_provider_session", state: "succeeded" },
+                { name: "dispatch_provider_session_stop", state: "succeeded" },
+                { name: "observe_provider_session_shutdown", state: "succeeded" },
+                { name: "recheck_before_thread_deletion", state: "succeeded" },
+                { name: "dispatch_thread_deletion", state: "succeeded" },
+                { name: "observe_thread_absence", state: "succeeded" },
+              ],
+            },
+          },
+        });
+        expect(options.sessionStopCommand?.commandId).toEqual(expect.any(String));
+        expect(options.threadDeleteCalls).toHaveLength(1);
+        expect(threadPresent()).toBe(false);
+      }),
+    ),
+  );
+
+  const runCertainThreadDeletionFailure = (requestId: string, failure: T3CodeAdapterError) =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const threadPresent = configureIdleSessionRemoval(options, "stopped");
+        options.deleteThread = () => Effect.fail(failure);
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_remove", {
+              requestId,
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        return {
+          result: result[0]?.result,
+          deleteCalls: options.threadDeleteCalls.length,
+          threadPresent: threadPresent(),
+        };
+      }),
+    );
+
+  it.live("records certain deletion failures independently of earlier session dispatch", () =>
+    Effect.gen(function* () {
+      const notDispatched = yield* runCertainThreadDeletionFailure(
+        "remove-certain-not-dispatched",
+        new T3CodeAdapterError({
+          kind: "transport",
+          message: "The delete command was not dispatched.",
+          uncertain: false,
+          status: null,
+        }),
+      );
+      const rejected = yield* runCertainThreadDeletionFailure(
+        "remove-certain-rejected",
+        new T3CodeAdapterError({
+          kind: "command_rejected",
+          message: "T3Code rejected the delete command.",
+          uncertain: false,
+          status: null,
+        }),
+      );
+
+      for (const result of [notDispatched, rejected]) {
+        expect(result.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "partial",
+              steps: [
+                { name: "check_thread_state", state: "succeeded" },
+                { name: "recheck_before_provider_session_stop", state: "succeeded" },
+                { name: "capture_provider_session", state: "succeeded" },
+                { name: "dispatch_provider_session_stop", state: "succeeded" },
+                { name: "observe_provider_session_shutdown", state: "succeeded" },
+                { name: "recheck_before_thread_deletion", state: "succeeded" },
+                { name: "dispatch_thread_deletion", state: "failed" },
+                { name: "observe_thread_absence", state: "skipped" },
+              ],
+            },
+          },
+        });
+        expect(result.deleteCalls).toBe(1);
+        expect(result.threadPresent).toBe(true);
+      }
+      expect(notDispatched.result).toMatchObject({
+        result: { kind: "ok", value: { dispatch: "not_dispatched" } },
+      });
+      expect(rejected.result).toMatchObject({
+        result: { kind: "ok", value: { dispatch: "rejected" } },
+      });
+    }),
+  );
+
+  it.live("refuses a replacement provider session after the captured session stops", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const threadPresent = configureIdleSessionRemoval(options, "replacement");
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_remove", {
+              requestId: "remove-replacement-session",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "partial",
+              dispatch: "accepted",
+              error: { code: "stale_state" },
+              steps: [
+                { name: "check_thread_state", state: "succeeded" },
+                { name: "recheck_before_provider_session_stop", state: "succeeded" },
+                { name: "capture_provider_session", state: "succeeded" },
+                { name: "dispatch_provider_session_stop", state: "succeeded" },
+                { name: "observe_provider_session_shutdown", state: "succeeded" },
+                { name: "recheck_before_thread_deletion", state: "failed" },
+                { name: "dispatch_thread_deletion", state: "skipped" },
+                { name: "observe_thread_absence", state: "skipped" },
+              ],
+            },
+          },
+        });
+        expect(options.threadDeleteCalls).toEqual([]);
+        expect(threadPresent()).toBe(true);
+      }),
+    ),
+  );
+
+  it.live("refuses a replacement provider session after shutdown was already absent", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktreePath = "/srv/project-a/.worktrees/feature";
+        let detailReads = 0;
+        let activeReads = 0;
+        let archivedReads = 0;
+        const initialSession = {
+          providerInstanceId: "provider-session-a",
+          status: "ready" as const,
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: "2026-09-24T00:00:00.000Z",
+        };
+        const replacementSession = {
+          ...initialSession,
+          providerInstanceId: "provider-session-b",
+          updatedAt: "2026-09-24T00:01:00.000Z",
+        };
+        options.activeStreams = {
+          "instance-a": () => {
+            activeReads += 1;
+            return Stream.make(
+              shellSnapshotItem(
+                100 + activeReads,
+                [shellProjectFixture("project-a")],
+                [shellThreadFixture("thread-a", { worktreePath })],
+              ),
+              shellSynchronizedItem,
+            );
+          },
+        };
+        options.archivedShells = {
+          "instance-a": () => {
+            archivedReads += 1;
+            return Effect.succeed({
+              snapshotSequence: 200 + archivedReads,
+              projects: [shellProjectFixture("project-a")],
+              threads: [],
+              observedAt: "2026-09-24T00:00:00.000Z",
+            });
+          },
+        };
+        options.threadStreams = {
+          "instance-a:thread-a": () => {
+            detailReads += 1;
+            const session =
+              detailReads <= 2 ? initialSession : detailReads === 3 ? null : replacementSession;
+            return detailSnapshotStream(
+              40 + detailReads,
+              observedThreadFixture("thread-a", {
+                projectId: "project-a",
+                worktreePath,
+                latestTurn: { turnId: "turn-a", state: "completed" },
+                session,
+              }),
+            );
+          },
+        };
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_remove", {
+              requestId: "remove-replacement-after-absent-session",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "failed",
+              dispatch: "not_dispatched",
+              error: { code: "stale_state" },
+              steps: [
+                { name: "check_thread_state", state: "succeeded" },
+                { name: "recheck_before_provider_session_stop", state: "succeeded" },
+                { name: "capture_provider_session", state: "succeeded" },
+                { name: "dispatch_provider_session_stop", state: "skipped" },
+                { name: "observe_provider_session_shutdown", state: "already_absent" },
+                { name: "recheck_before_thread_deletion", state: "failed" },
+                { name: "dispatch_thread_deletion", state: "skipped" },
+                { name: "observe_thread_absence", state: "skipped" },
+              ],
+            },
+          },
+        });
+        expect(options.threadDeleteCalls).toEqual([]);
+        expect(options.sessionStopCommand).toBeUndefined();
+      }),
+    ),
+  );
+
+  it.live("refuses activity started by another client after shutdown", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const threadPresent = configureIdleSessionRemoval(options, "activity");
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_remove", {
+              requestId: "remove-activity-after-stop",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "partial",
+              dispatch: "accepted",
+              error: { code: "active_execution" },
+              steps: [
+                { name: "check_thread_state", state: "succeeded" },
+                { name: "recheck_before_provider_session_stop", state: "succeeded" },
+                { name: "capture_provider_session", state: "succeeded" },
+                { name: "dispatch_provider_session_stop", state: "succeeded" },
+                { name: "observe_provider_session_shutdown", state: "succeeded" },
+                { name: "recheck_before_thread_deletion", state: "failed" },
+                { name: "dispatch_thread_deletion", state: "skipped" },
+                { name: "observe_thread_absence", state: "skipped" },
+              ],
+            },
+          },
+        });
+        expect(options.threadDeleteCalls).toEqual([]);
+        expect(threadPresent()).toBe(true);
+      }),
+    ),
+  );
+
+  it.live("completes a request when fresh inventories confirm the thread was already absent", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(101, [shellProjectFixture("project-a")], []),
+              shellSynchronizedItem,
+            ),
+        };
+        options.archivedShells = {
+          "instance-a": () =>
+            Effect.succeed({
+              snapshotSequence: 102,
+              projects: [shellProjectFixture("project-a")],
+              threads: [],
+              observedAt: "2026-09-24T00:00:00.000Z",
+            }),
+        };
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_remove", {
+              requestId: "remove-already-absent",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "completed",
+              dispatch: "not_dispatched",
+              steps: [
+                { name: "check_thread_state", state: "succeeded" },
+                { name: "recheck_before_provider_session_stop", state: "skipped" },
+                { name: "capture_provider_session", state: "skipped" },
+                { name: "dispatch_provider_session_stop", state: "skipped" },
+                { name: "observe_provider_session_shutdown", state: "skipped" },
+                { name: "recheck_before_thread_deletion", state: "skipped" },
+                { name: "dispatch_thread_deletion", state: "skipped" },
+                { name: "observe_thread_absence", state: "already_absent" },
+              ],
+            },
+          },
+        });
+        expect(options.seenThreads).toEqual([]);
+        expect(options.threadDeleteCalls).toEqual([]);
+      }),
+    ),
+  );
+
+  it.live("refuses pending and unknown request lifecycles", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const pendingWorktree = "/srv/project-a/.worktrees/pending";
+        const unknownWorktree = "/srv/project-a/.worktrees/unknown";
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(
+                101,
+                [shellProjectFixture("project-a")],
+                [
+                  shellThreadFixture("thread-pending", { worktreePath: pendingWorktree }),
+                  shellThreadFixture("thread-unknown", { worktreePath: unknownWorktree }),
+                ],
+              ),
+              shellSynchronizedItem,
+            ),
+        };
+        options.archivedShells = {
+          "instance-a": () =>
+            Effect.succeed({
+              snapshotSequence: 102,
+              projects: [shellProjectFixture("project-a")],
+              threads: [],
+              observedAt: "2026-09-24T00:00:00.000Z",
+            }),
+        };
+        options.threadStreams = {
+          "instance-a:thread-pending": () =>
+            detailSnapshotStream(
+              103,
+              observedThreadFixture("thread-pending", {
+                projectId: "project-a",
+                worktreePath: pendingWorktree,
+                activities: [
+                  approvalActivity("approval-pending", "request-pending", {
+                    requestType: "command_execution_approval",
+                    requestKind: "command",
+                    options: [{ decision: "accept", label: "Accept" }],
+                  }),
+                ],
+              }),
+            ),
+          "instance-a:thread-unknown": () =>
+            detailSnapshotStream(
+              104,
+              observedThreadFixture("thread-unknown", {
+                projectId: "project-a",
+                worktreePath: unknownWorktree,
+                activities: [
+                  inputActivity("input-without-id", null, [
+                    {
+                      id: "target",
+                      header: "Target",
+                      question: "Which target?",
+                      options: [],
+                      multiSelect: false,
+                    },
+                  ]),
+                ],
+              }),
+            ),
+        };
+
+        const results = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const pending = yield* callTool("thread_remove", {
+              requestId: "remove-pending-thread",
+              thread: { instanceId: "instance-a", threadId: "thread-pending" },
+            });
+            const unknown = yield* callTool("thread_remove", {
+              requestId: "remove-unknown-thread",
+              thread: { instanceId: "instance-a", threadId: "thread-unknown" },
+            });
+            return { pending, unknown };
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(results.pending[0]?.result).toMatchObject({
+          result: { kind: "ok", value: { state: "failed", error: { code: "pending_request" } } },
+        });
+        expect(results.unknown[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: { state: "failed", error: { code: "uncheckable_target" } },
+          },
+        });
+        expect(options.threadDeleteCalls).toEqual([]);
+      }),
+    ),
+  );
+
+  it.live("rechecks activity at the provider-session dispatch boundary", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        let detailReads = 0;
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(
+                101,
+                [shellProjectFixture("project-a")],
+                [shellThreadFixture("thread-a", { worktreePath: "/srv/project-a/.worktrees/a" })],
+              ),
+              shellSynchronizedItem,
+            ),
+        };
+        options.archivedShells = {
+          "instance-a": () =>
+            Effect.succeed({
+              snapshotSequence: 102,
+              projects: [shellProjectFixture("project-a")],
+              threads: [],
+              observedAt: "2026-09-24T00:00:00.000Z",
+            }),
+        };
+        options.threadStreams = {
+          "instance-a:thread-a": () => {
+            detailReads += 1;
+            return detailSnapshotStream(
+              110 + detailReads,
+              observedThreadFixture("thread-a", {
+                projectId: "project-a",
+                worktreePath: "/srv/project-a/.worktrees/a",
+                latestTurn:
+                  detailReads < 4
+                    ? { turnId: "turn-a", state: "completed" }
+                    : { turnId: "turn-b", state: "running" },
+                session:
+                  detailReads < 4
+                    ? {
+                        status: "ready",
+                        activeTurnId: null,
+                        lastError: null,
+                        updatedAt: "2026-09-24T00:00:00.000Z",
+                      }
+                    : {
+                        status: "running",
+                        activeTurnId: "turn-b",
+                        lastError: null,
+                        updatedAt: "2026-09-24T00:01:00.000Z",
+                      },
+              }),
+            );
+          },
+        };
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_remove", {
+              requestId: "remove-activity-race",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "failed",
+              dispatch: "not_dispatched",
+              error: { code: "active_execution" },
+              steps: [
+                { name: "check_thread_state", state: "succeeded" },
+                { name: "recheck_before_provider_session_stop", state: "succeeded" },
+                { name: "capture_provider_session", state: "succeeded" },
+                { name: "dispatch_provider_session_stop", state: "skipped" },
+                { name: "observe_provider_session_shutdown", state: "failed" },
+                { name: "recheck_before_thread_deletion", state: "skipped" },
+                { name: "dispatch_thread_deletion", state: "skipped" },
+                { name: "observe_thread_absence", state: "skipped" },
+              ],
+            },
+          },
+        });
+        expect(options.threadDeleteCalls).toEqual([]);
+        expect(options.sessionStopCommand).toBeUndefined();
+      }),
+    ),
+  );
+
+  it.live("rechecks activity after delete preparation before dispatch", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        let preparationCompleted = false;
+        let detailReads = 0;
+        options.beforeThreadDeletePreparation = () => {
+          preparationCompleted = true;
+        };
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(
+                101 + detailReads,
+                [shellProjectFixture("project-a")],
+                [shellThreadFixture("thread-a", { worktreePath: "/srv/project-a/.worktrees/a" })],
+              ),
+              shellSynchronizedItem,
+            ),
+        };
+        options.archivedShells = {
+          "instance-a": () =>
+            Effect.succeed({
+              snapshotSequence: 102 + detailReads,
+              projects: [shellProjectFixture("project-a")],
+              threads: [],
+              observedAt: "2026-09-24T00:00:00.000Z",
+            }),
+        };
+        options.threadStreams = {
+          "instance-a:thread-a": () => {
+            detailReads += 1;
+            const active = preparationCompleted;
+            return detailSnapshotStream(
+              110 + detailReads,
+              observedThreadFixture("thread-a", {
+                projectId: "project-a",
+                worktreePath: "/srv/project-a/.worktrees/a",
+                latestTurn: active ? { turnId: "turn-race", state: "running" } : null,
+                session: active
+                  ? {
+                      status: "running",
+                      activeTurnId: "turn-race",
+                      lastError: null,
+                      updatedAt: "2026-09-24T00:01:00.000Z",
+                    }
+                  : null,
+              }),
+            );
+          },
+        };
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_remove", {
+              requestId: "remove-activity-during-delete-preparation",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(preparationCompleted).toBe(true);
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "failed",
+              dispatch: "not_dispatched",
+              error: { code: "active_execution" },
+              steps: [
+                { name: "check_thread_state", state: "succeeded" },
+                { name: "recheck_before_provider_session_stop", state: "succeeded" },
+                { name: "capture_provider_session", state: "succeeded" },
+                { name: "dispatch_provider_session_stop", state: "skipped" },
+                { name: "observe_provider_session_shutdown", state: "already_absent" },
+                { name: "recheck_before_thread_deletion", state: "failed" },
+                { name: "dispatch_thread_deletion", state: "skipped" },
+                { name: "observe_thread_absence", state: "skipped" },
+              ],
+            },
+          },
+        });
+        expect(options.threadDeleteCalls).toEqual([]);
+      }),
+    ),
+  );
+
+  it.live(
+    "does not replay an uncertain deletion when the thread remains present",
+    () =>
+      withDatabasePath((databasePath) =>
+        Effect.gen(function* () {
+          const { options, connections } = emptyThreadFixtures();
+          const worktreePath = "/srv/project-a/.worktrees/feature";
+          options.activeStreams = {
+            "instance-a": () =>
+              Stream.make(
+                shellSnapshotItem(
+                  101,
+                  [shellProjectFixture("project-a")],
+                  [shellThreadFixture("thread-a", { worktreePath })],
+                ),
+                shellSynchronizedItem,
+              ),
+          };
+          options.archivedShells = {
+            "instance-a": () =>
+              Effect.succeed({
+                snapshotSequence: 102,
+                projects: [shellProjectFixture("project-a")],
+                threads: [],
+                observedAt: "2026-09-24T00:00:00.000Z",
+              }),
+          };
+          options.threadStreams = {
+            "instance-a:thread-a": () =>
+              detailSnapshotStream(
+                110,
+                observedThreadFixture("thread-a", {
+                  projectId: "project-a",
+                  worktreePath,
+                }),
+              ),
+          };
+          options.deleteThread = () =>
+            Effect.fail(
+              new T3CodeAdapterError({
+                kind: "transport",
+                message: "The thread-delete reply was lost.",
+                uncertain: true,
+                status: null,
+              }),
+            );
+
+          const results = yield* Effect.scoped(
+            Effect.gen(function* () {
+              yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+              const input = {
+                requestId: "remove-lost-reply",
+                thread: { instanceId: "instance-a", threadId: "thread-a" },
+              };
+              const first = yield* callTool("thread_remove", input);
+              const retry = yield* callTool("thread_remove", input);
+              const observed = yield* callTool("operation_get", {
+                requestId: input.requestId,
+                waitMs: 5_000,
+              });
+              return { first, observed, retry };
+            }).pipe(Effect.provide(appLayer(databasePath, connections))),
+          );
+
+          expect(results.first[0]?.result).toMatchObject({
+            result: {
+              kind: "ok",
+              value: { state: "pending", dispatch: "unknown" },
+            },
+          });
+          expect(results.observed[0]?.result).toMatchObject({
+            result: {
+              kind: "ok",
+              value: { operation: { state: "outcome_unknown", dispatch: "unknown" } },
+            },
+          });
+          expect(results.retry[0]?.result).toMatchObject({
+            result: {
+              kind: "ok",
+              value: {
+                state: "pending",
+                dispatch: "unknown",
+                steps: expect.arrayContaining([
+                  expect.objectContaining({
+                    name: "dispatch_thread_deletion",
+                    state: "outcome_unknown",
+                  }),
+                ]),
+              },
+            },
+          });
+          expect(options.threadDeleteCalls).toHaveLength(1);
+        }),
+      ),
+    40_000,
+  );
+
+  it.live("preserves a certain deletion failure when recovery confirms the thread remains", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        let activeReads = 0;
+        let archivedReads = 0;
+        options.activeStreams = {
+          "instance-a": () => {
+            activeReads += 1;
+            return Stream.make(
+              shellSnapshotItem(
+                100 + activeReads,
+                [shellProjectFixture("project-a")],
+                [
+                  shellThreadFixture("thread-a", {
+                    worktreePath: "/srv/project-a/.worktrees/feature",
+                  }),
+                ],
+              ),
+              shellSynchronizedItem,
+            );
+          },
+        };
+        options.archivedShells = {
+          "instance-a": () => {
+            archivedReads += 1;
+            return Effect.succeed({
+              snapshotSequence: 200 + archivedReads,
+              projects: [shellProjectFixture("project-a")],
+              threads: [],
+              observedAt: new Date().toISOString(),
+            });
+          },
+        };
+        const requestId = "remove-certain-failure-recovery";
+        const target = { instanceId: "instance-a", threadId: "thread-a" };
+        const now = new Date(Date.now() - LIVE_EFFECT_OBSERVATION_MILLIS - 1_000).toISOString();
+        const intent = {
+          ...target,
+          threadRemoval: {
+            ...target,
+            commandId: "remove-certain-failure-command",
+            dispatchSequence: null,
+            steps: { dispatch: 6, absence: 7 },
+          },
+        };
+        const failedDispatch = {
+          code: "upstream_failure" as const,
+          message: "T3Code rejected the thread-delete command.",
+          retry: "change_request" as const,
+          details: {},
+        };
+        const stepNames = [
+          "check_thread_state",
+          "recheck_before_provider_session_stop",
+          "capture_provider_session",
+          "dispatch_provider_session_stop",
+          "observe_provider_session_shutdown",
+          "recheck_before_thread_deletion",
+          "dispatch_thread_deletion",
+          "observe_thread_absence",
+        ];
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const store = yield* LocalStore;
+            yield* store.admitOperation({
+              requestId,
+              tool: "thread_remove",
+              fingerprint: "remove-certain-failure-recovery-fingerprint",
+              processNonce: "previous-process",
+              admittedAt: now,
+              intent,
+              completionMeans: "thread_absent",
+              target,
+              steps: stepNames,
+            });
+            for (const [position, state] of (
+              ["succeeded", "succeeded", "succeeded", "skipped", "succeeded", "succeeded"] as const
+            ).entries()) {
+              yield* store.updateOperation(requestId, {
+                now,
+                intent,
+                state: "pending",
+                dispatch: "unknown",
+                target,
+                stepPosition: position,
+                stepState: state,
+                evidence: [
+                  {
+                    kind: "snapshot",
+                    observedAt: now,
+                    sourceSequence: 100,
+                    nativeEventId: null,
+                    detail: `Persisted thread-removal step ${stepNames[position]}.`,
+                  },
+                ],
+                evidenceStepPosition: position,
+                recovery: "observe_operation",
+              });
+            }
+            yield* store.updateOperation(requestId, {
+              now,
+              intent,
+              state: "pending",
+              dispatch: "unknown",
+              target,
+              commandId: "remove-certain-failure-command",
+              stepPosition: 6,
+              stepState: "failed",
+              stepError: failedDispatch,
+              evidence: [
+                {
+                  kind: "rpc_result",
+                  observedAt: now,
+                  sourceSequence: null,
+                  nativeEventId: "remove-certain-failure-command",
+                  detail: failedDispatch.message,
+                },
+              ],
+              evidenceStepPosition: 6,
+              recovery: "observe_operation",
+            });
+            return yield* callTool("operation_get", { requestId });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              operation: {
+                state: "partial",
+                dispatch: "rejected",
+                error: { code: "upstream_failure" },
+                steps: [
+                  { name: "check_thread_state", state: "succeeded" },
+                  { name: "recheck_before_provider_session_stop", state: "succeeded" },
+                  { name: "capture_provider_session", state: "succeeded" },
+                  { name: "dispatch_provider_session_stop", state: "skipped" },
+                  { name: "observe_provider_session_shutdown", state: "succeeded" },
+                  { name: "recheck_before_thread_deletion", state: "succeeded" },
+                  { name: "dispatch_thread_deletion", state: "failed" },
+                  { name: "observe_thread_absence", state: "skipped" },
+                ],
+              },
+            },
+          },
+        });
+        expect(options.threadDeleteCalls).toEqual([]);
+      }),
+    ),
+  );
+
+  it.live("completes an unknown removal after fresh inventories confirm absence", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(201, [shellProjectFixture("project-a")], []),
+              shellSynchronizedItem,
+            ),
+        };
+        options.archivedShells = {
+          "instance-a": () =>
+            Effect.succeed({
+              snapshotSequence: 202,
+              projects: [shellProjectFixture("project-a")],
+              threads: [],
+              observedAt: new Date().toISOString(),
+            }),
+        };
+
+        const requestId = "remove-unknown-now-absent";
+        const target = { instanceId: "instance-a", threadId: "thread-a" };
+        const commandId = "remove-unknown-now-absent-command";
+        const now = new Date(Date.now() - LIVE_EFFECT_OBSERVATION_MILLIS - 1_000).toISOString();
+        const intent = {
+          ...target,
+          threadRemoval: {
+            ...target,
+            commandId,
+            dispatchSequence: null,
+            steps: { dispatch: 6, absence: 7 },
+          },
+        };
+        const stepNames = [
+          "check_thread_state",
+          "recheck_before_provider_session_stop",
+          "capture_provider_session",
+          "dispatch_provider_session_stop",
+          "observe_provider_session_shutdown",
+          "recheck_before_thread_deletion",
+          "dispatch_thread_deletion",
+          "observe_thread_absence",
+        ];
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const store = yield* LocalStore;
+            yield* store.admitOperation({
+              requestId,
+              tool: "thread_remove",
+              fingerprint: "remove-unknown-now-absent-fingerprint",
+              processNonce: "previous-process",
+              admittedAt: now,
+              intent,
+              completionMeans: "thread_absent",
+              target,
+              steps: stepNames,
+            });
+            for (const [position, state] of (
+              [
+                "succeeded",
+                "succeeded",
+                "succeeded",
+                "skipped",
+                "already_absent",
+                "succeeded",
+              ] as const
+            ).entries()) {
+              yield* store.updateOperation(requestId, {
+                now,
+                intent,
+                state: "pending",
+                dispatch: "unknown",
+                target,
+                stepPosition: position,
+                stepState: state,
+                evidence: [
+                  {
+                    kind: "snapshot",
+                    observedAt: now,
+                    sourceSequence: 200,
+                    nativeEventId: null,
+                    detail: `Persisted thread-removal step ${stepNames[position]}.`,
+                  },
+                ],
+                evidenceStepPosition: position,
+                recovery: "observe_operation",
+              });
+            }
+            for (const position of [6, 7]) {
+              yield* store.updateOperation(requestId, {
+                now,
+                intent,
+                state: "outcome_unknown",
+                dispatch: "unknown",
+                target,
+                commandId,
+                stepPosition: position,
+                stepState: "outcome_unknown",
+                evidence: [
+                  {
+                    kind: "adapter_inference",
+                    observedAt: now,
+                    sourceSequence: null,
+                    nativeEventId: commandId,
+                    detail: "The deletion reply is unknown; reconcile thread presence.",
+                  },
+                ],
+                evidenceStepPosition: position,
+                recovery: "observe_operation",
+              });
+            }
+            return yield* callTool("operation_get", { requestId });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              operation: {
+                state: "completed",
+                dispatch: "unknown",
+                completionMeans: "thread_absent",
+                steps: [
+                  { name: "check_thread_state", state: "succeeded" },
+                  { name: "recheck_before_provider_session_stop", state: "succeeded" },
+                  { name: "capture_provider_session", state: "succeeded" },
+                  { name: "dispatch_provider_session_stop", state: "skipped" },
+                  { name: "observe_provider_session_shutdown", state: "already_absent" },
+                  { name: "recheck_before_thread_deletion", state: "succeeded" },
+                  { name: "dispatch_thread_deletion", state: "outcome_unknown" },
+                  { name: "observe_thread_absence", state: "already_absent" },
+                ],
+              },
+            },
+          },
+        });
+        expect(options.threadDeleteCalls).toEqual([]);
+      }),
+    ),
+  );
+
+  it.live("continues admitted removal after the MCP caller cancels its wait", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const started = yield* Deferred.make<void>();
+        const gate = yield* Deferred.make<{ readonly sequence: number }>();
+        let threadPresent = true;
+        let activeReads = 0;
+        let archivedReads = 0;
+        options.activeStreams = {
+          "instance-a": () => {
+            activeReads += 1;
+            return Stream.make(
+              shellSnapshotItem(
+                100 + activeReads,
+                [shellProjectFixture("project-a")],
+                threadPresent
+                  ? [
+                      shellThreadFixture("thread-a", {
+                        worktreePath: "/srv/project-a/.worktrees/a",
+                      }),
+                    ]
+                  : [],
+              ),
+              shellSynchronizedItem,
+            );
+          },
+        };
+        options.archivedShells = {
+          "instance-a": () => {
+            archivedReads += 1;
+            return Effect.succeed({
+              snapshotSequence: 200 + archivedReads,
+              projects: [shellProjectFixture("project-a")],
+              threads: [],
+              observedAt: "2026-09-24T00:00:00.000Z",
+            });
+          },
+        };
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            detailSnapshotStream(
+              110,
+              observedThreadFixture("thread-a", {
+                projectId: "project-a",
+                worktreePath: "/srv/project-a/.worktrees/a",
+              }),
+            ),
+        };
+        options.deleteThread = () =>
+          Deferred.succeed(started, undefined).pipe(
+            Effect.andThen(Deferred.await(gate)),
+            Effect.tap(() => Effect.sync(() => (threadPresent = false))),
+          );
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const request = {
+              requestId: "remove-cancelled-wait",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            };
+            const caller = yield* Effect.forkDetach(callTool("thread_remove", request));
+            yield* Deferred.await(started);
+            yield* Fiber.interrupt(caller);
+            yield* Deferred.succeed(gate, { sequence: 50 });
+            return yield* callTool("operation_get", {
+              requestId: request.requestId,
+              waitMs: 5_000,
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: { kind: "ok", value: { operation: { state: "completed" } } },
+        });
+        expect(options.threadDeleteCalls).toHaveLength(1);
+        expect(options.interruptCalls).toEqual([]);
+        expect(threadPresent).toBe(false);
+      }),
+    ),
+  );
+
+  it.live("rejects unknown nested thread arguments before observation", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const result = yield* Effect.exit(
+          Effect.scoped(
+            callTool("thread_remove", {
+              requestId: "remove-invalid-thread-argument",
+              thread: { instanceId: "instance-a", threadId: "thread-a", unexpected: true },
+            }).pipe(Effect.provide(appLayer(databasePath, connections))),
+          ),
+        );
+
+        expect(Exit.isFailure(result)).toBe(true);
+        if (Exit.isSuccess(result)) return;
+        expect(String(result.cause)).toContain("Invalid parameters for tool 'thread_remove'");
+        expect(options.seenActive).toEqual([]);
+        expect(options.threadDeleteCalls).toEqual([]);
+      }),
+    ),
+  );
+
+  it.live("refuses removal when an archived inventory cannot be checked", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        options.activeStreams = {
+          "instance-a": () =>
+            Stream.make(
+              shellSnapshotItem(
+                101,
+                [shellProjectFixture("project-a")],
+                [shellThreadFixture("thread-a", { worktreePath: "/srv/project-a/.worktrees/a" })],
+              ),
+              shellSynchronizedItem,
+            ),
+        };
+        options.archivedShells = {
+          "instance-a": () =>
+            Effect.fail(
+              new T3CodeAdapterError({
+                kind: "transport",
+                message: "The archived inventory is unavailable.",
+                uncertain: false,
+                status: null,
+              }),
+            ),
+        };
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("thread_remove", {
+              requestId: "remove-with-unavailable-archive",
+              thread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "failed",
+              dispatch: "not_dispatched",
+              error: { code: "unavailable" },
+              steps: [
+                { name: "check_thread_state", state: "failed" },
+                { name: "recheck_before_provider_session_stop", state: "skipped" },
+                { name: "capture_provider_session", state: "skipped" },
+                { name: "dispatch_provider_session_stop", state: "skipped" },
+                { name: "observe_provider_session_shutdown", state: "skipped" },
+                { name: "recheck_before_thread_deletion", state: "skipped" },
+                { name: "dispatch_thread_deletion", state: "skipped" },
+                { name: "observe_thread_absence", state: "skipped" },
+              ],
+            },
+          },
+        });
+        expect(options.threadDeleteCalls).toEqual([]);
+      }),
+    ),
+  );
+});
+
+describe("tool failure classification", () => {
+  it.effect("keeps uncertain wire-incompatible stops reconcilable", () =>
+    Effect.sync(() => {
+      const failure = adapterErrorFailure(
+        new T3CodeAdapterError({
+          kind: "wire_incompatible",
+          message: "The stop reply did not match the pinned schema.",
+          uncertain: true,
+          status: null,
+        }),
+        "thread_stop",
+      );
+      expect(failure).toMatchObject({
+        code: "unavailable",
+        retry: "reconcile_first",
+        details: { action: "observe_operation" },
+      });
+
+      const certainFailure = adapterErrorFailure(
+        new T3CodeAdapterError({
+          kind: "wire_incompatible",
+          message: "The pairing response did not match the pinned schema.",
+          uncertain: false,
+          status: null,
+        }),
+        "thread_stop",
+      );
+      expect(certainFailure).toMatchObject({
+        code: "incompatible_instance",
+        retry: "change_request",
+      });
+    }),
   );
 });
 

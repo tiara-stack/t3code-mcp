@@ -135,6 +135,7 @@ describe("stdio transport", () => {
               "input_respond",
               "operation_get",
               "thread_stop_session",
+              "thread_remove",
             ]);
             expect(
               toolsMessage.result?.tools?.find((tool) => tool.name === "worktree_inspect")
@@ -274,6 +275,33 @@ describe("stdio transport", () => {
             let invalidWorktreePath = await nextMessage();
             while (invalidWorktreePath.id !== 9) invalidWorktreePath = await nextMessage();
             expect(invalidWorktreePath.error?.code).toBe(-32602);
+
+            send(child, {
+              jsonrpc: "2.0",
+              id: 10,
+              method: "tools/call",
+              params: {
+                name: "thread_remove",
+                arguments: {
+                  requestId: "stdio-failed-thread-remove",
+                  thread: { instanceId: "missing-instance", threadId: "thread-a" },
+                },
+              },
+            });
+            let failedThreadRemoval = await nextMessage();
+            while (failedThreadRemoval.id !== 10) failedThreadRemoval = await nextMessage();
+            expect(failedThreadRemoval.result?.isError).toBe(true);
+            expect(failedThreadRemoval.result?.structuredContent).toMatchObject({
+              result: {
+                kind: "ok",
+                value: {
+                  tool: "thread_remove",
+                  state: "failed",
+                  dispatch: "not_dispatched",
+                  error: { code: "registration_not_found" },
+                },
+              },
+            });
           }),
         ({ directory, child }) =>
           Effect.promise(async () => {

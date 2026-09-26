@@ -214,6 +214,8 @@ const threadStopOverrides = {
     retry: "change_request",
     details: {},
   },
+  wire_incompatible: (error) =>
+    error.uncertain ? threadStopUncertainFailure : sharedAdapterFailures.wire_incompatible,
   capacity: {
     code: "unavailable",
     retry: "safe_read",

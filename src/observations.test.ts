@@ -979,6 +979,243 @@ const threadObservationsLayer = (
   );
 
 describe("Thread session shutdown observation", () => {
+  it.live("accepts forward sequence jumps and skips overlapping shutdown events", () =>
+    withDatabasePath((databasePath) => {
+      const target: ThreadSessionShutdownTarget = {
+        instanceId: "instance-a",
+        threadId: "thread-a",
+        afterSequence: 7,
+        commandId: "stop-command-a",
+        createdAt: "2026-09-23T12:00:00.000Z",
+        session: {
+          providerInstanceId: "provider-a",
+          status: "ready",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: "2026-09-23T11:59:00.000Z",
+        },
+      };
+      const layer = threadObservationsLayer(
+        databasePath,
+        {
+          acquire: (instanceId) =>
+            Effect.succeed({
+              instanceId,
+              revision: 1,
+              endpoint: "https://a.test",
+              environmentId: "env-a",
+              credential: "secret-a",
+              verified: {
+                environmentId: "env-a",
+                serverVersion: "0.0.38",
+                scopes: [],
+                capabilities: {},
+              },
+            }),
+          openThreadStream: () =>
+            Stream.make(
+              {
+                kind: "session-stop-requested" as const,
+                sequence: 10,
+                threadId: target.threadId,
+                commandId: target.commandId,
+                createdAt: target.createdAt,
+              },
+              {
+                kind: "session-stop-requested" as const,
+                sequence: 10,
+                threadId: "other-thread",
+                commandId: "other-command",
+                createdAt: target.createdAt,
+              },
+              {
+                kind: "session-set" as const,
+                sequence: 12,
+                session: {
+                  providerInstanceId: "provider-a",
+                  status: "ready" as const,
+                  activeTurnId: null,
+                  lastError: null,
+                  updatedAt: target.createdAt,
+                },
+              },
+              {
+                kind: "session-set" as const,
+                sequence: 14,
+                session: {
+                  providerInstanceId: "provider-a",
+                  status: "stopped" as const,
+                  activeTurnId: null,
+                  lastError: null,
+                  updatedAt: target.createdAt,
+                },
+              },
+              threadSynchronizedItem,
+            ),
+        },
+        [],
+      );
+      return Effect.scoped(
+        Effect.gen(function* () {
+          yield* seedRegistration;
+          const observations = yield* Observations;
+          const result = yield* observations.watchThreadSessionShutdown(target, 1_000);
+          expect(result).toEqual({
+            kind: "observed",
+            requestSequence: 10,
+            shutdownSequence: 14,
+          });
+        }).pipe(Effect.provide(layer)),
+      );
+    }),
+  );
+
+  it.live("reports a same-provider active session update after the stop request as changed", () =>
+    withDatabasePath((databasePath) => {
+      const target: ThreadSessionShutdownTarget = {
+        instanceId: "instance-a",
+        threadId: "thread-a",
+        afterSequence: 7,
+        commandId: "stop-command-a",
+        createdAt: "2026-09-23T12:00:00.000Z",
+        session: {
+          providerInstanceId: "provider-a",
+          status: "ready",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: "2026-09-23T11:59:00.000Z",
+        },
+      };
+      const layer = threadObservationsLayer(
+        databasePath,
+        {
+          acquire: (instanceId) =>
+            Effect.succeed({
+              instanceId,
+              revision: 1,
+              endpoint: "https://a.test",
+              environmentId: "env-a",
+              credential: "secret-a",
+              verified: {
+                environmentId: "env-a",
+                serverVersion: "0.0.38",
+                scopes: [],
+                capabilities: {},
+              },
+            }),
+          openThreadStream: () =>
+            Stream.make(
+              {
+                kind: "session-stop-requested" as const,
+                sequence: 10,
+                threadId: target.threadId,
+                commandId: target.commandId,
+                createdAt: target.createdAt,
+              },
+              {
+                kind: "session-set" as const,
+                sequence: 12,
+                session: {
+                  providerInstanceId: "provider-a",
+                  status: "running" as const,
+                  activeTurnId: "turn-2",
+                  lastError: null,
+                  updatedAt: "2026-09-23T12:00:01.000Z",
+                },
+              },
+              threadSynchronizedItem,
+            ),
+        },
+        [],
+      );
+      return Effect.scoped(
+        Effect.gen(function* () {
+          yield* seedRegistration;
+          const observations = yield* Observations;
+          const result = yield* observations.watchThreadSessionShutdown(target, 1_000);
+          expect(result).toEqual({
+            kind: "session_changed",
+            requestSequence: 10,
+            sourceSequence: 12,
+          });
+        }).pipe(Effect.provide(layer)),
+      );
+    }),
+  );
+
+  it.live("reports a stopped session with a different timestamp as changed", () =>
+    withDatabasePath((databasePath) => {
+      const target: ThreadSessionShutdownTarget = {
+        instanceId: "instance-a",
+        threadId: "thread-a",
+        afterSequence: 7,
+        commandId: "stop-command-a",
+        createdAt: "2026-09-23T12:00:00.000Z",
+        session: {
+          providerInstanceId: "provider-a",
+          status: "ready",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: "2026-09-23T11:59:00.000Z",
+        },
+      };
+      const layer = threadObservationsLayer(
+        databasePath,
+        {
+          acquire: (instanceId) =>
+            Effect.succeed({
+              instanceId,
+              revision: 1,
+              endpoint: "https://a.test",
+              environmentId: "env-a",
+              credential: "secret-a",
+              verified: {
+                environmentId: "env-a",
+                serverVersion: "0.0.38",
+                scopes: [],
+                capabilities: {},
+              },
+            }),
+          openThreadStream: () =>
+            Stream.make(
+              {
+                kind: "session-stop-requested" as const,
+                sequence: 10,
+                threadId: target.threadId,
+                commandId: target.commandId,
+                createdAt: target.createdAt,
+              },
+              {
+                kind: "session-set" as const,
+                sequence: 12,
+                session: {
+                  providerInstanceId: "provider-a",
+                  status: "stopped" as const,
+                  activeTurnId: null,
+                  lastError: null,
+                  updatedAt: "2026-09-23T12:00:01.000Z",
+                },
+              },
+              threadSynchronizedItem,
+            ),
+        },
+        [],
+      );
+      return Effect.scoped(
+        Effect.gen(function* () {
+          yield* seedRegistration;
+          const observations = yield* Observations;
+          const result = yield* observations.watchThreadSessionShutdown(target, 1_000);
+          expect(result).toEqual({
+            kind: "session_changed",
+            requestSequence: 10,
+            sourceSequence: 12,
+          });
+        }).pipe(Effect.provide(layer)),
+      );
+    }),
+  );
+
   it.effect("returns timed_out when the stream closes after synchronization", () =>
     withDatabasePath((databasePath) => {
       let streamOpens = 0;

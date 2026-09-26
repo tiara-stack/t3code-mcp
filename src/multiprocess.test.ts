@@ -144,6 +144,7 @@ const startServer = async (databasePath: string): Promise<Server> => {
       "input_respond",
       "operation_get",
       "thread_stop_session",
+      "thread_remove",
     ]);
     return server;
   } catch (error) {
@@ -174,6 +175,28 @@ const startSessionStopWorker = async (
               T3CODE_MCP_SESSION_STOP_COMMAND_ID: recovery.commandId,
               T3CODE_MCP_SESSION_STOP_CREATED_AT: recovery.createdAt,
             }),
+      },
+      stdio: ["ignore", "pipe", "inherit"],
+    },
+  );
+  return { child, next: waitForMessage(child) };
+};
+
+const startThreadRemovalWorker = async (
+  databasePath: string,
+  mode: "start" | "recover",
+  requestId: string,
+): Promise<Server> => {
+  const child = spawn(
+    process.execPath,
+    [tsxCliPath, "scripts/multiprocess-thread-remove-worker.ts"],
+    {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        T3CODE_MCP_DATABASE_PATH: databasePath,
+        T3CODE_MCP_THREAD_REMOVE_MODE: mode,
+        T3CODE_MCP_THREAD_REMOVE_REQUEST_ID: requestId,
       },
       stdio: ["ignore", "pipe", "inherit"],
     },
@@ -937,6 +960,7 @@ describe("shared SQLite mutation admission", () => {
     () =>
       withServers("t3code-mcp-worktree-discard-multiprocess-", ({ databasePath, servers }) =>
         Effect.gen(function* () {
+          yield* seed(databasePath, []);
           const [left, right] = yield* Effect.promise(() =>
             Promise.all([startServer(databasePath), startServer(databasePath)]),
           );
@@ -1110,6 +1134,110 @@ describe("shared SQLite mutation admission", () => {
               },
             },
           });
+        }),
+      ),
+    60000,
+  );
+
+  it.live(
+    "does not redispatch thread deletion after the owning OS process dies with an unknown reply",
+    () =>
+      withServers("t3code-mcp-thread-remove-recovery-", ({ databasePath, servers }) =>
+        Effect.gen(function* () {
+          const requestId = "thread-remove-process-death";
+          yield* seed(databasePath, [{ instanceId: "instance-a" }]);
+
+          const first = yield* Effect.promise(() =>
+            startThreadRemovalWorker(databasePath, "start", requestId),
+          );
+          servers.add(first);
+          expect((yield* Effect.promise(() => first.next())).stage).toBe("delete-dispatch-started");
+
+          yield* Effect.acquireUseRelease(
+            Effect.sync(() => new DatabaseSync(databasePath)),
+            (database) =>
+              Effect.sync(() => {
+                const row = database
+                  .prepare(
+                    "SELECT intent_json, target_json, dispatch, state FROM operations WHERE request_id = ?",
+                  )
+                  .get(requestId) as
+                  | {
+                      intent_json: string;
+                      target_json: string | null;
+                      dispatch: string;
+                      state: string;
+                    }
+                  | undefined;
+                expect(row).toMatchObject({ dispatch: "unknown", state: "pending" });
+                expect(JSON.parse(row?.target_json ?? "null")).toEqual({
+                  instanceId: "instance-a",
+                  threadId: "thread-a",
+                });
+                expect(JSON.parse(row?.intent_json ?? "{}")).toMatchObject({
+                  threadRemoval: {
+                    instanceId: "instance-a",
+                    threadId: "thread-a",
+                    dispatchSequence: null,
+                  },
+                });
+              }),
+            (database) => Effect.sync(() => database.close()),
+          );
+
+          const exited = new Promise<void>((resolve) => first.child.once("exit", () => resolve()));
+          first.child.kill("SIGKILL");
+          yield* Effect.promise(() => exited);
+          servers.delete(first);
+          yield* agePendingOperation(databasePath, requestId);
+
+          const second = yield* Effect.promise(() =>
+            startThreadRemovalWorker(databasePath, "recover", requestId),
+          );
+          servers.add(second);
+          const recovered = yield* Effect.promise(() => second.next());
+          expect(recovered.stage).toBe("result");
+          expect(recovered.operation).toMatchObject({
+            result: {
+              kind: "ok",
+              value: {
+                operation: {
+                  state: "outcome_unknown",
+                  dispatch: "unknown",
+                  completionMeans: "thread_absent",
+                  steps: [
+                    { name: "check_thread_state", state: "succeeded" },
+                    { name: "recheck_before_provider_session_stop", state: "succeeded" },
+                    { name: "capture_provider_session", state: "succeeded" },
+                    { name: "dispatch_provider_session_stop", state: "skipped" },
+                    { name: "observe_provider_session_shutdown", state: "already_absent" },
+                    { name: "recheck_before_thread_deletion", state: "succeeded" },
+                    { name: "dispatch_thread_deletion", state: "outcome_unknown" },
+                    { name: "observe_thread_absence", state: "outcome_unknown" },
+                  ],
+                },
+              },
+            },
+          });
+          const repeated = yield* Effect.promise(() => second.next());
+          expect(repeated.stage).toBe("repeat");
+          const operationRecord = (message: JsonRpcMessage) =>
+            (
+              message.operation as
+                | {
+                    readonly result?: {
+                      readonly value?: {
+                        readonly operation?: {
+                          readonly revision?: number;
+                          readonly state?: string;
+                        };
+                      };
+                    };
+                  }
+                | undefined
+            )?.result?.value?.operation;
+          expect(operationRecord(repeated)).toMatchObject({ state: "outcome_unknown" });
+          expect(operationRecord(repeated)?.revision).toBe(operationRecord(recovered)?.revision);
         }),
       ),
     60000,

@@ -796,6 +796,12 @@ const ThreadSessionStopCommandWireSchema = Schema.Struct({
   createdAt: Schema.String,
 });
 
+const ThreadDeleteCommandWireSchema = Schema.Struct({
+  type: Schema.Literal("thread.delete"),
+  commandId: trimmedNonEmptyWireString,
+  threadId: trimmedNonEmptyWireString,
+});
+
 const DispatchCommandRpc = Rpc.make("orchestration.dispatchCommand", {
   payload: Schema.Union([
     InputResponseCommandWireSchema,
@@ -815,6 +821,7 @@ const DispatchCommandRpc = Rpc.make("orchestration.dispatchCommand", {
       threadId: trimmedNonEmptyWireString,
       reason: Schema.Literal("user"),
     }),
+    ThreadDeleteCommandWireSchema,
   ]),
   success: DispatchResultWireSchema,
   error: Schema.Union([
@@ -1064,22 +1071,60 @@ const boundedWebSocket = (websocket: Socket.WebSocketLike): Socket.WebSocketLike
   };
 };
 
+const authorizationErrorForScope = (requiredScope: unknown, message: string) =>
+  new T3CodeAdapterError({
+    kind: "authorization",
+    message,
+    uncertain: false,
+    status: null,
+    requiredScopes: [String(requiredScope)],
+  });
+
 const mapAuthorizationError = (error: unknown): T3CodeAdapterError | null => {
   if (
     Predicate.hasProperty(error, "_tag") &&
     error._tag === "EnvironmentAuthorizationError" &&
     Predicate.hasProperty(error, "requiredScope")
   ) {
-    return new T3CodeAdapterError({
-      kind: "authorization",
-      message: `The T3Code credential lacks the required ${String(error.requiredScope)} scope.`,
-      uncertain: false,
-      status: null,
-      requiredScopes: [String(error.requiredScope)],
-    });
+    return authorizationErrorForScope(
+      error.requiredScope,
+      `The T3Code credential lacks the required ${String(error.requiredScope)} scope.`,
+    );
   }
   return null;
 };
+
+const mapNativeCommandError = (
+  commandDescription: string,
+  error: unknown,
+): T3CodeAdapterError | RpcClientError.RpcClientError => {
+  if (error instanceof T3CodeAdapterError || error instanceof RpcClientError.RpcClientError) {
+    return error;
+  }
+  const authorizationError = mapAuthorizationError(error);
+  if (authorizationError !== null) return authorizationError;
+  const detail = Match.value(error).pipe(
+    Match.when(isNativeCommandInvariantError, (invariantError) => String(invariantError.detail)),
+    Match.when(hasErrorMessage, (messageError) => String(messageError.message)),
+    Match.orElse(() => "The command was rejected by the T3Code instance."),
+  );
+  return new T3CodeAdapterError({
+    kind: "command_rejected",
+    message: `The T3Code instance rejected ${commandDescription}: ${detail}`,
+    uncertain: false,
+    status: null,
+  });
+};
+
+const isNativeCommandInvariantError = (
+  error: unknown,
+): error is { readonly _tag: "OrchestrationCommandInvariantError"; readonly detail: unknown } =>
+  Predicate.hasProperty(error, "_tag") &&
+  error._tag === "OrchestrationCommandInvariantError" &&
+  Predicate.hasProperty(error, "detail");
+
+const hasErrorMessage = (error: unknown): error is { readonly message: unknown } =>
+  Predicate.hasProperty(error, "message");
 
 const mapOrchestrationReadError = (message: string) => (error: unknown) => {
   if (error instanceof T3CodeAdapterError) return error;
@@ -1160,6 +1205,17 @@ const mapAuthenticatedChannelError = (error: unknown): T3CodeAdapterError => {
     uncertain: false,
     status: null,
   });
+};
+
+const decodeAuthenticatedRpcError = <S extends Schema.ConstraintDecoder<unknown>>(
+  schema: S,
+  error: unknown,
+): Result.Result<S["Type"], T3CodeAdapterError> => {
+  const reason = error instanceof RpcClientError.RpcClientError ? error.reason : error;
+  const decoded = Schema.decodeUnknownResult(schema)(reason);
+  return Result.isFailure(decoded)
+    ? Result.fail(mapAuthenticatedChannelError(error))
+    : Result.succeed(decoded.success);
 };
 
 type DispatchCommandName = "approval response" | "thread creation";
@@ -1425,83 +1481,78 @@ const mapVcsReadError = (operation: "status" | "refs", error: unknown): T3CodeAd
   return mapped instanceof T3CodeAdapterError ? mapped : mapAuthenticatedChannelError(mapped);
 };
 
-export const mapReviewDiffPreviewError = (error: unknown): T3CodeAdapterError => {
-  const reason = error instanceof RpcClientError.RpcClientError ? error.reason : error;
-  const decoded = Schema.decodeUnknownResult(ReviewDiffPreviewErrorWireSchema)(reason);
-  if (Result.isFailure(decoded)) return mapAuthenticatedChannelError(error);
-  return Match.value(decoded.success).pipe(
-    Match.tag(
-      "EnvironmentAuthorizationError",
-      (authorizationError) =>
-        new T3CodeAdapterError({
-          kind: "authorization",
-          message: "The T3Code credential lacks authorization to read worktree diffs.",
-          uncertain: false,
-          status: null,
-          requiredScopes: [authorizationError.requiredScope],
-        }),
-    ),
-    Match.tag(
-      "VcsUnsupportedOperationError",
-      () =>
-        new T3CodeAdapterError({
-          kind: "unsupported_capability",
-          message: "The target T3Code instance does not support this worktree diff source.",
-          uncertain: false,
-          status: null,
-        }),
-    ),
-    Match.tag(
-      "VcsRepositoryDetectionError",
-      () =>
-        new T3CodeAdapterError({
-          kind: "unsupported_capability",
-          message:
-            "T3Code could not verify the requested worktree as an upstream-approved project root. Diff previews are available only for approved project roots.",
-          uncertain: false,
-          status: null,
-        }),
-    ),
-    Match.orElse(
-      () =>
-        new T3CodeAdapterError({
-          kind: "transport",
-          message: "T3Code could not read the requested worktree diff.",
-          uncertain: false,
-          status: null,
-        }),
-    ),
-  );
+const mapAuthenticatedRpcError = <S extends Schema.ConstraintDecoder<unknown>>(
+  schema: S,
+  error: unknown,
+  map: (decoded: S["Type"]) => T3CodeAdapterError,
+): T3CodeAdapterError => {
+  const decoded = decodeAuthenticatedRpcError(schema, error);
+  return Result.isFailure(decoded) ? decoded.failure : map(decoded.success);
 };
 
-const mapThreadHistoryDiffError = (error: unknown): T3CodeAdapterError => {
-  const reason = error instanceof RpcClientError.RpcClientError ? error.reason : error;
-  const decoded = Schema.decodeUnknownResult(ThreadHistoryDiffErrorWireSchema)(reason);
-  if (Result.isFailure(decoded)) return mapAuthenticatedChannelError(error);
-  return Match.value(decoded.success).pipe(
-    Match.tag(
-      "EnvironmentAuthorizationError",
-      (authorizationError) =>
-        new T3CodeAdapterError({
-          kind: "authorization",
-          message: "The T3Code credential lacks authorization to read thread-history diffs.",
-          uncertain: false,
-          status: null,
-          requiredScopes: [authorizationError.requiredScope],
-        }),
-    ),
-    Match.orElse(
-      () =>
-        new T3CodeAdapterError({
-          kind: "upstream_failure",
-          message:
-            "T3Code could not provide the requested thread-history diff. The thread or required history may be unavailable.",
-          uncertain: false,
-          status: null,
-        }),
+export const mapReviewDiffPreviewError = (error: unknown): T3CodeAdapterError =>
+  mapAuthenticatedRpcError(ReviewDiffPreviewErrorWireSchema, error, (decoded) =>
+    Match.value(decoded).pipe(
+      Match.tag("EnvironmentAuthorizationError", (authorizationError) =>
+        authorizationErrorForScope(
+          authorizationError.requiredScope,
+          "The T3Code credential lacks authorization to read worktree diffs.",
+        ),
+      ),
+      Match.tag(
+        "VcsUnsupportedOperationError",
+        () =>
+          new T3CodeAdapterError({
+            kind: "unsupported_capability",
+            message: "The target T3Code instance does not support this worktree diff source.",
+            uncertain: false,
+            status: null,
+          }),
+      ),
+      Match.tag(
+        "VcsRepositoryDetectionError",
+        () =>
+          new T3CodeAdapterError({
+            kind: "unsupported_capability",
+            message:
+              "T3Code could not verify the requested worktree as an upstream-approved project root. Diff previews are available only for approved project roots.",
+            uncertain: false,
+            status: null,
+          }),
+      ),
+      Match.orElse(
+        () =>
+          new T3CodeAdapterError({
+            kind: "transport",
+            message: "T3Code could not read the requested worktree diff.",
+            uncertain: false,
+            status: null,
+          }),
+      ),
     ),
   );
-};
+
+const mapThreadHistoryDiffError = (error: unknown): T3CodeAdapterError =>
+  mapAuthenticatedRpcError(ThreadHistoryDiffErrorWireSchema, error, (decoded) =>
+    Match.value(decoded).pipe(
+      Match.tag("EnvironmentAuthorizationError", (authorizationError) =>
+        authorizationErrorForScope(
+          authorizationError.requiredScope,
+          "The T3Code credential lacks authorization to read thread-history diffs.",
+        ),
+      ),
+      Match.orElse(
+        () =>
+          new T3CodeAdapterError({
+            kind: "upstream_failure",
+            message:
+              "T3Code could not provide the requested thread-history diff. The thread or required history may be unavailable.",
+            uncertain: false,
+            status: null,
+          }),
+      ),
+    ),
+  );
 
 /**
  * Map a failed vcs.listRefs read to a typed adapter error. Upstream git
@@ -2043,6 +2094,12 @@ export interface T3CodeAdapterService {
     readonly threadId: string;
     readonly commandId: string;
     readonly createdAt: string;
+  }) => Effect.Effect<{ readonly sequence: number }, T3CodeAdapterError>;
+  readonly deleteThread: (input: {
+    readonly endpoint: string;
+    readonly credential: string;
+    readonly threadId: string;
+    readonly commandId: string;
   }) => Effect.Effect<{ readonly sequence: number }, T3CodeAdapterError>;
   readonly subscribeShell: (input: {
     readonly endpoint: string;
@@ -2730,12 +2787,22 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
   static readonly layerTest = (
     service: Omit<
       T3CodeAdapterService,
-      "dispatchTurn" | "interruptThread" | "createThread" | "getTurnDiff" | "getFullThreadDiff"
+      | "dispatchTurn"
+      | "interruptThread"
+      | "createThread"
+      | "getTurnDiff"
+      | "getFullThreadDiff"
+      | "deleteThread"
     > &
       Partial<
         Pick<
           T3CodeAdapterService,
-          "dispatchTurn" | "interruptThread" | "createThread" | "getTurnDiff" | "getFullThreadDiff"
+          | "dispatchTurn"
+          | "interruptThread"
+          | "createThread"
+          | "getTurnDiff"
+          | "getFullThreadDiff"
+          | "deleteThread"
         >
       >,
   ): Layer.Layer<T3CodeAdapter> =>
@@ -2792,6 +2859,17 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
             new T3CodeAdapterError({
               kind: "capacity",
               message: "The test adapter does not support thread-history diffs.",
+              uncertain: false,
+              status: null,
+            }),
+          )),
+      deleteThread:
+        service.deleteThread ??
+        (() =>
+          Effect.fail(
+            new T3CodeAdapterError({
+              kind: "capacity",
+              message: "The test adapter does not support thread deletion.",
               uncertain: false,
               status: null,
             }),
@@ -3919,35 +3997,32 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
                 threadId: input.threadId,
                 createdAt: input.createdAt,
               }).pipe(
-                Effect.catchTag("EnvironmentAuthorizationError", (error) =>
-                  Effect.fail(
-                    new T3CodeAdapterError({
-                      kind: "authorization",
-                      message: `The T3Code credential lacks the required ${"requiredScope" in error ? String(error.requiredScope) : "operate"} scope.`,
-                      uncertain: false,
-                      status: null,
-                    }),
-                  ),
+                Effect.mapError((error) =>
+                  mapNativeCommandError("the provider-session stop command", error),
                 ),
-                Effect.catchTag("OrchestrationDispatchCommandError", (error) =>
-                  Effect.fail(
-                    new T3CodeAdapterError({
-                      kind: "command_rejected",
-                      message: `The T3Code instance rejected the provider-session stop command: ${error.message}`,
-                      uncertain: false,
-                      status: null,
-                    }),
-                  ),
-                ),
-                Effect.catchTag("OrchestrationCommandInvariantError", (error) =>
-                  Effect.fail(
-                    new T3CodeAdapterError({
-                      kind: "command_rejected",
-                      message: `The T3Code instance rejected the provider-session stop command: ${"detail" in error ? String(error.detail) : error.message}`,
-                      uncertain: false,
-                      status: null,
-                    }),
-                  ),
+              ),
+            { uncertainOnTimeout: true, uncertainOnWireIncompatible: true },
+          ),
+        );
+
+      const deleteThread = (input: {
+        readonly endpoint: string;
+        readonly credential: string;
+        readonly threadId: string;
+        readonly commandId: string;
+      }): Effect.Effect<{ readonly sequence: number }, T3CodeAdapterError> =>
+        withCapacity(
+          withAuthenticatedRpc(
+            input.endpoint,
+            input.credential,
+            (client) =>
+              client["orchestration.dispatchCommand"]({
+                type: "thread.delete",
+                commandId: input.commandId,
+                threadId: input.threadId,
+              }).pipe(
+                Effect.mapError((error) =>
+                  mapNativeCommandError("the thread deletion command", error),
                 ),
               ),
             { uncertainOnTimeout: true, uncertainOnWireIncompatible: true },
@@ -4002,6 +4077,7 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
         listVcsWorktreeRefs,
         interruptThread,
         stopThreadSession,
+        deleteThread,
         subscribeShell,
         subscribeThread,
         dispatchThreadSettlement,

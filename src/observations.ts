@@ -558,6 +558,33 @@ const sessionWasStoppedByThreadSessionRequest = (
   session.updatedAt === target.createdAt &&
   (session.providerInstanceId ?? null) === (target.session.providerInstanceId ?? null);
 
+const providerSessionChanged = (
+  session: ThreadSessionShutdownTarget["session"],
+  target: ThreadSessionShutdownTarget,
+): boolean => {
+  const providerInstanceId = session.providerInstanceId ?? null;
+  return (
+    providerInstanceId !== null &&
+    providerInstanceId !== (target.session.providerInstanceId ?? null)
+  );
+};
+
+const sessionHasActiveExecution = (session: ThreadSessionShutdownTarget["session"]): boolean =>
+  session.status === "starting" || session.status === "running" || session.activeTurnId !== null;
+
+const stoppedSessionWasNotUpdatedByRequest = (
+  session: ThreadSessionShutdownTarget["session"],
+  target: ThreadSessionShutdownTarget,
+): boolean => session.status === "stopped" && session.updatedAt !== target.createdAt;
+
+const sessionInvalidatesThreadSessionShutdown = (
+  session: ThreadSessionShutdownTarget["session"],
+  target: ThreadSessionShutdownTarget,
+): boolean =>
+  providerSessionChanged(session, target) ||
+  sessionHasActiveExecution(session) ||
+  stoppedSessionWasNotUpdatedByRequest(session, target);
+
 const currentThreadSessionShutdownSnapshot = (
   item: Extract<ThreadStreamItem, { readonly kind: "snapshot" }>,
   target: ThreadSessionShutdownTarget,
@@ -570,39 +597,22 @@ const currentThreadSessionShutdownSnapshot = (
     : threadSessionShutdownGap(item.snapshot.snapshotSequence);
 };
 
-type ThreadSessionSequencePosition =
-  | { readonly kind: "skip" }
-  | { readonly kind: "advanced" }
-  | { readonly kind: "gap"; readonly sourceSequence: number };
-
 const advanceThreadSessionShutdownCursor = (
   cursor: ThreadSessionShutdownCursor,
   sequence: number,
-): ThreadSessionSequencePosition => {
-  if (sequence <= cursor.lastSequence) return { kind: "skip" };
+): boolean => {
+  if (sequence <= cursor.lastSequence) return false;
   cursor.lastSequence = sequence;
-  return { kind: "advanced" };
+  return true;
 };
-
-const advanceThreadSessionShutdownItem = (
-  cursor: ThreadSessionShutdownCursor,
-  sequence: number,
-): ThreadSessionSequencePosition => advanceThreadSessionShutdownCursor(cursor, sequence);
-
-const threadSessionShutdownPositionFailure = (
-  position: ThreadSessionSequencePosition,
-): ThreadSessionShutdownObservation | null =>
-  position.kind === "gap" ? threadSessionShutdownGap(position.sourceSequence) : null;
 
 const processThreadSessionSequence = (
   cursor: ThreadSessionShutdownCursor,
   sequence: number,
   process: () => ThreadSessionShutdownObservation | null,
 ): ThreadSessionShutdownObservation | null => {
-  const position = advanceThreadSessionShutdownItem(cursor, sequence);
-  if (position.kind === "skip") return null;
-  const failure = threadSessionShutdownPositionFailure(position);
-  return failure ?? process();
+  if (!advanceThreadSessionShutdownCursor(cursor, sequence)) return null;
+  return process();
 };
 
 const processThreadSessionStopRequested = (
@@ -629,13 +639,16 @@ const processThreadSessionSet = (
     if (cursor.requestSequence === null || item.sequence <= cursor.requestSequence) {
       return threadSessionShutdownChanged(item.sequence, cursor.requestSequence);
     }
+    if (sessionInvalidatesThreadSessionShutdown(item.session, target)) {
+      return threadSessionShutdownChanged(item.sequence, cursor.requestSequence);
+    }
     return sessionWasStoppedByThreadSessionRequest(item.session, target)
       ? {
           kind: "observed",
           requestSequence: cursor.requestSequence,
           shutdownSequence: item.sequence,
         }
-      : threadSessionShutdownChanged(item.sequence, cursor.requestSequence);
+      : null;
   });
 
 const processThreadSessionShutdownItem = (
@@ -653,8 +666,8 @@ const processThreadSessionShutdownItem = (
     case "session-set":
       return processThreadSessionSet(item, target, cursor);
     default: {
-      const position = advanceThreadSessionShutdownItem(cursor, item.sequence);
-      return position.kind === "skip" ? null : threadSessionShutdownPositionFailure(position);
+      advanceThreadSessionShutdownCursor(cursor, item.sequence);
+      return null;
     }
   }
 };
