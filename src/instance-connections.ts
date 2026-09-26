@@ -3,6 +3,7 @@ import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
+import * as Match from "effect/Match";
 import * as Option from "effect/Option";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
@@ -12,9 +13,14 @@ import type {
   InstanceDetails,
   InteractionMode,
   RuntimeMode,
+  ThreadHistoryDiffReadSource,
   WorktreeReference,
 } from "./domain";
-import { MAX_INSTANCE_RPC_CAPACITY, REVISION_POLL_INTERVAL_MILLIS } from "./domain";
+import {
+  MAX_INSTANCE_RPC_CAPACITY,
+  REVISION_POLL_INTERVAL_MILLIS,
+  threadHistoryDiffCounts,
+} from "./domain";
 import { LocalStore, LocalStoreError } from "./local-store";
 import {
   T3CodeAdapter,
@@ -36,6 +42,7 @@ import {
   type VerifiedInstance,
   type CreatedWorktree,
   type ThreadCreateRequest,
+  type ThreadHistoryDiff,
   type WorktreeCreateRequest,
 } from "./t3code-adapter";
 
@@ -77,6 +84,10 @@ export interface ObservedVcsWorktreeStatus extends VcsWorktreeStatus {
 
 export interface ObservedVcsDiffPreview {
   readonly preview: VcsDiffPreview;
+  readonly observedAt: string;
+}
+
+export interface ObservedThreadHistoryDiff extends ThreadHistoryDiff {
   readonly observedAt: string;
 }
 
@@ -181,6 +192,10 @@ export interface InstanceConnectionsService {
     readonly baseRef?: string;
     readonly ignoreWhitespace: boolean;
   }) => Effect.Effect<ObservedVcsDiffPreview, LocalStoreError | T3CodeAdapterError>;
+  readonly readThreadHistoryDiff: (input: {
+    readonly source: ThreadHistoryDiffReadSource;
+    readonly ignoreWhitespace: boolean;
+  }) => Effect.Effect<ObservedThreadHistoryDiff, LocalStoreError | T3CodeAdapterError>;
   readonly discoverVcsWorktreeRefs: (
     instanceId: string,
     repositoryPath: string,
@@ -253,6 +268,7 @@ export class InstanceConnections extends Context.Service<
     service: Omit<
       InstanceConnectionsService,
       | "readVcsWorktreeDiffPreview"
+      | "readThreadHistoryDiff"
       | "respondToInput"
       | "dispatchTurn"
       | "interruptThread"
@@ -264,6 +280,7 @@ export class InstanceConnections extends Context.Service<
         Pick<
           InstanceConnectionsService,
           | "readVcsWorktreeDiffPreview"
+          | "readThreadHistoryDiff"
           | "respondToInput"
           | "dispatchTurn"
           | "interruptThread"
@@ -282,6 +299,17 @@ export class InstanceConnections extends Context.Service<
             new T3CodeAdapterError({
               kind: "capacity",
               message: "The test connection does not support VCS diff reads.",
+              uncertain: false,
+              status: null,
+            }),
+          )),
+      readThreadHistoryDiff:
+        service.readThreadHistoryDiff ??
+        (() =>
+          Effect.fail(
+            new T3CodeAdapterError({
+              kind: "capacity",
+              message: "The test connection does not support thread-history diffs.",
               uncertain: false,
               status: null,
             }),
@@ -685,6 +713,63 @@ export class InstanceConnections extends Context.Service<
             );
             const observedAt = new Date(yield* Clock.currentTimeMillis).toISOString();
             return { ...listing, observedAt };
+          });
+
+        const readThreadHistoryDiff = (input: {
+          readonly source: ThreadHistoryDiffReadSource;
+          readonly ignoreWhitespace: boolean;
+        }): Effect.Effect<ObservedThreadHistoryDiff, LocalStoreError | T3CodeAdapterError> =>
+          Effect.gen(function* () {
+            const { source } = input;
+            const instanceId = source.thread.instanceId;
+            yield* requireReadableRegistration(
+              instanceId,
+              "The saved registration requires pairing before thread-history diffs can be read.",
+            );
+            const connection = yield* acquire(instanceId);
+            const readEffect = Match.value(source).pipe(
+              Match.when({ kind: "thread_turn_range" }, (range) =>
+                adapter.getTurnDiff({
+                  endpoint: connection.endpoint,
+                  credential: connection.credential,
+                  threadId: range.thread.threadId,
+                  fromTurnCount: range.fromTurnCount,
+                  toTurnCount: range.toTurnCount,
+                  ignoreWhitespace: input.ignoreWhitespace,
+                }),
+              ),
+              Match.when({ kind: "thread_through_turn" }, (through) =>
+                adapter.getFullThreadDiff({
+                  endpoint: connection.endpoint,
+                  credential: connection.credential,
+                  threadId: through.thread.threadId,
+                  toTurnCount: through.toTurnCount,
+                  ignoreWhitespace: input.ignoreWhitespace,
+                }),
+              ),
+              Match.exhaustive,
+            );
+            const diff = yield* withInstanceCapacity(instanceId, readEffect);
+            const expectedCounts = threadHistoryDiffCounts(source);
+            if (
+              diff.threadId !== source.thread.threadId ||
+              diff.fromTurnCount !== expectedCounts.fromTurnCount ||
+              diff.toTurnCount !== expectedCounts.toTurnCount
+            ) {
+              return yield* Effect.fail(
+                new T3CodeAdapterError({
+                  kind: "wire_incompatible",
+                  message:
+                    "The T3Code thread-history diff did not match the requested thread and native turn counts.",
+                  uncertain: false,
+                  status: null,
+                }),
+              );
+            }
+            return {
+              ...diff,
+              observedAt: new Date(yield* Clock.currentTimeMillis).toISOString(),
+            } satisfies ObservedThreadHistoryDiff;
           });
 
         const interruptThread = (input: {
@@ -1244,6 +1329,7 @@ export class InstanceConnections extends Context.Service<
           discoverVcsRefs,
           readVcsWorktreeStatus,
           readVcsWorktreeDiffPreview,
+          readThreadHistoryDiff,
           discoverVcsWorktreeRefs,
           interruptThread,
           openShellStream,

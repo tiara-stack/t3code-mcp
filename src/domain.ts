@@ -1364,23 +1364,38 @@ export type DiffReadSource =
       readonly toTurnCount: number;
     };
 
-export type WorktreeDiffReadSource = Extract<
+export type ThreadHistoryDiffReadSource = Extract<
   DiffReadSource,
-  { readonly kind: "worktree_changes" | "worktree_against_base" }
+  { readonly kind: "thread_turn_range" | "thread_through_turn" }
 >;
 
+export const threadHistoryDiffCounts = (source: ThreadHistoryDiffReadSource) =>
+  Match.value(source).pipe(
+    Match.when({ kind: "thread_turn_range" }, (range) => ({
+      fromTurnCount: range.fromTurnCount,
+      toTurnCount: range.toTurnCount,
+    })),
+    Match.when({ kind: "thread_through_turn" }, (through) => ({
+      fromTurnCount: 0,
+      toTurnCount: through.toTurnCount,
+    })),
+    Match.exhaustive,
+  );
+
 export type DiffReadCaptureQuery = {
-  readonly source: WorktreeDiffReadSource;
+  readonly source: DiffReadSource;
   readonly ignoreWhitespace: boolean;
 };
 
-const worktreeDiffReadSourceRuntimeShape = Schema.Union([
+const diffReadCaptureSourceRuntimeShape = Schema.Union([
   diffReadSourceVariants.worktreeChanges.runtime,
   diffReadSourceVariants.worktreeAgainstBase.runtime,
+  diffReadSourceVariants.threadTurnRange.runtime,
+  diffReadSourceVariants.threadThroughTurn.runtime,
 ]);
 
 export const DiffReadCaptureQuerySchema = Schema.Struct({
-  source: worktreeDiffReadSourceRuntimeShape,
+  source: diffReadCaptureSourceRuntimeShape,
   ignoreWhitespace: Schema.Boolean,
 });
 

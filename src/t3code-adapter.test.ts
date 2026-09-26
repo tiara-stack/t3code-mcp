@@ -1,7 +1,9 @@
 import { NodeHttpServer } from "@effect/platform-node";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as RpcClientError from "effect/unstable/rpc/RpcClientError";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
@@ -77,7 +79,42 @@ const ThreadSubscriptionFixtureRpc = Rpc.make("orchestration.subscribeThread", {
   stream: true,
 });
 
-const ThreadSubscriptionFixtureGroup = RpcGroup.make(ThreadSubscriptionFixtureRpc);
+const GetTurnDiffFixtureRpc = Rpc.make("orchestration.getTurnDiff", {
+  payload: Schema.Struct({
+    threadId: Schema.String,
+    fromTurnCount: Schema.Int,
+    toTurnCount: Schema.Int,
+    ignoreWhitespace: Schema.Boolean,
+  }),
+  success: Schema.Struct({
+    threadId: Schema.String,
+    fromTurnCount: Schema.Int,
+    toTurnCount: Schema.Int,
+    diff: Schema.String,
+  }),
+  error: Schema.Unknown,
+});
+
+const GetFullThreadDiffFixtureRpc = Rpc.make("orchestration.getFullThreadDiff", {
+  payload: Schema.Struct({
+    threadId: Schema.String,
+    toTurnCount: Schema.Int,
+    ignoreWhitespace: Schema.Boolean,
+  }),
+  success: Schema.Struct({
+    threadId: Schema.String,
+    fromTurnCount: Schema.Int,
+    toTurnCount: Schema.Int,
+    diff: Schema.String,
+  }),
+  error: Schema.Unknown,
+});
+
+const ThreadSubscriptionFixtureGroup = RpcGroup.make(
+  ThreadSubscriptionFixtureRpc,
+  GetTurnDiffFixtureRpc,
+  GetFullThreadDiffFixtureRpc,
+);
 
 const threadMessageSentFrame = {
   kind: "event",
@@ -133,6 +170,28 @@ const pinnedT3CodeFixtureServer = HttpRouter.serve(
       Layer.provide(
         ThreadSubscriptionFixtureGroup.toLayer({
           "orchestration.subscribeThread": () => Stream.make(threadMessageSentFrame),
+          "orchestration.getTurnDiff": (input) =>
+            Effect.succeed({
+              threadId: input.threadId,
+              fromTurnCount: input.fromTurnCount,
+              toTurnCount: input.toTurnCount,
+              diff: `${input.ignoreWhitespace ? "ignore" : "include"}:range`,
+            }),
+          "orchestration.getFullThreadDiff": (input) =>
+            input.threadId === "missing-thread" && input.toTurnCount > 0
+              ? Effect.fail({
+                  _tag: "OrchestrationGetFullThreadDiffError",
+                  message: "the thread history is unavailable",
+                })
+              : Effect.succeed({
+                  threadId: input.threadId,
+                  fromTurnCount: 0,
+                  toTurnCount: input.toTurnCount,
+                  diff:
+                    input.toTurnCount === 0
+                      ? ""
+                      : `${input.ignoreWhitespace ? "ignore" : "include"}:through`,
+                }),
         }),
       ),
     ),
@@ -169,6 +228,78 @@ describe("T3Code thread subscriptions", () => {
             },
           },
         ]);
+      }).pipe(Effect.provide(pinnedT3CodeFixtureAdapter)),
+    ),
+  );
+});
+
+describe("T3Code native thread-history diffs", () => {
+  it.live("uses native turn-count RPCs and preserves unavailable-history errors", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* HttpServer.HttpServer;
+        const adapter = yield* T3CodeAdapter;
+        const endpoint = HttpServer.formatAddress(server.address);
+        const range = yield* adapter.getTurnDiff({
+          endpoint,
+          credential: "fixture-credential",
+          threadId: "fixture-thread",
+          fromTurnCount: 2,
+          toTurnCount: 4,
+          ignoreWhitespace: true,
+        });
+        const through = yield* adapter.getFullThreadDiff({
+          endpoint,
+          credential: "fixture-credential",
+          threadId: "fixture-thread",
+          toTurnCount: 4,
+          ignoreWhitespace: false,
+        });
+        const emptyThrough = yield* adapter.getFullThreadDiff({
+          endpoint,
+          credential: "fixture-credential",
+          threadId: "missing-thread",
+          toTurnCount: 0,
+          ignoreWhitespace: false,
+        });
+        const unavailable = yield* Effect.exit(
+          adapter.getFullThreadDiff({
+            endpoint,
+            credential: "fixture-credential",
+            threadId: "missing-thread",
+            toTurnCount: 4,
+            ignoreWhitespace: false,
+          }),
+        );
+
+        expect(range).toEqual({
+          threadId: "fixture-thread",
+          fromTurnCount: 2,
+          toTurnCount: 4,
+          diff: "ignore:range",
+        });
+        expect(through).toEqual({
+          threadId: "fixture-thread",
+          fromTurnCount: 0,
+          toTurnCount: 4,
+          diff: "include:through",
+        });
+        expect(emptyThrough).toEqual({
+          threadId: "missing-thread",
+          fromTurnCount: 0,
+          toTurnCount: 0,
+          diff: "",
+        });
+        expect(Exit.isFailure(unavailable)).toBe(true);
+        const unavailableError = Exit.findErrorOption(unavailable);
+        expect(Option.isSome(unavailableError)).toBe(true);
+        if (Option.isNone(unavailableError)) {
+          throw new Error("the unavailable-history RPC failure was not typed");
+        }
+        expect(unavailableError.value).toMatchObject({
+          kind: "upstream_failure",
+          uncertain: false,
+        });
       }).pipe(Effect.provide(pinnedT3CodeFixtureAdapter)),
     ),
   );

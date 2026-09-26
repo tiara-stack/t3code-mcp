@@ -9,6 +9,7 @@ import * as Effect from "effect/Effect";
 import * as Encoding from "effect/Encoding";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Match from "effect/Match";
 import * as Predicate from "effect/Predicate";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
@@ -207,25 +208,55 @@ const threadOutputQueriesEqual = (
   left.thread.threadId === right.thread.threadId;
 
 const diffReadScopeKey = (query: DiffReadCaptureQuery): string =>
-  JSON.stringify([
-    DIFF_READ_CAPTURE_SCOPE,
-    query.source.kind,
-    query.source.worktree.instanceId,
-    query.source.worktree.repositoryPath,
-    query.source.worktree.worktreePath,
-    query.source.kind === "worktree_against_base" ? query.source.baseRef : null,
-    query.ignoreWhitespace,
-  ]);
+  Match.value(query.source).pipe(
+    Match.when({ kind: "worktree_changes" }, (source) =>
+      JSON.stringify([
+        DIFF_READ_CAPTURE_SCOPE,
+        source.kind,
+        source.worktree.instanceId,
+        source.worktree.repositoryPath,
+        source.worktree.worktreePath,
+        null,
+        query.ignoreWhitespace,
+      ]),
+    ),
+    Match.when({ kind: "worktree_against_base" }, (source) =>
+      JSON.stringify([
+        DIFF_READ_CAPTURE_SCOPE,
+        source.kind,
+        source.worktree.instanceId,
+        source.worktree.repositoryPath,
+        source.worktree.worktreePath,
+        source.baseRef,
+        query.ignoreWhitespace,
+      ]),
+    ),
+    Match.when({ kind: "thread_turn_range" }, (source) =>
+      JSON.stringify([
+        DIFF_READ_CAPTURE_SCOPE,
+        source.kind,
+        source.thread.instanceId,
+        source.thread.threadId,
+        source.fromTurnCount,
+        source.toTurnCount,
+        query.ignoreWhitespace,
+      ]),
+    ),
+    Match.when({ kind: "thread_through_turn" }, (source) =>
+      JSON.stringify([
+        DIFF_READ_CAPTURE_SCOPE,
+        source.kind,
+        source.thread.instanceId,
+        source.thread.threadId,
+        source.toTurnCount,
+        query.ignoreWhitespace,
+      ]),
+    ),
+    Match.exhaustive,
+  );
 
 const diffReadQueriesEqual = (left: DiffReadCaptureQuery, right: DiffReadCaptureQuery): boolean =>
-  left.ignoreWhitespace === right.ignoreWhitespace &&
-  left.source.kind === right.source.kind &&
-  left.source.worktree.instanceId === right.source.worktree.instanceId &&
-  left.source.worktree.repositoryPath === right.source.worktree.repositoryPath &&
-  left.source.worktree.worktreePath === right.source.worktree.worktreePath &&
-  (left.source.kind !== "worktree_against_base" ||
-    (right.source.kind === "worktree_against_base" &&
-      left.source.baseRef === right.source.baseRef));
+  diffReadScopeKey(left) === diffReadScopeKey(right);
 
 export const REQUEST_RECORD_UNAVAILABLE_MESSAGE =
   "The mutation receipt details are unavailable; the request ID remains permanently reserved.";
@@ -3450,7 +3481,7 @@ const readDiffReadChunkAtPosition = (
   readOutputChunkAtPosition(sql, databaseId, captureId, now, position, maxBytes, {
     scopeKey: diffReadScopeKey(query),
     orderKey: DIFF_READ_CAPTURE_ORDER,
-    scopeName: "worktree diff",
+    scopeName: "diff_read capture",
     decodeFrame: decodeDiffReadCaptureFrame,
     decodeItem: decodeOutputChunkItem,
     makeCursor: (nextPosition) =>
@@ -3608,7 +3639,7 @@ const captureDiffReadPageInDatabase = (
     yield* verify();
     return yield* sql.withTransaction(
       Effect.gen(function* () {
-        const captureId = yield* newCaptureId(crypto, "worktree diff");
+        const captureId = yield* newCaptureId(crypto, "diff_read");
         const now = yield* Clock.currentTimeMillis;
         yield* publishCapture(
           sql,
@@ -4364,7 +4395,7 @@ const decodeThreadOutputCaptureFrame = (
 const decodeDiffReadCaptureFrame = (
   capture: CaptureRow,
 ): Effect.Effect<OutputCaptureFrame, LocalStoreError> =>
-  decodeCaptureStateJson(capture, OutputCaptureFrameSchema, "worktree diff");
+  decodeCaptureStateJson(capture, OutputCaptureFrameSchema, "diff_read");
 
 const decodeOutputChunkItem = (payload: unknown): Effect.Effect<OutputChunkItem, LocalStoreError> =>
   decodeListCaptureItem(payload, OutputChunkItemSchema);
@@ -5918,7 +5949,7 @@ const decodeCursorPayload = <Payload>(
     | "worktree inspection"
     | "thread state"
     | "thread output"
-    | "worktree diff",
+    | "diff_read",
 ): Effect.Effect<Payload, LocalStoreError> => {
   const malformed = new LocalStoreError({
     kind: "cursor_mismatch",
@@ -5970,4 +6001,4 @@ const decodeThreadOutputCursor = (
 const decodeDiffReadCursor = (
   value: string,
 ): Effect.Effect<DiffReadCursorPayload, LocalStoreError> =>
-  decodeCursorPayload(value, DiffReadCursorPayloadSchema, "worktree diff");
+  decodeCursorPayload(value, DiffReadCursorPayloadSchema, "diff_read");

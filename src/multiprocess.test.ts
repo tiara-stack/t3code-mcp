@@ -1989,21 +1989,22 @@ describe("shared SQLite thread-output captures", () => {
   );
 });
 
-describe("shared SQLite worktree-diff captures", () => {
+describe("shared SQLite diff_read captures", () => {
   it.live(
     "continues the exact captured diff through public tools across processes and restarts",
     () =>
       withServers("t3code-mcp-diff-continue-", ({ databasePath, servers }) =>
         Effect.gen(function* () {
-          const query: DiffReadCaptureQuery = {
-            source: {
-              kind: "worktree_changes",
-              worktree: {
-                instanceId: "diff-instance",
-                repositoryPath: "/srv/repository",
-                worktreePath: "/srv/repository/.worktrees/feature",
-              },
+          const source = {
+            kind: "worktree_changes" as const,
+            worktree: {
+              instanceId: "diff-instance",
+              repositoryPath: "/srv/repository",
+              worktreePath: "/srv/repository/.worktrees/feature",
             },
+          };
+          const query: DiffReadCaptureQuery = {
+            source,
             ignoreWhitespace: false,
           };
           const firstPage = yield* Effect.scoped(
@@ -2042,8 +2043,6 @@ describe("shared SQLite worktree-diff captures", () => {
           expect(firstPage.chunk.items).toHaveLength(1);
           expect(firstPage.chunk.nextCursor).toEqual(expect.any(String));
           const captureId = firstPage.chunk.captureId;
-          const source = query.source;
-
           const first = yield* Effect.promise(() => startServer(databasePath));
           servers.add(first);
           const second = yield* Effect.promise(() =>
@@ -2134,7 +2133,153 @@ describe("shared SQLite worktree-diff captures", () => {
     60000,
   );
 
-  it.live("labels malformed diff frames as worktree-diff captures", () =>
+  it.live(
+    "continues a thread-through-turn diff across processes, restart, and expiry",
+    () =>
+      withServers("t3code-mcp-thread-diff-continue-", ({ databasePath, servers }) =>
+        Effect.gen(function* () {
+          const source = {
+            kind: "thread_through_turn" as const,
+            thread: { instanceId: "history-instance", threadId: "shared-native-id" },
+            toTurnCount: 4,
+          };
+          const query: DiffReadCaptureQuery = { source, ignoreWhitespace: true };
+          const firstPage = yield* Effect.scoped(
+            Effect.gen(function* () {
+              const store = yield* LocalStore;
+              return yield* store.captureDiffReadPage({
+                query,
+                items: Array.from({ length: 3 }, (_unused, part) => ({
+                  id: "thread_through_turn:0-4",
+                  kind: "diff" as const,
+                  turn: null,
+                  part,
+                  lastPart: part === 2,
+                  text: "λ".repeat(500),
+                })),
+                metadata: {
+                  failures: [],
+                  coverage: "unknown",
+                  limitations: ["Native thread diff truncation was not reported."],
+                  observations: [
+                    {
+                      instanceId: "history-instance",
+                      observedAt: "2026-09-24T04:00:00.000Z",
+                      freshness: "fresh",
+                      sourceSequence: null,
+                      coverage: "unknown",
+                      limitations: ["Native thread diff truncation was not reported."],
+                    },
+                  ],
+                },
+                frame: { sourceCompleteness: "unknown", upstreamTruncated: null },
+                maxBytes: 1024,
+              });
+            }).pipe(Effect.provide(LocalStore.layer({ databasePath }))),
+          );
+          const captureId = firstPage.chunk.captureId;
+          const cursor = firstPage.chunk.nextCursor;
+          if (cursor === null) throw new Error("Expected a thread-diff continuation cursor.");
+
+          const first = yield* Effect.promise(() => startServer(databasePath));
+          servers.add(first);
+          const second = yield* Effect.promise(() =>
+            call(first, 3, "diff_read", {
+              source,
+              ignoreWhitespace: true,
+              cursor,
+              maxBytes: 1024,
+            }),
+          );
+          expect(second.result?.structuredContent).toMatchObject({
+            result: {
+              kind: "ok",
+              value: {
+                captureId,
+                items: [{ id: "thread_through_turn:0-4", part: 1, lastPart: false }],
+                sourceCompleteness: "unknown",
+                upstreamTruncated: null,
+                nextCursor: expect.any(String),
+              },
+            },
+            observations: [{ coverage: "unknown" }],
+          });
+          const secondContent = second.result?.structuredContent;
+          if (secondContent === undefined) throw new Error("diff_read returned no second page.");
+          const secondCursor = (
+            secondContent as {
+              result: { value: { nextCursor: string } };
+            }
+          ).result.value.nextCursor;
+
+          const mismatched = yield* Effect.promise(() =>
+            call(first, 4, "diff_read", {
+              source: {
+                ...source,
+                thread: { ...source.thread, instanceId: "other-instance" },
+              },
+              ignoreWhitespace: true,
+              cursor: secondCursor,
+            }),
+          );
+          expect(mismatched.result?.structuredContent).toMatchObject({
+            result: { kind: "error", error: { code: "cursor_mismatch" } },
+          });
+
+          yield* Effect.promise(() => stopServer(first));
+          servers.delete(first);
+          const restarted = yield* Effect.promise(() => startServer(databasePath));
+          servers.add(restarted);
+          const third = yield* Effect.promise(() =>
+            call(restarted, 3, "diff_read", {
+              source,
+              ignoreWhitespace: true,
+              cursor: secondCursor,
+              maxBytes: 1024,
+            }),
+          );
+          expect(third.result?.structuredContent).toMatchObject({
+            result: {
+              kind: "ok",
+              value: {
+                captureId,
+                items: [{ id: "thread_through_turn:0-4", part: 2, lastPart: true }],
+                sourceCompleteness: "unknown",
+                upstreamTruncated: null,
+              },
+            },
+          });
+
+          yield* Effect.acquireUseRelease(
+            Effect.sync(() => new DatabaseSync(databasePath)),
+            (database) =>
+              Effect.sync(() => {
+                database.exec("PRAGMA busy_timeout = 5000");
+                const result = database
+                  .prepare("UPDATE captures SET expires_at = 1 WHERE capture_id = ?")
+                  .run(captureId);
+                if (Number(result.changes) !== 1) {
+                  throw new Error(`Could not age thread diff capture ${captureId}`);
+                }
+              }),
+            (database) => Effect.sync(() => database.close()),
+          );
+          const expired = yield* Effect.promise(() =>
+            call(restarted, 4, "diff_read", {
+              source,
+              ignoreWhitespace: true,
+              cursor: secondCursor,
+            }),
+          );
+          expect(expired.result?.structuredContent).toMatchObject({
+            result: { kind: "error", error: { code: "cursor_expired" } },
+          });
+        }),
+      ),
+    60000,
+  );
+
+  it.live("labels malformed diff frames as diff_read captures", () =>
     withServers("t3code-mcp-diff-frame-", ({ databasePath }) =>
       Effect.scoped(
         Effect.gen(function* () {
@@ -2194,7 +2339,7 @@ describe("shared SQLite worktree-diff captures", () => {
           );
 
           const error = yield* Effect.flip(store.readDiffReadPage({ query, cursor, maxBytes: 1 }));
-          expect(error.message).toContain("A saved worktree diff capture is not valid JSON.");
+          expect(error.message).toContain("A saved diff_read capture is not valid JSON.");
         }).pipe(Effect.provide(LocalStore.layer({ databasePath }))),
       ),
     ),

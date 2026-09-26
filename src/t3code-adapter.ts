@@ -564,6 +564,27 @@ const ReviewDiffPreviewResultWireSchema = Schema.Struct({
   sources: Schema.Array(ReviewDiffPreviewSourceWireSchema),
 });
 
+const ThreadHistoryDiffWireSchema = Schema.Struct({
+  threadId: trimmedNonEmptyWireString,
+  fromTurnCount: nonNegativeWireInt,
+  toTurnCount: nonNegativeWireInt,
+  diff: Schema.String,
+});
+
+const ThreadHistoryDiffErrorWireSchema = Schema.Union([
+  Schema.Struct({
+    _tag: Schema.Literal("OrchestrationGetTurnDiffError"),
+    message: trimmedNonEmptyWireString,
+    cause: Schema.optionalKey(Schema.Unknown),
+  }),
+  Schema.Struct({
+    _tag: Schema.Literal("OrchestrationGetFullThreadDiffError"),
+    message: trimmedNonEmptyWireString,
+    cause: Schema.optionalKey(Schema.Unknown),
+  }),
+  EnvironmentAuthorizationErrorWireSchema,
+]);
+
 const GitManagerErrorWireSchema = Schema.Struct({
   _tag: Schema.Literal("GitManagerError"),
   operation: Schema.String,
@@ -856,6 +877,27 @@ const ReviewGetDiffPreviewRpc = Rpc.make("review.getDiffPreview", {
   error: ReviewDiffPreviewErrorWireSchema,
 });
 
+const OrchestrationGetTurnDiffRpc = Rpc.make("orchestration.getTurnDiff", {
+  payload: Schema.Struct({
+    threadId: trimmedNonEmptyWireString,
+    fromTurnCount: nonNegativeWireInt,
+    toTurnCount: nonNegativeWireInt,
+    ignoreWhitespace: Schema.optionalKey(Schema.Boolean),
+  }),
+  success: ThreadHistoryDiffWireSchema,
+  error: ThreadHistoryDiffErrorWireSchema,
+});
+
+const OrchestrationGetFullThreadDiffRpc = Rpc.make("orchestration.getFullThreadDiff", {
+  payload: Schema.Struct({
+    threadId: trimmedNonEmptyWireString,
+    toTurnCount: nonNegativeWireInt,
+    ignoreWhitespace: Schema.optionalKey(Schema.Boolean),
+  }),
+  success: ThreadHistoryDiffWireSchema,
+  error: ThreadHistoryDiffErrorWireSchema,
+});
+
 const AdapterRpcGroup = RpcGroup.make(
   ServerProbeRpc,
   ServerGetConfigRpc,
@@ -867,6 +909,8 @@ const AdapterRpcGroup = RpcGroup.make(
   VcsRefreshStatusRpc,
   VcsListRefsRpc,
   ReviewGetDiffPreviewRpc,
+  OrchestrationGetTurnDiffRpc,
+  OrchestrationGetFullThreadDiffRpc,
   VcsRemoveWorktreeRpc,
 );
 
@@ -1430,6 +1474,35 @@ export const mapReviewDiffPreviewError = (error: unknown): T3CodeAdapterError =>
   );
 };
 
+const mapThreadHistoryDiffError = (error: unknown): T3CodeAdapterError => {
+  const reason = error instanceof RpcClientError.RpcClientError ? error.reason : error;
+  const decoded = Schema.decodeUnknownResult(ThreadHistoryDiffErrorWireSchema)(reason);
+  if (Result.isFailure(decoded)) return mapAuthenticatedChannelError(error);
+  return Match.value(decoded.success).pipe(
+    Match.tag(
+      "EnvironmentAuthorizationError",
+      (authorizationError) =>
+        new T3CodeAdapterError({
+          kind: "authorization",
+          message: "The T3Code credential lacks authorization to read thread-history diffs.",
+          uncertain: false,
+          status: null,
+          requiredScopes: [authorizationError.requiredScope],
+        }),
+    ),
+    Match.orElse(
+      () =>
+        new T3CodeAdapterError({
+          kind: "upstream_failure",
+          message:
+            "T3Code could not provide the requested thread-history diff. The thread or required history may be unavailable.",
+          uncertain: false,
+          status: null,
+        }),
+    ),
+  );
+};
+
 /**
  * Map a failed vcs.listRefs read to a typed adapter error. Upstream git
  * failures stay explicit so the caller can mark the VCS evidence stream
@@ -1880,6 +1953,13 @@ export interface VcsDiffPreview {
   readonly sources: ReadonlyArray<VcsDiffPreviewSource>;
 }
 
+export interface ThreadHistoryDiff {
+  readonly threadId: string;
+  readonly fromTurnCount: number;
+  readonly toTurnCount: number;
+  readonly diff: string;
+}
+
 export interface VcsWorktreeRef {
   readonly branch: string;
   readonly worktreePath: string;
@@ -1930,6 +2010,21 @@ export interface T3CodeAdapterService {
     readonly baseRef?: string;
     readonly ignoreWhitespace: boolean;
   }) => Effect.Effect<VcsDiffPreview, T3CodeAdapterError>;
+  readonly getTurnDiff: (input: {
+    readonly endpoint: string;
+    readonly credential: string;
+    readonly threadId: string;
+    readonly fromTurnCount: number;
+    readonly toTurnCount: number;
+    readonly ignoreWhitespace: boolean;
+  }) => Effect.Effect<ThreadHistoryDiff, T3CodeAdapterError>;
+  readonly getFullThreadDiff: (input: {
+    readonly endpoint: string;
+    readonly credential: string;
+    readonly threadId: string;
+    readonly toTurnCount: number;
+    readonly ignoreWhitespace: boolean;
+  }) => Effect.Effect<ThreadHistoryDiff, T3CodeAdapterError>;
   readonly listVcsWorktreeRefs: (input: {
     readonly endpoint: string;
     readonly credential: string;
@@ -2633,8 +2728,16 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
   "t3code-mcp/T3CodeAdapter",
 ) {
   static readonly layerTest = (
-    service: Omit<T3CodeAdapterService, "dispatchTurn" | "interruptThread" | "createThread"> &
-      Partial<Pick<T3CodeAdapterService, "dispatchTurn" | "interruptThread" | "createThread">>,
+    service: Omit<
+      T3CodeAdapterService,
+      "dispatchTurn" | "interruptThread" | "createThread" | "getTurnDiff" | "getFullThreadDiff"
+    > &
+      Partial<
+        Pick<
+          T3CodeAdapterService,
+          "dispatchTurn" | "interruptThread" | "createThread" | "getTurnDiff" | "getFullThreadDiff"
+        >
+      >,
   ): Layer.Layer<T3CodeAdapter> =>
     Layer.succeed(T3CodeAdapter, {
       ...service,
@@ -2667,6 +2770,28 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
             new T3CodeAdapterError({
               kind: "capacity",
               message: "The test adapter does not support thread creation.",
+              uncertain: false,
+              status: null,
+            }),
+          )),
+      getTurnDiff:
+        service.getTurnDiff ??
+        (() =>
+          Effect.fail(
+            new T3CodeAdapterError({
+              kind: "capacity",
+              message: "The test adapter does not support thread-history diffs.",
+              uncertain: false,
+              status: null,
+            }),
+          )),
+      getFullThreadDiff:
+        service.getFullThreadDiff ??
+        (() =>
+          Effect.fail(
+            new T3CodeAdapterError({
+              kind: "capacity",
+              message: "The test adapter does not support thread-history diffs.",
               uncertain: false,
               status: null,
             }),
@@ -3666,6 +3791,48 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
           }),
         );
 
+      const getTurnDiff = (input: {
+        readonly endpoint: string;
+        readonly credential: string;
+        readonly threadId: string;
+        readonly fromTurnCount: number;
+        readonly toTurnCount: number;
+        readonly ignoreWhitespace: boolean;
+      }): Effect.Effect<ThreadHistoryDiff, T3CodeAdapterError> =>
+        withCapacity(
+          Effect.gen(function* () {
+            yield* requireReadSession(input);
+            return yield* withAuthenticatedRpc(input.endpoint, input.credential, (client) =>
+              client["orchestration.getTurnDiff"]({
+                threadId: input.threadId,
+                fromTurnCount: input.fromTurnCount,
+                toTurnCount: input.toTurnCount,
+                ignoreWhitespace: input.ignoreWhitespace,
+              }).pipe(Effect.mapError(mapThreadHistoryDiffError)),
+            );
+          }),
+        );
+
+      const getFullThreadDiff = (input: {
+        readonly endpoint: string;
+        readonly credential: string;
+        readonly threadId: string;
+        readonly toTurnCount: number;
+        readonly ignoreWhitespace: boolean;
+      }): Effect.Effect<ThreadHistoryDiff, T3CodeAdapterError> =>
+        withCapacity(
+          Effect.gen(function* () {
+            yield* requireReadSession(input);
+            return yield* withAuthenticatedRpc(input.endpoint, input.credential, (client) =>
+              client["orchestration.getFullThreadDiff"]({
+                threadId: input.threadId,
+                toTurnCount: input.toTurnCount,
+                ignoreWhitespace: input.ignoreWhitespace,
+              }).pipe(Effect.mapError(mapThreadHistoryDiffError)),
+            );
+          }),
+        );
+
       const listVcsWorktreeRefs = (input: {
         readonly endpoint: string;
         readonly credential: string;
@@ -3830,6 +3997,8 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
         listProviderModels,
         refreshVcsStatus,
         getReviewDiffPreview,
+        getTurnDiff,
+        getFullThreadDiff,
         listVcsWorktreeRefs,
         interruptThread,
         stopThreadSession,

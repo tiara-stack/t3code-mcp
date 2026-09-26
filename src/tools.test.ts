@@ -5,6 +5,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Match from "effect/Match";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
@@ -41,6 +42,7 @@ import {
 } from "./t3code-adapter";
 import {
   encodeThreadObservationCursor,
+  DiffReadToolResultSchema,
   LIVE_EFFECT_OBSERVATION_MILLIS,
   ThreadCreateInputSchema,
   WorktreeCreateInputSchema,
@@ -369,7 +371,14 @@ const fakeAdapterLayer = (
       capabilities: {},
     }),
   vcsOverrides: Partial<
-    Pick<T3CodeAdapterService, "refreshVcsStatus" | "getReviewDiffPreview" | "listVcsWorktreeRefs">
+    Pick<
+      T3CodeAdapterService,
+      | "refreshVcsStatus"
+      | "getReviewDiffPreview"
+      | "getTurnDiff"
+      | "getFullThreadDiff"
+      | "listVcsWorktreeRefs"
+    >
   > = {},
   dispatchTurn?: (
     input: DispatchTurnInput,
@@ -484,6 +493,10 @@ const fakeAdapterLayer = (
     ...(vcsOverrides.getReviewDiffPreview === undefined
       ? {}
       : { getReviewDiffPreview: vcsOverrides.getReviewDiffPreview }),
+    ...(vcsOverrides.getTurnDiff === undefined ? {} : { getTurnDiff: vcsOverrides.getTurnDiff }),
+    ...(vcsOverrides.getFullThreadDiff === undefined
+      ? {}
+      : { getFullThreadDiff: vcsOverrides.getFullThreadDiff }),
     ...(dispatchTurn === undefined ? {} : { dispatchTurn }),
   });
 
@@ -1075,27 +1088,144 @@ describe("diff_read", () => {
     ),
   );
 
-  it.live("rejects thread-history variants explicitly and rejects missing named bases", () =>
+  it.live("reads both native thread-history sources and rejects invalid ranges and bases", () =>
     withDatabasePath((databasePath) =>
+      // fallow-ignore-next-line complexity
       Effect.gen(function* () {
-        const layer = appLayer(databasePath);
+        const nativeCalls: Array<Record<string, unknown>> = [];
+        let mismatchResponse: "thread" | "counts" | null = null;
+        let failThreadA = false;
+        const layer = appLayer(
+          databasePath,
+          InstanceConnections.layerWithAdapter(
+            fakeAdapterLayer({ current: null }, {}, undefined, undefined, {
+              getTurnDiff: (input) => {
+                nativeCalls.push({ method: "getTurnDiff", ...input });
+                if (
+                  input.threadId === "missing-history" &&
+                  input.fromTurnCount !== input.toTurnCount
+                ) {
+                  return Effect.fail(
+                    new T3CodeAdapterError({
+                      kind: "upstream_failure",
+                      message: "The requested thread history is unavailable.",
+                      uncertain: false,
+                      status: null,
+                    }),
+                  );
+                }
+                if (input.threadId === "thread-a" && failThreadA) {
+                  return Effect.fail(
+                    new T3CodeAdapterError({
+                      kind: "transport",
+                      message: "The authenticated T3Code RPC channel dropped.",
+                      uncertain: true,
+                      status: null,
+                    }),
+                  );
+                }
+                return Effect.succeed({
+                  threadId:
+                    mismatchResponse === "thread" ? "different-native-thread" : input.threadId,
+                  fromTurnCount:
+                    mismatchResponse === "counts" ? input.fromTurnCount + 1 : input.fromTurnCount,
+                  toTurnCount: input.toTurnCount,
+                  diff: input.fromTurnCount === 0 && input.toTurnCount === 0 ? "" : "range diff",
+                });
+              },
+              getFullThreadDiff: (input) => {
+                nativeCalls.push({ method: "getFullThreadDiff", ...input });
+                return Effect.succeed({
+                  threadId: input.threadId,
+                  fromTurnCount: 0,
+                  toTurnCount: input.toTurnCount,
+                  diff: input.toTurnCount === 0 ? "" : "through diff",
+                });
+              },
+            }),
+          ),
+        );
         const results = yield* Effect.scoped(
           Effect.gen(function* () {
-            const unsupported = yield* callTool("diff_read", {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const range = yield* callTool("diff_read", {
               source: {
                 kind: "thread_turn_range",
                 thread: { instanceId: "instance-a", threadId: "thread-a" },
-                fromTurnCount: 1,
+                fromTurnCount: 0,
                 toTurnCount: 2,
               },
             });
-            const unsupportedThrough = yield* callTool("diff_read", {
+            mismatchResponse = "thread";
+            const mismatchedThread = yield* callTool("diff_read", {
+              source: {
+                kind: "thread_turn_range",
+                thread: { instanceId: "instance-a", threadId: "thread-a" },
+                fromTurnCount: 0,
+                toTurnCount: 2,
+              },
+            });
+            mismatchResponse = "counts";
+            const mismatchedCounts = yield* callTool("diff_read", {
+              source: {
+                kind: "thread_turn_range",
+                thread: { instanceId: "instance-a", threadId: "thread-a" },
+                fromTurnCount: 0,
+                toTurnCount: 2,
+              },
+            });
+            mismatchResponse = null;
+            failThreadA = true;
+            const retainedRange = yield* callTool("diff_read", {
+              source: {
+                kind: "thread_turn_range",
+                thread: { instanceId: "instance-a", threadId: "thread-a" },
+                fromTurnCount: 0,
+                toTurnCount: 2,
+              },
+              allowStale: true,
+            });
+            const through = yield* callTool("diff_read", {
               source: {
                 kind: "thread_through_turn",
                 thread: { instanceId: "instance-a", threadId: "thread-a" },
                 toTurnCount: 2,
               },
             });
+            const emptyRange = yield* callTool("diff_read", {
+              source: {
+                kind: "thread_turn_range",
+                thread: { instanceId: "instance-a", threadId: "missing-history" },
+                fromTurnCount: 0,
+                toTurnCount: 0,
+              },
+            });
+            const emptyThrough = yield* callTool("diff_read", {
+              source: {
+                kind: "thread_through_turn",
+                thread: { instanceId: "instance-a", threadId: "missing-history" },
+                toTurnCount: 0,
+              },
+            });
+            const missingHistory = yield* callTool("diff_read", {
+              source: {
+                kind: "thread_turn_range",
+                thread: { instanceId: "instance-a", threadId: "missing-history" },
+                fromTurnCount: 0,
+                toTurnCount: 1,
+              },
+              allowStale: true,
+            });
+            const invalidRange = yield* Effect.exit(
+              callTool("diff_read", {
+                source: {
+                  kind: "thread_turn_range",
+                  thread: { instanceId: "instance-a", threadId: "thread-a" },
+                  fromTurnCount: 3,
+                  toTurnCount: 2,
+                },
+              }),
+            );
             const missingBase = yield* Effect.exit(
               callTool("diff_read", {
                 source: {
@@ -1121,23 +1251,121 @@ describe("diff_read", () => {
                 },
               }),
             );
-            return { unsupported, unsupportedThrough, missingBase, emptyBase };
+            return {
+              range,
+              mismatchedThread,
+              mismatchedCounts,
+              retainedRange,
+              through,
+              emptyRange,
+              emptyThrough,
+              missingHistory,
+              invalidRange,
+              missingBase,
+              emptyBase,
+            };
           }).pipe(Effect.provide(layer)),
         );
 
-        expect(results.unsupported[0]?.result).toMatchObject({
-          result: { kind: "error", error: { code: "unsupported_capability" } },
+        const decodedRange = yield* Schema.decodeUnknownEffect(DiffReadToolResultSchema)(
+          results.range[0]?.result,
+        );
+        expect(decodedRange.result).toMatchObject({
+          kind: "ok",
+          value: {
+            items: [{ text: "range diff" }],
+            sourceCompleteness: "unknown",
+            upstreamTruncated: null,
+          },
         });
-        expect(results.unsupportedThrough[0]?.result).toMatchObject({
-          result: { kind: "error", error: { code: "unsupported_capability" } },
+        expect(decodedRange.observations).toMatchObject([{ coverage: "unknown" }]);
+        expect(results.mismatchedThread[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "incompatible_instance" } },
         });
+        expect(results.mismatchedCounts[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "incompatible_instance" } },
+        });
+        expect(results.retainedRange[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              items: [{ text: "range diff" }],
+              sourceCompleteness: "unknown",
+              upstreamTruncated: null,
+            },
+          },
+          observations: [{ freshness: "stale", coverage: "partial" }],
+        });
+        expect(results.through[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              items: [{ text: "through diff" }],
+              sourceCompleteness: "unknown",
+              upstreamTruncated: null,
+            },
+          },
+        });
+        const decodedEmptyRange = yield* Schema.decodeUnknownEffect(DiffReadToolResultSchema)(
+          results.emptyRange[0]?.result,
+        );
+        expect(decodedEmptyRange.result).toMatchObject({
+          kind: "ok",
+          value: {
+            items: [],
+            sourceCompleteness: "unknown",
+            upstreamTruncated: null,
+          },
+        });
+        const emptyRangeValue = Match.value(decodedEmptyRange.result).pipe(
+          Match.when({ kind: "ok" }, (success) => success.value),
+          Match.when({ kind: "error" }, (failure) => {
+            throw new Error(`empty range failed: ${failure.error.message}`);
+          }),
+          Match.exhaustive,
+        );
+        expect(emptyRangeValue.limitations).toEqual(
+          expect.arrayContaining([expect.stringContaining("without confirming that the thread")]),
+        );
+        expect(decodedEmptyRange.observations).toMatchObject([{ coverage: "unknown" }]);
+        const decodedEmptyThrough = yield* Schema.decodeUnknownEffect(DiffReadToolResultSchema)(
+          results.emptyThrough[0]?.result,
+        );
+        expect(decodedEmptyThrough.result).toMatchObject({
+          kind: "ok",
+          value: {
+            items: [],
+            sourceCompleteness: "unknown",
+            upstreamTruncated: null,
+          },
+        });
+        const emptyThroughValue = Match.value(decodedEmptyThrough.result).pipe(
+          Match.when({ kind: "ok" }, (success) => success.value),
+          Match.when({ kind: "error" }, (failure) => {
+            throw new Error(`empty through-turn diff failed: ${failure.error.message}`);
+          }),
+          Match.exhaustive,
+        );
+        expect(emptyThroughValue.limitations).toEqual(
+          expect.arrayContaining([expect.stringContaining("without confirming that the thread")]),
+        );
+        expect(results.missingHistory[0]?.result).toMatchObject({
+          result: { kind: "error", error: { code: "upstream_failure" } },
+        });
+        expect(decodedEmptyThrough.observations).toMatchObject([{ coverage: "unknown" }]);
+        expect(nativeCalls).toHaveLength(8);
+        expect(Exit.isFailure(results.invalidRange)).toBe(true);
+        if (Exit.isSuccess(results.invalidRange)) return;
+        expect(String(results.invalidRange.cause)).toContain(
+          "Invalid parameters for tool 'diff_read'",
+        );
         expect(Exit.isFailure(results.missingBase)).toBe(true);
-        if (Exit.isSuccess(results.missingBase)) return;
+        if (Exit.isSuccess(results.missingBase)) throw new Error("the named base was accepted");
         expect(String(results.missingBase.cause)).toContain(
           "Invalid parameters for tool 'diff_read'",
         );
         expect(Exit.isFailure(results.emptyBase)).toBe(true);
-        if (Exit.isSuccess(results.emptyBase)) return;
+        if (Exit.isSuccess(results.emptyBase)) throw new Error("the empty base was accepted");
         expect(String(results.emptyBase.cause)).toContain(
           "Invalid parameters for tool 'diff_read'",
         );
@@ -3758,6 +3986,116 @@ describe("instance_remove and operation_get", () => {
         expect(result.list[0]?.result).toMatchObject({
           result: { kind: "ok", value: { items: [] } },
         });
+      }),
+    ),
+  );
+
+  it.live("keeps large UTF-8 thread diffs immutable and binds cursors to the instance", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const originalDiff = "λ".repeat(6_000);
+        let currentDiff = originalDiff;
+        const nativeCalls: Array<{ readonly endpoint: string; readonly threadId: string }> = [];
+        const sourceA = {
+          kind: "thread_turn_range" as const,
+          thread: { instanceId: "instance-a", threadId: "same-native-id" },
+          fromTurnCount: 1,
+          toTurnCount: 3,
+        };
+        const sourceB = {
+          ...sourceA,
+          thread: { instanceId: "instance-b", threadId: "same-native-id" },
+        };
+        const layer = appLayer(
+          databasePath,
+          InstanceConnections.layerWithAdapter(
+            fakeAdapterLayer(
+              { current: null },
+              { "https://a.test": "environment-a", "https://b.test": "environment-b" },
+              undefined,
+              undefined,
+              {
+                getTurnDiff: (input) => {
+                  nativeCalls.push({ endpoint: input.endpoint, threadId: input.threadId });
+                  return Effect.succeed({
+                    threadId: input.threadId,
+                    fromTurnCount: input.fromTurnCount,
+                    toTurnCount: input.toTurnCount,
+                    diff: input.endpoint === "https://a.test" ? currentDiff : "B view",
+                  });
+                },
+              },
+            ),
+          ),
+        );
+        const pageValue = (items: ReadonlyArray<{ readonly result: unknown }>) =>
+          Effect.gen(function* () {
+            const response = items[0]?.result;
+            if (response === undefined) throw new Error("diff_read returned no result.");
+            const decoded = yield* Schema.decodeUnknownEffect(DiffReadToolResultSchema)(response);
+            const value = Match.value(decoded.result).pipe(
+              Match.when({ kind: "ok" }, (success) => success.value),
+              Match.when({ kind: "error" }, (failure) => {
+                throw new Error(`diff_read failed: ${failure.error.message}`);
+              }),
+              Match.exhaustive,
+            );
+            return {
+              ...value,
+              coverage: decoded.observations[0]?.coverage,
+            };
+          });
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            yield* seedProjectRegistration("instance-b", "https://b.test", "secret-b");
+            const firstA = yield* pageValue(
+              yield* callTool("diff_read", { source: sourceA, maxBytes: 1024 }),
+            );
+            let cursor = firstA.nextCursor;
+            const pages = [firstA];
+            const crossInstance = yield* callTool("diff_read", {
+              source: sourceB,
+              cursor: cursor ?? "missing-cursor",
+              maxBytes: 1024,
+            });
+            expect(crossInstance[0]?.result).toMatchObject({
+              result: { kind: "error", error: { code: "cursor_mismatch" } },
+            });
+            currentDiff = "the native diff changed after capture";
+            while (cursor !== null) {
+              const next = yield* pageValue(
+                yield* callTool("diff_read", { source: sourceA, cursor, maxBytes: 1024 }),
+              );
+              pages.push(next);
+              cursor = next.nextCursor;
+              expect(pages.length).toBeLessThan(20);
+            }
+            const secondInstance = yield* pageValue(
+              yield* callTool("diff_read", { source: sourceB, maxBytes: 1024 }),
+            );
+            return { pages, secondInstance };
+          }).pipe(Effect.provide(layer)),
+        );
+
+        expect(result.pages[0]).toMatchObject({
+          sourceCompleteness: "unknown",
+          upstreamTruncated: null,
+        });
+        expect(
+          result.pages
+            .flatMap((page) => page.items)
+            .map((item) => item.text)
+            .join(""),
+        ).toBe(originalDiff);
+        expect(result.pages.every((page) => page.coverage === "unknown")).toBe(true);
+        expect(result.secondInstance.items).toMatchObject([
+          { id: "thread_turn_range:1-3", kind: "diff", text: "B view" },
+        ]);
+        expect(nativeCalls).toEqual([
+          { endpoint: "https://a.test", threadId: "same-native-id" },
+          { endpoint: "https://b.test", threadId: "same-native-id" },
+        ]);
       }),
     ),
   );
