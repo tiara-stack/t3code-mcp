@@ -17054,11 +17054,11 @@ describe("thread_submit", () => {
                     },
                   })
                 : observedThreadFixture("thread-a", {
-                    latestTurn: { turnId: "turn-before-change", state: "interrupted" },
+                    latestTurn: { turnId: "replacement-turn", state: "running" },
                     session: {
-                      status: "interrupted",
-                      activeTurnId: null,
-                      lastError: "Execution was interrupted.",
+                      status: "running",
+                      activeTurnId: "turn-before-change",
+                      lastError: null,
                       updatedAt: "2026-09-23T09:00:01.000Z",
                     },
                   });

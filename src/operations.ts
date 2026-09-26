@@ -466,15 +466,22 @@ const requiredSubmissionGuarantees = (
 const submissionNeedsCapabilityCheck = (input: ThreadSubmitInput): boolean =>
   requiredSubmissionGuarantees(input).length > 0;
 
-const activeSubmissionTurnId = (thread: SynchronizedThreadDetail["thread"]): string | null => {
-  if (thread.latestTurn?.state === "running") return thread.latestTurn.turnId;
-  if (
-    thread.session === null ||
-    (thread.session.status !== "starting" && thread.session.status !== "running")
-  ) {
+const activeSessionTurnId = (
+  session: SynchronizedThreadDetail["thread"]["session"],
+): string | null => {
+  if (session === null || (session.status !== "starting" && session.status !== "running")) {
     return null;
   }
-  return thread.session.activeTurnId;
+  return session.activeTurnId;
+};
+
+const activeSubmissionTurnId = (thread: SynchronizedThreadDetail["thread"]): string | null => {
+  const sessionTurnId = activeSessionTurnId(thread.session);
+  if (thread.latestTurn === null) return sessionTurnId;
+  if (thread.latestTurn.state !== "running" || sessionTurnId !== thread.latestTurn.turnId) {
+    return null;
+  }
+  return thread.latestTurn.turnId;
 };
 
 const exactlyOne = <Value>(values: ReadonlyArray<Value>): Value | undefined =>

@@ -107,9 +107,10 @@ const liveCheck = (endpoint: string, pairingCode: string, threadId: string) =>
       };
     };
     if (thread.execution.state !== "active" || thread.execution.turn === null) {
-      throw new Error(
-        "LIVE CHECK UNAVAILABLE: supply a disposable UI thread with a currently active native turn",
-      );
+      return {
+        liveThreadGuarantees: false as const,
+        reason: "supply a disposable UI thread with a currently active native turn",
+      };
     }
 
     const modelPage = requireOk(
@@ -171,6 +172,17 @@ const liveCheck = (endpoint: string, pairingCode: string, threadId: string) =>
         intent: request.intent,
         context: request.context,
       });
+      if (
+        request.intent === "steer_current" &&
+        result.result.kind === "error" &&
+        result.result.error.code === "unsupported_capability" &&
+        result.result.error.message.includes("no current active turn to steer")
+      ) {
+        return {
+          liveThreadGuarantees: false as const,
+          reason: "the active turn ended before the steering capability check completed",
+        };
+      }
       expectCapabilityRefusal(`guarantee refusal ${index + 1}`, request.capability, result);
       if (JSON.stringify(result).includes(marker)) {
         throw new Error("capability refusal exposed or retained the prompt text");
@@ -217,6 +229,7 @@ Effect.runPromise(Effect.scoped(main.pipe(Effect.provide(NodeFileSystem.layer)))
       console.log("LIVE CHECK PASSED");
       process.exit(0);
     }
+    console.log(`LIVE CHECK UNAVAILABLE: ${outcome.reason}`);
     process.exit(2);
   },
   (error) => {
