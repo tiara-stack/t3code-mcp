@@ -323,7 +323,7 @@ export const WorktreeInspectTool = withToolHints(
 export const WorktreeDiscardTool = withToolHints(
   Tool.make("worktree_discard", {
     description:
-      "Explicitly discard one freshly verified orphan worktree, including modified, staged, untracked, and ignored contents, while retaining its branch. Shared or uncertain targets are refused; combined thread removal is not available yet.",
+      "Explicitly discard one freshly verified worktree, including modified, staged, untracked, and ignored contents, while retaining its branch. The worktree must be an orphan unless removeSoleThread names its only thread; active, shared, uncertain, or replacement targets are refused.",
     parameters: WorktreeDiscardInputSchema,
     success: OperationToolResultSchema,
   })
@@ -649,7 +649,7 @@ const operationServiceFailures = {
     retry: "change_request",
     details: {},
   },
-  unsupported_worktree_discard_variant: {
+  invalid_worktree_discard_target: {
     code: "invalid_argument",
     retry: "change_request",
     details: {},
@@ -2336,14 +2336,16 @@ const readWorktreeReferenceInventory = (options: {
     });
   });
 
-const checkOrphanWorktree = (options: {
+const checkWorktreeDiscardEligibility = (options: {
   readonly connections: InstanceConnectionsService;
   readonly observations: ObservationsService;
   readonly worktree: WorktreeInspectionQuery["worktree"];
+  readonly removeSoleThread?: WorktreeDiscardInput["removeSoleThread"];
 }): Effect.Effect<
   WorktreeDiscardEligibility,
   LocalStoreError | T3CodeAdapterError | ObservationError
 > => {
+  // fallow-ignore-next-line complexity
   const check = Effect.gen(function* () {
     const registrationBefore = yield* retryWorktreeInspectionCapacity(
       options.connections.acquire(options.worktree.instanceId),
@@ -2356,7 +2358,7 @@ const checkOrphanWorktree = (options: {
       observations: options.observations,
       worktree: options.worktree,
     });
-    if (references.items.length > 0) {
+    if (options.removeSoleThread === undefined && references.items.length > 0) {
       const threadIds = references.items.map((item) => item.summary.thread.threadId);
       return yield* Effect.fail(
         new ObservationError({
@@ -2364,6 +2366,32 @@ const checkOrphanWorktree = (options: {
           message: `The worktree is not orphaned; fresh active or archived thread references were found: ${threadIds.join(", ")}.`,
         }),
       );
+    }
+    if (options.removeSoleThread !== undefined) {
+      if (options.removeSoleThread.instanceId !== options.worktree.instanceId) {
+        return yield* Effect.fail(
+          new ObservationError({
+            kind: "uncheckable_target",
+            message: "The named thread and worktree must belong to the same T3Code instance.",
+          }),
+        );
+      }
+      const matching = references.items.filter(
+        (item) => item.summary.thread.threadId === options.removeSoleThread?.threadId,
+      );
+      if (references.items.length !== 1 || matching.length !== 1) {
+        const threadIds = references.items.map((item) => item.summary.thread.threadId);
+        const namedThreadIsShared = matching.length > 0 && references.items.length > 1;
+        return yield* Effect.fail(
+          new ObservationError({
+            kind: namedThreadIsShared ? "shared_worktree" : "uncheckable_target",
+            message:
+              matching.length === 0
+                ? `The named thread ${options.removeSoleThread.threadId} is not a verified reference to the requested worktree.`
+                : `The worktree must be referenced only by named thread ${options.removeSoleThread.threadId}; fresh active or archived references were found: ${threadIds.join(", ")}.`,
+          }),
+        );
+      }
     }
     const registrationAfter = yield* retryWorktreeInspectionCapacity(
       options.connections.acquire(options.worktree.instanceId),
@@ -2376,7 +2404,7 @@ const checkOrphanWorktree = (options: {
         new ObservationError({
           kind: "stale_generation",
           message:
-            "The saved instance registration changed while the worktree orphan check was running.",
+            "The saved instance registration changed while worktree discard eligibility was being checked.",
         }),
       );
     }
@@ -2394,7 +2422,9 @@ const checkOrphanWorktree = (options: {
         sourceSequence: observation.sourceSequence,
         nativeEventId: null,
         detail:
-          "Fresh active and archived thread inventories, including UI-created threads, contain no reference to the requested worktree.",
+          options.removeSoleThread === undefined
+            ? "Fresh active and archived thread inventories, including UI-created threads, contain no reference to the requested worktree."
+            : `Fresh active and archived thread inventories, including UI-created threads, show ${options.removeSoleThread.threadId} as the sole reference to the requested worktree.`,
       })),
     ];
     return {
@@ -2406,7 +2436,7 @@ const checkOrphanWorktree = (options: {
       },
     };
   });
-  return withWorktreeInspectionBound(check, "The complete orphan worktree eligibility check");
+  return withWorktreeInspectionBound(check, "The complete worktree discard eligibility check");
 };
 
 const guardCheck = (
@@ -5142,11 +5172,12 @@ const serverToolHandlers = ServerToolkit.of({
       const connections = yield* InstanceConnections;
       const observations = yield* Observations;
       return yield* operationMutationResult(
-        operations.discardWorktree(input, () =>
-          checkOrphanWorktree({
+        operations.discardWorktree(input, (removeSoleThread) =>
+          checkWorktreeDiscardEligibility({
             connections,
             observations,
             worktree: input.worktree,
+            ...(removeSoleThread === undefined ? {} : { removeSoleThread }),
           }),
         ),
       );

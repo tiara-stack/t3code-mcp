@@ -10160,6 +10160,268 @@ describe("worktree_discard", () => {
     };
   };
 
+  const SOLE_THREAD_DISCARD_STEP_NAMES = [
+    "check_named_sole_thread_and_worktree",
+    "recheck_before_provider_session_stop",
+    "capture_provider_session",
+    "dispatch_provider_session_stop",
+    "observe_provider_session_shutdown",
+    "recheck_before_thread_deletion",
+    "dispatch_thread_deletion",
+    "observe_thread_absence",
+    "recheck_worktree_references_after_thread_removal",
+    "recheck_before_worktree_discard",
+    "dispatch_worktree_remove",
+    "record_worktree_remove_response",
+    "confirm_worktree_absence",
+  ] as const;
+
+  const configureSoleThreadDiscard = (
+    options: ThreadFixtureOptions,
+    worktree: {
+      readonly instanceId: string;
+      readonly repositoryPath: string;
+      readonly worktreePath: string;
+    },
+    branch: string,
+    at: string,
+    setup: {
+      readonly secondThreadInitially?: boolean;
+      readonly addSecondThreadAfterDelete?: boolean;
+      readonly archivedNamedThread?: boolean;
+      readonly namedThreadWorktreePath?: string;
+      readonly namedThreadBranch?: string;
+      readonly activeTurn?: boolean;
+      readonly pendingApproval?: boolean;
+      readonly session?: "ready" | "none";
+      readonly sessionStopFailure?: T3CodeAdapterError;
+      readonly lostThreadDeleteReply?: boolean;
+      readonly lostWorktreeRemoveReply?: boolean;
+      readonly worktreeRemoveBeforeDispatchFailure?: T3CodeAdapterError;
+      readonly replaceCheckoutAfterDelete?: boolean;
+    } = {},
+  ) => {
+    let namedThreadPresent = true;
+    let secondThreadPresent = setup.secondThreadInitially ?? false;
+    let checkoutPresent = true;
+    let currentBranch = branch;
+    let activeSequence = 100;
+    let archivedSequence = 200;
+    let detailSequence = 300;
+    let initialDetailEmitted = false;
+    let stopEventsEmitted = false;
+    const archivedAt = setup.archivedNamedThread ? at : null;
+    const namedWorktreePath = setup.namedThreadWorktreePath ?? worktree.worktreePath;
+    const project = shellProjectFixture("project-a", worktree.repositoryPath);
+    const namedSummary = () =>
+      shellThreadFixture("thread-a", {
+        worktreePath: namedWorktreePath,
+        archivedAt,
+      });
+    const otherSummary = () =>
+      shellThreadFixture("thread-b", { worktreePath: worktree.worktreePath });
+    const statusKey = JSON.stringify([worktree.instanceId, worktree.worktreePath]);
+    const refsKey = JSON.stringify([worktree.instanceId, worktree.repositoryPath]);
+    const currentStatus = () => ({
+      isRepo: checkoutPresent,
+      branch: checkoutPresent ? currentBranch : null,
+      hasWorkingTreeChanges: false,
+      changedFiles: checkoutPresent ? 0 : null,
+      stagedFiles: null,
+      untrackedFiles: null,
+      hasUpstream: checkoutPresent,
+      ahead: checkoutPresent ? 0 : null,
+      behind: checkoutPresent ? 0 : null,
+      limitations: [],
+      observedAt: at,
+    });
+    const currentRefs = (): DiscoveredVcsWorktreeRefs => ({
+      isRepo: true,
+      refs: checkoutPresent ? [{ branch: currentBranch, worktreePath: worktree.worktreePath }] : [],
+      localBranches: [branch, ...(currentBranch === branch ? [] : [currentBranch])],
+      limitations: [],
+      truncated: false,
+      observedAt: at,
+    });
+    const activeThreads = () => [
+      ...(namedThreadPresent && !setup.archivedNamedThread ? [namedSummary()] : []),
+      ...(secondThreadPresent ? [otherSummary()] : []),
+    ];
+    const archivedThreads = () =>
+      namedThreadPresent && setup.archivedNamedThread ? [namedSummary()] : [];
+    const detail = (sessionOverride?: ReturnType<typeof observedThreadFixture>["session"]) => {
+      const value = observedThreadFixture("thread-a", {
+        projectId: "project-a",
+        branch: setup.namedThreadBranch ?? branch,
+        worktreePath: namedWorktreePath,
+        archivedAt,
+        latestTurn: setup.activeTurn
+          ? { turnId: "turn-a", state: "running" }
+          : setup.pendingApproval
+            ? { turnId: "turn-a", state: "completed" }
+            : null,
+        activities: setup.pendingApproval
+          ? [
+              {
+                activityId: "approval-a",
+                kind: "approval.requested",
+                summary: "Approval requested",
+                payload: {
+                  requestId: "approval-request-a",
+                  detail: "Allow this command?",
+                  options: [{ decision: "accept", label: "Allow" }],
+                },
+                turnId: "turn-a",
+                createdAt: at,
+              },
+            ]
+          : [],
+        session:
+          sessionOverride ??
+          (setup.session === "ready"
+            ? {
+                providerInstanceId: "provider-session-a",
+                status: "ready",
+                activeTurnId: null,
+                lastError: null,
+                updatedAt: at,
+              }
+            : null),
+      });
+      return value;
+    };
+
+    options.activeStreams = {
+      [worktree.instanceId]: () =>
+        Stream.make(
+          shellSnapshotItem(++activeSequence, [project], activeThreads()),
+          shellSynchronizedItem,
+        ),
+    };
+    options.archivedShells = {
+      [worktree.instanceId]: () =>
+        Effect.succeed({
+          snapshotSequence: ++archivedSequence,
+          projects: [project],
+          threads: archivedThreads(),
+          observedAt: at,
+        }),
+    };
+    options.threadStreams = {
+      [`${worktree.instanceId}:thread-a`]: () => {
+        if (!initialDetailEmitted) {
+          initialDetailEmitted = true;
+          return detailSnapshotStream(++detailSequence, detail());
+        }
+        const command = options.sessionStopCommand;
+        if (command === undefined || setup.sessionStopFailure !== undefined) {
+          return Stream.make({ kind: "synchronized" as const });
+        }
+        const stoppedSession = {
+          providerInstanceId: "provider-session-a",
+          status: "stopped" as const,
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: command.createdAt,
+        };
+        if (!stopEventsEmitted) {
+          stopEventsEmitted = true;
+          return Stream.make(
+            {
+              kind: "session-stop-requested" as const,
+              sequence: 500,
+              threadId: "thread-a",
+              commandId: command.commandId,
+              createdAt: command.createdAt,
+            },
+            { kind: "session-set" as const, sequence: 501, session: stoppedSession },
+            shellSynchronizedItem,
+          );
+        }
+        return detailSnapshotStream(++detailSequence, detail(stoppedSession));
+      },
+    };
+    options.vcsStatuses = {
+      ...options.vcsStatuses,
+      [statusKey]: currentStatus(),
+    };
+    options.vcsWorktreeRefStreams = {
+      ...options.vcsWorktreeRefStreams,
+      [worktree.instanceId]: () => Effect.succeed(currentRefs()),
+    };
+    options.vcsRefs = {
+      ...options.vcsRefs,
+      [refsKey]: currentRefs(),
+    };
+    if (setup.session === "ready") {
+      options.stopThreadSession = (command) => {
+        options.sessionStopCommand = command;
+        return setup.sessionStopFailure === undefined
+          ? Effect.succeed({ sequence: 500 })
+          : Effect.fail(setup.sessionStopFailure);
+      };
+    }
+    options.deleteThread = () => {
+      namedThreadPresent = false;
+      if (setup.addSecondThreadAfterDelete) secondThreadPresent = true;
+      if (setup.replaceCheckoutAfterDelete) {
+        currentBranch = "replacement/checkout";
+        options.vcsStatuses = {
+          ...options.vcsStatuses,
+          [statusKey]: currentStatus(),
+        };
+        options.vcsRefs = {
+          ...options.vcsRefs,
+          [refsKey]: currentRefs(),
+        };
+      }
+      return setup.lostThreadDeleteReply
+        ? Effect.fail(
+            new T3CodeAdapterError({
+              kind: "transport",
+              message: "The thread-delete reply was lost after dispatch.",
+              uncertain: true,
+              status: null,
+            }),
+          )
+        : Effect.succeed({ sequence: 50 });
+    };
+    options.removeWorktree = () => {
+      checkoutPresent = false;
+      options.vcsStatuses = {
+        ...options.vcsStatuses,
+        [statusKey]: currentStatus(),
+      };
+      options.vcsRefs = {
+        ...options.vcsRefs,
+        [refsKey]: currentRefs(),
+      };
+      return setup.lostWorktreeRemoveReply
+        ? Effect.fail(
+            new T3CodeAdapterError({
+              kind: "transport",
+              message: "The worktree-remove reply was lost after dispatch.",
+              uncertain: true,
+              status: null,
+            }),
+          )
+        : Effect.void;
+    };
+    if (setup.worktreeRemoveBeforeDispatchFailure !== undefined) {
+      options.removeWorktreeBeforeDispatchFailure = setup.worktreeRemoveBeforeDispatchFailure;
+    }
+    return {
+      namedThreadPresent: () => namedThreadPresent,
+      setNamedThreadPresent: (present: boolean) => {
+        namedThreadPresent = present;
+      },
+      secondThreadPresent: () => secondThreadPresent,
+      checkoutPresent: () => checkoutPresent,
+      currentRefs: () => currentRefs(),
+      currentBranch: () => currentBranch,
+    };
+  };
+
   const seedDispatchingDiscard = (input: {
     readonly store: LocalStoreService;
     readonly requestId: string;
@@ -10405,6 +10667,7 @@ describe("worktree_discard", () => {
           },
         });
         expect(removeCalls).toBe(0);
+        expect(options.threadDeleteCalls).toHaveLength(0);
       }),
     ),
   );
@@ -10621,7 +10884,7 @@ describe("worktree_discard", () => {
     ),
   );
 
-  it.live("explicitly refuses the unfinished combined thread-removal variant", () =>
+  it.live("rejects a cross-instance sole-thread reference before admission", () =>
     withDatabasePath((databasePath) =>
       Effect.gen(function* () {
         const result = yield* Effect.scoped(
@@ -10634,7 +10897,7 @@ describe("worktree_discard", () => {
                 worktreePath: "/srv/worktrees/feature-a",
               },
               removeSoleThread: {
-                instanceId: "instance-a",
+                instanceId: "instance-b",
                 threadId: "thread-a",
               },
             });
@@ -10650,13 +10913,1386 @@ describe("worktree_discard", () => {
             kind: "error",
             error: {
               code: "invalid_argument",
-              message: expect.stringContaining("Combined thread removal and worktree discard"),
+              message: expect.stringContaining("same T3Code instance"),
             },
           },
         });
         expect(result.lookup[0]?.result).toMatchObject({
           result: { kind: "error", error: { code: "request_record_unavailable" } },
         });
+      }),
+    ),
+  );
+
+  it.live("refuses when only a different thread references the worktree", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/repo",
+          worktreePath: "/srv/worktrees/association-mismatch",
+        };
+        const state = configureSoleThreadDiscard(
+          options,
+          worktree,
+          "feature/association-mismatch",
+          "2026-09-26T00:00:00.000Z",
+          {
+            namedThreadWorktreePath: "/srv/worktrees/another-checkout",
+            secondThreadInitially: true,
+          },
+        );
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("worktree_discard", {
+              requestId: "discard-sole-thread-association-mismatch",
+              worktree,
+              removeSoleThread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "failed",
+              dispatch: "not_dispatched",
+              error: { code: "uncheckable_target" },
+            },
+          },
+        });
+        expect(options.threadDeleteCalls).toHaveLength(0);
+        expect(state.secondThreadPresent()).toBe(true);
+        expect(state.checkoutPresent()).toBe(true);
+      }),
+    ),
+  );
+
+  it.live("refuses when the named thread records a different worktree branch", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/repo",
+          worktreePath: "/srv/worktrees/branch-mismatch",
+        };
+        const state = configureSoleThreadDiscard(
+          options,
+          worktree,
+          "feature/branch-mismatch",
+          "2026-09-26T00:00:00.000Z",
+          { namedThreadBranch: "feature/other-branch" },
+        );
+        let removeCalls = 0;
+        const originalRemove = options.removeWorktree;
+        options.removeWorktree = (target, registration) => {
+          removeCalls += 1;
+          return originalRemove?.(target, registration) ?? Effect.void;
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("worktree_discard", {
+              requestId: "discard-sole-thread-branch-mismatch",
+              worktree,
+              removeSoleThread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "failed",
+              dispatch: "not_dispatched",
+              error: { code: "uncheckable_target" },
+            },
+          },
+        });
+        expect(options.threadDeleteCalls).toHaveLength(0);
+        expect(removeCalls).toBe(0);
+        expect(state.namedThreadPresent()).toBe(true);
+        expect(state.checkoutPresent()).toBe(true);
+      }),
+    ),
+  );
+
+  it.live("removes the named sole thread before discarding its worktree", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/repo",
+          worktreePath: "/srv/worktrees/combined-success",
+        };
+        const state = configureSoleThreadDiscard(
+          options,
+          worktree,
+          "feature/combined-success",
+          "2026-09-26T00:00:00.000Z",
+          { archivedNamedThread: true },
+        );
+        let removeCalls = 0;
+        const removeWorktree = options.removeWorktree;
+        options.removeWorktree = (target, registration) => {
+          removeCalls += 1;
+          return removeWorktree?.(target, registration) ?? Effect.void;
+        };
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("worktree_discard", {
+              requestId: "discard-sole-thread-success",
+              worktree,
+              removeSoleThread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              tool: "worktree_discard",
+              state: "completed",
+              dispatch: "accepted",
+              error: null,
+            },
+          },
+        });
+        const value = result[0]?.result as unknown as {
+          readonly result: {
+            readonly value: {
+              readonly steps: ReadonlyArray<{ readonly name: string; readonly state: string }>;
+            };
+          };
+        };
+        expect(value.result.value.steps.map((step) => step.name)).toEqual([
+          ...SOLE_THREAD_DISCARD_STEP_NAMES,
+        ]);
+        expect(options.threadDeleteCalls).toHaveLength(1);
+        expect(options.threadDeleteCalls[0]).toMatchObject({
+          instanceId: "instance-a",
+          threadId: "thread-a",
+        });
+        expect(removeCalls).toBe(1);
+        expect(state.namedThreadPresent()).toBe(false);
+        expect(state.checkoutPresent()).toBe(false);
+        expect(state.currentRefs().localBranches).toContain("feature/combined-success");
+      }),
+    ),
+  );
+
+  it.live("refuses a shared worktree without deleting either thread", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/repo",
+          worktreePath: "/srv/worktrees/combined-shared",
+        };
+        const state = configureSoleThreadDiscard(
+          options,
+          worktree,
+          "feature/combined-shared",
+          "2026-09-26T00:00:00.000Z",
+          { secondThreadInitially: true },
+        );
+        let removeCalls = 0;
+        const originalRemove = options.removeWorktree;
+        options.removeWorktree = (target, registration) => {
+          removeCalls += 1;
+          return originalRemove?.(target, registration) ?? Effect.void;
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("worktree_discard", {
+              requestId: "discard-sole-thread-shared",
+              worktree,
+              removeSoleThread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              state: "failed",
+              dispatch: "not_dispatched",
+              error: { code: "shared_worktree" },
+            },
+          },
+        });
+        expect(options.threadDeleteCalls).toHaveLength(0);
+        expect(removeCalls).toBe(0);
+        expect(state.namedThreadPresent()).toBe(true);
+        expect(state.checkoutPresent()).toBe(true);
+      }),
+    ),
+  );
+
+  it.live(
+    "reports a partial result when another thread attaches after the named thread is removed",
+    () =>
+      withDatabasePath((databasePath) =>
+        Effect.gen(function* () {
+          const { options, connections } = emptyThreadFixtures();
+          const worktree = {
+            instanceId: "instance-a",
+            repositoryPath: "/srv/repo",
+            worktreePath: "/srv/worktrees/combined-late-reference",
+          };
+          const state = configureSoleThreadDiscard(
+            options,
+            worktree,
+            "feature/combined-late-reference",
+            "2026-09-26T00:00:00.000Z",
+            { addSecondThreadAfterDelete: true },
+          );
+          let removeCalls = 0;
+          const originalRemove = options.removeWorktree;
+          options.removeWorktree = (target, registration) => {
+            removeCalls += 1;
+            return originalRemove?.(target, registration) ?? Effect.void;
+          };
+          const result = yield* Effect.scoped(
+            Effect.gen(function* () {
+              yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+              return yield* callTool("worktree_discard", {
+                requestId: "discard-sole-thread-late-reference",
+                worktree,
+                removeSoleThread: { instanceId: "instance-a", threadId: "thread-a" },
+              });
+            }).pipe(Effect.provide(appLayer(databasePath, connections))),
+          );
+
+          expect(result[0]?.result).toMatchObject({
+            result: {
+              kind: "ok",
+              value: { state: "partial", error: { code: "shared_worktree" } },
+            },
+          });
+          expect(options.threadDeleteCalls).toHaveLength(1);
+          expect(removeCalls).toBe(0);
+          expect(state.namedThreadPresent()).toBe(false);
+          expect(state.secondThreadPresent()).toBe(true);
+          expect(state.checkoutPresent()).toBe(true);
+        }),
+      ),
+  );
+
+  it.live("refuses a replacement checkout at the worktree path after thread removal", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/repo",
+          worktreePath: "/srv/worktrees/combined-replacement",
+        };
+        const state = configureSoleThreadDiscard(
+          options,
+          worktree,
+          "feature/combined-original",
+          "2026-09-26T00:00:00.000Z",
+          { replaceCheckoutAfterDelete: true },
+        );
+        let removeCalls = 0;
+        const originalRemove = options.removeWorktree;
+        options.removeWorktree = (target, registration) => {
+          removeCalls += 1;
+          return originalRemove?.(target, registration) ?? Effect.void;
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("worktree_discard", {
+              requestId: "discard-sole-thread-replacement",
+              worktree,
+              removeSoleThread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: { state: "partial", error: { code: "stale_state" } },
+          },
+        });
+        expect(options.threadDeleteCalls).toHaveLength(1);
+        expect(state.currentBranch()).toBe("replacement/checkout");
+        expect(removeCalls).toBe(0);
+      }),
+    ),
+  );
+
+  it.live("refuses an unresolved approval request before thread deletion", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/repo",
+          worktreePath: "/srv/worktrees/combined-active",
+        };
+        configureSoleThreadDiscard(
+          options,
+          worktree,
+          "feature/combined-active",
+          "2026-09-26T00:00:00.000Z",
+          { pendingApproval: true },
+        );
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("worktree_discard", {
+              requestId: "discard-sole-thread-pending",
+              worktree,
+              removeSoleThread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: { state: "failed", error: { code: "pending_request" } },
+          },
+        });
+        expect(options.threadDeleteCalls).toHaveLength(0);
+      }),
+    ),
+  );
+
+  it.live("refuses active execution before stopping or deleting the named thread", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/repo",
+          worktreePath: "/srv/worktrees/combined-running",
+        };
+        configureSoleThreadDiscard(
+          options,
+          worktree,
+          "feature/combined-running",
+          "2026-09-26T00:00:00.000Z",
+          { activeTurn: true, session: "ready" },
+        );
+        let removeCalls = 0;
+        const originalRemove = options.removeWorktree;
+        options.removeWorktree = (target, registration) => {
+          removeCalls += 1;
+          return originalRemove?.(target, registration) ?? Effect.void;
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("worktree_discard", {
+              requestId: "discard-sole-thread-running",
+              worktree,
+              removeSoleThread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: { state: "failed", error: { code: "active_execution" } },
+          },
+        });
+        expect(options.sessionStopCommand).toBeUndefined();
+        expect(options.threadDeleteCalls).toHaveLength(0);
+        expect(removeCalls).toBe(0);
+      }),
+    ),
+  );
+
+  it.live("stops an idle provider session and observes it before deleting the thread", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/repo",
+          worktreePath: "/srv/worktrees/combined-idle-session",
+        };
+        configureSoleThreadDiscard(
+          options,
+          worktree,
+          "feature/combined-idle-session",
+          "2026-09-26T00:00:00.000Z",
+          { session: "ready" },
+        );
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("worktree_discard", {
+              requestId: "discard-sole-thread-idle-session",
+              worktree,
+              removeSoleThread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: { state: "completed", dispatch: "accepted" },
+          },
+        });
+        expect(options.sessionStopCommand).toMatchObject({ commandId: expect.any(String) });
+        expect(options.threadDeleteCalls).toHaveLength(1);
+      }),
+    ),
+  );
+
+  it.live("stops after a rejected provider-session shutdown without deleting either resource", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/repo",
+          worktreePath: "/srv/worktrees/combined-rejected-session-stop",
+        };
+        configureSoleThreadDiscard(
+          options,
+          worktree,
+          "feature/combined-rejected-session-stop",
+          "2026-09-26T00:00:00.000Z",
+          {
+            session: "ready",
+            sessionStopFailure: new T3CodeAdapterError({
+              kind: "command_rejected",
+              message: "The provider-session stop command was rejected.",
+              uncertain: false,
+              status: 409,
+            }),
+          },
+        );
+        let removeCalls = 0;
+        const originalRemove = options.removeWorktree;
+        options.removeWorktree = (target, registration) => {
+          removeCalls += 1;
+          return originalRemove?.(target, registration) ?? Effect.void;
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("worktree_discard", {
+              requestId: "discard-sole-thread-session-stop-rejected",
+              worktree,
+              removeSoleThread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: { state: "failed", dispatch: "rejected" },
+          },
+        });
+        expect(options.threadDeleteCalls).toHaveLength(0);
+        expect(removeCalls).toBe(0);
+      }),
+    ),
+  );
+
+  it.live(
+    "returns partial after a lost delete reply confirms absence but finds a new reference",
+    () =>
+      withDatabasePath((databasePath) =>
+        Effect.gen(function* () {
+          const { options, connections } = emptyThreadFixtures();
+          const worktree = {
+            instanceId: "instance-a",
+            repositoryPath: "/srv/repo",
+            worktreePath: "/srv/worktrees/combined-lost-delete-late-reference",
+          };
+          const state = configureSoleThreadDiscard(
+            options,
+            worktree,
+            "feature/combined-lost-delete-late-reference",
+            "2026-09-26T00:00:00.000Z",
+            { lostThreadDeleteReply: true, addSecondThreadAfterDelete: true },
+          );
+          let removeCalls = 0;
+          const originalRemove = options.removeWorktree;
+          options.removeWorktree = (target, registration) => {
+            removeCalls += 1;
+            return originalRemove?.(target, registration) ?? Effect.void;
+          };
+          const result = yield* Effect.scoped(
+            Effect.gen(function* () {
+              yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+              return yield* callTool("worktree_discard", {
+                requestId: "discard-lost-delete-late-reference",
+                worktree,
+                removeSoleThread: { instanceId: "instance-a", threadId: "thread-a" },
+              });
+            }).pipe(Effect.provide(appLayer(databasePath, connections))),
+          );
+          expect(result[0]?.result).toMatchObject({
+            result: {
+              kind: "ok",
+              value: { state: "partial", error: { code: "shared_worktree" } },
+            },
+          });
+          expect(options.threadDeleteCalls).toHaveLength(1);
+          expect(removeCalls).toBe(0);
+          expect(state.namedThreadPresent()).toBe(false);
+          expect(state.secondThreadPresent()).toBe(true);
+          expect(state.checkoutPresent()).toBe(true);
+        }),
+      ),
+  );
+
+  it.live(
+    "confirms an absent thread after a lost delete reply before discarding the worktree",
+    () =>
+      withDatabasePath((databasePath) =>
+        Effect.gen(function* () {
+          const { options, connections } = emptyThreadFixtures();
+          const worktree = {
+            instanceId: "instance-a",
+            repositoryPath: "/srv/repo",
+            worktreePath: "/srv/worktrees/combined-lost-delete-reply",
+          };
+          const state = configureSoleThreadDiscard(
+            options,
+            worktree,
+            "feature/combined-lost-delete-reply",
+            "2026-09-26T00:00:00.000Z",
+            { lostThreadDeleteReply: true },
+          );
+          const result = yield* Effect.scoped(
+            Effect.gen(function* () {
+              yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+              return yield* callTool("worktree_discard", {
+                requestId: "discard-sole-thread-lost-delete-reply",
+                worktree,
+                removeSoleThread: { instanceId: "instance-a", threadId: "thread-a" },
+              });
+            }).pipe(Effect.provide(appLayer(databasePath, connections))),
+          );
+          expect(result[0]?.result).toMatchObject({
+            result: {
+              kind: "ok",
+              value: { state: "completed", dispatch: "accepted" },
+            },
+          });
+          expect(options.threadDeleteCalls).toHaveLength(1);
+          expect(state.namedThreadPresent()).toBe(false);
+          expect(state.checkoutPresent()).toBe(false);
+        }),
+      ),
+  );
+
+  it.live("reconciles a lost worktree-removal reply without replaying it", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/repo",
+          worktreePath: "/srv/worktrees/combined-lost-worktree-reply",
+        };
+        const state = configureSoleThreadDiscard(
+          options,
+          worktree,
+          "feature/combined-lost-worktree-reply",
+          "2026-09-26T00:00:00.000Z",
+          { lostWorktreeRemoveReply: true },
+        );
+        let removeCalls = 0;
+        const originalRemove = options.removeWorktree;
+        options.removeWorktree = (target, registration) => {
+          removeCalls += 1;
+          return originalRemove?.(target, registration) ?? Effect.void;
+        };
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const initial = yield* callTool("worktree_discard", {
+              requestId: "discard-sole-thread-lost-worktree-reply",
+              worktree,
+              removeSoleThread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+            const reconciled = yield* callTool("operation_get", {
+              requestId: "discard-sole-thread-lost-worktree-reply",
+            });
+            return { initial, reconciled };
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        expect(result.initial[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: { state: "outcome_unknown" },
+          },
+        });
+        expect(result.reconciled[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: { operation: { state: "completed" } },
+          },
+        });
+        expect(removeCalls).toBe(1);
+        expect(options.threadDeleteCalls).toHaveLength(1);
+        expect(state.checkoutPresent()).toBe(false);
+      }),
+    ),
+  );
+
+  it.live("preserves thread-delete dispatch when worktree removal fails before dispatch", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/repo",
+          worktreePath: "/srv/worktrees/combined-worktree-predispatch-failure",
+        };
+        const state = configureSoleThreadDiscard(
+          options,
+          worktree,
+          "feature/combined-worktree-predispatch-failure",
+          "2026-09-26T00:00:00.000Z",
+          {
+            worktreeRemoveBeforeDispatchFailure: new T3CodeAdapterError({
+              kind: "command_rejected",
+              message: "The worktree removal was rejected before dispatch.",
+              uncertain: false,
+              status: 409,
+            }),
+          },
+        );
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("worktree_discard", {
+              requestId: "discard-combined-worktree-predispatch-failure",
+              worktree,
+              removeSoleThread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: { state: "partial", dispatch: "accepted" },
+          },
+        });
+        expect(options.threadDeleteCalls).toHaveLength(1);
+        expect(state.namedThreadPresent()).toBe(false);
+        expect(state.checkoutPresent()).toBe(true);
+        const receipt = result[0]?.result as unknown as {
+          readonly result: {
+            readonly value: {
+              readonly steps: ReadonlyArray<{
+                readonly name: string;
+                readonly evidence: ReadonlyArray<{ readonly kind: string }>;
+              }>;
+            };
+          };
+        };
+        const removeStep = receipt.result.value.steps.find(
+          (step) => step.name === "dispatch_worktree_remove",
+        );
+        expect(removeStep?.evidence).toEqual(
+          expect.arrayContaining([expect.objectContaining({ kind: "adapter_inference" })]),
+        );
+      }),
+    ),
+  );
+
+  it.live("classifies a dispatched worktree removal rejection as RPC evidence", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/repo",
+          worktreePath: "/srv/worktrees/combined-worktree-rpc-rejection",
+        };
+        const state = configureSoleThreadDiscard(
+          options,
+          worktree,
+          "feature/combined-worktree-rpc-rejection",
+          "2026-09-26T00:00:00.000Z",
+        );
+        options.removeWorktree = () =>
+          Effect.fail(
+            new T3CodeAdapterError({
+              kind: "command_rejected",
+              message: "The worktree removal was rejected by T3Code.",
+              uncertain: false,
+              status: 409,
+            }),
+          );
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("worktree_discard", {
+              requestId: "discard-combined-worktree-rpc-rejection",
+              worktree,
+              removeSoleThread: { instanceId: "instance-a", threadId: "thread-a" },
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: { state: "partial" },
+          },
+        });
+        const receipt = result[0]?.result as unknown as {
+          readonly result: {
+            readonly value: {
+              readonly steps: ReadonlyArray<{
+                readonly name: string;
+                readonly evidence: ReadonlyArray<{ readonly kind: string }>;
+              }>;
+            };
+          };
+        };
+        const removeStep = receipt.result.value.steps.find(
+          (step) => step.name === "dispatch_worktree_remove",
+        );
+        expect(removeStep?.evidence).toEqual(
+          expect.arrayContaining([expect.objectContaining({ kind: "rpc_result" })]),
+        );
+        expect(options.threadDeleteCalls).toHaveLength(1);
+        expect(state.namedThreadPresent()).toBe(false);
+        expect(state.checkoutPresent()).toBe(true);
+      }),
+    ),
+  );
+
+  it.live("continues the combined cleanup after the caller cancels its wait", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/repo",
+          worktreePath: "/srv/worktrees/combined-cancelled-wait",
+        };
+        const state = configureSoleThreadDiscard(
+          options,
+          worktree,
+          "feature/combined-cancelled-wait",
+          "2026-09-26T00:00:00.000Z",
+        );
+        const dispatched = yield* Deferred.make<void>();
+        const reply = yield* Deferred.make<void>();
+        let removeCalls = 0;
+        const originalRemove = options.removeWorktree;
+        options.removeWorktree = (target, registration) =>
+          Effect.gen(function* () {
+            removeCalls += 1;
+            yield* Deferred.succeed(dispatched, undefined);
+            yield* Deferred.await(reply);
+            return yield* originalRemove?.(target, registration) ?? Effect.void;
+          });
+
+        const completed = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const caller = yield* Effect.forkScoped(
+              callTool("worktree_discard", {
+                requestId: "discard-combined-cancelled-wait",
+                worktree,
+                removeSoleThread: { instanceId: "instance-a", threadId: "thread-a" },
+              }),
+            );
+            yield* Deferred.await(dispatched);
+            yield* Fiber.interrupt(caller);
+            yield* Deferred.succeed(reply, undefined);
+            return yield* callTool("operation_get", {
+              requestId: "discard-combined-cancelled-wait",
+              waitMs: 5_000,
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(removeCalls).toBe(1);
+        expect(options.threadDeleteCalls).toHaveLength(1);
+        expect(state.namedThreadPresent()).toBe(false);
+        expect(state.checkoutPresent()).toBe(false);
+        expect(completed[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              operation: { tool: "worktree_discard", state: "completed" },
+            },
+          },
+        });
+      }),
+    ),
+  );
+
+  it.live(
+    "reports a partial combined discard after process recovery without replaying remaining steps",
+    () =>
+      withDatabasePath((databasePath) =>
+        Effect.gen(function* () {
+          const { options, connections } = emptyThreadFixtures();
+          const worktree = {
+            instanceId: "instance-a",
+            repositoryPath: "/srv/repo",
+            worktreePath: "/srv/worktrees/combined-process-death",
+          };
+          const state = configureSoleThreadDiscard(
+            options,
+            worktree,
+            "feature/combined-process-death",
+            "2026-09-26T00:00:00.000Z",
+          );
+          state.setNamedThreadPresent(false);
+          let removeCalls = 0;
+          const originalRemove = options.removeWorktree;
+          options.removeWorktree = (target, registration) => {
+            removeCalls += 1;
+            return originalRemove?.(target, registration) ?? Effect.void;
+          };
+          const stepNames = SOLE_THREAD_DISCARD_STEP_NAMES;
+          const requestId = "discard-combined-process-death";
+          const request = {
+            requestId,
+            worktree,
+            removeSoleThread: { instanceId: "instance-a", threadId: "thread-a" },
+          };
+          const recovered = yield* Effect.scoped(
+            Effect.gen(function* () {
+              const store = yield* LocalStore;
+              const old = "2020-01-01T00:00:00.000Z";
+              const intent = {
+                instanceId: worktree.instanceId,
+                repositoryPath: worktree.repositoryPath,
+                worktreePath: worktree.worktreePath,
+                branch: "feature/combined-process-death",
+                soleThread: request.removeSoleThread,
+                threadRemoval: {
+                  instanceId: "instance-a",
+                  threadId: "thread-a",
+                  commandId: "thread-delete-command",
+                  dispatchSequence: null,
+                  steps: { dispatch: 6, absence: 7 },
+                },
+              };
+              const fingerprint = yield* store.fingerprintRequest("worktree_discard", request);
+              yield* store.admitOperation({
+                requestId,
+                tool: "worktree_discard",
+                fingerprint,
+                processNonce: "terminated-process",
+                admittedAt: old,
+                intent,
+                completionMeans: "worktree_absent",
+                target: worktree,
+                steps: stepNames,
+              });
+              for (let position = 0; position <= 5; position += 1) {
+                yield* store.updateOperation(requestId, {
+                  now: old,
+                  intent,
+                  state: "pending",
+                  dispatch: "accepted",
+                  target: worktree,
+                  stepPosition: position,
+                  stepState: "succeeded",
+                  evidence: [
+                    {
+                      kind: "snapshot",
+                      observedAt: old,
+                      sourceSequence: null,
+                      nativeEventId: null,
+                      detail: `Persisted step ${position} before the owner process terminated.`,
+                    },
+                  ],
+                  evidenceStepPosition: position,
+                  recovery: "observe_operation",
+                });
+              }
+              yield* store.updateOperation(requestId, {
+                now: old,
+                intent,
+                state: "pending",
+                dispatch: "unknown",
+                target: worktree,
+                commandId: "thread-delete-command",
+                stepPosition: 6,
+                stepState: "pending",
+                evidence: [
+                  {
+                    kind: "adapter_inference",
+                    observedAt: old,
+                    sourceSequence: null,
+                    nativeEventId: "thread-delete-command",
+                    detail:
+                      "The owner persisted the thread-delete marker before process termination.",
+                  },
+                ],
+                evidenceStepPosition: 6,
+                recovery: "observe_operation",
+              });
+              yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+              const registration = yield* store.getRegistration("instance-a");
+              if (registration === null)
+                throw new Error("recovery test registration was not stored");
+              return yield* callTool("operation_get", { requestId, waitMs: 1_000 });
+            }).pipe(Effect.provide(appLayer(databasePath, connections))),
+          );
+
+          expect(recovered[0]?.result).toMatchObject({
+            result: {
+              kind: "ok",
+              value: { operation: { tool: "worktree_discard", state: "partial" } },
+            },
+          });
+          const recoveredValue = recovered[0]?.result as unknown as {
+            readonly result: {
+              readonly value: {
+                readonly operation: {
+                  readonly steps: ReadonlyArray<{ readonly name: string; readonly state: string }>;
+                };
+              };
+            };
+          };
+          expect(recoveredValue.result.value.operation.steps).toEqual(
+            expect.arrayContaining([
+              expect.objectContaining({
+                name: "dispatch_thread_deletion",
+                state: "outcome_unknown",
+              }),
+              expect.objectContaining({ name: "observe_thread_absence", state: "already_absent" }),
+              expect.objectContaining({ name: "dispatch_worktree_remove", state: "skipped" }),
+            ]),
+          );
+          expect(removeCalls).toBe(0);
+          expect(options.threadDeleteCalls).toHaveLength(0);
+          expect(state.namedThreadPresent()).toBe(false);
+          expect(state.checkoutPresent()).toBe(true);
+        }),
+      ),
+  );
+
+  it.live(
+    "uses persisted thread absence after process death without another registration read",
+    () =>
+      withDatabasePath((databasePath) =>
+        Effect.gen(function* () {
+          const worktree = {
+            instanceId: "instance-a",
+            repositoryPath: "/srv/repo",
+            worktreePath: "/srv/worktrees/combined-recorded-thread-absence",
+          };
+          const requestId = "discard-combined-recorded-thread-absence";
+          const request = {
+            requestId,
+            worktree,
+            removeSoleThread: { instanceId: "instance-a", threadId: "thread-a" },
+          };
+          const stepNames = SOLE_THREAD_DISCARD_STEP_NAMES;
+          const result = yield* Effect.scoped(
+            Effect.gen(function* () {
+              const store = yield* LocalStore;
+              const old = "2020-01-01T00:00:00.000Z";
+              const intent = {
+                instanceId: worktree.instanceId,
+                repositoryPath: worktree.repositoryPath,
+                worktreePath: worktree.worktreePath,
+                branch: "feature/combined-recorded-thread-absence",
+                soleThread: request.removeSoleThread,
+                threadRemoval: {
+                  instanceId: "instance-a",
+                  threadId: "thread-a",
+                  commandId: "thread-delete-command",
+                  dispatchSequence: 50,
+                  steps: { dispatch: 6, absence: 7 },
+                },
+              };
+              const fingerprint = yield* store.fingerprintRequest("worktree_discard", request);
+              yield* store.admitOperation({
+                requestId,
+                tool: "worktree_discard",
+                fingerprint,
+                processNonce: "terminated-recorded-absence-process",
+                admittedAt: old,
+                intent,
+                completionMeans: "worktree_absent",
+                target: worktree,
+                steps: stepNames,
+              });
+              for (let position = 0; position <= 7; position += 1) {
+                yield* store.updateOperation(requestId, {
+                  now: old,
+                  intent,
+                  state: "pending",
+                  dispatch: "accepted",
+                  target: worktree,
+                  stepPosition: position,
+                  stepState: "succeeded",
+                  evidence: [
+                    {
+                      kind: "snapshot",
+                      observedAt: old,
+                      sourceSequence: null,
+                      nativeEventId: null,
+                      detail: `Persisted step ${position} before the owner process terminated.`,
+                    },
+                  ],
+                  evidenceStepPosition: position,
+                  recovery: "observe_operation",
+                });
+              }
+              return yield* callTool("operation_get", { requestId, waitMs: 1_000 });
+            }).pipe(Effect.provide(appLayer(databasePath))),
+          );
+          expect(result[0]?.result).toMatchObject({
+            result: {
+              kind: "ok",
+              value: { operation: { tool: "worktree_discard", state: "partial" } },
+            },
+          });
+          const recovered = result[0]?.result as unknown as {
+            readonly result: {
+              readonly value: {
+                readonly operation: {
+                  readonly steps: ReadonlyArray<{
+                    readonly name: string;
+                    readonly state: string;
+                  }>;
+                };
+              };
+            };
+          };
+          expect(recovered.result.value.operation.steps).toEqual(
+            expect.arrayContaining([
+              expect.objectContaining({ name: "observe_thread_absence", state: "succeeded" }),
+              expect.objectContaining({ name: "dispatch_worktree_remove", state: "skipped" }),
+            ]),
+          );
+        }),
+      ),
+    60000,
+  );
+
+  it.live("stops stale recovery when the owner advances the operation revision", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/repo",
+          worktreePath: "/srv/worktrees/sole-thread-recovery-revision-race",
+        };
+        const requestId = "discard-sole-thread-recovery-revision-race";
+        const request = {
+          requestId,
+          worktree,
+          removeSoleThread: { instanceId: "instance-a", threadId: "thread-a" },
+        };
+        let ownerAdvanced = false;
+        const storeLayer = Layer.effect(
+          LocalStore,
+          Effect.gen(function* () {
+            const store = yield* LocalStore;
+            return LocalStore.of({
+              ...store,
+              compareAndSetOperationDispatch: (expectation, update) =>
+                Effect.gen(function* () {
+                  if (!ownerAdvanced && expectation.requestId === requestId) {
+                    ownerAdvanced = true;
+                    const current = yield* store.getOperation(requestId);
+                    if (current === null) throw new Error("race fixture operation is missing");
+                    const now = new Date().toISOString();
+                    const threadRemoval = {
+                      instanceId: "instance-a",
+                      threadId: "thread-a",
+                      commandId: "owner-thread-delete-command",
+                      dispatchSequence: null,
+                      steps: { dispatch: 6, absence: 7 },
+                    };
+                    yield* store.updateOperation(requestId, {
+                      now,
+                      intent: { ...current.intent, threadRemoval },
+                      state: "pending",
+                      dispatch: "unknown",
+                      target: worktree,
+                      commandId: threadRemoval.commandId,
+                      stepPosition: threadRemoval.steps.dispatch,
+                      stepState: "pending",
+                      evidence: [
+                        {
+                          kind: "adapter_inference",
+                          observedAt: now,
+                          sourceSequence: null,
+                          nativeEventId: threadRemoval.commandId,
+                          detail: "The active owner persisted the thread-delete marker.",
+                        },
+                      ],
+                      evidenceStepPosition: threadRemoval.steps.dispatch,
+                      recovery: "observe_operation",
+                    });
+                  }
+                  return yield* store.compareAndSetOperationDispatch(expectation, update);
+                }),
+            });
+          }),
+        ).pipe(Layer.provide(LocalStore.layer({ databasePath })));
+        const application = serverToolkitLayer.pipe(
+          Layer.provideMerge(connections),
+          Layer.provideMerge(storeLayer),
+        );
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            const store = yield* LocalStore;
+            const old = "2020-01-01T00:00:00.000Z";
+            const intent = {
+              instanceId: worktree.instanceId,
+              repositoryPath: worktree.repositoryPath,
+              worktreePath: worktree.worktreePath,
+              branch: "feature/sole-thread-recovery-revision-race",
+              soleThread: request.removeSoleThread,
+            };
+            const fingerprint = yield* store.fingerprintRequest("worktree_discard", request);
+            yield* store.admitOperation({
+              requestId,
+              tool: "worktree_discard",
+              fingerprint,
+              processNonce: "stale-recovery-race-owner",
+              admittedAt: old,
+              intent,
+              completionMeans: "worktree_absent",
+              target: worktree,
+              steps: SOLE_THREAD_DISCARD_STEP_NAMES,
+            });
+            yield* store.updateOperation(requestId, {
+              now: old,
+              intent,
+              state: "pending",
+              dispatch: "not_dispatched",
+              target: worktree,
+              stepPosition: 0,
+              stepState: "succeeded",
+              recovery: "observe_operation",
+            });
+            const response = yield* callTool("operation_get", { requestId });
+            const stored = yield* store.getOperation(requestId);
+            return { response, stored };
+          }).pipe(Effect.provide(application)),
+        );
+
+        expect(ownerAdvanced).toBe(true);
+        expect(result.response[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              operation: {
+                state: "pending",
+                dispatch: "unknown",
+                error: null,
+                steps: expect.arrayContaining([
+                  expect.objectContaining({ name: "dispatch_thread_deletion", state: "pending" }),
+                  expect.objectContaining({
+                    name: "dispatch_worktree_remove",
+                    state: "not_started",
+                  }),
+                ]),
+              },
+            },
+          },
+        });
+        expect(result.stored?.record.state).toBe("pending");
+        expect(result.stored?.record.dispatch).toBe("unknown");
+        expect(result.stored?.record.steps[1]?.state).toBe("not_started");
+        expect(options.threadDeleteCalls).toHaveLength(0);
+      }),
+    ),
+  );
+
+  it.live(
+    "recovers unresolved provider shutdown at the shutdown step without later mutations",
+    () =>
+      withDatabasePath((databasePath) =>
+        Effect.gen(function* () {
+          const worktree = {
+            instanceId: "instance-a",
+            repositoryPath: "/srv/repo",
+            worktreePath: "/srv/worktrees/combined-session-process-death",
+          };
+          const requestId = "discard-combined-session-process-death";
+          const intent = {
+            instanceId: "instance-a",
+            repositoryPath: worktree.repositoryPath,
+            worktreePath: worktree.worktreePath,
+            branch: "feature/combined-session-process-death",
+            soleThread: { instanceId: "instance-a", threadId: "thread-a" },
+            sessionStop: {
+              instanceId: "instance-a",
+              threadId: "thread-a",
+              afterSequence: 10,
+              session: {
+                providerInstanceId: "provider-session-a",
+                status: "ready",
+                activeTurnId: null,
+                lastError: null,
+                updatedAt: "2020-01-01T00:00:00.000Z",
+              },
+              commandId: "session-stop-command",
+              createdAt: "2020-01-01T00:00:00.000Z",
+              steps: { capture: 2, dispatch: 3, shutdown: 4 },
+            },
+          };
+          const result = yield* Effect.scoped(
+            Effect.gen(function* () {
+              const store = yield* LocalStore;
+              const old = "2020-01-01T00:00:00.000Z";
+              const stepNames = SOLE_THREAD_DISCARD_STEP_NAMES;
+              const fingerprint = yield* store.fingerprintRequest("worktree_discard", {
+                requestId,
+                worktree,
+                removeSoleThread: intent.soleThread,
+              });
+              yield* store.admitOperation({
+                requestId,
+                tool: "worktree_discard",
+                fingerprint,
+                processNonce: "terminated-session-process",
+                admittedAt: old,
+                intent,
+                completionMeans: "worktree_absent",
+                target: worktree,
+                steps: stepNames,
+              });
+              for (let position = 0; position <= 3; position += 1) {
+                yield* store.updateOperation(requestId, {
+                  now: old,
+                  intent,
+                  state: "pending",
+                  dispatch: position === 3 ? "unknown" : "not_dispatched",
+                  target: worktree,
+                  stepPosition: position,
+                  stepState: position === 3 ? "outcome_unknown" : "succeeded",
+                  evidence: [
+                    {
+                      kind: "snapshot",
+                      observedAt: old,
+                      sourceSequence: null,
+                      nativeEventId: null,
+                      detail: `Persisted session-stop step ${position} before process termination.`,
+                    },
+                  ],
+                  evidenceStepPosition: position,
+                  recovery: "observe_operation",
+                });
+              }
+              return yield* callTool("operation_get", { requestId, waitMs: 1_000 });
+            }).pipe(Effect.provide(appLayer(databasePath))),
+          );
+          expect(result[0]?.result).toMatchObject({
+            result: {
+              kind: "ok",
+              value: {
+                operation: {
+                  state: "outcome_unknown",
+                  steps: expect.arrayContaining([
+                    expect.objectContaining({
+                      name: "dispatch_provider_session_stop",
+                      state: "outcome_unknown",
+                    }),
+                    expect.objectContaining({
+                      name: "observe_provider_session_shutdown",
+                      state: "outcome_unknown",
+                    }),
+                    expect.objectContaining({ name: "dispatch_thread_deletion", state: "skipped" }),
+                  ]),
+                },
+              },
+            },
+          });
+        }),
+      ),
+  );
+
+  it.live("does not reconcile malformed sole-thread intent as an orphan discard", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/repo",
+          worktreePath: "/srv/worktrees/malformed-sole-thread-intent",
+        };
+        configureWorktree(
+          options,
+          worktree,
+          "feature/malformed-sole-thread-intent",
+          "2026-09-26T00:00:00.000Z",
+        );
+        let removeCalls = 0;
+        options.removeWorktree = () => {
+          removeCalls += 1;
+          return Effect.void;
+        };
+        const requestId = "discard-malformed-sole-thread-intent";
+        const request = { requestId, worktree };
+        const stepNames = SOLE_THREAD_DISCARD_STEP_NAMES;
+        const recovered = yield* Effect.scoped(
+          Effect.gen(function* () {
+            const store = yield* LocalStore;
+            const old = "2020-01-01T00:00:00.000Z";
+            const intent = {
+              instanceId: worktree.instanceId,
+              repositoryPath: worktree.repositoryPath,
+              worktreePath: worktree.worktreePath,
+              branch: "feature/malformed-sole-thread-intent",
+              soleThread: null,
+            };
+            const fingerprint = yield* store.fingerprintRequest("worktree_discard", request);
+            yield* store.admitOperation({
+              requestId,
+              tool: "worktree_discard",
+              fingerprint,
+              processNonce: "terminated-malformed-process",
+              admittedAt: old,
+              intent,
+              completionMeans: "worktree_absent",
+              target: worktree,
+              steps: stepNames,
+            });
+            yield* store.updateOperation(requestId, {
+              now: old,
+              intent,
+              state: "pending",
+              dispatch: "not_dispatched",
+              target: worktree,
+              stepPosition: 0,
+              stepState: "succeeded",
+              recovery: "observe_operation",
+            });
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("operation_get", { requestId, waitMs: 1_000 });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+        expect(recovered[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: { operation: { tool: "worktree_discard", state: "outcome_unknown" } },
+          },
+        });
+        expect(removeCalls).toBe(0);
+        expect(options.threadDeleteCalls).toHaveLength(0);
       }),
     ),
   );

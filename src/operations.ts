@@ -147,6 +147,49 @@ const THREAD_REMOVE_STEP_NAMES = [
   "observe_thread_absence",
 ] as const;
 
+const WORKTREE_DISCARD_STEP_NAMES = [
+  "check_orphan_eligibility",
+  "recheck_orphan_eligibility",
+  "dispatch_worktree_remove",
+  "record_worktree_remove_response",
+  "confirm_worktree_absence",
+] as const;
+
+const WORKTREE_DISCARD_SOLE_THREAD_STEPS = {
+  threadCheck: 0,
+  beforeSessionStop: 1,
+  sessionCapture: 2,
+  sessionDispatch: 3,
+  sessionShutdown: 4,
+  beforeThreadDelete: 5,
+  threadDeleteDispatch: 6,
+  threadAbsence: 7,
+  postRemovalReferences: 8,
+  beforeWorktreeDiscard: 9,
+  worktreeDispatch: 10,
+  worktreeResponse: 11,
+  worktreeAbsence: 12,
+} as const;
+
+type WorktreeDiscardSoleThreadStepPosition =
+  (typeof WORKTREE_DISCARD_SOLE_THREAD_STEPS)[keyof typeof WORKTREE_DISCARD_SOLE_THREAD_STEPS];
+
+const WORKTREE_DISCARD_SOLE_THREAD_STEP_NAMES = [
+  "check_named_sole_thread_and_worktree",
+  "recheck_before_provider_session_stop",
+  "capture_provider_session",
+  "dispatch_provider_session_stop",
+  "observe_provider_session_shutdown",
+  "recheck_before_thread_deletion",
+  "dispatch_thread_deletion",
+  "observe_thread_absence",
+  "recheck_worktree_references_after_thread_removal",
+  "recheck_before_worktree_discard",
+  "dispatch_worktree_remove",
+  "record_worktree_remove_response",
+  "confirm_worktree_absence",
+] as const;
+
 type ThreadRemovalStepPosition = (typeof THREAD_REMOVE_STEPS)[keyof typeof THREAD_REMOVE_STEPS];
 
 const threadRemovalStepsAfter = (position: ThreadRemovalStepPosition): ReadonlyArray<number> =>
@@ -249,7 +292,7 @@ export class OperationServiceError extends Data.TaggedError("OperationServiceErr
     | "stale_approval"
     | "unsupported_approval_decision"
     | "unsupported"
-    | "unsupported_worktree_discard_variant";
+    | "invalid_worktree_discard_target";
   readonly message: string;
 }> {}
 
@@ -259,7 +302,9 @@ export interface WorktreeDiscardEligibility {
   readonly registration: Pick<InstanceConnection, "revision" | "environmentId">;
 }
 
-export type WorktreeDiscardCheck = () => Effect.Effect<
+export type WorktreeDiscardCheck = (
+  removeSoleThread?: WorktreeDiscardInput["removeSoleThread"],
+) => Effect.Effect<
   WorktreeDiscardEligibility,
   LocalStoreError | T3CodeAdapterError | ObservationError
 >;
@@ -3102,6 +3147,22 @@ export class Operations extends Context.Service<Operations, OperationsService>()
         return { repositoryPath, worktreePath, branch };
       };
 
+      const worktreeDiscardTargetFromIntent = (
+        intent: OperationIntent,
+        fallback: OperationRecord["target"],
+      ): OperationRecord["target"] => {
+        const instanceId = intent.instanceId;
+        const repositoryPath = intent.repositoryPath;
+        const worktreePath = intent.worktreePath;
+        return typeof instanceId === "string" &&
+          typeof repositoryPath === "string" &&
+          repositoryPath.length > 0 &&
+          typeof worktreePath === "string" &&
+          worktreePath.length > 0
+          ? { instanceId, repositoryPath, worktreePath }
+          : fallback;
+      };
+
       const classifyWorktreeDiscardListing = (options: {
         readonly listing: DiscoveredVcsWorktreeRefs;
         readonly identity: WorktreeDiscardIdentity;
@@ -3203,7 +3264,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
             {
               now: observed.observedAt,
               intent: stored.intent,
-              target: record.target,
+              target: worktreeDiscardTargetFromIntent(stored.intent, record.target),
               stepPosition: position,
               stepState: options.state,
               evidence: [observed],
@@ -3246,6 +3307,15 @@ export class Operations extends Context.Service<Operations, OperationsService>()
         revision: number,
       ): Effect.Effect<OperationRecord, LocalStoreError> =>
         Effect.gen(function* () {
+          const stepsRevision = yield* markUnconfirmedWorktreeDiscardSteps(
+            stored,
+            record,
+            revision,
+          );
+          if (stepsRevision === null) {
+            const refreshed = yield* store.getOperation(stored.record.requestId);
+            return refreshed?.record ?? record;
+          }
           const observed = yield* evidence(
             `The recorded checkout path is absent, but a fresh complete VCS listing did not find branch ${branch}.`,
             "snapshot",
@@ -3264,7 +3334,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
               tool: "worktree_discard",
               state: record.state,
               dispatch: record.dispatch,
-              revision,
+              revision: stepsRevision,
             },
             {
               now: observed.observedAt,
@@ -3416,29 +3486,518 @@ export class Operations extends Context.Service<Operations, OperationsService>()
             markOutcomeUnknown(stored, record, detail, stored.intent),
           ),
           Match.when({ kind: "branch_missing" }, ({ branch }) =>
-            Effect.gen(function* () {
-              const stepsRevision = yield* markUnconfirmedWorktreeDiscardSteps(
-                stored,
-                record,
-                record.revision,
-              );
-              if (stepsRevision === null) {
-                const refreshed = yield* store.getOperation(stored.record.requestId);
-                return refreshed?.record ?? record;
-              }
-              return yield* failWorktreeDiscardBranchRetention(
-                stored,
-                record,
-                branch,
-                stepsRevision,
-              );
-            }),
+            failWorktreeDiscardBranchRetention(stored, record, branch, record.revision),
           ),
           Match.when({ kind: "absent" }, ({ branch }) =>
             completeWorktreeDiscardReconciliation(stored, record, branch, record.revision),
           ),
           Match.exhaustive,
         );
+
+      const soleThreadWorktreeDiscardTarget = (intent: OperationIntent) => {
+        const decoded = Schema.decodeUnknownResult(
+          Schema.Struct({
+            instanceId: Schema.NonEmptyString,
+            threadId: Schema.NonEmptyString,
+          }),
+        )(intent.soleThread);
+        return Result.isSuccess(decoded) ? decoded.success : null;
+      };
+
+      const persistSoleThreadDiscardStep = (
+        stored: StoredOperation,
+        expectedRevision: number,
+        position: number,
+        state: OperationRecord["steps"][number]["state"],
+        detail: string,
+        failure?: ToolFailure,
+        kind: Evidence["kind"] = "adapter_inference",
+      ): Effect.Effect<number | null, LocalStoreError> =>
+        // fallow-ignore-next-line complexity
+        Effect.gen(function* () {
+          const current = yield* store.getOperation(stored.record.requestId);
+          if (current === null || current.record.revision !== expectedRevision) return null;
+          const currentStep = current.record.steps[position];
+          if (
+            currentStep?.state === state &&
+            (currentStep.error?.code ?? null) === (failure?.code ?? null)
+          ) {
+            return expectedRevision;
+          }
+          const observed = yield* evidence(detail, kind);
+          const claimed = yield* store.compareAndSetOperationDispatch(
+            {
+              requestId: stored.record.requestId,
+              ownerProcessNonce: stored.ownerProcessNonce,
+              tool: "worktree_discard",
+              state: current.record.state,
+              dispatch: current.record.dispatch,
+              revision: expectedRevision,
+            },
+            {
+              now: observed.observedAt,
+              intent: current.intent,
+              target: worktreeDiscardTargetFromIntent(current.intent, current.record.target),
+              stepPosition: position,
+              stepState: state,
+              stepError: failure ?? null,
+              evidence: [observed],
+              evidenceStepPosition: position,
+              recovery: "observe_operation",
+            },
+          );
+          return claimed ? expectedRevision + 1 : null;
+        });
+
+      const skipSoleThreadDiscardSteps = (
+        stored: StoredOperation,
+        expectedRevision: number,
+        after: number,
+        detail: string,
+      ): Effect.Effect<number | null, LocalStoreError> =>
+        Effect.gen(function* () {
+          const current = yield* store.getOperation(stored.record.requestId);
+          if (current === null || current.record.revision !== expectedRevision) return null;
+          let revision = expectedRevision;
+          for (let position = after + 1; position < current.record.steps.length; position += 1) {
+            const step = current.record.steps[position];
+            if (step?.state !== "not_started") continue;
+            const nextRevision = yield* persistSoleThreadDiscardStep(
+              stored,
+              revision,
+              position,
+              "skipped",
+              detail,
+            );
+            if (nextRevision === null) return null;
+            revision = nextRevision;
+          }
+          return revision;
+        });
+
+      const finishSoleThreadDiscardRecovery = (
+        stored: StoredOperation,
+        expectedRevision: number,
+        options: {
+          readonly state: "failed" | "partial" | "outcome_unknown";
+          readonly error: ToolFailure;
+          readonly recovery: OperationRecord["recovery"];
+          readonly detail: string;
+        },
+      ): Effect.Effect<OperationRecord, LocalStoreError> =>
+        // fallow-ignore-next-line complexity
+        Effect.gen(function* () {
+          const current = yield* store.getOperation(stored.record.requestId);
+          if (current === null) return stored.record;
+          if (current.record.revision !== expectedRevision) return current.record;
+          if (
+            current.record.state === options.state &&
+            current.record.error?.code === options.error.code
+          ) {
+            return current.record;
+          }
+          const observed = yield* evidence(options.detail, "adapter_inference");
+          const claimed = yield* store.compareAndSetOperationDispatch(
+            {
+              requestId: stored.record.requestId,
+              ownerProcessNonce: stored.ownerProcessNonce,
+              tool: "worktree_discard",
+              state: current.record.state,
+              dispatch: current.record.dispatch,
+              revision: expectedRevision,
+            },
+            {
+              now: observed.observedAt,
+              intent: current.intent,
+              state: options.state,
+              dispatch: current.record.dispatch,
+              target: worktreeDiscardTargetFromIntent(current.intent, current.record.target),
+              error: options.error,
+              recovery: options.recovery,
+              recoverableUntil:
+                options.state === "outcome_unknown"
+                  ? null
+                  : new Date(
+                      Date.parse(observed.observedAt) + OPERATION_DETAIL_RETENTION_MILLIS,
+                    ).toISOString(),
+              evidence: [observed],
+              evidenceStepPosition: null,
+            },
+          );
+          if (!claimed) {
+            const refreshed = yield* store.getOperation(stored.record.requestId);
+            return refreshed?.record ?? current.record;
+          }
+          yield* signalCompletion(stored.record.requestId);
+          const refreshed = yield* store.getOperation(stored.record.requestId);
+          return refreshed?.record ?? current.record;
+        });
+
+      // fallow-ignore-next-line complexity
+      const reconcileSoleThreadWorktreeDiscard = (
+        stored: StoredOperation,
+        record: OperationRecord,
+        previousOwner: boolean,
+        previousOwnerStale: boolean,
+      ): Effect.Effect<OperationRecord, LocalStoreError> =>
+        // fallow-ignore-next-line complexity
+        Effect.gen(function* () {
+          if (previousOwner && !previousOwnerStale) return record;
+          if (record.state === "outcome_unknown") {
+            const claim = yield* claimRecoveryObservation(record);
+            if (claim.kind === "rate_limited") return claim.record;
+          }
+          const thread = soleThreadWorktreeDiscardTarget(stored.intent);
+          if (thread === null) {
+            return yield* markOutcomeUnknown(
+              stored,
+              record,
+              "The combined discard receipt lost its instance-qualified thread identity; no mutation was replayed.",
+              stored.intent,
+            );
+          }
+
+          let current = yield* store.getOperation(record.requestId);
+          if (current === null) return record;
+          let sessionWasStopped =
+            current.record.steps[WORKTREE_DISCARD_SOLE_THREAD_STEPS.sessionShutdown]?.state ===
+            "succeeded";
+          let sessionUnknown =
+            current.record.steps[WORKTREE_DISCARD_SOLE_THREAD_STEPS.sessionShutdown]?.state ===
+              "outcome_unknown" ||
+            current.record.steps[WORKTREE_DISCARD_SOLE_THREAD_STEPS.sessionDispatch]?.state ===
+              "outcome_unknown";
+          const sessionRecovery = threadSessionStopRecovery(current.intent);
+          if (
+            sessionRecovery !== null &&
+            !sessionWasStopped &&
+            current.record.steps[WORKTREE_DISCARD_SOLE_THREAD_STEPS.sessionShutdown]?.state !==
+              "already_absent"
+          ) {
+            const stopped = yield* Effect.result(
+              updateThreadSessionStopFromObservation(
+                record.requestId,
+                sessionRecovery,
+                Math.min(1_000, MAX_THREAD_WAIT_MILLIS),
+              ),
+            );
+            sessionWasStopped = Result.isSuccess(stopped) && stopped.success.kind === "observed";
+            sessionUnknown =
+              Result.isFailure(stopped) ||
+              (Result.isSuccess(stopped) && stopped.success.kind === "outcome_unknown");
+            current = (yield* store.getOperation(record.requestId)) ?? current;
+          }
+
+          const deletion = threadRemovalRecovery(current.intent);
+          if (deletion === null) {
+            const sessionDispatchPosition = WORKTREE_DISCARD_SOLE_THREAD_STEPS.sessionDispatch;
+            let revision = current.record.revision;
+            if (
+              sessionUnknown &&
+              current.record.steps[sessionDispatchPosition]?.state === "pending"
+            ) {
+              const failure: ToolFailure = {
+                code: "unavailable",
+                message:
+                  "Provider-session stop dispatch is uncertain; no thread or worktree mutation will be replayed.",
+                retry: "reconcile_first",
+                details: { action: "observe_operation" },
+              };
+              const nextRevision = yield* persistSoleThreadDiscardStep(
+                stored,
+                revision,
+                sessionDispatchPosition,
+                "outcome_unknown",
+                failure.message,
+                failure,
+              );
+              if (nextRevision === null) {
+                const refreshed = yield* store.getOperation(record.requestId);
+                return refreshed?.record ?? current.record;
+              }
+              revision = nextRevision;
+              const refreshed = yield* store.getOperation(record.requestId);
+              if (refreshed === null) return current.record;
+              if (refreshed.record.revision !== revision) return refreshed.record;
+              current = refreshed;
+            }
+            const firstUnfinished = current.record.steps.findIndex(
+              (step) => step.state === "pending" || step.state === "not_started",
+            );
+            const position = sessionUnknown
+              ? WORKTREE_DISCARD_SOLE_THREAD_STEPS.sessionShutdown
+              : firstUnfinished < 0
+                ? WORKTREE_DISCARD_SOLE_THREAD_STEPS.threadDeleteDispatch
+                : firstUnfinished;
+            const failure: ToolFailure = {
+              code: "unavailable",
+              message: sessionUnknown
+                ? previousOwner
+                  ? "A previous process stopped during provider-session shutdown; remaining cleanup steps were not replayed."
+                  : "Provider-session shutdown is unresolved; remaining cleanup steps were not replayed."
+                : previousOwner
+                  ? "The owning process stopped before persisting a thread-delete dispatch identity; the remaining cleanup steps were not replayed."
+                  : "The operation ended before persisting a thread-delete dispatch identity; the remaining cleanup steps were not replayed.",
+              retry: sessionUnknown ? "reconcile_first" : "change_request",
+              details: { action: "inspect_target" },
+            };
+            const stepRevision = yield* persistSoleThreadDiscardStep(
+              stored,
+              revision,
+              position,
+              sessionUnknown ? "outcome_unknown" : "failed",
+              failure.message,
+              failure,
+            );
+            if (stepRevision === null) {
+              const refreshed = yield* store.getOperation(record.requestId);
+              return refreshed?.record ?? current.record;
+            }
+            const skippedRevision = yield* skipSoleThreadDiscardSteps(
+              stored,
+              stepRevision,
+              position,
+              sessionUnknown
+                ? "Provider-session shutdown was not confirmed; thread deletion and worktree discard were not resumed."
+                : previousOwner
+                  ? "The previous process stopped before thread deletion; no later cleanup step was dispatched."
+                  : "Thread deletion had not started; no later cleanup step was dispatched.",
+            );
+            if (skippedRevision === null) {
+              const refreshed = yield* store.getOperation(record.requestId);
+              return refreshed?.record ?? current.record;
+            }
+            const state = sessionUnknown
+              ? "outcome_unknown"
+              : sessionWasStopped
+                ? "partial"
+                : "failed";
+            return yield* finishSoleThreadDiscardRecovery(stored, skippedRevision, {
+              state,
+              error: failure,
+              recovery: state === "outcome_unknown" ? "observe_operation" : "new_explicit_request",
+              detail:
+                state === "partial"
+                  ? previousOwner
+                    ? "A provider session was stopped, but the prior process ended before thread deletion; remaining cleanup steps were not replayed."
+                    : "A provider session was stopped, but thread deletion did not continue; remaining cleanup steps were not replayed."
+                  : failure.message,
+            });
+          }
+
+          const deletionDispatch = current.record.steps[deletion.steps.dispatch];
+          if (deletion.dispatchSequence === null && deletionDispatch?.state === "pending") {
+            const failure: ToolFailure = {
+              code: "unavailable",
+              message:
+                "The owning process stopped after persisting the thread-delete marker; the command reply is unknown and it will not be replayed.",
+              retry: "reconcile_first",
+              details: { action: "observe_thread" },
+            };
+            const nextRevision = yield* persistSoleThreadDiscardStep(
+              stored,
+              current.record.revision,
+              deletion.steps.dispatch,
+              "outcome_unknown",
+              failure.message,
+              failure,
+            );
+            if (nextRevision === null) {
+              const refreshed = yield* store.getOperation(record.requestId);
+              return refreshed?.record ?? current.record;
+            }
+            const refreshed = yield* store.getOperation(record.requestId);
+            if (refreshed === null) return current.record;
+            if (refreshed.record.revision !== nextRevision) return refreshed.record;
+            current = refreshed;
+          }
+          const priorAbsenceState = current.record.steps[deletion.steps.absence]?.state;
+          const recordedAbsenceConfirmed =
+            priorAbsenceState === "succeeded" || priorAbsenceState === "already_absent";
+          const presence = recordedAbsenceConfirmed
+            ? undefined
+            : yield* Effect.result(readThreadRemovalPresence(thread));
+          const absenceConfirmed =
+            recordedAbsenceConfirmed ||
+            (presence !== undefined &&
+              Result.isSuccess(presence) &&
+              threadRemovalAbsenceConfirmed(presence.success, deletion.dispatchSequence));
+          if (!absenceConfirmed) {
+            const knownNoDelete =
+              deletion.dispatchSequence === null &&
+              deletionDispatch?.state === "failed" &&
+              presence !== undefined &&
+              Result.isSuccess(presence);
+            const failure: ToolFailure =
+              presence !== undefined && Result.isFailure(presence)
+                ? threadRemovalFailure(presence.failure)
+                : {
+                    code: "unavailable",
+                    message: knownNoDelete
+                      ? "The named thread remains present after a failed delete attempt; the operation will not retry it."
+                      : "The previous thread-delete outcome is unresolved; the operation will not retry it or discard the worktree.",
+                    retry: "reconcile_first",
+                    details: { action: "observe_thread" },
+                  };
+            const stepRevision = yield* persistSoleThreadDiscardStep(
+              stored,
+              current.record.revision,
+              deletion.steps.absence,
+              knownNoDelete ? "skipped" : "outcome_unknown",
+              failure.message,
+              knownNoDelete ? undefined : failure,
+              presence !== undefined && Result.isSuccess(presence)
+                ? "snapshot"
+                : "adapter_inference",
+            );
+            if (stepRevision === null) {
+              const refreshed = yield* store.getOperation(record.requestId);
+              return refreshed?.record ?? current.record;
+            }
+            const skippedRevision = yield* skipSoleThreadDiscardSteps(
+              stored,
+              stepRevision,
+              deletion.steps.absence,
+              "Thread deletion was not confirmed after process termination; worktree discard was not dispatched.",
+            );
+            if (skippedRevision === null) {
+              const refreshed = yield* store.getOperation(record.requestId);
+              return refreshed?.record ?? current.record;
+            }
+            const state = knownNoDelete
+              ? sessionWasStopped
+                ? "partial"
+                : "failed"
+              : "outcome_unknown";
+            return yield* finishSoleThreadDiscardRecovery(stored, skippedRevision, {
+              state,
+              error: failure,
+              recovery: state === "outcome_unknown" ? "observe_operation" : "new_explicit_request",
+              detail: failure.message,
+            });
+          }
+
+          if (!recordedAbsenceConfirmed) {
+            const absentStepState =
+              deletion.dispatchSequence === null ? "already_absent" : "succeeded";
+            const nextRevision = yield* persistSoleThreadDiscardStep(
+              stored,
+              current.record.revision,
+              deletion.steps.absence,
+              absentStepState,
+              "Fresh active and archived inventories confirm the explicitly named thread is absent after process termination; no mutation was replayed.",
+              undefined,
+              "snapshot",
+            );
+            if (nextRevision === null) {
+              const refreshed = yield* store.getOperation(record.requestId);
+              return refreshed?.record ?? current.record;
+            }
+            const refreshed = yield* store.getOperation(record.requestId);
+            if (refreshed === null) return current.record;
+            if (refreshed.record.revision !== nextRevision) return refreshed.record;
+            current = refreshed;
+          }
+          const worktreeDispatchPosition = current.record.steps.findIndex(
+            (step) => step.name === "dispatch_worktree_remove",
+          );
+          const worktreeDispatch =
+            worktreeDispatchPosition < 0
+              ? undefined
+              : current.record.steps[worktreeDispatchPosition];
+          const worktreeWasStarted =
+            worktreeDispatch?.state === "pending" ||
+            worktreeDispatch?.state === "outcome_unknown" ||
+            worktreeDispatch?.state === "succeeded";
+          if (!worktreeWasStarted) {
+            const detail = previousOwner
+              ? "The previous process stopped after thread removal; worktree discard was not resumed."
+              : "Thread removal was observed, but worktree discard did not run and was not resumed.";
+            const skippedRevision = yield* skipSoleThreadDiscardSteps(
+              stored,
+              current.record.revision,
+              deletion.steps.absence,
+              detail,
+            );
+            if (skippedRevision === null) {
+              const refreshed = yield* store.getOperation(record.requestId);
+              return refreshed?.record ?? current.record;
+            }
+            const failure: ToolFailure = {
+              code: "unavailable",
+              message: previousOwner
+                ? "The named thread was removed, but the owning process stopped before worktree discard; inspect the checkout and make a new explicit request if needed."
+                : "The named thread was removed, but worktree discard did not run; inspect the checkout and make a new explicit request if needed.",
+              retry: "change_request",
+              details: { action: "inspect_target" },
+            };
+            return yield* finishSoleThreadDiscardRecovery(stored, skippedRevision, {
+              state: "partial",
+              error: failure,
+              recovery: "inspect_target",
+              detail: failure.message,
+            });
+          }
+
+          const worktreeOutcome = yield* inspectWorktreeDiscardReconciliation(current);
+          return yield* Match.value(worktreeOutcome).pipe(
+            Match.when({ kind: "unknown" }, ({ detail }) =>
+              Effect.gen(function* () {
+                const failure: ToolFailure = {
+                  code: "unavailable",
+                  message: detail,
+                  retry: "reconcile_first",
+                  details: { action: "inspect_target" },
+                };
+                const lastPosition = Math.max(0, current.record.steps.length - 1);
+                const stepsRevision = yield* markUnconfirmedWorktreeDiscardSteps(
+                  stored,
+                  current.record,
+                  current.record.revision,
+                );
+                if (stepsRevision === null) {
+                  const refreshed = yield* store.getOperation(record.requestId);
+                  return refreshed?.record ?? current.record;
+                }
+                const finalRevision = yield* persistSoleThreadDiscardStep(
+                  stored,
+                  stepsRevision,
+                  lastPosition,
+                  "outcome_unknown",
+                  failure.message,
+                  failure,
+                );
+                if (finalRevision === null) {
+                  const refreshed = yield* store.getOperation(record.requestId);
+                  return refreshed?.record ?? current.record;
+                }
+                return yield* finishSoleThreadDiscardRecovery(stored, finalRevision, {
+                  state: "outcome_unknown",
+                  error: failure,
+                  recovery: "observe_operation",
+                  detail: failure.message,
+                });
+              }),
+            ),
+            Match.when({ kind: "branch_missing" }, ({ branch }) =>
+              failWorktreeDiscardBranchRetention(
+                stored,
+                current.record,
+                branch,
+                current.record.revision,
+              ),
+            ),
+            Match.when({ kind: "absent" }, ({ branch }) =>
+              completeWorktreeDiscardReconciliation(
+                stored,
+                current.record,
+                branch,
+                current.record.revision,
+              ),
+            ),
+            Match.exhaustive,
+          );
+        });
 
       const reconcileWorktreeDiscard = (
         stored: StoredOperation,
@@ -3447,6 +4006,14 @@ export class Operations extends Context.Service<Operations, OperationsService>()
         previousOwnerStale: boolean,
       ): Effect.Effect<OperationRecord, LocalStoreError> =>
         Effect.gen(function* () {
+          if (Object.hasOwn(stored.intent, "soleThread")) {
+            return yield* reconcileSoleThreadWorktreeDiscard(
+              stored,
+              record,
+              previousOwner,
+              previousOwnerStale,
+            );
+          }
           if (previousOwner && !previousOwnerStale) return record;
           if (record.dispatch === "not_dispatched" || record.dispatch === "rejected") {
             return yield* failUnsentWorktreeDiscard(stored, record);
@@ -6927,6 +7494,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
         input: WorktreeDiscardInput,
         branch: string,
         intent: OperationIntent,
+        absenceStepPosition: number,
         persist: (
           expectation: Pick<OperationDispatchExpectation, "state" | "dispatch">,
           update: OperationUpdate,
@@ -6989,11 +7557,11 @@ export class Operations extends Context.Service<Operations, OperationsService>()
                 state: "partial",
                 dispatch: "accepted",
                 target: input.worktree,
-                stepPosition: 4,
+                stepPosition: absenceStepPosition,
                 stepState: "failed",
                 stepError: failure,
                 evidence: [observed],
-                evidenceStepPosition: 4,
+                evidenceStepPosition: absenceStepPosition,
                 error: failure,
                 recovery: "inspect_target",
                 recoverableUntil: new Date(
@@ -7017,10 +7585,10 @@ export class Operations extends Context.Service<Operations, OperationsService>()
               state: "completed",
               dispatch: "accepted",
               target: input.worktree,
-              stepPosition: 4,
+              stepPosition: absenceStepPosition,
               stepState: "succeeded",
               evidence: [confirmed],
-              evidenceStepPosition: 4,
+              evidenceStepPosition: absenceStepPosition,
               error: null,
               recovery: "none",
               recoverableUntil: new Date(
@@ -7083,6 +7651,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
             ),
           );
 
+        // fallow-ignore-next-line complexity
         return Effect.gen(function* () {
           const current = yield* store.getOperation(input.requestId);
           if (current === null) {
@@ -7244,7 +7813,7 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           );
 
           stepPosition = 4;
-          yield* recordWorktreeDiscardOutcome(input, branch, intent, persist);
+          yield* recordWorktreeDiscardOutcome(input, branch, intent, 4, persist);
         }).pipe(
           Effect.catchTags({
             WorktreeDiscardClaimLost: () => signalCompletion(input.requestId),
@@ -7290,6 +7859,900 @@ export class Operations extends Context.Service<Operations, OperationsService>()
                 );
               }),
             ),
+          ),
+          Effect.asVoid,
+        );
+      };
+
+      // fallow-ignore-next-line complexity
+      const executeWorktreeDiscardWithSoleThread = (
+        input: WorktreeDiscardInput,
+        checkWorktree: WorktreeDiscardCheck,
+      ): Effect.Effect<void, never> => {
+        const thread = input.removeSoleThread;
+        if (thread === undefined) return executeWorktreeDiscard(input, checkWorktree);
+
+        let stepPosition: WorktreeDiscardSoleThreadStepPosition =
+          WORKTREE_DISCARD_SOLE_THREAD_STEPS.threadCheck;
+        let branch: string | null = null;
+        let initialEligibility: WorktreeDiscardEligibility | null = null;
+        let initialDetail: SynchronizedThreadDetail | null = null;
+        let sessionStopped = false;
+        let threadDeleteAttempted = false;
+        let threadRemoved = false;
+        let worktreeDispatchStarted = false;
+        let worktreeDispatchAccepted = false;
+        let worktreeDispatchMarkerPersisted = false;
+        let dispatchBeforeWorktreeRemove: OperationRecord["dispatch"] | null = null;
+        const worktree = input.worktree;
+        const updateOwnedOperation = (
+          update: OperationUpdate,
+          expectation: Pick<OperationDispatchExpectation, "state" | "dispatch">,
+        ): Effect.Effect<void, LocalStoreError | WorktreeDiscardClaimLost> =>
+          Effect.gen(function* () {
+            const current = yield* store.getOperation(input.requestId);
+            if (current === null) {
+              return yield* Effect.fail(
+                new LocalStoreError({
+                  kind: "request_record_unavailable",
+                  message: REQUEST_RECORD_UNAVAILABLE_MESSAGE,
+                }),
+              );
+            }
+            if (
+              current.ownerProcessNonce !== processNonce ||
+              current.record.state !== expectation.state ||
+              current.record.dispatch !== expectation.dispatch
+            ) {
+              return yield* Effect.fail(new WorktreeDiscardClaimLost());
+            }
+            const updated = yield* store.compareAndUpdateOperation(input.requestId, {
+              ...update,
+              expectedRevision: current.record.revision,
+              onlyIfNonterminal: true,
+            });
+            if (!updated) return yield* Effect.fail(new WorktreeDiscardClaimLost());
+          });
+        const updateOwnedPendingOperation = (
+          update: OperationUpdate,
+          expectedDispatch?: OperationRecord["dispatch"],
+        ): Effect.Effect<void, LocalStoreError | WorktreeDiscardClaimLost> =>
+          Effect.gen(function* () {
+            const current = yield* store.getOperation(input.requestId);
+            if (current === null) {
+              return yield* Effect.fail(
+                new LocalStoreError({
+                  kind: "request_record_unavailable",
+                  message: REQUEST_RECORD_UNAVAILABLE_MESSAGE,
+                }),
+              );
+            }
+            return yield* updateOwnedOperation(update, {
+              state: "pending",
+              dispatch: expectedDispatch ?? current.record.dispatch,
+            });
+          });
+        const updateOwnedAdmittedOperation = (
+          update: OperationUpdate,
+        ): Effect.Effect<void, LocalStoreError | WorktreeDiscardClaimLost> =>
+          updateOwnedOperation(update, { state: "admitted", dispatch: "not_dispatched" });
+        const recordStep = (options: {
+          readonly position: number;
+          readonly state: OperationRecord["steps"][number]["state"];
+          readonly detail: string;
+          readonly error?: ToolFailure | null;
+          readonly kind?: Evidence["kind"];
+          readonly sourceSequence?: number | null;
+          readonly nativeEventId?: string | null;
+          readonly evidence?: ReadonlyArray<Evidence>;
+          readonly intent?: OperationIntent;
+        }): Effect.Effect<void, LocalStoreError | WorktreeDiscardClaimLost> =>
+          evidenceAt({
+            detail: options.detail,
+            kind: options.kind ?? "adapter_inference",
+            sourceSequence: options.sourceSequence ?? null,
+            ...(options.nativeEventId === undefined
+              ? {}
+              : { nativeEventId: options.nativeEventId }),
+          }).pipe(
+            Effect.flatMap((observed) =>
+              updateOwnedPendingOperation({
+                now: observed.observedAt,
+                ...(options.intent === undefined ? {} : { intent: options.intent }),
+                target: worktree,
+                stepPosition: options.position,
+                stepState: options.state,
+                stepError: options.error ?? null,
+                evidence: [...(options.evidence ?? []), observed],
+                evidenceStepPosition: options.position,
+              }),
+            ),
+          );
+        const skipAfter = (
+          position: number,
+          reason: string,
+        ): Effect.Effect<void, LocalStoreError | WorktreeDiscardClaimLost> =>
+          Effect.gen(function* () {
+            const current = yield* store.getOperation(input.requestId);
+            if (current === null) return;
+            const positions = current.record.steps.flatMap((step, index) =>
+              index > position && step.state === "not_started" ? [index] : [],
+            );
+            yield* Effect.forEach(
+              positions,
+              (index) =>
+                recordStep({
+                  position: index,
+                  state: "skipped",
+                  detail: reason,
+                }),
+              { discard: true },
+            );
+          });
+        const finish = (options: {
+          readonly state: OperationRecord["state"];
+          readonly error: ToolFailure | null;
+          readonly recovery: OperationRecord["recovery"];
+          readonly detail: string;
+          readonly dispatch?: OperationRecord["dispatch"];
+        }): Effect.Effect<void, LocalStoreError | WorktreeDiscardClaimLost> =>
+          Effect.gen(function* () {
+            const current = yield* store.getOperation(input.requestId);
+            if (current === null) return;
+            const observed = yield* evidence(options.detail, "adapter_inference");
+            yield* updateOwnedOperation(
+              {
+                now: observed.observedAt,
+                state: options.state,
+                dispatch: options.dispatch ?? current.record.dispatch,
+                target: worktree,
+                error: options.error,
+                recovery: options.recovery,
+                recoverableUntil:
+                  options.state === "outcome_unknown"
+                    ? null
+                    : new Date(
+                        Date.parse(observed.observedAt) + OPERATION_DETAIL_RETENTION_MILLIS,
+                      ).toISOString(),
+                evidence: [observed],
+                evidenceStepPosition: null,
+              },
+              { state: "pending", dispatch: current.record.dispatch },
+            );
+            yield* signalCompletion(input.requestId);
+          });
+        const failAt = (options: {
+          readonly position: WorktreeDiscardSoleThreadStepPosition;
+          readonly failure: ToolFailure;
+          readonly state: OperationRecord["state"];
+          readonly stepState?: OperationRecord["steps"][number]["state"];
+          readonly detail?: string;
+        }): Effect.Effect<void, LocalStoreError | WorktreeDiscardClaimLost> =>
+          Effect.gen(function* () {
+            stepPosition = options.position;
+            yield* recordStep({
+              position: options.position,
+              state:
+                options.stepState ??
+                (options.state === "outcome_unknown" ? "outcome_unknown" : "failed"),
+              detail: options.detail ?? options.failure.message,
+              error: options.failure,
+            });
+            yield* skipAfter(
+              options.position,
+              "The combined discard stopped at an earlier guard or uncertain effect; remaining mutations were not dispatched.",
+            );
+            yield* finish({
+              state: options.state,
+              error: options.failure,
+              recovery:
+                options.state === "outcome_unknown" ? "observe_operation" : "new_explicit_request",
+              detail: options.detail ?? options.failure.message,
+            });
+          });
+        const checkNamedWorktree = () =>
+          Effect.gen(function* () {
+            const checked = yield* checkWorktree(thread);
+            if (
+              initialEligibility !== null &&
+              (checked.branch !== initialEligibility.branch ||
+                checked.registration.revision !== initialEligibility.registration.revision ||
+                checked.registration.environmentId !==
+                  initialEligibility.registration.environmentId)
+            ) {
+              return yield* Effect.fail(
+                new ObservationError({
+                  kind: "stale_generation",
+                  message:
+                    "The worktree branch or instance registration changed during sole-thread discard; the prior intent will not apply to a replacement target.",
+                }),
+              );
+            }
+            return checked;
+          });
+        const checkThreadReady = (options?: {
+          readonly initialDetail?: SynchronizedThreadDetail;
+          readonly initialSession?: {
+            readonly session: SynchronizedThreadDetail["thread"]["session"];
+          };
+          readonly expectedSessionStop?: ThreadSessionStopRecovery;
+        }) =>
+          Effect.gen(function* () {
+            const checked = yield* checkThreadForRemoval(thread, options);
+            return Match.value(checked).pipe(
+              Match.when({ kind: "ready" }, ({ detail, sequence }) => {
+                if (detail.thread.branch !== null && detail.thread.branch !== branch) {
+                  return {
+                    kind: "blocked" as const,
+                    sequence,
+                    failure: threadRemovalCheckFailure(
+                      "uncheckable_target",
+                      `Thread ${thread.threadId} records branch ${JSON.stringify(detail.thread.branch)}, but the live worktree branch is ${JSON.stringify(branch)}.`,
+                    ),
+                  };
+                }
+                return { kind: "ready" as const, detail };
+              }),
+              Match.when({ kind: "blocked" }, ({ failure, sequence }) => ({
+                kind: "blocked" as const,
+                failure,
+                sequence,
+              })),
+              Match.when({ kind: "absent" }, ({ sequence }) => ({
+                kind: "blocked" as const,
+                failure: threadRemovalCheckFailure(
+                  "stale_state",
+                  "The explicitly named thread is no longer present to authorize this worktree discard.",
+                ),
+                sequence,
+              })),
+              Match.exhaustive,
+            );
+          });
+        const persistCurrent = (
+          expectation: Pick<OperationDispatchExpectation, "state" | "dispatch">,
+          update: OperationUpdate,
+        ): Effect.Effect<void, LocalStoreError | WorktreeDiscardClaimLost> =>
+          updateOwnedOperation(update, expectation);
+
+        // fallow-ignore-next-line complexity
+        return Effect.gen(function* () {
+          const current = yield* store.getOperation(input.requestId);
+          if (current === null) {
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: "request_record_unavailable",
+                message: REQUEST_RECORD_UNAVAILABLE_MESSAGE,
+              }),
+            );
+          }
+          const admitted = yield* evidence(
+            "Sole-thread worktree discard admission was committed; this process owns the ordered cleanup attempt.",
+            "adapter_inference",
+          );
+          yield* updateOwnedAdmittedOperation({
+            now: admitted.observedAt,
+            state: "pending",
+            dispatch: "not_dispatched",
+            target: worktree,
+            stepPosition,
+            stepState: "pending",
+            evidence: [admitted],
+            evidenceStepPosition: stepPosition,
+            recovery: "observe_operation",
+          });
+
+          const initial = yield* checkNamedWorktree();
+          initialEligibility = initial;
+          branch = initial.branch;
+          const initialThread = yield* checkThreadReady();
+          if (initialThread.kind === "blocked") {
+            return yield* failAt({
+              position: WORKTREE_DISCARD_SOLE_THREAD_STEPS.threadCheck,
+              failure: initialThread.failure,
+              state: "failed",
+            });
+          }
+          initialDetail = initialThread.detail;
+          yield* recordStep({
+            position: WORKTREE_DISCARD_SOLE_THREAD_STEPS.threadCheck,
+            state: "succeeded",
+            kind: "snapshot",
+            sourceSequence: initialThread.detail.snapshotSequence,
+            detail: `Fresh worktree identity, complete active and archived reference inventories, and thread detail confirm ${thread.threadId} is the sole inactive reference to branch ${branch}.`,
+            evidence: initial.evidence,
+            intent: { ...current.intent, branch },
+          });
+
+          stepPosition = WORKTREE_DISCARD_SOLE_THREAD_STEPS.beforeSessionStop;
+          const beforeStopWorktree = yield* checkNamedWorktree();
+          const beforeStop = yield* checkThreadReady({ initialDetail: initialDetail });
+          if (beforeStop.kind === "blocked") {
+            return yield* failAt({
+              position: WORKTREE_DISCARD_SOLE_THREAD_STEPS.beforeSessionStop,
+              failure: beforeStop.failure,
+              state: "failed",
+            });
+          }
+          yield* recordStep({
+            position: WORKTREE_DISCARD_SOLE_THREAD_STEPS.beforeSessionStop,
+            state: "succeeded",
+            kind: "snapshot",
+            sourceSequence: beforeStop.detail.snapshotSequence,
+            detail: `A fresh pre-shutdown check confirms ${thread.threadId} remains the sole inactive reference to the same worktree.`,
+            evidence: beforeStopWorktree.evidence,
+          });
+
+          stepPosition = WORKTREE_DISCARD_SOLE_THREAD_STEPS.sessionCapture;
+          const stoppedResult = yield* Effect.result(
+            stopThreadSessionForOperation({
+              requestId: input.requestId,
+              thread,
+              steps: {
+                capture: WORKTREE_DISCARD_SOLE_THREAD_STEPS.sessionCapture,
+                dispatch: WORKTREE_DISCARD_SOLE_THREAD_STEPS.sessionDispatch,
+                shutdown: WORKTREE_DISCARD_SOLE_THREAD_STEPS.sessionShutdown,
+              },
+              waitMs: MAX_THREAD_WAIT_MILLIS,
+              preDispatchGuard: (detail) => threadRemovalActivityFailure(thread, detail),
+            }),
+          );
+          if (Result.isFailure(stoppedResult)) {
+            const refreshed = yield* store.getOperation(input.requestId);
+            const sessionDispatch =
+              refreshed?.record.steps[WORKTREE_DISCARD_SOLE_THREAD_STEPS.sessionDispatch]?.state;
+            const sessionShutdown =
+              refreshed?.record.steps[WORKTREE_DISCARD_SOLE_THREAD_STEPS.sessionShutdown]?.state;
+            const uncertain =
+              sessionDispatch === "pending" ||
+              sessionDispatch === "outcome_unknown" ||
+              sessionShutdown === "outcome_unknown" ||
+              refreshed?.record.dispatch === "unknown";
+            return yield* failAt({
+              position: uncertain
+                ? WORKTREE_DISCARD_SOLE_THREAD_STEPS.sessionShutdown
+                : WORKTREE_DISCARD_SOLE_THREAD_STEPS.sessionCapture,
+              failure: threadRemovalFailure(stoppedResult.failure),
+              state: uncertain ? "outcome_unknown" : "failed",
+            });
+          }
+          const sessionOutcome = stoppedResult.success;
+          sessionStopped = sessionOutcome.kind === "observed";
+          const afterStop = yield* store.getOperation(input.requestId);
+          if (afterStop === null) {
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: "request_record_unavailable",
+                message: REQUEST_RECORD_UNAVAILABLE_MESSAGE,
+              }),
+            );
+          }
+          yield* updateOwnedPendingOperation(
+            {
+              now: yield* nowIso,
+              intent: afterStop.intent,
+              target: worktree,
+            },
+            afterStop.record.dispatch,
+          );
+          if (
+            sessionOutcome.kind === "not_dispatched" ||
+            sessionOutcome.kind === "outcome_unknown"
+          ) {
+            return yield* failAt({
+              position:
+                sessionOutcome.kind === "outcome_unknown"
+                  ? WORKTREE_DISCARD_SOLE_THREAD_STEPS.sessionShutdown
+                  : WORKTREE_DISCARD_SOLE_THREAD_STEPS.sessionDispatch,
+              failure: sessionOutcome.error,
+              state: sessionOutcome.kind === "outcome_unknown" ? "outcome_unknown" : "failed",
+            });
+          }
+
+          const sessionRecovery = threadSessionStopRecovery(afterStop.intent);
+          const deletionCheckOptions = {
+            initialDetail: initialDetail,
+            initialSession: {
+              session:
+                sessionOutcome.kind === "already_stopped" ? null : beforeStop.detail.thread.session,
+            },
+            ...(sessionOutcome.kind === "observed" && sessionRecovery !== null
+              ? { expectedSessionStop: sessionRecovery }
+              : {}),
+          };
+          const checkBeforeDeletion = () =>
+            Effect.gen(function* () {
+              const eligible = yield* checkNamedWorktree();
+              const checked = yield* checkThreadReady(deletionCheckOptions);
+              return { eligible, checked };
+            });
+
+          stepPosition = WORKTREE_DISCARD_SOLE_THREAD_STEPS.beforeThreadDelete;
+          const beforePrepare = yield* checkBeforeDeletion();
+          if (beforePrepare.checked.kind === "blocked") {
+            return yield* failAt({
+              position: WORKTREE_DISCARD_SOLE_THREAD_STEPS.beforeThreadDelete,
+              failure: beforePrepare.checked.failure,
+              state: sessionStopped ? "partial" : "failed",
+            });
+          }
+          yield* recordStep({
+            position: WORKTREE_DISCARD_SOLE_THREAD_STEPS.beforeThreadDelete,
+            state: "succeeded",
+            kind: "snapshot",
+            sourceSequence: beforePrepare.checked.detail.snapshotSequence,
+            detail:
+              "Fresh reference, association, inactive-execution, request, and provider-session checks pass before thread-delete preparation.",
+            evidence: beforePrepare.eligible.evidence,
+          });
+
+          const prepared = yield* Effect.result(connections.prepareThreadDelete(thread.instanceId));
+          if (Result.isFailure(prepared)) {
+            return yield* failAt({
+              position: WORKTREE_DISCARD_SOLE_THREAD_STEPS.threadDeleteDispatch,
+              failure: threadRemovalFailure(prepared.failure),
+              state: sessionStopped ? "partial" : "failed",
+            });
+          }
+          const beforeDispatch = yield* checkBeforeDeletion();
+          if (beforeDispatch.checked.kind === "blocked") {
+            return yield* failAt({
+              position: WORKTREE_DISCARD_SOLE_THREAD_STEPS.beforeThreadDelete,
+              failure: beforeDispatch.checked.failure,
+              state: sessionStopped ? "partial" : "failed",
+            });
+          }
+          yield* recordStep({
+            position: WORKTREE_DISCARD_SOLE_THREAD_STEPS.beforeThreadDelete,
+            state: "succeeded",
+            kind: "snapshot",
+            sourceSequence: beforeDispatch.checked.detail.snapshotSequence,
+            detail:
+              "A second fresh reference, association, inactive-execution, request, and session check passes immediately before thread deletion.",
+            evidence: beforeDispatch.eligible.evidence,
+          });
+
+          const commandIdResult = yield* Effect.result(crypto.randomUUIDv4);
+          if (Result.isFailure(commandIdResult)) {
+            return yield* failAt({
+              position: WORKTREE_DISCARD_SOLE_THREAD_STEPS.threadDeleteDispatch,
+              failure: {
+                code: "unavailable",
+                message:
+                  "The operation supervisor could not create a thread-deletion command identity.",
+                retry: "change_request",
+                details: {},
+              },
+              state: sessionStopped ? "partial" : "failed",
+            });
+          }
+          const commandId = commandIdResult.success;
+          const beforeThreadDispatch = yield* store.getOperation(input.requestId);
+          if (beforeThreadDispatch === null) {
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: "request_record_unavailable",
+                message: REQUEST_RECORD_UNAVAILABLE_MESSAGE,
+              }),
+            );
+          }
+          const threadRemoval: ThreadRemovalRecovery = {
+            instanceId: thread.instanceId,
+            threadId: thread.threadId,
+            commandId,
+            dispatchSequence: null,
+            steps: {
+              dispatch: WORKTREE_DISCARD_SOLE_THREAD_STEPS.threadDeleteDispatch,
+              absence: WORKTREE_DISCARD_SOLE_THREAD_STEPS.threadAbsence,
+            },
+          };
+          const dispatchMarker = yield* evidenceAt({
+            detail:
+              "The named thread-delete command identity and fresh sole-thread checks were persisted before dispatch; the command will not be replayed.",
+            kind: "adapter_inference",
+            sourceSequence: beforeDispatch.checked.detail.snapshotSequence,
+            nativeEventId: commandId,
+          });
+          yield* updateOwnedPendingOperation(
+            {
+              now: dispatchMarker.observedAt,
+              intent: { ...beforeThreadDispatch.intent, threadRemoval },
+              target: worktree,
+              state: "pending",
+              dispatch: "unknown",
+              commandId,
+              stepPosition: WORKTREE_DISCARD_SOLE_THREAD_STEPS.threadDeleteDispatch,
+              stepState: "pending",
+              evidence: [dispatchMarker],
+              evidenceStepPosition: WORKTREE_DISCARD_SOLE_THREAD_STEPS.threadDeleteDispatch,
+              recovery: "observe_operation",
+            },
+            beforeThreadDispatch.record.dispatch,
+          );
+          threadDeleteAttempted = true;
+          stepPosition = WORKTREE_DISCARD_SOLE_THREAD_STEPS.threadDeleteDispatch;
+
+          const dispatched = yield* Effect.result(
+            prepared.success.dispatch({ threadId: thread.threadId, commandId }),
+          );
+          if (Result.isFailure(dispatched)) {
+            const failure = threadRemovalFailure(dispatched.failure);
+            const uncertain =
+              dispatched.failure instanceof T3CodeAdapterError && dispatched.failure.uncertain;
+            const dispatch = uncertain
+              ? "unknown"
+              : dispatched.failure instanceof T3CodeAdapterError &&
+                  dispatched.failure.kind === "command_rejected"
+                ? "rejected"
+                : "not_dispatched";
+            yield* updateOwnedPendingOperation(
+              {
+                now: yield* nowIso,
+                target: worktree,
+                dispatch,
+                stepPosition: WORKTREE_DISCARD_SOLE_THREAD_STEPS.threadDeleteDispatch,
+                stepState: uncertain ? "outcome_unknown" : "failed",
+                stepError: failure,
+                evidence: [
+                  yield* evidenceAt({
+                    detail: uncertain
+                      ? "The named thread-delete reply was lost; no retry will be sent."
+                      : failure.message,
+                    kind: uncertain ? "adapter_inference" : "rpc_result",
+                    sourceSequence: null,
+                    nativeEventId: commandId,
+                  }),
+                ],
+                evidenceStepPosition: WORKTREE_DISCARD_SOLE_THREAD_STEPS.threadDeleteDispatch,
+                error: failure,
+                recovery: uncertain ? "observe_operation" : "new_explicit_request",
+              },
+              "unknown",
+            );
+            const presence = uncertain
+              ? yield* waitForThreadRemovalAbsence(thread, null, MAX_THREAD_WAIT_MILLIS)
+              : yield* Effect.result(readThreadRemovalPresence(thread));
+            const absent =
+              Result.isSuccess(presence) &&
+              (uncertain
+                ? threadRemovalAbsenceConfirmed(presence.success, null)
+                : presence.success.absent);
+            if (!absent) {
+              const presenceUnknown = Result.isFailure(presence);
+              const finalFailure = presenceUnknown
+                ? threadRemovalFailure(presence.failure)
+                : failure;
+              if (uncertain || presenceUnknown) {
+                return yield* failAt({
+                  position: WORKTREE_DISCARD_SOLE_THREAD_STEPS.threadAbsence,
+                  failure: finalFailure,
+                  state: "outcome_unknown",
+                });
+              }
+              return yield* failAt({
+                position: WORKTREE_DISCARD_SOLE_THREAD_STEPS.threadDeleteDispatch,
+                failure: finalFailure,
+                state: sessionStopped ? "partial" : "failed",
+              });
+            }
+            threadRemoved = true;
+            yield* recordStep({
+              position: WORKTREE_DISCARD_SOLE_THREAD_STEPS.threadAbsence,
+              state: "already_absent",
+              kind: "snapshot",
+              sourceSequence: Math.min(
+                presence.success.activeSequence,
+                presence.success.archivedSequence,
+              ),
+              nativeEventId: commandId,
+              detail:
+                "Fresh active and archived inventories confirm the named thread is absent; the observation does not attribute absence to a particular client.",
+            });
+          } else {
+            const acceptedEvidence = yield* evidenceAt({
+              detail:
+                "T3Code accepted deletion of the explicitly named sole thread; fresh active and archived inventories must confirm its absence before worktree discard.",
+              kind: "rpc_result",
+              sourceSequence: dispatched.success.sequence,
+              nativeEventId: commandId,
+            });
+            const currentAfterDispatch = yield* store.getOperation(input.requestId);
+            if (currentAfterDispatch === null) {
+              return yield* Effect.fail(
+                new LocalStoreError({
+                  kind: "request_record_unavailable",
+                  message: REQUEST_RECORD_UNAVAILABLE_MESSAGE,
+                }),
+              );
+            }
+            const acceptedRecovery: ThreadRemovalRecovery = {
+              ...threadRemoval,
+              dispatchSequence: dispatched.success.sequence,
+            };
+            yield* updateOwnedPendingOperation(
+              {
+                now: acceptedEvidence.observedAt,
+                intent: { ...currentAfterDispatch.intent, threadRemoval: acceptedRecovery },
+                target: worktree,
+                state: "pending",
+                dispatch: "accepted",
+                commandId,
+                stepPosition: WORKTREE_DISCARD_SOLE_THREAD_STEPS.threadDeleteDispatch,
+                stepState: "succeeded",
+                stepError: null,
+                evidence: [acceptedEvidence],
+                evidenceStepPosition: WORKTREE_DISCARD_SOLE_THREAD_STEPS.threadDeleteDispatch,
+                error: null,
+                recovery: "observe_operation",
+              },
+              "unknown",
+            );
+            const absence = yield* waitForThreadRemovalAbsence(
+              thread,
+              dispatched.success.sequence,
+              MAX_THREAD_WAIT_MILLIS,
+            );
+            if (
+              Result.isFailure(absence) ||
+              !threadRemovalAbsenceConfirmed(absence.success, dispatched.success.sequence)
+            ) {
+              const failure = Result.isFailure(absence)
+                ? threadRemovalFailure(absence.failure)
+                : {
+                    code: "unavailable" as const,
+                    message:
+                      "Fresh active and archived inventories did not confirm that the named thread was removed; the worktree will be retained.",
+                    retry: "reconcile_first" as const,
+                    details: { action: "observe_thread" },
+                  };
+              return yield* failAt({
+                position: WORKTREE_DISCARD_SOLE_THREAD_STEPS.threadAbsence,
+                failure,
+                state: "outcome_unknown",
+              });
+            }
+            threadRemoved = true;
+            yield* recordStep({
+              position: WORKTREE_DISCARD_SOLE_THREAD_STEPS.threadAbsence,
+              state: "succeeded",
+              kind: "snapshot",
+              sourceSequence: Math.min(
+                absence.success.activeSequence,
+                absence.success.archivedSequence,
+              ),
+              nativeEventId: commandId,
+              detail:
+                "Fresh active and archived inventories after the accepted delete command confirm the named thread is absent.",
+            });
+          }
+
+          stepPosition = WORKTREE_DISCARD_SOLE_THREAD_STEPS.postRemovalReferences;
+          const orphanCheck = yield* checkWorktree();
+          if (
+            orphanCheck.branch !== branch ||
+            (initialEligibility !== null &&
+              (orphanCheck.registration.revision !== initialEligibility.registration.revision ||
+                orphanCheck.registration.environmentId !==
+                  initialEligibility.registration.environmentId))
+          ) {
+            return yield* failAt({
+              position: WORKTREE_DISCARD_SOLE_THREAD_STEPS.postRemovalReferences,
+              failure: {
+                code: "stale_state",
+                message:
+                  "The worktree branch or instance registration changed after thread removal; the discard will not apply to a replacement target.",
+                retry: "reconcile_first",
+                details: {},
+              },
+              state: "partial",
+            });
+          }
+          yield* recordStep({
+            position: WORKTREE_DISCARD_SOLE_THREAD_STEPS.postRemovalReferences,
+            state: "succeeded",
+            kind: "snapshot",
+            detail:
+              "A fresh complete VCS and active/archived inventory recheck confirms the removed thread left no worktree references.",
+            evidence: orphanCheck.evidence,
+          });
+
+          stepPosition = WORKTREE_DISCARD_SOLE_THREAD_STEPS.beforeWorktreeDiscard;
+          const finalCheck = yield* checkWorktree();
+          if (
+            finalCheck.branch !== branch ||
+            finalCheck.registration.revision !== orphanCheck.registration.revision ||
+            finalCheck.registration.environmentId !== orphanCheck.registration.environmentId
+          ) {
+            return yield* failAt({
+              position: WORKTREE_DISCARD_SOLE_THREAD_STEPS.beforeWorktreeDiscard,
+              failure: {
+                code: "stale_state",
+                message:
+                  "The worktree branch or instance registration changed before discard; the prior request will not apply to a replacement target.",
+                retry: "reconcile_first",
+                details: {},
+              },
+              state: "partial",
+            });
+          }
+          yield* recordStep({
+            position: WORKTREE_DISCARD_SOLE_THREAD_STEPS.beforeWorktreeDiscard,
+            state: "succeeded",
+            kind: "snapshot",
+            detail: `A second fresh VCS and active/archived inventory check confirms branch ${branch} is still the intended orphan checkout immediately before discard.`,
+            evidence: finalCheck.evidence,
+          });
+
+          const beforeWorktreeDispatch = yield* store.getOperation(input.requestId);
+          if (beforeWorktreeDispatch === null) {
+            return yield* Effect.fail(
+              new LocalStoreError({
+                kind: "request_record_unavailable",
+                message: REQUEST_RECORD_UNAVAILABLE_MESSAGE,
+              }),
+            );
+          }
+          const dispatchStarted = yield* evidence(
+            "The single VCS remove attempt is crossing its dispatch boundary; recovery will only observe state and never resend it.",
+            "adapter_inference",
+          );
+          dispatchBeforeWorktreeRemove = beforeWorktreeDispatch.record.dispatch;
+          yield* persistCurrent(
+            {
+              state: beforeWorktreeDispatch.record.state,
+              dispatch: beforeWorktreeDispatch.record.dispatch,
+            },
+            {
+              now: dispatchStarted.observedAt,
+              intent: { ...beforeWorktreeDispatch.intent, branch },
+              state: "pending",
+              dispatch: "unknown",
+              target: worktree,
+              stepPosition: WORKTREE_DISCARD_SOLE_THREAD_STEPS.worktreeDispatch,
+              stepState: "pending",
+              evidence: [dispatchStarted],
+              evidenceStepPosition: WORKTREE_DISCARD_SOLE_THREAD_STEPS.worktreeDispatch,
+              recovery: "observe_operation",
+            },
+          );
+          worktreeDispatchMarkerPersisted = true;
+          const intent = { ...beforeWorktreeDispatch.intent, branch };
+          stepPosition = WORKTREE_DISCARD_SOLE_THREAD_STEPS.worktreeDispatch;
+          yield* connections.removeWorktree(worktree, finalCheck.registration, () => {
+            worktreeDispatchStarted = true;
+          });
+          worktreeDispatchAccepted = true;
+          const accepted = yield* evidence(
+            "The T3Code VCS remove RPC returned successfully; a separate fresh inventory must establish worktree absence and branch retention.",
+            "adapter_inference",
+          );
+          yield* persistCurrent(
+            { state: "pending", dispatch: "unknown" },
+            {
+              now: accepted.observedAt,
+              state: "pending",
+              dispatch: "accepted",
+              target: worktree,
+              stepPosition: WORKTREE_DISCARD_SOLE_THREAD_STEPS.worktreeDispatch,
+              stepState: "succeeded",
+              evidence: [accepted],
+              evidenceStepPosition: WORKTREE_DISCARD_SOLE_THREAD_STEPS.worktreeDispatch,
+              recovery: "observe_operation",
+            },
+          );
+          stepPosition = WORKTREE_DISCARD_SOLE_THREAD_STEPS.worktreeResponse;
+          const response = yield* evidence(
+            "T3Code acknowledged forced removal of the named checkout; the acknowledgement alone does not prove the checkout is absent.",
+            "rpc_result",
+          );
+          yield* persistCurrent(
+            { state: "pending", dispatch: "accepted" },
+            {
+              now: response.observedAt,
+              state: "pending",
+              dispatch: "accepted",
+              target: worktree,
+              stepPosition: WORKTREE_DISCARD_SOLE_THREAD_STEPS.worktreeResponse,
+              stepState: "succeeded",
+              evidence: [response],
+              evidenceStepPosition: WORKTREE_DISCARD_SOLE_THREAD_STEPS.worktreeResponse,
+              recovery: "observe_operation",
+            },
+          );
+          stepPosition = WORKTREE_DISCARD_SOLE_THREAD_STEPS.worktreeAbsence;
+          yield* recordWorktreeDiscardOutcome(
+            input,
+            branch,
+            intent,
+            WORKTREE_DISCARD_SOLE_THREAD_STEPS.worktreeAbsence,
+            persistCurrent,
+          );
+        }).pipe(
+          Effect.catchTags({
+            WorktreeDiscardClaimLost: () => signalCompletion(input.requestId),
+          }),
+          Effect.catch((error: LocalStoreError | T3CodeAdapterError | ObservationError) =>
+            // fallow-ignore-next-line complexity
+            Effect.gen(function* () {
+              const current = yield* store.getOperation(input.requestId);
+              if (current === null) return;
+              const failure =
+                stepPosition >= WORKTREE_DISCARD_SOLE_THREAD_STEPS.postRemovalReferences
+                  ? worktreeDiscardFailure(error)
+                  : threadRemovalFailure(error);
+              const threadSteps = current.record.steps;
+              const threadDeleteDispatchState =
+                threadSteps[WORKTREE_DISCARD_SOLE_THREAD_STEPS.threadDeleteDispatch]?.state;
+              const threadAbsenceState =
+                threadSteps[WORKTREE_DISCARD_SOLE_THREAD_STEPS.threadAbsence]?.state;
+              const sessionDispatchState =
+                threadSteps[WORKTREE_DISCARD_SOLE_THREAD_STEPS.sessionDispatch]?.state;
+              const sessionShutdownState =
+                threadSteps[WORKTREE_DISCARD_SOLE_THREAD_STEPS.sessionShutdown]?.state;
+              const threadAbsenceConfirmed =
+                threadAbsenceState === "succeeded" || threadAbsenceState === "already_absent";
+              const uncertainThreadEffect =
+                threadDeleteAttempted &&
+                !threadAbsenceConfirmed &&
+                (threadDeleteDispatchState === "pending" ||
+                  threadDeleteDispatchState === "outcome_unknown" ||
+                  threadDeleteDispatchState === "succeeded" ||
+                  threadAbsenceState === "outcome_unknown");
+              const uncertainSessionEffect =
+                sessionDispatchState === "outcome_unknown" ||
+                sessionShutdownState === "outcome_unknown" ||
+                (sessionDispatchState === "succeeded" &&
+                  sessionShutdownState !== "succeeded" &&
+                  sessionShutdownState !== "already_absent");
+              const progress = worktreeDispatchStarted
+                ? worktreeDiscardFailureProgress({
+                    error,
+                    dispatchStarted: worktreeDispatchStarted,
+                    dispatchAccepted: worktreeDispatchAccepted,
+                    now: yield* nowIso,
+                  })
+                : null;
+              const state: OperationRecord["state"] =
+                progress?.state === "outcome_unknown" ||
+                uncertainThreadEffect ||
+                uncertainSessionEffect
+                  ? "outcome_unknown"
+                  : threadRemoved || sessionStopped
+                    ? "partial"
+                    : (progress?.state ?? "failed");
+              const stepState = state === "outcome_unknown" ? "outcome_unknown" : "failed";
+              yield* recordStep({
+                position: stepPosition,
+                state: stepState,
+                detail: failure.message,
+                error: failure,
+                kind:
+                  worktreeDispatchStarted && error instanceof T3CodeAdapterError && !error.uncertain
+                    ? "rpc_result"
+                    : "adapter_inference",
+              });
+              yield* skipAfter(
+                stepPosition,
+                "The combined discard stopped after a failure or uncertain effect; no later mutation was dispatched.",
+              );
+              yield* finish({
+                state,
+                error: failure,
+                ...(progress !== null
+                  ? { dispatch: progress.dispatch }
+                  : worktreeDispatchMarkerPersisted &&
+                      !worktreeDispatchStarted &&
+                      dispatchBeforeWorktreeRemove !== null
+                    ? { dispatch: dispatchBeforeWorktreeRemove }
+                    : {}),
+                recovery:
+                  state === "outcome_unknown" ? "observe_operation" : "new_explicit_request",
+                detail:
+                  state === "partial" && threadRemoved
+                    ? "The named thread was removed, but the worktree was retained after a later guard or discard failure."
+                    : failure.message,
+              });
+            }).pipe(Effect.catch(() => Effect.void)),
           ),
           Effect.asVoid,
         );
@@ -9060,36 +10523,40 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           const fingerprint = yield* store.fingerprintRequest("worktree_discard", input);
           const existing = yield* findExistingOperation(input.requestId, fingerprint);
           if (existing !== null) return existing;
-          if (input.removeSoleThread !== undefined) {
+          if (
+            input.removeSoleThread !== undefined &&
+            input.removeSoleThread.instanceId !== input.worktree.instanceId
+          ) {
             return yield* Effect.fail(
               new OperationServiceError({
-                kind: "unsupported_worktree_discard_variant",
-                message:
-                  "Combined thread removal and worktree discard is not available yet. Remove the thread with thread_remove, then make a separate explicit worktree_discard request.",
+                kind: "invalid_worktree_discard_target",
+                message: "The named thread and worktree must belong to the same T3Code instance.",
               }),
             );
           }
 
           const { worktree } = input;
+          const intent: OperationIntent = {
+            instanceId: worktree.instanceId,
+            repositoryPath: worktree.repositoryPath,
+            worktreePath: worktree.worktreePath,
+            ...(input.removeSoleThread === undefined ? {} : { soleThread: input.removeSoleThread }),
+          };
           return yield* admitAndRun({
             requestId: input.requestId,
             fingerprint,
             tool: "worktree_discard",
-            intent: {
-              instanceId: worktree.instanceId,
-              repositoryPath: worktree.repositoryPath,
-              worktreePath: worktree.worktreePath,
-            },
+            intent,
             target: worktree,
             completionMeans: "worktree_absent",
-            steps: [
-              "check_orphan_eligibility",
-              "recheck_orphan_eligibility",
-              "dispatch_worktree_remove",
-              "record_worktree_remove_response",
-              "confirm_worktree_absence",
-            ],
-            execute: executeWorktreeDiscard(input, checkOrphan),
+            steps:
+              input.removeSoleThread === undefined
+                ? WORKTREE_DISCARD_STEP_NAMES
+                : WORKTREE_DISCARD_SOLE_THREAD_STEP_NAMES,
+            execute:
+              input.removeSoleThread === undefined
+                ? executeWorktreeDiscard(input, checkOrphan)
+                : executeWorktreeDiscardWithSoleThread(input, checkOrphan),
           });
         });
 

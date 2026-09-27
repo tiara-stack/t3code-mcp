@@ -2147,6 +2147,7 @@ export interface T3CodeAdapterService {
     readonly credential: string;
     readonly repositoryPath: string;
     readonly worktreePath: string;
+    readonly onDispatchStart: () => void;
   }) => Effect.Effect<void, T3CodeAdapterError>;
   readonly createThread: <E>(
     input: { readonly endpoint: string; readonly credential: string } & ThreadCreateRequest & {
@@ -3460,17 +3461,20 @@ export class T3CodeAdapter extends Context.Service<T3CodeAdapter, T3CodeAdapterS
         readonly credential: string;
         readonly repositoryPath: string;
         readonly worktreePath: string;
+        readonly onDispatchStart: () => void;
       }): Effect.Effect<void, T3CodeAdapterError> =>
         withCapacity(
           withAuthenticatedRpc(
             input.endpoint,
             input.credential,
-            (client) =>
-              client["vcs.removeWorktree"]({
+            (client) => {
+              input.onDispatchStart();
+              return client["vcs.removeWorktree"]({
                 cwd: input.repositoryPath,
                 path: input.worktreePath,
                 force: true,
-              }).pipe(Effect.mapError(worktreeRemoveError)),
+              }).pipe(Effect.mapError(worktreeRemoveError));
+            },
             { uncertainOnTimeout: true },
           ),
         ).pipe(Effect.mapError(worktreeRemoveError));

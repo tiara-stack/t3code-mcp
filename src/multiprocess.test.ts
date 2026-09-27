@@ -21,6 +21,8 @@ type JsonRpcMessage = {
   readonly id?: number;
   readonly stage?: string;
   readonly operation?: unknown;
+  readonly data?: unknown;
+  readonly removeCalls?: number;
   readonly result?: {
     readonly tools?: ReadonlyArray<{ readonly name: string }>;
     readonly isError?: boolean;
@@ -197,6 +199,28 @@ const startThreadRemovalWorker = async (
         T3CODE_MCP_DATABASE_PATH: databasePath,
         T3CODE_MCP_THREAD_REMOVE_MODE: mode,
         T3CODE_MCP_THREAD_REMOVE_REQUEST_ID: requestId,
+      },
+      stdio: ["ignore", "pipe", "inherit"],
+    },
+  );
+  return { child, next: waitForMessage(child) };
+};
+
+const startSoleThreadDiscardWorker = async (
+  databasePath: string,
+  mode: "start" | "recover",
+  requestId: string,
+): Promise<Server> => {
+  const child = spawn(
+    process.execPath,
+    [tsxCliPath, "scripts/multiprocess-sole-thread-discard-worker.ts"],
+    {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        T3CODE_MCP_DATABASE_PATH: databasePath,
+        T3CODE_MCP_SOLE_DISCARD_MODE: mode,
+        T3CODE_MCP_SOLE_DISCARD_REQUEST_ID: requestId,
       },
       stdio: ["ignore", "pipe", "inherit"],
     },
@@ -1011,6 +1035,68 @@ describe("shared SQLite mutation admission", () => {
         }),
       ),
     60000,
+  );
+
+  it.live(
+    "reconciles sole-thread discard after its owner dies without replaying the worktree removal",
+    () =>
+      withServers("t3code-mcp-sole-thread-discard-recovery-", ({ databasePath, servers }) =>
+        Effect.gen(function* () {
+          const requestId = "sole-thread-discard-process-death";
+          yield* seed(databasePath, [{ instanceId: "sole-discard-instance" }]);
+          const owner = yield* Effect.promise(() =>
+            startSoleThreadDiscardWorker(databasePath, "start", requestId),
+          );
+          servers.add(owner);
+          const dispatch = yield* Effect.promise(() => owner.next());
+          expect(dispatch.stage).toBe("worktree-remove-dispatch-started");
+          yield* Effect.promise(
+            () =>
+              new Promise<void>((resolve) => {
+                owner.child.once("exit", () => resolve());
+                owner.child.kill("SIGKILL");
+              }),
+          );
+          servers.delete(owner);
+          yield* agePendingOperation(databasePath, requestId);
+
+          const observer = yield* Effect.promise(() =>
+            startSoleThreadDiscardWorker(databasePath, "recover", requestId),
+          );
+          servers.add(observer);
+          const recovered = yield* Effect.promise(() => observer.next());
+          expect(recovered.stage).toBe("result");
+          expect(recovered.data).toMatchObject({
+            result: {
+              kind: "ok",
+              value: { operation: { tool: "worktree_discard", state: "outcome_unknown" } },
+            },
+          });
+          const recoveredData = recovered.data as {
+            readonly result: {
+              readonly value: {
+                readonly operation: {
+                  readonly steps: ReadonlyArray<{ readonly name: string; readonly state: string }>;
+                };
+              };
+            };
+          };
+          expect(recoveredData.result.value.operation.steps).toEqual(
+            expect.arrayContaining([
+              expect.objectContaining({
+                name: "dispatch_worktree_remove",
+                state: "outcome_unknown",
+              }),
+              expect.objectContaining({
+                name: "record_worktree_remove_response",
+                state: "skipped",
+              }),
+            ]),
+          );
+          expect(recovered.removeCalls).toBe(0);
+        }),
+      ),
+    60_000,
   );
 
   it.live(

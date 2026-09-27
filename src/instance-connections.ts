@@ -1270,18 +1270,18 @@ export class InstanceConnections extends Context.Service<
             }
             yield* withInstanceCapacity(
               instanceId,
-              Effect.suspend(() => {
+              Effect.suspend(() =>
                 // Keep dispatch on this verified connection snapshot. A later
                 // registration update cannot retarget the removal to another
                 // endpoint after the identity check above.
-                onDispatchStart();
-                return adapter.removeWorktree({
+                adapter.removeWorktree({
                   endpoint: connection.endpoint,
                   credential: connection.credential,
                   repositoryPath: worktree.repositoryPath,
                   worktreePath: worktree.worktreePath,
-                });
-              }),
+                  onDispatchStart,
+                }),
+              ),
             );
           });
 
