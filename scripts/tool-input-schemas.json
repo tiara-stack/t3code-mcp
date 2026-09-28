@@ -1,0 +1,1182 @@
+[
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "cursor": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "limit": {
+          "maximum": 100,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "name": "instance_list"
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "allowStale": {
+          "type": "boolean"
+        },
+        "instanceId": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": ["instanceId"],
+      "type": "object"
+    },
+    "name": "instance_get"
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "alias": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "endpoint": {
+          "type": "string"
+        },
+        "includeDiffReadScope": {
+          "type": "boolean"
+        },
+        "pairingCode": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "requestId": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": ["alias", "endpoint", "pairingCode", "requestId"],
+      "type": "object"
+    },
+    "name": "instance_pair"
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "alias": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "endpoint": {
+          "type": "string"
+        },
+        "instanceId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "requestId": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": ["instanceId", "requestId"],
+      "type": "object"
+    },
+    "name": "instance_update"
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "includeDiffReadScope": {
+          "type": "boolean"
+        },
+        "instanceId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "pairingCode": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "requestId": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": ["instanceId", "pairingCode", "requestId"],
+      "type": "object"
+    },
+    "name": "instance_pair_again"
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "instanceId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "requestId": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": ["instanceId", "requestId"],
+      "type": "object"
+    },
+    "name": "instance_remove"
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "instanceId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "newBranch": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "path": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "repositoryPath": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "requestId": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "startRef": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": ["instanceId", "repositoryPath", "requestId", "startRef"],
+      "type": "object"
+    },
+    "name": "worktree_create"
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "requestId": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "thread": {
+          "additionalProperties": false,
+          "properties": {
+            "instanceId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "threadId": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": ["instanceId", "threadId"],
+          "type": "object"
+        }
+      },
+      "required": ["requestId", "thread"],
+      "type": "object"
+    },
+    "name": "thread_interrupt"
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "checkout": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "enum": ["project_root"],
+                  "type": "string"
+                }
+              },
+              "required": ["kind"],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "enum": ["worktree"],
+                  "type": "string"
+                },
+                "worktree": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "instanceId": {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "repositoryPath": {
+                      "type": "string"
+                    },
+                    "worktreePath": {
+                      "type": "string"
+                    }
+                  },
+                  "required": ["instanceId", "repositoryPath", "worktreePath"],
+                  "type": "object"
+                }
+              },
+              "required": ["kind", "worktree"],
+              "type": "object"
+            }
+          ]
+        },
+        "interactionMode": {
+          "enum": ["default", "plan"],
+          "type": "string"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "enum": ["explicit"],
+                  "type": "string"
+                },
+                "selection": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "model": {
+                      "type": "string"
+                    },
+                    "options": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "value": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "boolean"
+                              }
+                            ]
+                          }
+                        },
+                        "required": ["id", "value"],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "providerInstanceId": {
+                      "type": "string"
+                    }
+                  },
+                  "required": ["model", "providerInstanceId"],
+                  "type": "object"
+                }
+              },
+              "required": ["kind", "selection"],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "enum": ["project_default"],
+                  "type": "string"
+                }
+              },
+              "required": ["kind"],
+              "type": "object"
+            }
+          ]
+        },
+        "project": {
+          "additionalProperties": false,
+          "properties": {
+            "instanceId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "projectId": {
+              "type": "string"
+            }
+          },
+          "required": ["instanceId", "projectId"],
+          "type": "object"
+        },
+        "requestId": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "runtimeMode": {
+          "enum": ["approval-required", "auto-accept-edits", "auto", "full-access"],
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "checkout",
+        "interactionMode",
+        "model",
+        "project",
+        "requestId",
+        "runtimeMode",
+        "title"
+      ],
+      "type": "object"
+    },
+    "name": "thread_create"
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "allowStale": {
+          "type": "boolean"
+        },
+        "cursor": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "limit": {
+          "maximum": 100,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "scope": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "instanceId": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "kind": {
+                  "enum": ["instance"],
+                  "type": "string"
+                }
+              },
+              "required": ["instanceId", "kind"],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "enum": ["all_instances"],
+                  "type": "string"
+                }
+              },
+              "required": ["kind"],
+              "type": "object"
+            }
+          ]
+        }
+      },
+      "required": ["scope"],
+      "type": "object"
+    },
+    "name": "project_list"
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "allowStale": {
+          "type": "boolean"
+        },
+        "cursor": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "instanceId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "limit": {
+          "maximum": 100,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "providerInstanceId": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": ["instanceId"],
+      "type": "object"
+    },
+    "name": "model_list"
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "allowStale": {
+          "type": "boolean"
+        },
+        "cursor": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "instanceId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "limit": {
+          "maximum": 100,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "repositoryPath": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": ["instanceId", "repositoryPath"],
+      "type": "object"
+    },
+    "name": "worktree_list"
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "allowStale": {
+          "type": "boolean"
+        },
+        "archived": {
+          "enum": ["exclude", "include", "only"],
+          "type": "string"
+        },
+        "cursor": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "limit": {
+          "maximum": 100,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "scope": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "instanceId": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "kind": {
+                  "enum": ["instance"],
+                  "type": "string"
+                }
+              },
+              "required": ["instanceId", "kind"],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "enum": ["project"],
+                  "type": "string"
+                },
+                "project": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "instanceId": {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "projectId": {
+                      "minLength": 1,
+                      "type": "string"
+                    }
+                  },
+                  "required": ["instanceId", "projectId"],
+                  "type": "object"
+                }
+              },
+              "required": ["kind", "project"],
+              "type": "object"
+            }
+          ]
+        }
+      },
+      "required": ["scope"],
+      "type": "object"
+    },
+    "name": "thread_list"
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "allowStale": {
+          "type": "boolean"
+        },
+        "cursor": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "limit": {
+          "maximum": 100,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "worktree": {
+          "additionalProperties": false,
+          "properties": {
+            "instanceId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "repositoryPath": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "worktreePath": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": ["instanceId", "repositoryPath", "worktreePath"],
+          "type": "object"
+        }
+      },
+      "required": ["worktree"],
+      "type": "object"
+    },
+    "name": "worktree_inspect"
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "removeSoleThread": {
+          "additionalProperties": false,
+          "properties": {
+            "instanceId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "threadId": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": ["instanceId", "threadId"],
+          "type": "object"
+        },
+        "requestId": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "worktree": {
+          "additionalProperties": false,
+          "properties": {
+            "instanceId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "repositoryPath": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "worktreePath": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": ["instanceId", "repositoryPath", "worktreePath"],
+          "type": "object"
+        }
+      },
+      "required": ["requestId", "worktree"],
+      "type": "object"
+    },
+    "name": "worktree_discard"
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "allowStale": {
+          "type": "boolean"
+        },
+        "cursor": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "limit": {
+          "maximum": 100,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "thread": {
+          "additionalProperties": false,
+          "properties": {
+            "instanceId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "threadId": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": ["instanceId", "threadId"],
+          "type": "object"
+        }
+      },
+      "required": ["thread"],
+      "type": "object"
+    },
+    "name": "thread_get"
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "context": {
+          "enum": ["thread_default", "require_retained"],
+          "type": "string"
+        },
+        "intent": {
+          "enum": ["provider_default", "steer_current"],
+          "type": "string"
+        },
+        "requestId": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "text": {
+          "maxLength": 120000,
+          "minLength": 1,
+          "type": "string"
+        },
+        "thread": {
+          "additionalProperties": false,
+          "properties": {
+            "instanceId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "threadId": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": ["instanceId", "threadId"],
+          "type": "object"
+        }
+      },
+      "required": ["context", "intent", "requestId", "text", "thread"],
+      "type": "object"
+    },
+    "name": "thread_submit"
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "decision": {
+          "enum": ["accept", "acceptForSession", "acceptAlways", "decline", "cancel"],
+          "type": "string"
+        },
+        "pendingRequest": {
+          "additionalProperties": false,
+          "properties": {
+            "instanceId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "pendingRequestId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "threadId": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": ["instanceId", "pendingRequestId", "threadId"],
+          "type": "object"
+        },
+        "requestId": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": ["decision", "pendingRequest", "requestId"],
+      "type": "object"
+    },
+    "name": "approval_respond"
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "allowStale": {
+          "type": "boolean"
+        },
+        "cursor": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "maxBytes": {
+          "maximum": 65536,
+          "minimum": 1024,
+          "type": "integer"
+        },
+        "thread": {
+          "additionalProperties": false,
+          "properties": {
+            "instanceId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "threadId": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": ["instanceId", "threadId"],
+          "type": "object"
+        }
+      },
+      "required": ["thread"],
+      "type": "object"
+    },
+    "name": "thread_output"
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "allowStale": {
+          "type": "boolean"
+        },
+        "cursor": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "ignoreWhitespace": {
+          "type": "boolean"
+        },
+        "maxBytes": {
+          "maximum": 65536,
+          "minimum": 1024,
+          "type": "integer"
+        },
+        "source": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "enum": ["worktree_changes"],
+                  "type": "string"
+                },
+                "worktree": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "instanceId": {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "repositoryPath": {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "worktreePath": {
+                      "minLength": 1,
+                      "type": "string"
+                    }
+                  },
+                  "required": ["instanceId", "repositoryPath", "worktreePath"],
+                  "type": "object"
+                }
+              },
+              "required": ["kind", "worktree"],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "baseRef": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "kind": {
+                  "enum": ["worktree_against_base"],
+                  "type": "string"
+                },
+                "worktree": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "instanceId": {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "repositoryPath": {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "worktreePath": {
+                      "minLength": 1,
+                      "type": "string"
+                    }
+                  },
+                  "required": ["instanceId", "repositoryPath", "worktreePath"],
+                  "type": "object"
+                }
+              },
+              "required": ["baseRef", "kind", "worktree"],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "fromTurnCount": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "kind": {
+                  "enum": ["thread_turn_range"],
+                  "type": "string"
+                },
+                "thread": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "instanceId": {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "threadId": {
+                      "minLength": 1,
+                      "type": "string"
+                    }
+                  },
+                  "required": ["instanceId", "threadId"],
+                  "type": "object"
+                },
+                "toTurnCount": {
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": ["fromTurnCount", "kind", "thread", "toTurnCount"],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "enum": ["thread_through_turn"],
+                  "type": "string"
+                },
+                "thread": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "instanceId": {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "threadId": {
+                      "minLength": 1,
+                      "type": "string"
+                    }
+                  },
+                  "required": ["instanceId", "threadId"],
+                  "type": "object"
+                },
+                "toTurnCount": {
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": ["kind", "thread", "toTurnCount"],
+              "type": "object"
+            }
+          ]
+        }
+      },
+      "required": ["source"],
+      "type": "object"
+    },
+    "name": "diff_read"
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "afterCursor": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "condition": {
+          "enum": [
+            "changed",
+            "inactive",
+            "settled",
+            "unsettled",
+            "session_stopped",
+            "needs_response"
+          ],
+          "type": "string"
+        },
+        "thread": {
+          "additionalProperties": false,
+          "properties": {
+            "instanceId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "threadId": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": ["instanceId", "threadId"],
+          "type": "object"
+        },
+        "waitMs": {
+          "maximum": 30000,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": ["condition", "thread"],
+      "type": "object"
+    },
+    "name": "thread_wait"
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "requestId": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "settled": {
+          "type": "boolean"
+        },
+        "thread": {
+          "additionalProperties": false,
+          "properties": {
+            "instanceId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "threadId": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": ["instanceId", "threadId"],
+          "type": "object"
+        }
+      },
+      "required": ["requestId", "settled", "thread"],
+      "type": "object"
+    },
+    "name": "thread_set_settled"
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "turn": {
+          "additionalProperties": false,
+          "properties": {
+            "instanceId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "threadId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "turnId": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": ["instanceId", "threadId", "turnId"],
+          "type": "object"
+        },
+        "waitMs": {
+          "maximum": 30000,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": ["turn"],
+      "type": "object"
+    },
+    "name": "turn_wait"
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "answers": {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            ]
+          },
+          "type": "object"
+        },
+        "pendingRequest": {
+          "additionalProperties": false,
+          "properties": {
+            "instanceId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "pendingRequestId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "threadId": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": ["instanceId", "pendingRequestId", "threadId"],
+          "type": "object"
+        },
+        "requestId": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": ["answers", "pendingRequest", "requestId"],
+      "type": "object"
+    },
+    "name": "input_respond"
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "requestId": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "waitMs": {
+          "maximum": 30000,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": ["requestId"],
+      "type": "object"
+    },
+    "name": "operation_get"
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "requestId": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "thread": {
+          "additionalProperties": false,
+          "properties": {
+            "instanceId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "threadId": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": ["instanceId", "threadId"],
+          "type": "object"
+        }
+      },
+      "required": ["requestId", "thread"],
+      "type": "object"
+    },
+    "name": "thread_stop_session"
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "requestId": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "thread": {
+          "additionalProperties": false,
+          "properties": {
+            "instanceId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "threadId": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": ["instanceId", "threadId"],
+          "type": "object"
+        }
+      },
+      "required": ["requestId", "thread"],
+      "type": "object"
+    },
+    "name": "thread_remove"
+  }
+]

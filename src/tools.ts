@@ -9,6 +9,7 @@ import * as Match from "effect/Match";
 import * as McpSchema from "effect/unstable/ai/McpSchema";
 import * as McpServer from "effect/unstable/ai/McpServer";
 import * as Option from "effect/Option";
+import * as Predicate from "effect/Predicate";
 import * as Schema from "effect/Schema";
 import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
@@ -5482,6 +5483,38 @@ type ServerToolkitRequirements =
   | McpServer.McpServer
   | Exclude<Tool.HandlerServices<ServerToolDefinition>, McpSchema.McpServerClient>;
 
+const isStrictObjectBoundary = (value: unknown): value is Record<string, unknown> =>
+  Predicate.isObject(value) &&
+  value["type"] === "object" &&
+  value["additionalProperties"] === false &&
+  Object.keys(value).every((key) => key === "type" || key === "additionalProperties");
+
+/**
+ * Effect Schema represents StructWithRest strictness as an allOf object
+ * without the sibling properties. JSON Schema additionalProperties only sees
+ * properties in the same subschema, so publish that boundary beside them.
+ */
+const normalizeStrictObjectBoundaries = (schema: unknown): unknown => {
+  if (Array.isArray(schema)) return schema.map(normalizeStrictObjectBoundaries);
+  if (!Predicate.isObject(schema)) return schema;
+
+  const normalized = Object.fromEntries(
+    Object.entries(schema).map(([key, value]) => [key, normalizeStrictObjectBoundaries(value)]),
+  );
+  const allOf = normalized["allOf"];
+  if (normalized["type"] !== "object" || !Array.isArray(allOf)) return normalized;
+
+  const remaining = allOf.filter((branch) => !isStrictObjectBoundary(branch));
+  if (remaining.length === allOf.length) return normalized;
+  if (remaining.length > 0 || normalized["additionalProperties"] !== undefined) {
+    throw new Error("Cannot safely normalize this strict object JSON schema");
+  }
+
+  normalized["additionalProperties"] = false;
+  delete normalized["allOf"];
+  return normalized;
+};
+
 // fallow-ignore-next-line complexity
 export const mcpServerToolkitLayer: Layer.Layer<never, never, ServerToolkitRequirements> =
   Layer.effectDiscard(
@@ -5498,8 +5531,15 @@ export const mcpServerToolkitLayer: Layer.Layer<never, never, ServerToolkitRequi
                 Effect.orDie,
               )
             : undefined;
+        const inputJsonSchema = yield* Effect.try({
+          try: () => normalizeStrictObjectBoundaries(Tool.getJsonSchema(tool)),
+          catch: (cause) =>
+            new Error(`Unable to normalize the input schema for MCP tool ${tool.name}`, {
+              cause,
+            }),
+        }).pipe(Effect.orDie);
         const inputSchema = yield* Schema.decodeUnknownEffect(McpSchema.ToolJsonSchema)(
-          Tool.getJsonSchema(tool),
+          inputJsonSchema,
         ).pipe(Effect.orDie);
         const readOnlyHint = Context.get(tool.annotations, Tool.Readonly);
 

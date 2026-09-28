@@ -137,7 +137,10 @@ export const InstanceListInputSchema = Schema.declare<{
 export type InstanceListInput = typeof InstanceListInputSchema.Type;
 
 const requestId = Schema.String.check(
-  Schema.makeFilter((value) => value.length > 0 && value.length <= MAX_REQUEST_ID_LENGTH, {
+  Schema.isMinLength(1, {
+    message: `expected a request ID between 1 and ${MAX_REQUEST_ID_LENGTH} characters`,
+  }),
+  Schema.isMaxLength(MAX_REQUEST_ID_LENGTH, {
     message: `expected a request ID between 1 and ${MAX_REQUEST_ID_LENGTH} characters`,
   }),
 );
@@ -334,7 +337,8 @@ export const InstancePairAgainInputSchema = Schema.declare<{
 export type InstancePairAgainInput = typeof InstancePairAgainInputSchema.Type;
 
 const worktreeCreateString = Schema.String.check(
-  Schema.makeFilter((value) => value.length > 0 && value.trim() === value, {
+  Schema.isMinLength(1, { message: "expected a trimmed non-empty string" }),
+  Schema.makeFilter((value) => value.trim() === value, {
     message: "expected a trimmed non-empty string",
   }),
 );

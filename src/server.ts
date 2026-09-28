@@ -9,7 +9,7 @@ import { mcpServerToolkitLayer, serverToolkitLayer } from "./tools";
 const mcpLayer = McpServer.layerStdio({
   name: "t3code-mcp",
   version: "0.1.0",
-  description: "An Effect-based MCP server starter.",
+  description: "Control existing T3Code instances, threads, and worktrees through MCP.",
   protocols: [
     McpProtocol.v2025_11_25,
     McpProtocol.v2025_06_18,

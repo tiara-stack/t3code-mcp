@@ -154,10 +154,22 @@ describe("stdio transport", () => {
               idempotentHint: false,
             });
             for (const tool of toolsMessage.result?.tools ?? []) {
-              expect(tool.inputSchema).toMatchObject({ allOf: [{ additionalProperties: false }] });
+              expect(tool.inputSchema).toMatchObject({
+                type: "object",
+                properties: expect.any(Object),
+                additionalProperties: false,
+              });
             }
-            expect(toolsMessage.result?.tools?.[0]?.inputSchema).toMatchObject({
-              allOf: [{ additionalProperties: false }],
+            const worktreeInspectSchema = toolsMessage.result?.tools?.find(
+              (tool) => tool.name === "worktree_inspect",
+            )?.inputSchema;
+            const worktreeProperties = worktreeInspectSchema?.["properties"] as
+              | Record<string, unknown>
+              | undefined;
+            expect(worktreeProperties?.["worktree"]).toMatchObject({
+              type: "object",
+              properties: expect.any(Object),
+              additionalProperties: false,
             });
 
             send(child, {

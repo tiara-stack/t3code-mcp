@@ -4,7 +4,7 @@ Status: confirmed by the human on 2026-09-19 for [Choose the MCP tools and end-t
 
 Canonical published asset: [MCP controlling-agent contract](https://linear.app/tiara-stack/document/mcp-controlling-agent-contract-d4e717a3006c). This file is the repository copy of that decision asset.
 
-This document records the agreed contract. It does not describe implemented tools. The repository currently exposes only its starter echo tool. Production implementation belongs to a later effort.
+This document records the agreed contract and intended wire behavior. Implementation status and executable acceptance evidence are tracked by TIA-267 and TIA-298.
 
 ## Decision status
 

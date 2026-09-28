@@ -2,7 +2,7 @@
   "name": "t3code-mcp",
   "version": "0.1.0",
   "private": true,
-  "description": "A standalone MCP server starter built with Effect.",
+  "description": "An Effect MCP server for controlling existing T3Code instances.",
   "bin": {
     "t3code-mcp": "./dist/main.mjs"
   },
@@ -21,6 +21,8 @@
     "lint:agents": "vp lint .agents/skills --tsconfig .agents/tsconfig.json",
     "check:agents": "tsc -p .agents/tsconfig.json --pretty false",
     "fallow": "fallow audit --base main",
+    "acceptance:packaged": "pnpm build && pnpm exec tsx scripts/packaged-acceptance.ts",
+    "acceptance": "pnpm build && pnpm exec tsx scripts/packaged-acceptance.ts && pnpm exec tsx scripts/workflow-acceptance.ts",
     "checks": "pnpm check && pnpm test && pnpm build && pnpm fallow"
   },
   "dependencies": {
