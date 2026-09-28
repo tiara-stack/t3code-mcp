@@ -1,0 +1,23 @@
+version: 1
+worker_backend: t3code-mcp
+max_workers: 2
+stack_backend: graphite
+review_pools:
+  local-review:
+    scope: local
+    # CodeRabbit CLI account: tiara-stack/TheerapakG
+    reviewers:
+      - coderabbit
+    max_active: 1
+    rolling_window:
+      max_invocations: 3
+      window_seconds: 3600
+  hosted-review:
+    scope: hosted
+    # Hosted GitHub reviewer: coderabbitai[bot] on tiara-stack/t3code-mcp
+    reviewers:
+      - "coderabbitai[bot]"
+    max_active: 1
+    rolling_window:
+      max_invocations: 2
+      window_seconds: 3600

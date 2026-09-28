@@ -1,0 +1,19 @@
+version: 1
+
+reviewers:
+  correctness_reliability:
+    coding_agent: "explorer"
+    model: "gpt-6-luna"
+    reasoning_effort: "medium"
+  security_privacy:
+    coding_agent: "explorer"
+    model: "gpt-6-luna"
+    reasoning_effort: "medium"
+  maintainability_tests:
+    coding_agent: "explorer"
+    model: "gpt-6-luna"
+    reasoning_effort: "medium"
+  spec_conformance:
+    coding_agent: "explorer"
+    model: "gpt-6-luna"
+    reasoning_effort: "medium"

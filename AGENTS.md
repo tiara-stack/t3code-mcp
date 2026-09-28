@@ -7,7 +7,23 @@ Effect.
 
 - Run commands from the repository root with `pnpm`.
 - Use `pnpm check`, `pnpm test`, `pnpm build`, and `pnpm fallow` to validate changes.
-- Load a relevant project skill from `.agents/skills/` before using that workflow.
+- Load a matching repository skill from `.agents/skills/` when one exists. Otherwise, follow this file and the selected workflow configuration.
+
+## Branching and submission
+
+- `main` is the trunk. For Linear issues, use the branch name provided by the issue when available. Otherwise, use `<username>/<lowercase-kebab-case-feature-slug>`.
+- Use Graphite to create or track topic branches from the trunk and submit them. Do not commit to `main`.
+- Keep unrelated changes out of the work and stage only in-scope paths. Commit coherent, validated slices with Conventional Commit subjects (`type(scope): summary`); use the package name as the scope when it is clear.
+- Submit with `gt submit --no-interactive` after local review and record the resulting PR URL and number.
+- Keep the PR in draft until all required checks and the hosted CodeRabbit review have completed for the current head. Mark it ready only after those gates pass. The `to merge` label is Graphite merge-queue admission; apply it only after those gates pass. Do not merge the PR.
+
+## Validation and review
+
+- `package.json` defines local commands, and `.github/workflows/ci.yml` defines CI. Require the `checks` job and every additional required check to pass for the submitted PR head.
+- For autonomous-development, run the local reviewers in `.agents/autonomous-development.yaml` order: Agentic Review using `.agents/agentic-review.yaml`, then CodeRabbit.
+- Run the local CodeRabbit review with `coderabbit review --agent --base "$(gt trunk)" --include-untracked`. After repairs, repeat it until a successful run reports no new valid findings. A failed review command is not a clean review.
+- The hosted reviewer is GitHub bot `coderabbitai[bot]`. To request or rerun a hosted review, comment `@coderabbitai review`; confirm it covers the current PR head.
+- Follow `docs/acceptance.md` for the two-instance acceptance walkthrough; use only disposable T3Code instances and projects.
 
 ## Shared-machine resources
 

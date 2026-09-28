@@ -3,3 +3,7 @@ merge_label: "to merge"
 subagent:
   model: "gpt-6-luna"
   reasoning_effort: "medium"
+
+local_reviewers:
+  - agentic-review
+  - coderabbit
