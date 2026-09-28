@@ -20,7 +20,8 @@ Effect.
 ## Validation and review
 
 - `package.json` defines local commands, and `.github/workflows/ci.yml` defines CI. Require the `checks` job and every additional required check to pass for the submitted PR head.
-- For autonomous-development, run the local reviewers in `.agents/autonomous-development.yaml` order: Agentic Review using `.agents/agentic-review.yaml`, then CodeRabbit.
+- For autonomous-development, run the local reviewers in `.agents/autonomous-development.yaml` order: Open Code Review delegation, then CodeRabbit.
+- Run Open Code Review on workspace changes with `ocr delegate preview --format json`. Resolve rules for every listed path with `ocr delegate rule --format json <paths>`, inspect each diff against its rules, and account for each `(path, status)` as reviewed or skipped with a reason. Report total, reviewed, skipped, and coverage; the review succeeds only at 100% coverage. If a command reports exactly `unknown flag: --format`, retry that command without the flag. Treat any other command failure, missing rule result, or incomplete coverage as a failed review.
 - Run the local CodeRabbit review with `coderabbit review --agent --base "$(gt trunk)" --include-untracked`. After repairs, repeat it until a successful run reports no new valid findings. A failed review command is not a clean review.
 - The hosted reviewer is GitHub bot `coderabbitai[bot]`. To request or rerun a hosted review, comment `@coderabbitai review`; confirm it covers the current PR head.
 - Follow `docs/acceptance.md` for the two-instance acceptance walkthrough; use only disposable T3Code instances and projects.

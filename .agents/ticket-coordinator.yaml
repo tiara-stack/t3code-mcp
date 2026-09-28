@@ -12,6 +12,11 @@ review_pools:
     rolling_window:
       max_invocations: 3
       window_seconds: 3600
+  local-review-open-code-review:
+    scope: local
+    reviewers:
+      - open-code-review-delegate
+    max_active: 1
   hosted-review:
     scope: hosted
     # Hosted GitHub reviewer: coderabbitai[bot] on tiara-stack/t3code-mcp

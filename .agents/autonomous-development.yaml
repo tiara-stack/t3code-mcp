@@ -5,5 +5,5 @@ subagent:
   reasoning_effort: "medium"
 
 local_reviewers:
-  - agentic-review
+  - open-code-review-delegate
   - coderabbit
