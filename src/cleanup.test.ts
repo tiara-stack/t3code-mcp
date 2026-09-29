@@ -2,7 +2,9 @@ import { it } from "@effect/vitest";
 import * as Clock from "effect/Clock";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
+import * as Option from "effect/Option";
 import * as Result from "effect/Result";
 import * as TestClock from "effect/testing/TestClock";
 import { describe, expect, it as syncIt } from "vitest";
@@ -22,6 +24,63 @@ const references = (...threadIds: ReadonlyArray<string>): WorktreeGuardReference
 });
 
 describe("Cleanup worktree guard", () => {
+  it.effect("rechecks orphan eligibility before its one dispatch", () =>
+    Effect.gen(function* () {
+      const checks: number[] = [];
+      const recorded: number[] = [];
+      let dispatches = 0;
+      const result = yield* Cleanup.dispatchOrphanWorktreeDiscard({
+        check: () =>
+          Effect.sync(() => {
+            checks.push(checks.length + 1);
+            return {
+              branch: "feature/a",
+              registration: { revision: 1, environmentId: "env-a" },
+            };
+          }),
+        recordCheck: (position) => Effect.sync(() => void recorded.push(position)),
+        dispatch: () => Effect.sync(() => void (dispatches += 1)),
+        afterDispatch: () => Effect.void,
+        observeAbsence: () => Effect.void,
+      });
+      expect(checks).toEqual([1, 2]);
+      expect(recorded).toEqual([0, 1]);
+      expect(dispatches).toBe(1);
+      expect(result.branch).toBe("feature/a");
+    }),
+  );
+
+  it.effect("blocks orphan dispatch when the second fresh check sees a changed target", () =>
+    Effect.gen(function* () {
+      let checks = 0;
+      let dispatches = 0;
+      const recordedPositions: Array<0 | 1> = [];
+      const exit = yield* Effect.exit(
+        Cleanup.dispatchOrphanWorktreeDiscard({
+          check: () =>
+            Effect.sync(() => ({
+              branch: checks++ === 0 ? "feature/a" : "feature/replaced",
+              registration: { revision: 1, environmentId: "env-a" },
+            })),
+          recordCheck: (position) =>
+            Effect.sync(() => {
+              recordedPositions.push(position);
+            }),
+          dispatch: () => Effect.sync(() => void (dispatches += 1)),
+          afterDispatch: () => Effect.void,
+          observeAbsence: () => Effect.void,
+        }),
+      );
+      expect(Exit.isFailure(exit)).toBe(true);
+      const failure = Exit.findErrorOption(exit);
+      expect(Option.isSome(failure)).toBe(true);
+      if (Option.isNone(failure)) throw new Error("orphan recheck did not produce a typed failure");
+      expect(failure.value).toMatchObject({ kind: "stale_generation" });
+      expect(recordedPositions).toEqual([0]);
+      expect(dispatches).toBe(0);
+    }),
+  );
+
   it.effect(
     "allows inspection to report references without treating them as discard eligibility",
     () =>

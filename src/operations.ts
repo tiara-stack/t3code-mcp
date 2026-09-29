@@ -7540,137 +7540,122 @@ export class Operations extends Context.Service<Operations, OperationsService>()
             },
           );
 
-          const initialCheck = yield* checkOrphan();
-          branch = initialCheck.branch;
-          const initialEvidence = yield* evidence(
-            `Fresh VCS identity and complete active/archived thread inventories show ${worktree.worktreePath} on branch ${branch} with zero thread references.`,
-            "snapshot",
-          );
-          yield* persist(
-            { state: "pending", dispatch: "not_dispatched" },
-            {
-              now: initialEvidence.observedAt,
-              intent: { ...intent, branch },
-              state: "pending",
-              dispatch: "not_dispatched",
-              target: worktree,
-              stepPosition,
-              stepState: "succeeded",
-              evidence: [...initialCheck.evidence, initialEvidence],
-              evidenceStepPosition: stepPosition,
-              recovery: "observe_operation",
-            },
-          );
-
-          stepPosition = 1;
-          const finalCheck = yield* checkOrphan();
-          if (finalCheck.branch !== branch) {
-            return yield* Effect.fail(
-              new ObservationError({
-                kind: "stale_generation",
-                message:
-                  "The worktree branch changed between the initial orphan check and the final pre-dispatch check.",
+          let checkPosition: 0 | 1 = 0;
+          yield* Cleanup.dispatchOrphanWorktreeDiscard({
+            check: () =>
+              Effect.suspend(() => {
+                stepPosition = checkPosition;
+                checkPosition = 1;
+                return checkOrphan();
               }),
-            );
-          }
-          if (
-            finalCheck.registration.revision !== initialCheck.registration.revision ||
-            finalCheck.registration.environmentId !== initialCheck.registration.environmentId
-          ) {
-            return yield* Effect.fail(
-              new ObservationError({
-                kind: "stale_generation",
-                message:
-                  "The saved instance registration changed between orphan verification and dispatch.",
+            recordCheck: (position, checked) =>
+              Effect.gen(function* () {
+                branch = checked.branch;
+                stepPosition = position;
+                const checkEvidence = yield* evidence(
+                  position === 0
+                    ? `Fresh VCS identity and complete active/archived thread inventories show ${worktree.worktreePath} on branch ${branch} with zero thread references.`
+                    : `A second fresh check immediately before dispatch confirms branch ${branch} and zero active or archived thread references.`,
+                  "snapshot",
+                );
+                yield* persist(
+                  { state: "pending", dispatch: "not_dispatched" },
+                  {
+                    now: checkEvidence.observedAt,
+                    intent: { ...intent, branch },
+                    state: "pending",
+                    dispatch: "not_dispatched",
+                    target: worktree,
+                    stepPosition,
+                    stepState: "succeeded",
+                    evidence: [...checked.evidence, checkEvidence],
+                    evidenceStepPosition: stepPosition,
+                    recovery: "observe_operation",
+                  },
+                );
               }),
-            );
-          }
-          const finalEvidence = yield* evidence(
-            `A second fresh check immediately before dispatch confirms branch ${branch} and zero active or archived thread references.`,
-            "snapshot",
-          );
-          yield* persist(
-            { state: "pending", dispatch: "not_dispatched" },
-            {
-              now: finalEvidence.observedAt,
-              intent: { ...intent, branch },
-              state: "pending",
-              dispatch: "not_dispatched",
-              target: worktree,
-              stepPosition,
-              stepState: "succeeded",
-              evidence: [...finalCheck.evidence, finalEvidence],
-              evidenceStepPosition: stepPosition,
-              recovery: "observe_operation",
-            },
-          );
+            dispatch: (checked) =>
+              Effect.gen(function* () {
+                stepPosition = 2;
+                const dispatchMarker = yield* evidence(
+                  "The single VCS remove attempt is crossing its dispatch boundary; recovery must observe state and never resend it.",
+                  "adapter_inference",
+                );
+                yield* persist(
+                  { state: "pending", dispatch: "not_dispatched" },
+                  {
+                    now: dispatchMarker.observedAt,
+                    intent: { ...intent, branch },
+                    state: "pending",
+                    dispatch: "unknown",
+                    target: worktree,
+                    stepPosition,
+                    stepState: "pending",
+                    evidence: [dispatchMarker],
+                    evidenceStepPosition: stepPosition,
+                    recovery: "observe_operation",
+                  },
+                );
+                yield* connections.removeWorktree(worktree, checked.registration, () => {
+                  dispatchStarted = true;
+                });
+              }),
+            afterDispatch: () =>
+              Effect.gen(function* () {
+                dispatchAccepted = true;
+                const dispatched = yield* evidence(
+                  "The T3Code VCS remove RPC returned successfully; a separate fresh inventory is required to establish absence.",
+                  "adapter_inference",
+                );
+                yield* persist(
+                  { state: "pending", dispatch: "unknown" },
+                  {
+                    now: dispatched.observedAt,
+                    state: "pending",
+                    dispatch: "accepted",
+                    target: worktree,
+                    stepPosition,
+                    stepState: "succeeded",
+                    evidence: [dispatched],
+                    evidenceStepPosition: stepPosition,
+                    recovery: "observe_operation",
+                  },
+                );
 
-          stepPosition = 2;
-          const dispatchMarker = yield* evidence(
-            "The single VCS remove attempt is crossing its dispatch boundary; recovery must observe state and never resend it.",
-            "adapter_inference",
-          );
-          yield* persist(
-            { state: "pending", dispatch: "not_dispatched" },
-            {
-              now: dispatchMarker.observedAt,
-              intent: { ...intent, branch },
-              state: "pending",
-              dispatch: "unknown",
-              target: worktree,
-              stepPosition,
-              stepState: "pending",
-              evidence: [dispatchMarker],
-              evidenceStepPosition: stepPosition,
-              recovery: "observe_operation",
+                stepPosition = 3;
+                const response = yield* evidence(
+                  "T3Code acknowledged the forced checkout removal request; this reply alone does not establish that the checkout is absent.",
+                  "rpc_result",
+                );
+                yield* persist(
+                  { state: "pending", dispatch: "accepted" },
+                  {
+                    now: response.observedAt,
+                    state: "pending",
+                    dispatch: "accepted",
+                    target: worktree,
+                    stepPosition,
+                    stepState: "succeeded",
+                    evidence: [response],
+                    evidenceStepPosition: stepPosition,
+                    recovery: "observe_operation",
+                  },
+                );
+              }),
+            observeAbsence: () => {
+              stepPosition = 4;
+              if (branch === null) {
+                return Effect.fail(
+                  new ObservationError({
+                    kind: "uncheckable_target",
+                    message:
+                      "The verified worktree branch was not recorded before absence confirmation.",
+                  }),
+                );
+              }
+              return recordWorktreeDiscardOutcome(input, branch, intent, 4, persist);
             },
-          );
-          yield* connections.removeWorktree(worktree, finalCheck.registration, () => {
-            dispatchStarted = true;
           });
-          dispatchAccepted = true;
-
-          const dispatched = yield* evidence(
-            "The T3Code VCS remove RPC returned successfully; a separate fresh inventory is required to establish absence.",
-            "adapter_inference",
-          );
-          yield* persist(
-            { state: "pending", dispatch: "unknown" },
-            {
-              now: dispatched.observedAt,
-              state: "pending",
-              dispatch: "accepted",
-              target: worktree,
-              stepPosition,
-              stepState: "succeeded",
-              evidence: [dispatched],
-              evidenceStepPosition: stepPosition,
-              recovery: "observe_operation",
-            },
-          );
-
-          stepPosition = 3;
-          const response = yield* evidence(
-            "T3Code acknowledged the forced checkout removal request; this reply alone does not establish that the checkout is absent.",
-            "rpc_result",
-          );
-          yield* persist(
-            { state: "pending", dispatch: "accepted" },
-            {
-              now: response.observedAt,
-              state: "pending",
-              dispatch: "accepted",
-              target: worktree,
-              stepPosition,
-              stepState: "succeeded",
-              evidence: [response],
-              evidenceStepPosition: stepPosition,
-              recovery: "observe_operation",
-            },
-          );
-
-          stepPosition = 4;
-          yield* recordWorktreeDiscardOutcome(input, branch, intent, 4, persist);
         }).pipe(
           Effect.catchTags({
             WorktreeDiscardClaimLost: () => signalCompletion(input.requestId),

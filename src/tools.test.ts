@@ -10622,6 +10622,89 @@ describe("worktree_discard", () => {
     ),
   );
 
+  it.live("attributes a failed second orphan check to the recheck step", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const worktree = {
+          instanceId: "instance-a",
+          repositoryPath: "/srv/repo",
+          worktreePath: "/srv/worktrees/orphan-second-check-fails",
+        };
+        const at = "2026-09-24T03:31:00.000Z";
+        configureWorktree(options, worktree, "feature/orphan-second-check-fails", at);
+        let removeCalls = 0;
+        options.removeWorktree = () => {
+          removeCalls += 1;
+          return Effect.void;
+        };
+        let activeCheckCount = 0;
+        options.activeStreams = {
+          "instance-a": () => {
+            const threads =
+              activeCheckCount === 0
+                ? []
+                : [
+                    shellThreadFixture("ui-thread-created-after-first-check", {
+                      worktreePath: worktree.worktreePath,
+                    }),
+                  ];
+            const snapshotSequence = 61 + activeCheckCount;
+            activeCheckCount += 1;
+            return Stream.make(
+              shellSnapshotItem(
+                snapshotSequence,
+                [shellProjectFixture("project-a", worktree.repositoryPath)],
+                threads,
+              ),
+              shellSynchronizedItem,
+            );
+          },
+        };
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            return yield* callTool("worktree_discard", {
+              requestId: "discard-orphan-second-check-fails",
+              worktree,
+            });
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "ok",
+            value: {
+              requestId: "discard-orphan-second-check-fails",
+              state: "failed",
+              dispatch: "not_dispatched",
+              error: { code: "shared_worktree" },
+            },
+          },
+        });
+        const response = result[0];
+        if (response === undefined) throw new Error("worktree_discard returned no response");
+        const steps = (
+          response.result as unknown as {
+            readonly result: {
+              readonly value: { readonly steps: ReadonlyArray<unknown> };
+            };
+          }
+        ).result.value.steps;
+        expect(steps).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ name: "check_orphan_eligibility", state: "succeeded" }),
+            expect.objectContaining({ name: "recheck_orphan_eligibility", state: "failed" }),
+          ]),
+        );
+        expect(options.seenActive).toHaveLength(2);
+        expect(options.seenArchived).toHaveLength(2);
+        expect(removeCalls).toBe(0);
+      }),
+    ),
+  );
+
   it.live("records a registration mismatch before removal dispatch", () =>
     withDatabasePath((databasePath) =>
       Effect.gen(function* () {

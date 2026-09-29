@@ -281,6 +281,7 @@ const checkThreadRemoval = (options: {
     readonly createdAt: string;
     readonly session: { readonly providerInstanceId: string | null };
   };
+
   readonly initialDetail?: SynchronizedThreadDetail | null;
   readonly initialSession?: { readonly session: SynchronizedThreadDetail["thread"]["session"] };
 }): Effect.Effect<ThreadRemovalCheck, LocalStoreError | T3CodeAdapterError | ObservationError> =>
@@ -516,6 +517,56 @@ const assertSameWorktreeGuard = (
   return Effect.void;
 };
 
+/** The identity captured by a fresh orphan-discard guard decision. */
+interface OrphanWorktreeDiscardCheck {
+  readonly branch: string;
+  readonly registration: {
+    readonly revision: number;
+    readonly environmentId: string;
+  };
+}
+
+/**
+ * Own the orphan discard guard/dispatch order. Operations supplies durable
+ * evidence callbacks; this sequence guarantees both fresh checks precede the
+ * single dispatch callback and that the target identity did not change.
+ */
+const dispatchOrphanWorktreeDiscard = <
+  Check extends OrphanWorktreeDiscardCheck,
+  E,
+  Extra = never,
+>(options: {
+  readonly check: () => Effect.Effect<Check, E>;
+  readonly recordCheck: (position: 0 | 1, check: Check) => Effect.Effect<void, E | Extra>;
+  readonly dispatch: (check: Check) => Effect.Effect<void, E | Extra>;
+  readonly afterDispatch: () => Effect.Effect<void, E | Extra>;
+  readonly observeAbsence: () => Effect.Effect<void, E | Extra>;
+}): Effect.Effect<Check, E | Extra | ObservationError> =>
+  Effect.gen(function* () {
+    const initial = yield* options.check();
+    yield* options.recordCheck(0, initial);
+
+    const final = yield* options.check();
+    if (
+      final.branch !== initial.branch ||
+      final.registration.revision !== initial.registration.revision ||
+      final.registration.environmentId !== initial.registration.environmentId
+    ) {
+      return yield* Effect.fail(
+        new ObservationError({
+          kind: "stale_generation",
+          message:
+            "The worktree branch or instance registration changed between orphan verification and dispatch.",
+        }),
+      );
+    }
+    yield* options.recordCheck(1, final);
+    yield* options.dispatch(final);
+    yield* options.afterDispatch();
+    yield* options.observeAbsence();
+    return final;
+  });
+
 /** Fresh target and complete thread-reference guard decisions shared by inspection and discard. */
 export const Cleanup = {
   captureProviderSession,
@@ -524,6 +575,7 @@ export const Cleanup = {
   checkThreadRemoval,
   prepareThreadRemoval,
   dispatchAndConfirmThreadRemoval,
+  dispatchOrphanWorktreeDiscard,
   confirmThreadRemovalAbsence,
   waitForThreadRemovalAbsence,
   verifyThreadRemovalActivity: activityFailure,
