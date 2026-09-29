@@ -174,6 +174,7 @@ import {
   type VcsDiffPreviewSource,
 } from "./t3code-adapter";
 import { pendingRequestsFromActivities } from "./pending-requests";
+import { projectThreadState } from "./thread-state-projection";
 import { Cleanup } from "./cleanup";
 import { adapterErrorFailure, observationErrorFailure } from "./tool-failure";
 import {
@@ -2525,8 +2526,8 @@ const inspectWorktreeThread = (options: {
         shellObservation: null,
       },
     });
-    const execution = threadExecutionState(worktree.instanceId, detail);
-    const session = threadSessionStateOf(detail);
+    const projection = projectThreadState({ instanceId: worktree.instanceId, detail });
+    const { execution, session } = projection;
     const pendingRequests = pendingRequestsFromActivities(
       summary.thread,
       detail.thread.activities,
@@ -2841,34 +2842,6 @@ const discoverWorktreeInspection = (options: {
     });
   });
 
-const sessionStateByNativeStatus: Record<string, ThreadState["session"]["state"]> = {
-  starting: "starting",
-  running: "running",
-  // The pinned projection's idle sessions are live sessions awaiting work;
-  // the native string stays available alongside the normalized state.
-  ready: "ready",
-  idle: "ready",
-  // An interrupted session is no longer running; interruption-driven
-  // shutdown is preserved on nativeState rather than conflated with an
-  // explicit stop request.
-  stopped: "stopped",
-  interrupted: "stopped",
-  error: "error",
-};
-
-const threadSessionState = (status: string | null): ThreadState["session"]["state"] =>
-  status === null ? "unknown" : (sessionStateByNativeStatus[status] ?? "unknown");
-
-const threadSnapshotEvidence = (detail: SynchronizedThreadDetail, note: string): Evidence[] => [
-  {
-    kind: "snapshot",
-    observedAt: detail.observedAt,
-    sourceSequence: detail.snapshotSequence,
-    nativeEventId: null,
-    detail: note,
-  },
-];
-
 const threadConfigurationFromDetail = (detail: ObservedThreadDetail): ThreadConfiguration => ({
   model: {
     providerInstanceId: detail.modelSelection.providerInstanceId,
@@ -3049,61 +3022,6 @@ const lookupThreadProject = (options: {
 
 const limitedHistoryLimitation = `The pinned server retained only the most recent ${THREAD_SNAPSHOT_TURN_LIMIT} user-anchored turns; earlier history is unavailable through this read.`;
 
-const threadExecutionState = (
-  instanceId: string,
-  detail: SynchronizedThreadDetail,
-): ThreadState["execution"] => {
-  const { thread } = detail;
-  if (thread.latestTurn === null) {
-    return {
-      state: "inactive",
-      turn: null,
-      nativeState: null,
-      evidence: threadSnapshotEvidence(
-        detail,
-        "The thread detail snapshot published no latest turn.",
-      ),
-    };
-  }
-  const turn = { instanceId, threadId: thread.threadId, turnId: thread.latestTurn.turnId };
-  if (detail.projectedTurnState) {
-    // Session readiness or interruption alone cannot establish authoritative
-    // turn completion; the projected state stays visible as the native
-    // diagnostic string while the normalized state stays unknown.
-    return {
-      state: "unknown",
-      turn,
-      nativeState: thread.latestTurn.state,
-      evidence: threadSnapshotEvidence(
-        detail,
-        `The latest turn state ${thread.latestTurn.state} was projected from a session transition racing the snapshot, not observed as authoritative turn evidence.`,
-      ),
-    };
-  }
-  return {
-    state: thread.latestTurn.state === "running" ? "active" : "inactive",
-    turn,
-    nativeState: thread.latestTurn.state,
-    evidence: threadSnapshotEvidence(
-      detail,
-      `The thread detail snapshot published the latest turn as ${thread.latestTurn.state}.`,
-    ),
-  };
-};
-
-const threadSessionStateOf = (detail: SynchronizedThreadDetail): ThreadState["session"] => {
-  const { thread } = detail;
-  if (thread.session === null) return { state: "unknown", nativeState: null, evidence: [] };
-  return {
-    state: threadSessionState(thread.session.status),
-    nativeState: thread.session.status,
-    evidence: threadSnapshotEvidence(
-      detail,
-      `The thread detail snapshot published the provider session as ${thread.session.status}.`,
-    ),
-  };
-};
-
 const threadSummaryFromDetail = (options: {
   readonly instanceId: string;
   readonly detail: SynchronizedThreadDetail;
@@ -3144,6 +3062,7 @@ const buildThreadState = (options: {
 } => {
   const { instanceId, detail, project } = options;
   const { thread } = detail;
+  const projection = projectThreadState({ instanceId, detail });
   const historyLimitations = detail.limitedHistory ? [limitedHistoryLimitation] : [];
   const nativeCoverageLimitations =
     options.includeNativeShellState === false ? [] : project.nativeSettlementLimitations;
@@ -3178,8 +3097,8 @@ const buildThreadState = (options: {
       observedAt: detail.observedAt,
     }),
     configuration: threadConfigurationFromDetail(thread),
-    execution: threadExecutionState(instanceId, detail),
-    session: threadSessionStateOf(detail),
+    execution: projection.execution,
+    session: projection.session,
     pendingRequests: {
       items: [],
       nextCursor: null,
@@ -3187,8 +3106,7 @@ const buildThreadState = (options: {
       limitations: [],
       failures: [],
     },
-    interruptionPending:
-      thread.latestTurn?.state === "interrupted" || thread.session?.status === "interrupted",
+    interruptionPending: projection.interruptionPending,
     limitations,
   };
   const frame: CapturedThreadState = {
@@ -4637,14 +4555,12 @@ const evaluateTurnOutcome = (options: {
   const { turn, detail, evidence, pendingRequests } = options;
   const latest = detail.thread.latestTurn;
   if (latest !== null && latest.turnId === turn.turnId) {
-    if (!detail.projectedTurnState && latest.state !== "running") {
+    const projection = projectThreadState({ instanceId: turn.instanceId, detail });
+    if (projection.execution.state === "inactive" && latest.state !== "running") {
       return {
         execution: terminalExecutionFromState(latest.state),
         satisfied: true,
-        evidence: threadSnapshotEvidence(
-          detail,
-          `The thread detail snapshot published the latest turn as ${latest.state}.`,
-        ),
+        evidence: projection.execution.evidence,
       };
     }
     const awaiting = awaitingTurnOutcome({
@@ -4656,10 +4572,7 @@ const evaluateTurnOutcome = (options: {
       return {
         execution: "running",
         satisfied: false,
-        evidence: threadSnapshotEvidence(
-          detail,
-          "The thread detail snapshot published the latest turn as running.",
-        ),
+        evidence: projection.execution.evidence,
       };
     }
     // A projected terminal state — session readiness or an interruption
@@ -4667,10 +4580,7 @@ const evaluateTurnOutcome = (options: {
     return {
       execution: "outcome_unknown",
       satisfied: false,
-      evidence: threadSnapshotEvidence(
-        detail,
-        `The latest turn state ${latest.state} was projected from a session transition racing the snapshot, not observed as authoritative turn evidence.`,
-      ),
+      evidence: projection.execution.evidence,
     };
   }
   // The target is not the latest observed turn: a newer turn never replaces

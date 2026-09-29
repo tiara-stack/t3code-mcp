@@ -20,6 +20,7 @@ import {
 } from "./domain";
 import { LocalStore, LocalStoreError, type LocalStoreService } from "./local-store";
 import { InstanceConnections } from "./instance-connections";
+import { projectThreadState } from "./thread-state-projection";
 import {
   T3CodeAdapterError,
   type DiscoveredProject,
@@ -492,15 +493,14 @@ const recordPublishedTurnEvidence = (options: {
   const { store, instanceId, threadId, recorded, detail } = options;
   const latestTurn = detail.thread.latestTurn;
   if (latestTurn === null || turnEvidenceUnchanged(recorded, detail)) return Effect.void;
+  const projection = projectThreadState({ instanceId, detail });
   return store.recordTurnEvidence({
     turn: { instanceId, threadId, turnId: latestTurn.turnId },
     state: latestTurn.state,
     projected: detail.projectedTurnState,
     sourceSequence: detail.snapshotSequence,
     observedAt: detail.observedAt,
-    detail: detail.projectedTurnState
-      ? `The latest turn state ${latestTurn.state} was projected from a session transition racing the snapshot, not observed as authoritative turn evidence.`
-      : `The thread detail snapshot published the latest turn as ${latestTurn.state}.`,
+    detail: projection.execution.evidence[0]!.detail,
   });
 };
 
