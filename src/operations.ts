@@ -8368,147 +8368,142 @@ export class Operations extends Context.Service<Operations, OperationsService>()
             });
           }
 
-          stepPosition = WORKTREE_DISCARD_SOLE_THREAD_STEPS.postRemovalReferences;
-          const orphanCheck = yield* checkWorktree();
-          if (
-            orphanCheck.branch !== branch ||
-            (initialEligibility !== null &&
-              (orphanCheck.registration.revision !== initialEligibility.registration.revision ||
-                orphanCheck.registration.environmentId !==
-                  initialEligibility.registration.environmentId))
-          ) {
-            return yield* failAt({
-              position: WORKTREE_DISCARD_SOLE_THREAD_STEPS.postRemovalReferences,
-              failure: {
-                code: "stale_state",
-                message:
-                  "The worktree branch or instance registration changed after thread removal; the discard will not apply to a replacement target.",
-                retry: "reconcile_first",
-                details: {},
-              },
-              state: "partial",
-            });
-          }
-          yield* recordStep({
-            position: WORKTREE_DISCARD_SOLE_THREAD_STEPS.postRemovalReferences,
-            state: "succeeded",
-            kind: "snapshot",
-            detail:
-              "A fresh complete VCS and active/archived inventory recheck confirms the removed thread left no worktree references.",
-            evidence: orphanCheck.evidence,
-          });
-
-          stepPosition = WORKTREE_DISCARD_SOLE_THREAD_STEPS.beforeWorktreeDiscard;
-          const finalCheck = yield* checkWorktree();
-          if (
-            finalCheck.branch !== branch ||
-            finalCheck.registration.revision !== orphanCheck.registration.revision ||
-            finalCheck.registration.environmentId !== orphanCheck.registration.environmentId
-          ) {
-            return yield* failAt({
-              position: WORKTREE_DISCARD_SOLE_THREAD_STEPS.beforeWorktreeDiscard,
-              failure: {
-                code: "stale_state",
-                message:
-                  "The worktree branch or instance registration changed before discard; the prior request will not apply to a replacement target.",
-                retry: "reconcile_first",
-                details: {},
-              },
-              state: "partial",
-            });
-          }
-          yield* recordStep({
-            position: WORKTREE_DISCARD_SOLE_THREAD_STEPS.beforeWorktreeDiscard,
-            state: "succeeded",
-            kind: "snapshot",
-            detail: `A second fresh VCS and active/archived inventory check confirms branch ${branch} is still the intended orphan checkout immediately before discard.`,
-            evidence: finalCheck.evidence,
-          });
-
-          const beforeWorktreeDispatch = yield* store.getOperation(input.requestId);
-          if (beforeWorktreeDispatch === null) {
-            return yield* Effect.fail(
-              new LocalStoreError({
-                kind: "request_record_unavailable",
-                message: REQUEST_RECORD_UNAVAILABLE_MESSAGE,
+          let referenceCheck: WorktreeDiscardEligibility | null = null;
+          let discardIntent: OperationIntent | null = null;
+          let discardedBranch: string | null = null;
+          yield* Cleanup.dispatchOrphanWorktreeDiscard({
+            check: () =>
+              Effect.suspend(() => {
+                stepPosition =
+                  referenceCheck === null
+                    ? WORKTREE_DISCARD_SOLE_THREAD_STEPS.postRemovalReferences
+                    : WORKTREE_DISCARD_SOLE_THREAD_STEPS.beforeWorktreeDiscard;
+                return checkWorktree();
               }),
-            );
-          }
-          const dispatchStarted = yield* evidence(
-            "The single VCS remove attempt is crossing its dispatch boundary; recovery will only observe state and never resend it.",
-            "adapter_inference",
-          );
-          dispatchBeforeWorktreeRemove = beforeWorktreeDispatch.record.dispatch;
-          yield* persistCurrent(
-            {
-              state: beforeWorktreeDispatch.record.state,
-              dispatch: beforeWorktreeDispatch.record.dispatch,
+            recordCheck: (position, checked) =>
+              Effect.gen(function* () {
+                const positionForCheck =
+                  position === 0
+                    ? WORKTREE_DISCARD_SOLE_THREAD_STEPS.postRemovalReferences
+                    : WORKTREE_DISCARD_SOLE_THREAD_STEPS.beforeWorktreeDiscard;
+                stepPosition = positionForCheck;
+                if (position === 0 && initialEligibility !== null) {
+                  yield* Cleanup.assertSameWorktreeGuard(initialEligibility, checked);
+                }
+                referenceCheck = checked;
+                const isFirst = position === 0;
+                yield* recordStep({
+                  position: positionForCheck,
+                  state: "succeeded",
+                  kind: "snapshot",
+                  detail: isFirst
+                    ? "A fresh complete VCS and active/archived inventory recheck confirms the removed thread left no worktree references."
+                    : `A second fresh VCS and active/archived inventory check confirms branch ${branch} is still the intended orphan checkout immediately before discard.`,
+                  evidence: checked.evidence,
+                });
+              }),
+            dispatch: (finalCheck) =>
+              Effect.gen(function* () {
+                const verifiedBranch = finalCheck.branch;
+                discardedBranch = verifiedBranch;
+                stepPosition = WORKTREE_DISCARD_SOLE_THREAD_STEPS.worktreeDispatch;
+                const beforeWorktreeDispatch = yield* store.getOperation(input.requestId);
+                if (beforeWorktreeDispatch === null) {
+                  return yield* Effect.fail(
+                    new LocalStoreError({
+                      kind: "request_record_unavailable",
+                      message: REQUEST_RECORD_UNAVAILABLE_MESSAGE,
+                    }),
+                  );
+                }
+                const dispatchStarted = yield* evidence(
+                  "The single VCS remove attempt is crossing its dispatch boundary; recovery will only observe state and never resend it.",
+                  "adapter_inference",
+                );
+                dispatchBeforeWorktreeRemove = beforeWorktreeDispatch.record.dispatch;
+                yield* persistCurrent(
+                  {
+                    state: beforeWorktreeDispatch.record.state,
+                    dispatch: beforeWorktreeDispatch.record.dispatch,
+                  },
+                  {
+                    now: dispatchStarted.observedAt,
+                    intent: { ...beforeWorktreeDispatch.intent, branch: verifiedBranch },
+                    state: "pending",
+                    dispatch: "unknown",
+                    target: worktree,
+                    stepPosition: WORKTREE_DISCARD_SOLE_THREAD_STEPS.worktreeDispatch,
+                    stepState: "pending",
+                    evidence: [dispatchStarted],
+                    evidenceStepPosition: WORKTREE_DISCARD_SOLE_THREAD_STEPS.worktreeDispatch,
+                    recovery: "observe_operation",
+                  },
+                );
+                worktreeDispatchMarkerPersisted = true;
+                discardIntent = { ...beforeWorktreeDispatch.intent, branch: verifiedBranch };
+                yield* connections.removeWorktree(worktree, finalCheck.registration, () => {
+                  worktreeDispatchStarted = true;
+                });
+                worktreeDispatchAccepted = true;
+                const accepted = yield* evidence(
+                  "The T3Code VCS remove RPC returned successfully; a separate fresh inventory must establish worktree absence and branch retention.",
+                  "adapter_inference",
+                );
+                yield* persistCurrent(
+                  { state: "pending", dispatch: "unknown" },
+                  {
+                    now: accepted.observedAt,
+                    state: "pending",
+                    dispatch: "accepted",
+                    target: worktree,
+                    stepPosition: WORKTREE_DISCARD_SOLE_THREAD_STEPS.worktreeDispatch,
+                    stepState: "succeeded",
+                    evidence: [accepted],
+                    evidenceStepPosition: WORKTREE_DISCARD_SOLE_THREAD_STEPS.worktreeDispatch,
+                    recovery: "observe_operation",
+                  },
+                );
+              }),
+            afterDispatch: () =>
+              Effect.gen(function* () {
+                stepPosition = WORKTREE_DISCARD_SOLE_THREAD_STEPS.worktreeResponse;
+                const response = yield* evidence(
+                  "T3Code acknowledged forced removal of the named checkout; the acknowledgement alone does not prove the checkout is absent.",
+                  "rpc_result",
+                );
+                yield* persistCurrent(
+                  { state: "pending", dispatch: "accepted" },
+                  {
+                    now: response.observedAt,
+                    state: "pending",
+                    dispatch: "accepted",
+                    target: worktree,
+                    stepPosition: WORKTREE_DISCARD_SOLE_THREAD_STEPS.worktreeResponse,
+                    stepState: "succeeded",
+                    evidence: [response],
+                    evidenceStepPosition: WORKTREE_DISCARD_SOLE_THREAD_STEPS.worktreeResponse,
+                    recovery: "observe_operation",
+                  },
+                );
+              }),
+            observeAbsence: () => {
+              stepPosition = WORKTREE_DISCARD_SOLE_THREAD_STEPS.worktreeAbsence;
+              return discardIntent === null || discardedBranch === null
+                ? Effect.fail(
+                    new LocalStoreError({
+                      kind: "request_record_unavailable",
+                      message: REQUEST_RECORD_UNAVAILABLE_MESSAGE,
+                    }),
+                  )
+                : recordWorktreeDiscardOutcome(
+                    input,
+                    discardedBranch,
+                    discardIntent,
+                    WORKTREE_DISCARD_SOLE_THREAD_STEPS.worktreeAbsence,
+                    persistCurrent,
+                  );
             },
-            {
-              now: dispatchStarted.observedAt,
-              intent: { ...beforeWorktreeDispatch.intent, branch },
-              state: "pending",
-              dispatch: "unknown",
-              target: worktree,
-              stepPosition: WORKTREE_DISCARD_SOLE_THREAD_STEPS.worktreeDispatch,
-              stepState: "pending",
-              evidence: [dispatchStarted],
-              evidenceStepPosition: WORKTREE_DISCARD_SOLE_THREAD_STEPS.worktreeDispatch,
-              recovery: "observe_operation",
-            },
-          );
-          worktreeDispatchMarkerPersisted = true;
-          const intent = { ...beforeWorktreeDispatch.intent, branch };
-          stepPosition = WORKTREE_DISCARD_SOLE_THREAD_STEPS.worktreeDispatch;
-          yield* connections.removeWorktree(worktree, finalCheck.registration, () => {
-            worktreeDispatchStarted = true;
           });
-          worktreeDispatchAccepted = true;
-          const accepted = yield* evidence(
-            "The T3Code VCS remove RPC returned successfully; a separate fresh inventory must establish worktree absence and branch retention.",
-            "adapter_inference",
-          );
-          yield* persistCurrent(
-            { state: "pending", dispatch: "unknown" },
-            {
-              now: accepted.observedAt,
-              state: "pending",
-              dispatch: "accepted",
-              target: worktree,
-              stepPosition: WORKTREE_DISCARD_SOLE_THREAD_STEPS.worktreeDispatch,
-              stepState: "succeeded",
-              evidence: [accepted],
-              evidenceStepPosition: WORKTREE_DISCARD_SOLE_THREAD_STEPS.worktreeDispatch,
-              recovery: "observe_operation",
-            },
-          );
-          stepPosition = WORKTREE_DISCARD_SOLE_THREAD_STEPS.worktreeResponse;
-          const response = yield* evidence(
-            "T3Code acknowledged forced removal of the named checkout; the acknowledgement alone does not prove the checkout is absent.",
-            "rpc_result",
-          );
-          yield* persistCurrent(
-            { state: "pending", dispatch: "accepted" },
-            {
-              now: response.observedAt,
-              state: "pending",
-              dispatch: "accepted",
-              target: worktree,
-              stepPosition: WORKTREE_DISCARD_SOLE_THREAD_STEPS.worktreeResponse,
-              stepState: "succeeded",
-              evidence: [response],
-              evidenceStepPosition: WORKTREE_DISCARD_SOLE_THREAD_STEPS.worktreeResponse,
-              recovery: "observe_operation",
-            },
-          );
-          stepPosition = WORKTREE_DISCARD_SOLE_THREAD_STEPS.worktreeAbsence;
-          yield* recordWorktreeDiscardOutcome(
-            input,
-            branch,
-            intent,
-            WORKTREE_DISCARD_SOLE_THREAD_STEPS.worktreeAbsence,
-            persistCurrent,
-          );
         }).pipe(
           Effect.catchTags({
             WorktreeDiscardClaimLost: () => signalCompletion(input.requestId),
