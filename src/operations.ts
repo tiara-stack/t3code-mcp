@@ -4626,26 +4626,40 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           }
         | { readonly kind: "unknown"; readonly failure: ToolFailure };
 
-      const observeThreadRemovalAbsence = (input: {
+      type ThreadRemovalAbsencePersistenceInput = {
         readonly requestId: string;
-        readonly thread: ThreadRemoveInput["thread"];
         readonly commandId: string | null;
         readonly dispatchSequence: number | null;
-      }): Effect.Effect<ThreadRemovalAbsenceOutcome, LocalStoreError> =>
+        readonly presence: Result.Result<
+          ThreadRemovalPresence,
+          LocalStoreError | T3CodeAdapterError | ObservationError
+        >;
+      };
+
+      function persistThreadRemovalAbsenceResult(
+        input: ThreadRemovalAbsencePersistenceInput & { readonly allowPresent: true },
+      ): Effect.Effect<
+        ThreadRemovalAbsenceOutcome | { readonly kind: "still_present" },
+        LocalStoreError
+      >;
+      function persistThreadRemovalAbsenceResult(
+        input: ThreadRemovalAbsencePersistenceInput & { readonly allowPresent: false },
+      ): Effect.Effect<ThreadRemovalAbsenceOutcome, LocalStoreError>;
+      function persistThreadRemovalAbsenceResult(
+        input: ThreadRemovalAbsencePersistenceInput & { readonly allowPresent: boolean },
+      ): Effect.Effect<
+        ThreadRemovalAbsenceOutcome | { readonly kind: "still_present" },
+        LocalStoreError
+      > {
         // fallow-ignore-next-line complexity
-        Effect.gen(function* () {
-          const presence = yield* waitForThreadRemovalAbsence(
-            input.thread,
-            input.dispatchSequence,
-            MAX_THREAD_WAIT_MILLIS,
-          );
+        return Effect.gen(function* () {
           if (
-            Result.isSuccess(presence) &&
-            threadRemovalAbsenceConfirmed(presence.success, input.dispatchSequence)
+            Result.isSuccess(input.presence) &&
+            threadRemovalAbsenceConfirmed(input.presence.success, input.dispatchSequence)
           ) {
             const sequence = Math.min(
-              presence.success.activeSequence,
-              presence.success.archivedSequence,
+              input.presence.success.activeSequence,
+              input.presence.success.archivedSequence,
             );
             const stepState = input.dispatchSequence === null ? "already_absent" : "succeeded";
             yield* updateThreadRemovalStep({
@@ -4662,12 +4676,31 @@ export class Operations extends Context.Service<Operations, OperationsService>()
             });
             return { kind: "confirmed", sequence, stepState } as const;
           }
-
-          const failure = Result.isFailure(presence)
-            ? threadRemovalFailure(presence.failure)
+          if (
+            input.allowPresent &&
+            Result.isSuccess(input.presence) &&
+            !input.presence.success.absent
+          ) {
+            yield* updateThreadRemovalStep({
+              requestId: input.requestId,
+              position: THREAD_REMOVE_STEPS.absence,
+              state: "skipped",
+              detail:
+                "Fresh active and archived inventories confirm that the target remains present after the certain deletion failure.",
+              kind: "snapshot",
+              sourceSequence: Math.min(
+                input.presence.success.activeSequence,
+                input.presence.success.archivedSequence,
+              ),
+              nativeEventId: input.commandId,
+            });
+            return { kind: "still_present" } as const;
+          }
+          const failure = Result.isFailure(input.presence)
+            ? threadRemovalFailure(input.presence.failure)
             : {
                 code: "unavailable" as const,
-                message: presence.success.absent
+                message: input.presence.success.absent
                   ? "The active and archived inventories did not advance past the deletion command, so thread absence is not established."
                   : "The target thread is still present after deletion was requested; its removal outcome is unknown.",
                 retry: "reconcile_first" as const,
@@ -4679,13 +4712,39 @@ export class Operations extends Context.Service<Operations, OperationsService>()
             state: "outcome_unknown",
             detail: failure.message,
             error: failure,
-            kind: Result.isSuccess(presence) ? "snapshot" : "adapter_inference",
-            sourceSequence: Result.isSuccess(presence)
-              ? Math.min(presence.success.activeSequence, presence.success.archivedSequence)
+            kind: Result.isSuccess(input.presence) ? "snapshot" : "adapter_inference",
+            sourceSequence: Result.isSuccess(input.presence)
+              ? Math.min(
+                  input.presence.success.activeSequence,
+                  input.presence.success.archivedSequence,
+                )
               : null,
             nativeEventId: input.commandId,
           });
           return { kind: "unknown", failure } as const;
+        });
+      }
+
+      const observeThreadRemovalAbsence = (input: {
+        readonly requestId: string;
+        readonly thread: ThreadRemoveInput["thread"];
+        readonly commandId: string | null;
+        readonly dispatchSequence: number | null;
+      }): Effect.Effect<ThreadRemovalAbsenceOutcome, LocalStoreError> =>
+        // fallow-ignore-next-line complexity
+        Effect.gen(function* () {
+          const presence = yield* waitForThreadRemovalAbsence(
+            input.thread,
+            input.dispatchSequence,
+            MAX_THREAD_WAIT_MILLIS,
+          );
+          return yield* persistThreadRemovalAbsenceResult({
+            requestId: input.requestId,
+            commandId: input.commandId,
+            dispatchSequence: input.dispatchSequence,
+            presence,
+            allowPresent: false,
+          });
         });
 
       const skipNotStartedThreadRemovalSteps = (
@@ -10751,23 +10810,30 @@ export class Operations extends Context.Service<Operations, OperationsService>()
               ? { expectedSessionStop: stopRecovery }
               : {}),
           };
-          const beforePreparationReady = yield* checkBeforeThreadDeletion({
-            requestId: input.requestId,
-            thread: input.thread,
-            options: deletionCheckOptions,
-            sessionOutcome,
-            successDetail:
-              "Fresh execution, pending-request, association, and session checks pass before deletion.",
-            absentDetail:
-              "The target became absent before deletion; no deletion command was dispatched.",
+          let recheckCount = 0;
+          const preparation = yield* Cleanup.prepareThreadRemoval({
+            recheck: () => {
+              recheckCount += 1;
+              return checkBeforeThreadDeletion({
+                requestId: input.requestId,
+                thread: input.thread,
+                options: deletionCheckOptions,
+                sessionOutcome,
+                successDetail:
+                  recheckCount === 1
+                    ? "Fresh execution, pending-request, association, and session checks pass before delete preparation."
+                    : "Fresh execution, pending-request, association, and session checks pass after delete preparation, immediately before dispatch.",
+                absentDetail:
+                  recheckCount === 1
+                    ? "The target became absent before delete preparation; no deletion command was dispatched."
+                    : "The target became absent after delete preparation; no deletion command was dispatched.",
+              });
+            },
+            prepare: () => connections.prepareThreadDelete(input.thread.instanceId),
           });
-          if (beforePreparationReady === null) return;
-
-          const preparedResult = yield* Effect.result(
-            connections.prepareThreadDelete(input.thread.instanceId),
-          );
-          if (Result.isFailure(preparedResult)) {
-            const failure = threadRemovalFailure(preparedResult.failure);
+          if (preparation.kind === "not_ready") return;
+          if (preparation.kind === "preparation_failed") {
+            const failure = threadRemovalFailure(preparation.error);
             yield* updateThreadRemovalStep({
               requestId: input.requestId,
               position: THREAD_REMOVE_STEPS.deleteDispatch,
@@ -10792,17 +10858,8 @@ export class Operations extends Context.Service<Operations, OperationsService>()
             });
             return;
           }
-          const readyForDispatch = yield* checkBeforeThreadDeletion({
-            requestId: input.requestId,
-            thread: input.thread,
-            options: deletionCheckOptions,
-            sessionOutcome,
-            successDetail:
-              "Fresh execution, pending-request, association, and session checks pass after delete preparation, immediately before dispatch.",
-            absentDetail:
-              "The target became absent after delete preparation; no deletion command was dispatched.",
-          });
-          if (readyForDispatch === null) return;
+          const readyForDispatch = preparation.checked;
+          const preparedDelete = preparation.prepared;
 
           const commandIdResult = yield* Effect.result(crypto.randomUUIDv4);
           if (Result.isFailure(commandIdResult)) {
@@ -10837,15 +10894,6 @@ export class Operations extends Context.Service<Operations, OperationsService>()
             return;
           }
           const commandId = commandIdResult.success;
-          const beforeDispatch = yield* store.getOperation(input.requestId);
-          if (beforeDispatch === null) {
-            return yield* Effect.fail(
-              new LocalStoreError({
-                kind: "request_record_unavailable",
-                message: REQUEST_RECORD_UNAVAILABLE_MESSAGE,
-              }),
-            );
-          }
           const removalRecovery: ThreadRemovalRecovery = {
             instanceId: input.thread.instanceId,
             threadId: input.thread.threadId,
@@ -10856,226 +10904,244 @@ export class Operations extends Context.Service<Operations, OperationsService>()
               absence: THREAD_REMOVE_STEPS.absence,
             },
           };
-          const dispatchStartedAt = yield* nowIso;
-          const dispatchStarted: Evidence = {
-            kind: "adapter_inference",
-            observedAt: dispatchStartedAt,
-            sourceSequence: readyForDispatch.sequence,
-            nativeEventId: commandId,
-            detail:
-              "The thread-delete command identity and current inactive-thread checks were persisted before dispatch; this command will not be replayed.",
-          };
-          const dispatchMarked = yield* store.compareAndUpdateOperation(input.requestId, {
-            now: dispatchStartedAt,
-            expectedRevision: beforeDispatch.record.revision,
-            onlyIfNonterminal: true,
-            intent: { ...beforeDispatch.intent, threadRemoval: removalRecovery },
-            target: input.thread,
-            state: "pending",
-            dispatch: "unknown",
+          const execution = yield* Cleanup.dispatchAndConfirmThreadRemoval({
+            prepared: preparedDelete,
+            threadId: input.thread.threadId,
             commandId,
-            stepPosition: THREAD_REMOVE_STEPS.deleteDispatch,
-            stepState: "pending",
-            evidence: [dispatchStarted],
-            evidenceStepPosition: THREAD_REMOVE_STEPS.deleteDispatch,
-            recovery: "observe_operation",
-          });
-          if (!dispatchMarked) {
-            const failure = threadRemovalCheckFailure(
-              "stale_state",
-              "The operation record changed before thread deletion could be dispatched.",
-            );
-            yield* updateThreadRemovalStep({
-              requestId: input.requestId,
-              position: THREAD_REMOVE_STEPS.deleteDispatch,
-              state: "failed",
-              detail: failure.message,
-              error: failure,
-            });
-            yield* skipThreadRemovalSteps(
-              input.requestId,
-              [THREAD_REMOVE_STEPS.absence],
-              "The operation record changed before deletion; no command was dispatched.",
-            );
-            const current = yield* store.getOperation(input.requestId);
-            yield* finishThreadRemoval({
-              requestId: input.requestId,
-              state: sessionOutcome.kind === "observed" ? "partial" : "failed",
-              dispatch: current?.record.dispatch ?? "not_dispatched",
-              error: failure,
-              recovery: "observe_operation",
-              detail: failure.message,
-            });
-            return;
-          }
-
-          const dispatched = yield* Effect.result(
-            preparedResult.success.dispatch({ threadId: input.thread.threadId, commandId }),
-          );
-          if (Result.isFailure(dispatched)) {
-            const failure = threadRemovalFailure(dispatched.failure);
-            const uncertain =
-              dispatched.failure instanceof T3CodeAdapterError && dispatched.failure.uncertain;
-            const dispatch = uncertain
-              ? "unknown"
-              : dispatched.failure instanceof T3CodeAdapterError &&
-                  dispatched.failure.kind === "command_rejected"
-                ? "rejected"
-                : "not_dispatched";
-            yield* updateThreadRemovalStep({
-              requestId: input.requestId,
-              position: THREAD_REMOVE_STEPS.deleteDispatch,
-              state: uncertain ? "outcome_unknown" : "failed",
-              detail: failure.message,
-              error: failure,
-              kind: uncertain ? "adapter_inference" : "rpc_result",
-              nativeEventId: commandId,
-            });
-            if (uncertain) {
-              const absence = yield* observeThreadRemovalAbsence({
-                requestId: input.requestId,
-                thread: input.thread,
-                commandId,
-                dispatchSequence: null,
-              });
-              if (absence.kind === "confirmed") {
-                yield* finishThreadRemoval({
-                  requestId: input.requestId,
-                  state: "completed",
-                  dispatch: "unknown",
-                  error: null,
-                  recovery: "none",
+            waitMs: MAX_THREAD_WAIT_MILLIS,
+            persistDispatchStart: () =>
+              Effect.gen(function* () {
+                const beforeDispatch = yield* store.getOperation(input.requestId);
+                if (beforeDispatch === null) {
+                  return yield* Effect.fail(
+                    new LocalStoreError({
+                      kind: "request_record_unavailable",
+                      message: REQUEST_RECORD_UNAVAILABLE_MESSAGE,
+                    }),
+                  );
+                }
+                const dispatchStartedAt = yield* nowIso;
+                const dispatchStarted: Evidence = {
+                  kind: "adapter_inference",
+                  observedAt: dispatchStartedAt,
+                  sourceSequence: readyForDispatch.sequence,
+                  nativeEventId: commandId,
                   detail:
-                    "Fresh active and archived inventories confirm the thread is absent after an uncertain deletion reply; causality is not inferred.",
+                    "The thread-delete command identity and current inactive-thread checks were persisted before dispatch; this command will not be replayed.",
+                };
+                const dispatchMarked = yield* store.compareAndUpdateOperation(input.requestId, {
+                  now: dispatchStartedAt,
+                  expectedRevision: beforeDispatch.record.revision,
+                  onlyIfNonterminal: true,
+                  intent: { ...beforeDispatch.intent, threadRemoval: removalRecovery },
+                  target: input.thread,
+                  state: "pending",
+                  dispatch: "unknown",
+                  commandId,
+                  stepPosition: THREAD_REMOVE_STEPS.deleteDispatch,
+                  stepState: "pending",
+                  evidence: [dispatchStarted],
+                  evidenceStepPosition: THREAD_REMOVE_STEPS.deleteDispatch,
+                  recovery: "observe_operation",
                 });
-              } else {
+                if (dispatchMarked) return true;
+
+                const failure = threadRemovalCheckFailure(
+                  "stale_state",
+                  "The operation record changed before thread deletion could be dispatched.",
+                );
+                yield* updateThreadRemovalStep({
+                  requestId: input.requestId,
+                  position: THREAD_REMOVE_STEPS.deleteDispatch,
+                  state: "failed",
+                  detail: failure.message,
+                  error: failure,
+                });
+                yield* skipThreadRemovalSteps(
+                  input.requestId,
+                  [THREAD_REMOVE_STEPS.absence],
+                  "The operation record changed before deletion; no command was dispatched.",
+                );
+                const current = yield* store.getOperation(input.requestId);
                 yield* finishThreadRemoval({
                   requestId: input.requestId,
-                  state: "outcome_unknown",
-                  dispatch: "unknown",
-                  error: absence.failure,
-                  recovery: "observe_thread",
-                  detail: absence.failure.message,
+                  state: sessionOutcome.kind === "observed" ? "partial" : "failed",
+                  dispatch: current?.record.dispatch ?? "not_dispatched",
+                  error: failure,
+                  recovery: "observe_operation",
+                  detail: failure.message,
                 });
-              }
-              return;
-            }
-
-            const presence = yield* Effect.result(readThreadRemovalPresence(input.thread));
-            if (Result.isSuccess(presence) && presence.success.absent) {
-              yield* updateThreadRemovalStep({
+                return false;
+              }),
+            persistDispatchResult: (result) =>
+              Effect.gen(function* () {
+                if (Result.isSuccess(result)) {
+                  const acceptedAt = yield* nowIso;
+                  const acceptedEvidence: Evidence = {
+                    kind: "rpc_result",
+                    observedAt: acceptedAt,
+                    sourceSequence: result.success.sequence,
+                    nativeEventId: commandId,
+                    detail:
+                      "T3Code accepted the thread-delete command. The thread remains pending until fresh active and archived inventories both confirm absence.",
+                  };
+                  const current = yield* store.getOperation(input.requestId);
+                  if (current === null) {
+                    return yield* Effect.fail(
+                      new LocalStoreError({
+                        kind: "request_record_unavailable",
+                        message: REQUEST_RECORD_UNAVAILABLE_MESSAGE,
+                      }),
+                    );
+                  }
+                  const acceptedRecovery: ThreadRemovalRecovery = {
+                    ...removalRecovery,
+                    dispatchSequence: result.success.sequence,
+                  };
+                  yield* store.updateOperation(input.requestId, {
+                    now: acceptedAt,
+                    intent: { ...current.intent, threadRemoval: acceptedRecovery },
+                    state: "pending",
+                    dispatch: "accepted",
+                    target: input.thread,
+                    commandId,
+                    stepPosition: THREAD_REMOVE_STEPS.deleteDispatch,
+                    stepState: "succeeded",
+                    stepError: null,
+                    evidence: [acceptedEvidence],
+                    evidenceStepPosition: THREAD_REMOVE_STEPS.deleteDispatch,
+                    error: null,
+                    recovery: "observe_thread",
+                  });
+                  return { kind: "accepted", sequence: result.success.sequence } as const;
+                }
+                const failure = threadRemovalFailure(result.failure);
+                const uncertain = result.failure.uncertain;
+                const dispatch: "rejected" | "not_dispatched" = uncertain
+                  ? "not_dispatched"
+                  : result.failure.kind === "command_rejected"
+                    ? "rejected"
+                    : "not_dispatched";
+                yield* updateThreadRemovalStep({
+                  requestId: input.requestId,
+                  position: THREAD_REMOVE_STEPS.deleteDispatch,
+                  state: uncertain ? "outcome_unknown" : "failed",
+                  detail: failure.message,
+                  error: failure,
+                  kind: uncertain ? "adapter_inference" : "rpc_result",
+                  nativeEventId: commandId,
+                });
+                return uncertain
+                  ? ({ kind: "uncertain", failure } as const)
+                  : ({ kind: "failed", dispatch, failure } as const);
+              }),
+            readPresence: () => readThreadRemovalPresence(input.thread),
+            persistAbsenceResult: ({ dispatch, presence }) => {
+              const absenceInput = {
                 requestId: input.requestId,
-                position: THREAD_REMOVE_STEPS.absence,
-                state: "already_absent",
-                detail:
-                  "A fresh active and archived inventory confirmed that the target was removed concurrently after the deletion command was rejected.",
-                kind: "snapshot",
-                sourceSequence: Math.min(
-                  presence.success.activeSequence,
-                  presence.success.archivedSequence,
-                ),
-              });
+                commandId,
+                dispatchSequence: dispatch.kind === "accepted" ? dispatch.sequence : null,
+                presence,
+              };
+              return dispatch.kind === "failed"
+                ? persistThreadRemovalAbsenceResult({ ...absenceInput, allowPresent: true })
+                : persistThreadRemovalAbsenceResult({ ...absenceInput, allowPresent: false });
+            },
+          });
+          if (execution.kind === "not_dispatched") return;
+
+          const { dispatch, absence } = execution;
+          if (dispatch.kind === "accepted") {
+            if (absence.kind === "confirmed") {
               yield* finishThreadRemoval({
                 requestId: input.requestId,
                 state: "completed",
-                dispatch,
+                dispatch: "accepted",
                 error: null,
                 recovery: "none",
                 detail:
-                  "Fresh inventories confirm the requested thread is absent; no causal success is claimed.",
+                  "Fresh active and archived inventories confirm the requested thread is absent; its worktree was retained.",
               });
-              return;
+            } else {
+              const failure =
+                absence.kind === "unknown"
+                  ? absence.failure
+                  : {
+                      code: "unavailable" as const,
+                      message:
+                        "The active and archived inventories did not confirm thread absence.",
+                      retry: "reconcile_first" as const,
+                      details: { action: "observe_thread" },
+                    };
+              yield* finishThreadRemoval({
+                requestId: input.requestId,
+                state: "outcome_unknown",
+                dispatch: "accepted",
+                error: failure,
+                recovery: "observe_thread",
+                detail: failure.message,
+              });
             }
-            const absenceFailure = Result.isFailure(presence)
-              ? threadRemovalFailure(presence.failure)
-              : failure;
-            yield* updateThreadRemovalStep({
-              requestId: input.requestId,
-              position: THREAD_REMOVE_STEPS.absence,
-              state: Result.isFailure(presence) ? "outcome_unknown" : "skipped",
-              detail: absenceFailure.message,
-              ...(Result.isFailure(presence) ? { error: absenceFailure } : {}),
-            });
-            const finalState = Result.isFailure(presence)
-              ? "outcome_unknown"
-              : sessionOutcome.kind === "observed"
-                ? "partial"
-                : "failed";
-            yield* finishThreadRemoval({
-              requestId: input.requestId,
-              state: finalState,
-              dispatch,
-              error: absenceFailure,
-              recovery:
-                finalState === "outcome_unknown" ? "observe_thread" : "new_explicit_request",
-              detail: absenceFailure.message,
-            });
+            return;
+          }
+          if (dispatch.kind === "uncertain") {
+            if (absence.kind === "confirmed") {
+              yield* finishThreadRemoval({
+                requestId: input.requestId,
+                state: "completed",
+                dispatch: "unknown",
+                error: null,
+                recovery: "none",
+                detail:
+                  "Fresh active and archived inventories confirm the thread is absent after an uncertain deletion reply; causality is not inferred.",
+              });
+            } else {
+              const failure = absence.kind === "unknown" ? absence.failure : dispatch.failure;
+              yield* finishThreadRemoval({
+                requestId: input.requestId,
+                state: "outcome_unknown",
+                dispatch: "unknown",
+                error: failure,
+                recovery: "observe_thread",
+                detail: failure.message,
+              });
+            }
             return;
           }
 
-          const acceptedAt = yield* nowIso;
-          const acceptedEvidence: Evidence = {
-            kind: "rpc_result",
-            observedAt: acceptedAt,
-            sourceSequence: dispatched.success.sequence,
-            nativeEventId: commandId,
-            detail:
-              "T3Code accepted the thread-delete command. The thread remains pending until fresh active and archived inventories both confirm absence.",
-          };
-          const current = yield* store.getOperation(input.requestId);
-          if (current === null) {
-            return yield* Effect.fail(
-              new LocalStoreError({
-                kind: "request_record_unavailable",
-                message: REQUEST_RECORD_UNAVAILABLE_MESSAGE,
-              }),
-            );
-          }
-          const acceptedRecovery: ThreadRemovalRecovery = {
-            ...removalRecovery,
-            dispatchSequence: dispatched.success.sequence,
-          };
-          yield* store.updateOperation(input.requestId, {
-            now: acceptedAt,
-            intent: { ...current.intent, threadRemoval: acceptedRecovery },
-            state: "pending",
-            dispatch: "accepted",
-            target: input.thread,
-            commandId,
-            stepPosition: THREAD_REMOVE_STEPS.deleteDispatch,
-            stepState: "succeeded",
-            stepError: null,
-            evidence: [acceptedEvidence],
-            evidenceStepPosition: THREAD_REMOVE_STEPS.deleteDispatch,
-            error: null,
-            recovery: "observe_thread",
-          });
-          const absence = yield* observeThreadRemovalAbsence({
-            requestId: input.requestId,
-            thread: input.thread,
-            commandId,
-            dispatchSequence: dispatched.success.sequence,
-          });
           if (absence.kind === "confirmed") {
             yield* finishThreadRemoval({
               requestId: input.requestId,
               state: "completed",
-              dispatch: "accepted",
+              dispatch: dispatch.dispatch,
               error: null,
               recovery: "none",
               detail:
-                "Fresh active and archived inventories confirm the requested thread is absent; its worktree was retained.",
+                "Fresh inventories confirm the requested thread is absent; no causal success is claimed.",
             });
-          } else {
+            return;
+          }
+          if (absence.kind === "still_present") {
+            const state = sessionOutcome.kind === "observed" ? "partial" : "failed";
             yield* finishThreadRemoval({
               requestId: input.requestId,
-              state: "outcome_unknown",
-              dispatch: "accepted",
-              error: absence.failure,
-              recovery: "observe_thread",
-              detail: absence.failure.message,
+              state,
+              dispatch: dispatch.dispatch,
+              error: dispatch.failure,
+              recovery: "new_explicit_request",
+              detail: dispatch.failure.message,
             });
+            return;
           }
+          const failure = absence.failure;
+          yield* finishThreadRemoval({
+            requestId: input.requestId,
+            state: "outcome_unknown",
+            dispatch: dispatch.dispatch,
+            error: failure,
+            recovery: "observe_thread",
+            detail: failure.message,
+          });
         });
 
         return operation.pipe(

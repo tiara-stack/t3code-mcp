@@ -8,6 +8,7 @@ import * as TestClock from "effect/testing/TestClock";
 import { describe, expect, it as syncIt } from "vitest";
 import { Cleanup, type ThreadRemovalPresence, type WorktreeGuardReferences } from "./cleanup";
 import type { SynchronizedShell, SynchronizedThreadDetail } from "./observations";
+import { T3CodeAdapterError } from "./t3code-adapter";
 
 const worktree = {
   instanceId: "instance-a",
@@ -212,9 +213,10 @@ describe("Cleanup thread removal eligibility", () => {
   });
   const detail = (
     overrides: Partial<SynchronizedThreadDetail["thread"]> = {},
+    snapshotSequence = 30,
   ): SynchronizedThreadDetail => ({
-    snapshotSequence: 30,
-    threadSequence: 30,
+    snapshotSequence,
+    threadSequence: snapshotSequence,
     thread: {
       threadId: "thread-a",
       projectId: "project-a",
@@ -257,6 +259,228 @@ describe("Cleanup thread removal eligibility", () => {
       readInventories: () => Effect.succeed([active, archived] as const),
       readDetail: () => Effect.succeed(targetDetail),
     });
+
+  it.effect("owns both fresh rechecks around thread-delete preparation", () =>
+    Effect.gen(function* () {
+      const events: Array<string> = [];
+      let rechecks = 0;
+      const prepared = { dispatch: "delete" };
+      const result = yield* Cleanup.prepareThreadRemoval({
+        recheck: () => {
+          events.push("recheck");
+          rechecks += 1;
+          const snapshot = rechecks === 1 ? 10 : 20;
+          return Effect.map(
+            check(shell(snapshot, [shellThread()]), shell(snapshot + 1, []), detail({}, 1)),
+            (checked) => (checked.kind === "ready" ? checked : null),
+          );
+        },
+        prepare: () => {
+          events.push("prepare");
+          return Effect.succeed(prepared);
+        },
+      });
+      expect(events).toEqual(["recheck", "prepare", "recheck"]);
+      expect(result).toMatchObject({ kind: "ready", checked: { sequence: 21 }, prepared });
+    }),
+  );
+
+  it.effect("directs one persisted deletion attempt and its absence confirmation", () =>
+    Effect.gen(function* () {
+      const events: Array<string> = [];
+      let deleteCalls = 0;
+      const result = yield* Cleanup.dispatchAndConfirmThreadRemoval({
+        prepared: {
+          dispatch: () => {
+            deleteCalls += 1;
+            events.push("dispatch");
+            return Effect.succeed({ sequence: 12 });
+          },
+        },
+        threadId: thread.threadId,
+        commandId: "command-a",
+        waitMs: 0,
+        persistDispatchStart: () => {
+          events.push("persist_start");
+          return Effect.succeed(true);
+        },
+        persistDispatchResult: (response) => {
+          events.push("persist_dispatch_result");
+          expect(Result.isSuccess(response)).toBe(true);
+          if (Result.isSuccess(response)) expect(response.success.sequence).toBe(12);
+          return Effect.succeed({ kind: "accepted", sequence: 12 } as const);
+        },
+        readPresence: () => {
+          events.push("read_presence");
+          return Effect.succeed({ absent: true, activeSequence: 12, archivedSequence: 12 });
+        },
+        persistAbsenceResult: ({ dispatch, presence }) => {
+          events.push("persist_absence");
+          expect(dispatch).toEqual({ kind: "accepted", sequence: 12 });
+          expect(Result.isSuccess(presence)).toBe(true);
+          if (Result.isSuccess(presence)) {
+            expect(Cleanup.confirmThreadRemovalAbsence(presence.success, 12)).toBe(true);
+          }
+          return Effect.succeed({
+            kind: "confirmed",
+            sequence: 12,
+            stepState: "succeeded",
+          } as const);
+        },
+      });
+      expect(events).toEqual([
+        "persist_start",
+        "dispatch",
+        "persist_dispatch_result",
+        "read_presence",
+        "persist_absence",
+      ]);
+      expect(deleteCalls).toBe(1);
+      expect(result).toMatchObject({ kind: "observed", absence: { kind: "confirmed" } });
+    }),
+  );
+
+  it.effect("does not dispatch or observe absence when dispatch-start persistence refuses", () =>
+    Effect.gen(function* () {
+      let dispatchCalls = 0;
+      let presenceReads = 0;
+      let absencePersists = 0;
+      const result = yield* Cleanup.dispatchAndConfirmThreadRemoval({
+        prepared: {
+          dispatch: () => {
+            dispatchCalls += 1;
+            return Effect.succeed({ sequence: 12 });
+          },
+        },
+        threadId: thread.threadId,
+        commandId: "command-refused",
+        waitMs: 60_000,
+        persistDispatchStart: () => Effect.succeed(false),
+        persistDispatchResult: () => Effect.succeed({ kind: "accepted", sequence: 12 } as const),
+        readPresence: () => {
+          presenceReads += 1;
+          return Effect.succeed({ absent: true, activeSequence: 12, archivedSequence: 12 });
+        },
+        persistAbsenceResult: () => {
+          absencePersists += 1;
+          return Effect.succeed({
+            kind: "confirmed",
+            sequence: 12,
+            stepState: "succeeded",
+          } as const);
+        },
+      });
+      expect(result).toEqual({ kind: "not_dispatched" });
+      expect(dispatchCalls).toBe(0);
+      expect(presenceReads).toBe(0);
+      expect(absencePersists).toBe(0);
+    }),
+  );
+
+  it.effect("reads presence once after a certain failed dispatch despite a long wait", () =>
+    Effect.gen(function* () {
+      let presenceReads = 0;
+      const failure = {
+        code: "upstream_failure" as const,
+        message: "The delete command was rejected.",
+        retry: "reconcile_first" as const,
+        details: {},
+      };
+      const dispatchReceipt = { kind: "failed", dispatch: "rejected", failure } as const;
+      const result = yield* Cleanup.dispatchAndConfirmThreadRemoval({
+        prepared: {
+          dispatch: () =>
+            Effect.fail(
+              new T3CodeAdapterError({
+                kind: "command_rejected",
+                message: failure.message,
+                uncertain: false,
+                status: null,
+              }),
+            ),
+        },
+        threadId: thread.threadId,
+        commandId: "command-rejected",
+        waitMs: 60_000,
+        persistDispatchStart: () => Effect.succeed(true),
+        persistDispatchResult: (response) => {
+          expect(Result.isFailure(response)).toBe(true);
+          return Effect.succeed(dispatchReceipt);
+        },
+        readPresence: () => {
+          presenceReads += 1;
+          return Effect.succeed({ absent: false, activeSequence: 20, archivedSequence: 20 });
+        },
+        persistAbsenceResult: ({ dispatch, presence }) => {
+          expect(dispatch).toEqual(dispatchReceipt);
+          expect(Result.isSuccess(presence)).toBe(true);
+          return Effect.succeed({ kind: "still_present" } as const);
+        },
+      });
+      expect(presenceReads).toBe(1);
+      expect(result).toMatchObject({
+        kind: "observed",
+        dispatch: dispatchReceipt,
+        absence: { kind: "still_present" },
+      });
+    }),
+  );
+
+  it.effect("confirms uncertain deletion from absence without sequence watermarks", () =>
+    Effect.gen(function* () {
+      let presenceReads = 0;
+      const failure = {
+        code: "unavailable" as const,
+        message: "The delete reply was lost.",
+        retry: "reconcile_first" as const,
+        details: {},
+      };
+      const dispatchReceipt = { kind: "uncertain", failure } as const;
+      const result = yield* Cleanup.dispatchAndConfirmThreadRemoval({
+        prepared: {
+          dispatch: () =>
+            Effect.fail(
+              new T3CodeAdapterError({
+                kind: "transport",
+                message: failure.message,
+                uncertain: true,
+                status: null,
+              }),
+            ),
+        },
+        threadId: thread.threadId,
+        commandId: "command-uncertain",
+        waitMs: 60_000,
+        persistDispatchStart: () => Effect.succeed(true),
+        persistDispatchResult: (response) => {
+          expect(Result.isFailure(response)).toBe(true);
+          return Effect.succeed(dispatchReceipt);
+        },
+        readPresence: () => {
+          presenceReads += 1;
+          return Effect.succeed({ absent: true, activeSequence: 2, archivedSequence: 3 });
+        },
+        persistAbsenceResult: ({ dispatch, presence }) => {
+          expect(dispatch).toEqual(dispatchReceipt);
+          expect(Result.isSuccess(presence)).toBe(true);
+          if (Result.isSuccess(presence)) {
+            expect(Cleanup.confirmThreadRemovalAbsence(presence.success, null)).toBe(true);
+          }
+          return Effect.succeed({
+            kind: "confirmed",
+            sequence: 2,
+            stepState: "already_absent",
+          } as const);
+        },
+      });
+      expect(presenceReads).toBe(1);
+      expect(result).toMatchObject({
+        kind: "observed",
+        dispatch: dispatchReceipt,
+        absence: { kind: "confirmed", stepState: "already_absent" },
+      });
+    }),
+  );
 
   it.effect("distinguishes duplicate inventory matches from an absent target", () =>
     Effect.gen(function* () {

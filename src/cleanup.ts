@@ -28,6 +28,109 @@ export interface ThreadRemovalPresence {
   readonly archivedSequence: number;
 }
 
+export type PreparedThreadRemoval<Prepared> =
+  | { readonly kind: "not_ready" }
+  | { readonly kind: "preparation_failed"; readonly error: LocalStoreError | T3CodeAdapterError }
+  | {
+      readonly kind: "ready";
+      readonly checked: Extract<ThreadRemovalCheck, { readonly kind: "ready" }>;
+      readonly prepared: Prepared;
+    };
+
+export type ThreadRemovalDispatchReceipt =
+  | { readonly kind: "accepted"; readonly sequence: number }
+  | { readonly kind: "uncertain"; readonly failure: ToolFailure }
+  | {
+      readonly kind: "failed";
+      readonly dispatch: "rejected" | "not_dispatched";
+      readonly failure: ToolFailure;
+    };
+
+export type ThreadRemovalAbsenceReceipt =
+  | {
+      readonly kind: "confirmed";
+      readonly sequence: number;
+      readonly stepState: "succeeded" | "already_absent";
+    }
+  | { readonly kind: "unknown"; readonly failure: ToolFailure }
+  | { readonly kind: "still_present" };
+
+export type ThreadRemovalExecution =
+  | { readonly kind: "not_dispatched" }
+  | {
+      readonly kind: "observed";
+      readonly dispatch: ThreadRemovalDispatchReceipt;
+      readonly absence: ThreadRemovalAbsenceReceipt;
+    };
+
+/**
+ * Own the post-shutdown recheck/preparation/recheck sequence. The supplied
+ * check callback records durable operation evidence and returns null when a
+ * guard blocks deletion or the target is already absent.
+ */
+const prepareThreadRemoval = <Prepared, E>(options: {
+  readonly recheck: () => Effect.Effect<
+    Extract<ThreadRemovalCheck, { readonly kind: "ready" }> | null,
+    E
+  >;
+  readonly prepare: () => Effect.Effect<Prepared, LocalStoreError | T3CodeAdapterError>;
+}): Effect.Effect<PreparedThreadRemoval<Prepared>, E> =>
+  Effect.gen(function* () {
+    const beforePreparation = yield* options.recheck();
+    if (beforePreparation === null) return { kind: "not_ready" } as const;
+    const prepared = yield* Effect.result(options.prepare());
+    if (Result.isFailure(prepared))
+      return { kind: "preparation_failed", error: prepared.failure } as const;
+    const immediatelyBeforeDeletion = yield* options.recheck();
+    if (immediatelyBeforeDeletion === null) return { kind: "not_ready" } as const;
+    return {
+      kind: "ready",
+      checked: immediatelyBeforeDeletion,
+      prepared: prepared.success,
+    } as const;
+  });
+
+/** Persist, dispatch exactly once, then direct fresh inventory confirmation. */
+const dispatchAndConfirmThreadRemoval = <
+  Prepared extends {
+    readonly dispatch: (input: {
+      readonly threadId: string;
+      readonly commandId: string;
+    }) => Effect.Effect<{ readonly sequence: number }, T3CodeAdapterError>;
+  },
+  E,
+>(options: {
+  readonly prepared: Prepared;
+  readonly threadId: string;
+  readonly commandId: string;
+  readonly persistDispatchStart: () => Effect.Effect<boolean, E>;
+  readonly persistDispatchResult: (
+    result: Result.Result<{ readonly sequence: number }, T3CodeAdapterError>,
+  ) => Effect.Effect<ThreadRemovalDispatchReceipt, E>;
+  readonly readPresence: () => Effect.Effect<ThreadRemovalPresence, E>;
+  readonly persistAbsenceResult: (input: {
+    readonly dispatch: ThreadRemovalDispatchReceipt;
+    readonly presence: Result.Result<ThreadRemovalPresence, E>;
+  }) => Effect.Effect<ThreadRemovalAbsenceReceipt, E>;
+  readonly waitMs: number;
+}): Effect.Effect<ThreadRemovalExecution, E> =>
+  Effect.gen(function* () {
+    const mayDispatch = yield* options.persistDispatchStart();
+    if (!mayDispatch) return { kind: "not_dispatched" } as const;
+    const response = yield* Effect.result(
+      options.prepared.dispatch({ threadId: options.threadId, commandId: options.commandId }),
+    );
+    const dispatch = yield* options.persistDispatchResult(response);
+    const dispatchSequence = dispatch.kind === "accepted" ? dispatch.sequence : null;
+    const presence = yield* waitForThreadRemovalAbsence({
+      readPresence: options.readPresence,
+      dispatchSequence,
+      waitMs: dispatch.kind === "failed" ? 0 : options.waitMs,
+    });
+    const absence = yield* options.persistAbsenceResult({ dispatch, presence });
+    return { kind: "observed", dispatch, absence } as const;
+  });
+
 /** Session identity captured by guarded cleanup before it considers a stop command. */
 const captureProviderSession = (detail: SynchronizedThreadDetail) => detail.thread.session;
 
@@ -419,6 +522,8 @@ export const Cleanup = {
   matchesCapturedProviderSession,
   observeCapturedProviderSessionShutdown,
   checkThreadRemoval,
+  prepareThreadRemoval,
+  dispatchAndConfirmThreadRemoval,
   confirmThreadRemovalAbsence,
   waitForThreadRemovalAbsence,
   verifyThreadRemovalActivity: activityFailure,
