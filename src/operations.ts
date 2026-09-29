@@ -79,8 +79,9 @@ import {
   type ThreadSessionShutdownObservation,
   type ThreadSessionShutdownTarget,
 } from "./observations";
-import { pendingRequestsFromActivities, validateObservedInputResponse } from "./pending-requests";
+import { validateObservedInputResponse } from "./pending-requests";
 import { adapterErrorFailure, observationErrorFailure } from "./tool-failure";
+import { Cleanup, type ThreadRemovalCheck, type ThreadRemovalPresence } from "./cleanup";
 import { readVerifiedWorktreeCheckout } from "./worktree-checkout";
 
 const ThreadSessionStopRecoverySchema = Schema.Struct({
@@ -4317,70 +4318,13 @@ export class Operations extends Context.Service<Operations, OperationsService>()
             );
       };
 
-      type ThreadRemovalCheck =
-        | { readonly kind: "absent"; readonly sequence: number }
-        | {
-            readonly kind: "ready";
-            readonly sequence: number;
-            readonly detail: SynchronizedThreadDetail;
-          }
-        | {
-            readonly kind: "blocked";
-            readonly sequence: number;
-            readonly failure: ToolFailure;
-          };
-
-      const threadRemovalCheckFailure = (
-        code: ToolFailure["code"],
-        message: string,
-      ): ToolFailure => ({ code, message, retry: "reconcile_first", details: {} });
-
-      // fallow-ignore-next-line complexity
-      const threadRemovalActivityFailure = (
-        thread: ThreadRemoveInput["thread"],
-        detail: SynchronizedThreadDetail,
-      ): ToolFailure | null => {
-        if (detail.projectedTurnState) {
-          return threadRemovalCheckFailure(
-            "uncheckable_target",
-            "The latest turn state is only projected from a session transition and cannot establish inactivity.",
-          );
-        }
-        if (
-          detail.thread.latestTurn?.state === "running" ||
-          detail.thread.session?.status === "starting" ||
-          detail.thread.session?.status === "running" ||
-          (detail.thread.session !== null && detail.thread.session.activeTurnId !== null)
-        ) {
-          return threadRemovalCheckFailure(
-            "active_execution",
-            "The thread has active execution or a running provider session and cannot be removed.",
-          );
-        }
-        const pendingRequests = pendingRequestsFromActivities(
-          thread,
-          detail.thread.activities,
-          detail.limitedHistory,
-        );
-        if (pendingRequests.some((request) => request.state === "pending")) {
-          return threadRemovalCheckFailure(
-            "pending_request",
-            "The thread has an unresolved approval or input request and cannot be removed.",
-          );
-        }
-        if (pendingRequests.some((request) => request.state === "unknown")) {
-          return threadRemovalCheckFailure(
-            "uncheckable_target",
-            "The current request lifecycle is unknown, so the thread cannot be removed safely.",
-          );
-        }
-        return null;
-      };
-
       const readThreadRemovalInventories = (instanceId: string) =>
         Effect.all([observations.activeShell(instanceId), observations.archivedShell(instanceId)], {
           concurrency: "unbounded",
         });
+
+      const threadRemovalCheckFailure = Cleanup.removalFailure;
+      const threadRemovalActivityFailure = Cleanup.verifyThreadRemovalActivity;
 
       const checkThreadForRemoval = (
         thread: ThreadRemoveInput["thread"],
@@ -4391,155 +4335,18 @@ export class Operations extends Context.Service<Operations, OperationsService>()
             readonly session: SynchronizedThreadDetail["thread"]["session"];
           };
         } = {},
-      ): Effect.Effect<
-        ThreadRemovalCheck,
-        LocalStoreError | T3CodeAdapterError | ObservationError
-      > =>
-        // fallow-ignore-next-line complexity
-        Effect.gen(function* () {
-          const [active, archived] = yield* readThreadRemovalInventories(thread.instanceId);
-          const sequence = Math.max(active.snapshotSequence, archived.snapshotSequence);
-          const activeThreads = active.threads.filter((item) => item.threadId === thread.threadId);
-          const archivedThreads = archived.threads.filter(
-            (item) => item.threadId === thread.threadId,
-          );
-          const matches = [
-            ...activeThreads.map((item) => ({ item, archived: false })),
-            ...archivedThreads.map((item) => ({ item, archived: true })),
-          ];
-          if (matches.length === 0) return { kind: "absent", sequence } as const;
-          if (matches.length !== 1) {
-            return {
-              kind: "blocked",
-              sequence,
-              failure: threadRemovalCheckFailure(
-                "stale_state",
-                "The active and archived thread inventories disagree about the target thread.",
-              ),
-            } as const;
-          }
-
-          const match = matches[0];
-          if (match === undefined) {
-            return {
-              kind: "blocked",
-              sequence,
-              failure: threadRemovalCheckFailure(
-                "uncheckable_target",
-                "The target thread could not be identified in a fresh inventory.",
-              ),
-            } as const;
-          }
-          const projectRows = [...active.projects, ...archived.projects].filter(
-            (project) => project.projectId === match.item.projectId,
-          );
-          if (
-            projectRows.length === 0 ||
-            new Set(projectRows.map((project) => project.repositoryPath)).size !== 1 ||
-            (match.archived ? match.item.archivedAt === null : match.item.archivedAt !== null)
-          ) {
-            return {
-              kind: "blocked",
-              sequence,
-              failure: threadRemovalCheckFailure(
-                "uncheckable_target",
-                "The fresh thread inventories do not establish one consistent project association.",
-              ),
-            } as const;
-          }
-
-          const detail = yield* observations.threadDetail(thread.instanceId, thread.threadId);
-          if (
-            detail.thread.projectId !== match.item.projectId ||
-            detail.thread.worktreePath !== match.item.worktreePath ||
-            (detail.thread.archivedAt !== null) !== match.archived
-          ) {
-            return {
-              kind: "blocked",
-              sequence: Math.max(sequence, detail.snapshotSequence),
-              failure: threadRemovalCheckFailure(
-                "stale_state",
-                "The target thread's project or worktree association changed during the fresh check.",
-              ),
-            } as const;
-          }
-          if (
-            options.initialDetail !== undefined &&
-            (detail.thread.projectId !== options.initialDetail.thread.projectId ||
-              detail.thread.worktreePath !== options.initialDetail.thread.worktreePath ||
-              detail.thread.archivedAt !== options.initialDetail.thread.archivedAt)
-          ) {
-            return {
-              kind: "blocked",
-              sequence: Math.max(sequence, detail.snapshotSequence),
-              failure: threadRemovalCheckFailure(
-                "stale_state",
-                "The target thread's project or worktree association changed after the removal was admitted.",
-              ),
-            } as const;
-          }
-
-          const currentSession = detail.thread.session;
-          const activityFailure = threadRemovalActivityFailure(thread, detail);
-          if (activityFailure !== null) {
-            return {
-              kind: "blocked",
-              sequence: Math.max(sequence, detail.snapshotSequence),
-              failure: activityFailure,
-            } as const;
-          }
-
-          if (options.expectedSessionStop !== undefined && currentSession !== null) {
-            const expected = options.expectedSessionStop;
-            if (
-              currentSession.status !== "stopped" ||
-              currentSession.activeTurnId !== null ||
-              currentSession.updatedAt !== expected.createdAt ||
-              (currentSession.providerInstanceId ?? null) !==
-                (expected.session.providerInstanceId ?? null)
-            ) {
-              return {
-                kind: "blocked",
-                sequence: Math.max(sequence, detail.snapshotSequence),
-                failure: threadRemovalCheckFailure(
-                  "stale_state",
-                  "A replacement provider session appeared before thread deletion; its shutdown was not observed.",
-                ),
-              } as const;
-            }
-          } else if (options.initialSession !== undefined) {
-            const initialSession = options.initialSession.session;
-            if (
-              (initialSession === null || initialSession.status === "stopped") &&
-              currentSession !== null &&
-              currentSession.status !== "stopped"
-            ) {
-              return {
-                kind: "blocked",
-                sequence: Math.max(sequence, detail.snapshotSequence),
-                failure: threadRemovalCheckFailure(
-                  "stale_state",
-                  "A provider session appeared after the initial cleanup check; it was not stopped.",
-                ),
-              } as const;
-            }
-          }
-
-          return {
-            kind: "ready",
-            sequence: Math.max(sequence, detail.snapshotSequence),
-            detail,
-          } as const;
+      ) =>
+        Cleanup.checkThreadRemoval({
+          thread,
+          readInventories: readThreadRemovalInventories,
+          readDetail: (target) => observations.threadDetail(target.instanceId, target.threadId),
+          ...options,
         });
 
       const readThreadRemovalPresence = (
         thread: ThreadRemoveInput["thread"],
       ): Effect.Effect<
-        {
-          readonly absent: boolean;
-          readonly activeSequence: number;
-          readonly archivedSequence: number;
-        },
+        ThreadRemovalPresence,
         LocalStoreError | T3CodeAdapterError | ObservationError
       > =>
         Effect.gen(function* () {
@@ -4553,38 +4360,17 @@ export class Operations extends Context.Service<Operations, OperationsService>()
           };
         });
 
-      const threadRemovalAbsenceConfirmed = (
-        presence: {
-          readonly absent: boolean;
-          readonly activeSequence: number;
-          readonly archivedSequence: number;
-        },
-        dispatchSequence: number | null,
-      ): boolean =>
-        presence.absent &&
-        (dispatchSequence === null ||
-          (presence.activeSequence >= dispatchSequence &&
-            presence.archivedSequence >= dispatchSequence));
+      const threadRemovalAbsenceConfirmed = Cleanup.confirmThreadRemovalAbsence;
 
       const waitForThreadRemovalAbsence = (
         thread: ThreadRemoveInput["thread"],
         dispatchSequence: number | null,
         waitMs: number,
       ) =>
-        Effect.gen(function* () {
-          const deadline = (yield* Clock.currentTimeMillis) + waitMs;
-          let presence = yield* Effect.result(readThreadRemovalPresence(thread));
-          let observedAt = yield* Clock.currentTimeMillis;
-          while (
-            (Result.isFailure(presence) ||
-              !threadRemovalAbsenceConfirmed(presence.success, dispatchSequence)) &&
-            observedAt < deadline
-          ) {
-            yield* Effect.sleep(Duration.millis(Math.min(250, deadline - observedAt)));
-            presence = yield* Effect.result(readThreadRemovalPresence(thread));
-            observedAt = yield* Clock.currentTimeMillis;
-          }
-          return presence;
+        Cleanup.waitForThreadRemovalAbsence({
+          readPresence: () => readThreadRemovalPresence(thread),
+          dispatchSequence,
+          waitMs,
         });
 
       const updateThreadRemovalStep = (input: {
