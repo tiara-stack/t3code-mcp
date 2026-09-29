@@ -2409,7 +2409,14 @@ export class Operations extends Context.Service<Operations, OperationsService>()
             session: recovery.session,
           };
           const observed = yield* Effect.result(
-            observations.watchThreadSessionShutdown(target, waitMs),
+            recovery.steps.capture === THREAD_REMOVE_STEPS.sessionCapture
+              ? Cleanup.observeCapturedProviderSessionShutdown({
+                  watch: (capturedTarget, capturedWaitMs) =>
+                    observations.watchThreadSessionShutdown(capturedTarget, capturedWaitMs),
+                  target,
+                  waitMs,
+                })
+              : observations.watchThreadSessionShutdown(target, waitMs),
           );
           if (Result.isSuccess(observed) && observed.success.kind === "observed") {
             return yield* persistObservedThreadSessionStop(
@@ -2492,7 +2499,10 @@ export class Operations extends Context.Service<Operations, OperationsService>()
             input.thread.instanceId,
             input.thread.threadId,
           );
-          const session = baseline.thread.session;
+          const session =
+            input.preDispatchGuard === undefined
+              ? baseline.thread.session
+              : Cleanup.captureProviderSession(baseline);
           const captured = yield* sessionStopEvidenceAt(
             `T3Code reported the provider session as ${session?.status ?? "absent"} before shutdown was requested.`,
             "snapshot",
@@ -2550,7 +2560,9 @@ export class Operations extends Context.Service<Operations, OperationsService>()
             input.preDispatchGuard?.(preflight) ??
             (preflight.snapshotReset ||
             preflight.snapshotSequence < baseline.snapshotSequence ||
-            !observedSessionsMatch(session, preflight.thread.session)
+            !(input.preDispatchGuard === undefined
+              ? observedSessionsMatch(session, preflight.thread.session)
+              : Cleanup.matchesCapturedProviderSession(session, preflight.thread.session))
               ? {
                   code: "stale_state" as const,
                   message:

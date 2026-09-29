@@ -8,7 +8,13 @@ import { readVerifiedWorktreeCheckout, retryWorktreeInspectionCapacity } from ".
 import * as Result from "effect/Result";
 import * as Clock from "effect/Clock";
 import * as Duration from "effect/Duration";
-import type { SynchronizedShell, SynchronizedThreadDetail } from "./observations";
+import {
+  observedSessionsMatch,
+  type SynchronizedShell,
+  type SynchronizedThreadDetail,
+  type ThreadSessionShutdownObservation,
+  type ThreadSessionShutdownTarget,
+} from "./observations";
 import { pendingRequestsFromActivities } from "./pending-requests";
 
 export type ThreadRemovalCheck =
@@ -21,6 +27,27 @@ export interface ThreadRemovalPresence {
   readonly activeSequence: number;
   readonly archivedSequence: number;
 }
+
+/** Session identity captured by guarded cleanup before it considers a stop command. */
+const captureProviderSession = (detail: SynchronizedThreadDetail) => detail.thread.session;
+
+/** Shutdown evidence is valid for cleanup only while it names the captured session. */
+const matchesCapturedProviderSession = (
+  captured: SynchronizedThreadDetail["thread"]["session"],
+  current: SynchronizedThreadDetail["thread"]["session"],
+): boolean => observedSessionsMatch(current, captured);
+
+const observeCapturedProviderSessionShutdown = (options: {
+  readonly watch: (
+    target: ThreadSessionShutdownTarget,
+    waitMs: number,
+  ) => Effect.Effect<
+    ThreadSessionShutdownObservation,
+    LocalStoreError | T3CodeAdapterError | ObservationError
+  >;
+  readonly target: ThreadSessionShutdownTarget;
+  readonly waitMs: number;
+}) => options.watch(options.target, options.waitMs);
 
 const removalFailure = (code: ToolFailure["code"], message: string): ToolFailure => ({
   code,
@@ -388,6 +415,9 @@ const assertSameWorktreeGuard = (
 
 /** Fresh target and complete thread-reference guard decisions shared by inspection and discard. */
 export const Cleanup = {
+  captureProviderSession,
+  matchesCapturedProviderSession,
+  observeCapturedProviderSessionShutdown,
   checkThreadRemoval,
   confirmThreadRemovalAbsence,
   waitForThreadRemovalAbsence,
