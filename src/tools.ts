@@ -174,9 +174,9 @@ import {
   type VcsDiffPreviewSource,
 } from "./t3code-adapter";
 import { pendingRequestsFromActivities } from "./pending-requests";
+import { Cleanup } from "./cleanup";
 import { adapterErrorFailure, observationErrorFailure } from "./tool-failure";
 import {
-  readVerifiedWorktreeCheckout,
   retryWorktreeInspectionCapacity,
   verifyCompleteWorktreeRefInventory,
   worktreeRefForPath,
@@ -2346,97 +2346,16 @@ const checkWorktreeDiscardEligibility = (options: {
   WorktreeDiscardEligibility,
   LocalStoreError | T3CodeAdapterError | ObservationError
 > => {
-  // fallow-ignore-next-line complexity
-  const check = Effect.gen(function* () {
-    const registrationBefore = yield* retryWorktreeInspectionCapacity(
-      options.connections.acquire(options.worktree.instanceId),
-    );
-    const vcs = yield* readVerifiedWorktreeCheckout({
-      connections: options.connections,
-      worktree: options.worktree,
-    });
-    const references = yield* readWorktreeReferenceInventory({
-      observations: options.observations,
-      worktree: options.worktree,
-    });
-    if (options.removeSoleThread === undefined && references.items.length > 0) {
-      const threadIds = references.items.map((item) => item.summary.thread.threadId);
-      return yield* Effect.fail(
-        new ObservationError({
-          kind: "shared_worktree",
-          message: `The worktree is not orphaned; fresh active or archived thread references were found: ${threadIds.join(", ")}.`,
-        }),
-      );
-    }
-    if (options.removeSoleThread !== undefined) {
-      if (options.removeSoleThread.instanceId !== options.worktree.instanceId) {
-        return yield* Effect.fail(
-          new ObservationError({
-            kind: "uncheckable_target",
-            message: "The named thread and worktree must belong to the same T3Code instance.",
-          }),
-        );
-      }
-      const matching = references.items.filter(
-        (item) => item.summary.thread.threadId === options.removeSoleThread?.threadId,
-      );
-      if (references.items.length !== 1 || matching.length !== 1) {
-        const threadIds = references.items.map((item) => item.summary.thread.threadId);
-        const namedThreadIsShared = matching.length > 0 && references.items.length > 1;
-        return yield* Effect.fail(
-          new ObservationError({
-            kind: namedThreadIsShared ? "shared_worktree" : "uncheckable_target",
-            message:
-              matching.length === 0
-                ? `The named thread ${options.removeSoleThread.threadId} is not a verified reference to the requested worktree.`
-                : `The worktree must be referenced only by named thread ${options.removeSoleThread.threadId}; fresh active or archived references were found: ${threadIds.join(", ")}.`,
-          }),
-        );
-      }
-    }
-    const registrationAfter = yield* retryWorktreeInspectionCapacity(
-      options.connections.acquire(options.worktree.instanceId),
-    );
-    if (
-      registrationAfter.revision !== registrationBefore.revision ||
-      registrationAfter.environmentId !== registrationBefore.environmentId
-    ) {
-      return yield* Effect.fail(
-        new ObservationError({
-          kind: "stale_generation",
-          message:
-            "The saved instance registration changed while worktree discard eligibility was being checked.",
-        }),
-      );
-    }
-    const evidence: Array<Evidence> = [
-      {
-        kind: "snapshot",
-        observedAt: vcs.status.observedAt,
-        sourceSequence: null,
-        nativeEventId: null,
-        detail: `Fresh VCS status and a complete local-ref inventory identify branch ${vcs.branch} at the requested worktree path.`,
-      },
-      ...references.observations.map((observation) => ({
-        kind: "snapshot" as const,
-        observedAt: observation.observedAt,
-        sourceSequence: observation.sourceSequence,
-        nativeEventId: null,
-        detail:
-          options.removeSoleThread === undefined
-            ? "Fresh active and archived thread inventories, including UI-created threads, contain no reference to the requested worktree."
-            : `Fresh active and archived thread inventories, including UI-created threads, show ${options.removeSoleThread.threadId} as the sole reference to the requested worktree.`,
-      })),
-    ];
-    return {
-      branch: vcs.branch,
-      evidence,
-      registration: {
-        revision: registrationAfter.revision,
-        environmentId: registrationAfter.environmentId,
-      },
-    };
-  });
+  const check = Cleanup.readWorktreeGuard({
+    connections: options.connections,
+    worktree: options.worktree,
+    readReferences: () =>
+      readWorktreeReferenceInventory({
+        observations: options.observations,
+        worktree: options.worktree,
+      }),
+    ...(options.removeSoleThread === undefined ? {} : { soleThread: options.removeSoleThread }),
+  }).pipe(Effect.map(({ branch, evidence, registration }) => ({ branch, evidence, registration })));
   return withWorktreeInspectionBound(check, "The complete worktree discard eligibility check");
 };
 
@@ -2761,19 +2680,6 @@ const buildWorktreeInspectionFrame = (options: {
   };
 };
 
-const assertSameWorktreeBranch = (
-  before: string,
-  after: string,
-): Effect.Effect<void, ObservationError> =>
-  before === after
-    ? Effect.void
-    : Effect.fail(
-        new ObservationError({
-          kind: "stale_generation",
-          message: "The target worktree branch changed while its status was being inspected.",
-        }),
-      );
-
 const inspectWorktreeFresh = (options: {
   readonly store: LocalStoreService;
   readonly connections: InstanceConnectionsService;
@@ -2787,25 +2693,35 @@ const inspectWorktreeFresh = (options: {
   const inspection = Effect.gen(function* () {
     const { store, connections, observations, query, limit } = options;
     const worktree = query.worktree;
-    const initialVcs = yield* readVerifiedWorktreeCheckout({ connections, worktree });
-    const initialReferences = yield* readWorktreeReferenceInventory({ observations, worktree });
+    const initialGuard = yield* Cleanup.readWorktreeGuard({
+      connections,
+      worktree,
+      allowReferences: true,
+      readReferences: () => readWorktreeReferenceInventory({ observations, worktree }),
+    });
+    const initialReferences = initialGuard.references;
     const records = yield* inspectWorktreeThreads({
       observations,
       worktree,
       candidates: initialReferences.items,
     });
-    const finalReferences = yield* readWorktreeReferenceInventory({ observations, worktree });
+    const finalGuard = yield* Cleanup.readWorktreeGuard({
+      connections,
+      worktree,
+      allowReferences: true,
+      readReferences: () => readWorktreeReferenceInventory({ observations, worktree }),
+    });
+    const finalReferences = finalGuard.references;
     yield* assertSameWorktreeReferenceInventory(initialReferences, finalReferences);
     yield* assertWorktreeThreadsUnchanged({ worktree, references: finalReferences, records });
 
-    const finalVcs = yield* readVerifiedWorktreeCheckout({ connections, worktree });
-    yield* assertSameWorktreeBranch(initialVcs.branch, finalVcs.branch);
-    yield* assertWorktreeThreadBranchesMatch(records, finalVcs.branch);
+    yield* Cleanup.assertSameWorktreeGuard(initialGuard, finalGuard);
+    yield* assertWorktreeThreadBranchesMatch(records, finalGuard.branch);
 
     const { frame, summaries } = buildWorktreeInspectionFrame({
       worktree,
-      branch: finalVcs.branch,
-      status: finalVcs.status,
+      branch: finalGuard.branch,
+      status: finalGuard.checkout.status,
       records,
     });
     const metadata: WorktreeInspectionCaptureMetadata = {
@@ -2815,11 +2731,11 @@ const inspectWorktreeFresh = (options: {
         "The page limit controls displayed references only; guard checks use the complete fresh inventory.",
       ],
       observations: [
-        ...initialVcs.observations,
+        ...initialGuard.checkout.observations,
         ...initialReferences.observations,
         ...records.map((record) => record.observation),
         ...finalReferences.observations,
-        ...finalVcs.observations,
+        ...finalGuard.checkout.observations,
       ],
       frame,
     };

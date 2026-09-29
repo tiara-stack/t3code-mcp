@@ -10880,6 +10880,8 @@ describe("worktree_discard", () => {
           ]),
         );
         expect(removeCalls).toBe(0);
+        expect(options.seenActive).toHaveLength(1);
+        expect(options.seenArchived).toHaveLength(1);
       }),
     ),
   );
@@ -13556,6 +13558,9 @@ describe("worktree_inspect", () => {
           "thread-a",
         ]);
         expect(firstValue.referencingThreads.coverage).toBe("complete_for_query");
+        expect(firstValue.checks).toContainEqual(
+          expect.objectContaining({ name: "reference_coverage", state: "passed" }),
+        );
         expect(cursor).toEqual(expect.any(String));
         const readsBeforeContinuation = {
           active: options.seenActive.length,
