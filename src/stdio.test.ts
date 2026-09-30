@@ -331,7 +331,7 @@ describe("stdio transport", () => {
 
   // fallow-ignore-next-line complexity
   it.live(
-    "cancelling a waiting thread_wait call stops only the observation",
+    "cancelling a waiting turn_wait call stops only the observation",
     () =>
       Effect.acquireUseRelease(
         Effect.gen(function* () {
@@ -393,10 +393,9 @@ describe("stdio transport", () => {
               id: 7,
               method: "tools/call",
               params: {
-                name: "thread_wait",
+                name: "turn_wait",
                 arguments: {
-                  thread: { instanceId: "hang-instance", threadId: "thread-a" },
-                  condition: "inactive",
+                  turn: { instanceId: "hang-instance", threadId: "thread-a", turnId: "turn-a" },
                   waitMs: 30_000,
                 },
               },
@@ -416,7 +415,7 @@ describe("stdio transport", () => {
             send(child, { jsonrpc: "2.0", id: 8, method: "tools/list", params: {} });
             const listed = await awaitResponse(8);
             expect(seen).not.toContain(7);
-            expect(listed.result?.tools?.map((tool) => tool.name)).toContain("thread_wait");
+            expect(listed.result?.tools?.map((tool) => tool.name)).toContain("turn_wait");
 
             // Cancelling the MCP request interrupts only the observation; the
             // cancelled request never receives a response and the server stays

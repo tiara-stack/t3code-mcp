@@ -31,16 +31,15 @@ import {
   WorktreeCreateInputSchema,
   WorktreeDiscardInputSchema,
   DEFAULT_THREAD_WAIT_MILLIS,
+  LIMITED_HISTORY_LIMITATION,
   MAX_OPERATION_CAPACITY,
   MAX_TOTAL_RPC_CAPACITY,
   THREAD_OUTPUT_PART_LIMIT_BYTES,
-  THREAD_SNAPSHOT_TURN_LIMIT,
   type CapturedThreadState,
   type DiffReadCaptureQuery,
   type DiffReadInput,
   type DiffReadToolResult,
   type ThreadHistoryDiffReadSource,
-  type Evidence,
   type OperationRecord,
   type OutputChunkItem,
   type PendingRequest,
@@ -100,9 +99,6 @@ import {
   type WorktreeDiscardInput,
   TurnWaitInputSchema,
   TurnWaitToolResultSchema,
-  type TurnWaitResult,
-  type TurnWaitToolResult,
-  type TurnReference,
   ToolResultSchema,
   WorktreeListInputSchema,
   WorktreeListToolResultSchema,
@@ -139,7 +135,6 @@ import {
   type ThreadOutputCaptureMetadata,
   type DiffReadCaptureMetadata,
   type WorktreeInspectionCaptureMetadata,
-  type TurnEvidenceRecord,
   type WorktreeCaptureMetadata,
 } from "./local-store";
 import {
@@ -174,7 +169,6 @@ import {
 } from "./t3code-adapter";
 import { pendingRequestsFromActivities } from "./pending-requests";
 import { projectThreadState } from "./thread-state-projection";
-import { type BoundedWaitPoll, isRetriableWaitFailure, runBoundedWaitLoop } from "./wait-polling";
 import { Cleanup } from "./cleanup";
 import { adapterErrorFailure, observationErrorFailure } from "./tool-failure";
 import {
@@ -3020,8 +3014,6 @@ const lookupThreadProject = (options: {
     };
   });
 
-const limitedHistoryLimitation = `The pinned server retained only the most recent ${THREAD_SNAPSHOT_TURN_LIMIT} user-anchored turns; earlier history is unavailable through this read.`;
-
 const threadSummaryFromDetail = (options: {
   readonly instanceId: string;
   readonly detail: SynchronizedThreadDetail;
@@ -3063,7 +3055,7 @@ const buildThreadState = (options: {
   const { instanceId, detail, project } = options;
   const { thread } = detail;
   const projection = projectThreadState({ instanceId, detail });
-  const historyLimitations = detail.limitedHistory ? [limitedHistoryLimitation] : [];
+  const historyLimitations = detail.limitedHistory ? [LIMITED_HISTORY_LIMITATION] : [];
   const nativeCoverageLimitations =
     options.includeNativeShellState === false ? [] : project.nativeSettlementLimitations;
   const detailDerivedAttentionLimitations =
@@ -3511,7 +3503,7 @@ const discoverThreadOutput = (options: {
     const items = threadOutputParts(instanceId, query.thread.threadId, detail);
     const limitations = [
       threadOutputProjectionLimitation,
-      ...(detail.limitedHistory ? [limitedHistoryLimitation] : []),
+      ...(detail.limitedHistory ? [LIMITED_HISTORY_LIMITATION] : []),
     ];
     const coverage = detail.limitedHistory ? ("partial" as const) : ("complete_for_query" as const);
     const frame: ThreadOutputCaptureFrame = {
@@ -4109,348 +4101,6 @@ const runThreadWait = (
     };
   });
 
-const TURN_HISTORY_GAP_LIMITATION =
-  "The target turn is not covered by the current observation and no retained evidence establishes its outcome; a newer turn may have superseded it, and a fresh thread_get may not recover the target. Resynchronize before deciding on a new explicit request.";
-
-const TURN_RETAINED_EVIDENCE_LIMITATION =
-  "The target turn is no longer covered by the current observation; the outcome was established from retained turn evidence rather than a live projection.";
-
-interface TurnWaitEvaluation {
-  readonly execution: TurnWaitResult["execution"];
-  readonly satisfied: boolean;
-  readonly evidence: ReadonlyArray<Evidence>;
-}
-
-const terminalExecutionFromState = (
-  state: "interrupted" | "completed" | "error",
-): TurnWaitResult["execution"] =>
-  state === "completed" ? "completed" : state === "interrupted" ? "interrupted" : "failed";
-
-const retainedTurnEvidence = (record: TurnEvidenceRecord): Evidence => ({
-  kind: "snapshot",
-  observedAt: record.observedAt,
-  sourceSequence: record.sourceSequence,
-  nativeEventId: null,
-  detail: record.detail,
-});
-
-const requestKindOf = (request: PendingRequest): "approval" | "input" | null => {
-  if (request.form.kind === "approval") return "approval";
-  if (request.form.kind === "input") return "input";
-  return request.form.requestKind === "approval"
-    ? "approval"
-    : request.form.requestKind === "input"
-      ? "input"
-      : null;
-};
-
-const awaitingRequestEvidence = (options: {
-  readonly detail: SynchronizedThreadDetail;
-  readonly request: PendingRequest;
-  readonly kind: "approval" | "input";
-}): Evidence => ({
-  kind: "snapshot",
-  observedAt: options.detail.observedAt,
-  sourceSequence: options.detail.snapshotSequence,
-  nativeEventId: options.request.activityId,
-  detail: `The retained activity ${options.request.activityId} published an unresolved ${options.kind} request correlated to the turn.`,
-});
-
-/**
- * The awaiting outcome established by one correlated still-pending approval
- * or input request, or null when no correlated pending request exists. A
- * request whose lifecycle is unknown was never established as pending, so it
- * can never manufacture an awaiting outcome; it stays visible in the result's
- * pending requests instead.
- */
-const awaitingTurnOutcome = (options: {
-  readonly detail: SynchronizedThreadDetail;
-  readonly pending: ReadonlyArray<PendingRequest>;
-}): TurnWaitEvaluation | null => {
-  const { detail, pending } = options;
-  const approval = pending.find((request) => requestKindOf(request) === "approval");
-  if (approval !== undefined) {
-    return {
-      execution: "awaiting_approval",
-      satisfied: true,
-      evidence: [awaitingRequestEvidence({ detail, request: approval, kind: "approval" })],
-    };
-  }
-  const input = pending.find((request) => requestKindOf(request) === "input");
-  if (input !== undefined) {
-    return {
-      execution: "awaiting_input",
-      satisfied: true,
-      evidence: [awaitingRequestEvidence({ detail, request: input, kind: "input" })],
-    };
-  }
-  return null;
-};
-
-/**
- * Classify one exact-turn outcome from one published thread detail and the
- * retained evidence row. Pure: no I/O. Only supported, non-projected
- * evidence establishes completion, interruption, or failure; projected
- * states, supersession, settlement, session readiness, and catch-up never
- * do. Only correlated requests observed pending establish awaiting outcomes,
- * and only while the target is the latest observed turn.
- */
-// fallow-ignore-next-line complexity
-const evaluateTurnOutcome = (options: {
-  readonly turn: TurnReference;
-  readonly detail: SynchronizedThreadDetail;
-  readonly evidence: TurnEvidenceRecord | null;
-  readonly pendingRequests: ReadonlyArray<PendingRequest>;
-}): TurnWaitEvaluation => {
-  const { turn, detail, evidence, pendingRequests } = options;
-  const latest = detail.thread.latestTurn;
-  if (latest !== null && latest.turnId === turn.turnId) {
-    const projection = projectThreadState({ instanceId: turn.instanceId, detail });
-    if (projection.execution.state === "inactive" && latest.state !== "running") {
-      return {
-        execution: terminalExecutionFromState(latest.state),
-        satisfied: true,
-        evidence: projection.execution.evidence,
-      };
-    }
-    const awaiting = awaitingTurnOutcome({
-      detail,
-      pending: pendingRequests.filter((request) => request.state === "pending"),
-    });
-    if (awaiting !== null) return awaiting;
-    if (latest.state === "running") {
-      return {
-        execution: "running",
-        satisfied: false,
-        evidence: projection.execution.evidence,
-      };
-    }
-    // A projected terminal state — session readiness or an interruption
-    // racing the snapshot — can never establish completion by itself.
-    return {
-      execution: "outcome_unknown",
-      satisfied: false,
-      evidence: projection.execution.evidence,
-    };
-  }
-  // The target is not the latest observed turn: a newer turn never replaces
-  // the target. Only retained non-projected terminal evidence answers here;
-  // anything else is an honest unknown with lost coverage.
-  if (evidence !== null && !evidence.projected && evidence.state !== "running") {
-    return {
-      execution: terminalExecutionFromState(evidence.state),
-      satisfied: true,
-      evidence: [retainedTurnEvidence(evidence)],
-    };
-  }
-  return {
-    execution: "outcome_unknown",
-    satisfied: false,
-    evidence: evidence === null ? [] : [retainedTurnEvidence(evidence)],
-  };
-};
-
-const turnWaitResult = (options: {
-  readonly turn: TurnReference;
-  readonly observation: TurnWaitResult["observation"];
-  readonly evaluation: TurnWaitEvaluation;
-  readonly pendingRequests: ReadonlyArray<PendingRequest>;
-  readonly observations: ReadonlyArray<Observation>;
-  readonly warnings: ReadonlyArray<{ readonly code: string; readonly message: string }>;
-}): TurnWaitToolResult => ({
-  result: {
-    kind: "ok" as const,
-    value: {
-      target: options.turn,
-      observation: options.observation,
-      execution: options.evaluation.execution,
-      evidence: options.evaluation.evidence,
-      pendingRequests: options.pendingRequests,
-    },
-  },
-  observations: options.observations,
-  warnings: options.warnings,
-});
-
-interface TurnWaitPollEvaluation {
-  readonly evaluation: TurnWaitEvaluation;
-  readonly correlated: ReadonlyArray<PendingRequest>;
-  readonly observation: Observation;
-}
-
-/**
- * Evaluate one published thread detail against the exact-turn target. The
- * wait's observation records the limited-history and coverage-gap
- * limitations so a caller can tell fresh evidence from lost coverage.
- */
-const pollTurnWait = (options: {
-  readonly turn: TurnReference;
-  readonly detail: SynchronizedThreadDetail;
-  readonly evidence: TurnEvidenceRecord | null;
-}): TurnWaitPollEvaluation => {
-  const { turn, detail, evidence } = options;
-  const all = pendingRequestsFromActivities(
-    { instanceId: turn.instanceId, threadId: turn.threadId },
-    detail.thread.activities,
-    detail.limitedHistory,
-  );
-  const correlated = all.filter(
-    (request) => request.turn !== null && request.turn.turnId === turn.turnId,
-  );
-  const evaluation = evaluateTurnOutcome({ turn, detail, evidence, pendingRequests: correlated });
-  const covered = detail.thread.latestTurn?.turnId === turn.turnId;
-  // Retained evidence that answers the wait is partial coverage with an
-  // explicit note; an unanswered uncovered target is a history gap.
-  const answeredFromRetained = !covered && evaluation.satisfied;
-  const limitations = [
-    ...(detail.limitedHistory ? [limitedHistoryLimitation] : []),
-    ...(covered
-      ? []
-      : [answeredFromRetained ? TURN_RETAINED_EVIDENCE_LIMITATION : TURN_HISTORY_GAP_LIMITATION]),
-  ];
-  return {
-    evaluation,
-    correlated,
-    observation: freshThreadStateObservation({
-      instanceId: turn.instanceId,
-      detail,
-      coverage: covered && !detail.limitedHistory ? "complete_for_query" : "partial",
-      limitations,
-    }),
-  };
-};
-
-const unknownTurnWaitEvaluation: TurnWaitEvaluation = {
-  execution: "outcome_unknown",
-  satisfied: false,
-  evidence: [],
-};
-
-type TurnWaitPollOutcome =
-  | { readonly kind: "result"; readonly result: TurnWaitToolResult }
-  | { readonly kind: "pending"; readonly poll: TurnWaitPollEvaluation };
-
-/**
- * Evaluate one published thread detail against the exact-turn target: a
- * satisfied evaluation or a coverage gap ends the wait with its result,
- * while a covered, unsatisfied evaluation stays pending until the deadline.
- * Retained evidence is consulted only when the target is not the latest
- * turn; a covered target is classified from the fresh detail.
- */
-const runTurnWaitPoll = (options: {
-  readonly turn: TurnReference;
-  readonly store: LocalStoreService;
-  readonly detail: SynchronizedThreadDetail;
-}): Effect.Effect<TurnWaitPollOutcome, LocalStoreError> =>
-  Effect.gen(function* () {
-    const { turn, store, detail } = options;
-    const evidence =
-      detail.thread.latestTurn?.turnId === turn.turnId ? null : yield* store.findTurnEvidence(turn);
-    const poll = pollTurnWait({ turn, detail, evidence });
-    if (poll.evaluation.satisfied) {
-      return {
-        kind: "result" as const,
-        result: turnWaitResult({
-          turn,
-          observation: "condition_met",
-          evaluation: poll.evaluation,
-          pendingRequests: poll.correlated,
-          observations: [poll.observation],
-          warnings: [],
-        }),
-      };
-    }
-    const covered = detail.thread.latestTurn?.turnId === turn.turnId;
-    if (!covered) {
-      return {
-        kind: "result" as const,
-        result: turnWaitResult({
-          turn,
-          observation: "history_gap",
-          evaluation: poll.evaluation,
-          pendingRequests: poll.correlated,
-          observations: [poll.observation],
-          warnings: [],
-        }),
-      };
-    }
-    return { kind: "pending" as const, poll };
-  });
-
-/** Exact-turn polling remains in the toolkit until its separately scoped migration. */
-type TurnWaitPollResult<Outcome, Pending> = BoundedWaitPoll<Outcome, Pending>;
-
-const observeTurnWait = <Outcome, Pending>(options: {
-  readonly observe: () => Effect.Effect<
-    SynchronizedThreadDetail,
-    LocalStoreError | T3CodeAdapterError | ObservationError
-  >;
-  readonly poll: (
-    detail: SynchronizedThreadDetail,
-  ) => Effect.Effect<
-    TurnWaitPollResult<Outcome, Pending>,
-    LocalStoreError | T3CodeAdapterError | ObservationError
-  >;
-}): Effect.Effect<
-  TurnWaitPollResult<Outcome, Pending>,
-  LocalStoreError | T3CodeAdapterError | ObservationError
-> =>
-  Effect.gen(function* () {
-    const detail = yield* options.observe();
-    return yield* options.poll(detail);
-  });
-
-/**
- * Observe one exact turn until supported evidence satisfies the wait, the
- * deadline passes, the observation becomes unavailable, or the target slips
- * out of coverage with no retained evidence. Every synchronization is
- * scoped: cancelling the wait interrupts only this observation and never
- * dispatches an interruption, settlement, session shutdown, or any other
- * provider mutation.
- */
-const runTurnWait = (options: {
-  readonly store: LocalStoreService;
-  readonly observations: ObservationsService;
-  readonly turn: TurnReference;
-  readonly waitMs: number;
-}): Effect.Effect<TurnWaitToolResult, LocalStoreError | T3CodeAdapterError | ObservationError> =>
-  runBoundedWaitLoop({
-    waitMs: options.waitMs,
-    poll: () =>
-      observeTurnWait({
-        observe: () =>
-          options.observations.threadDetail(options.turn.instanceId, options.turn.threadId),
-        poll: (detail) =>
-          runTurnWaitPoll({ turn: options.turn, store: options.store, detail }).pipe(
-            Effect.map((outcome) =>
-              outcome.kind === "result"
-                ? ({ kind: "result", result: outcome.result } as const)
-                : ({ kind: "pending", pending: outcome.poll } as const),
-            ),
-          ),
-      }),
-    isRetriable: (failure) =>
-      isRetriableWaitFailure(failure, (candidate) => candidate instanceof ObservationError),
-    unavailable: (failure) =>
-      turnWaitResult({
-        turn: options.turn,
-        observation: "unavailable",
-        evaluation: unknownTurnWaitEvaluation,
-        pendingRequests: [],
-        observations: [],
-        warnings: [{ code: "observation_unavailable", message: failure.message }],
-      }),
-    timedOut: (poll) =>
-      turnWaitResult({
-        turn: options.turn,
-        observation: "timed_out",
-        evaluation: poll.evaluation,
-        pendingRequests: poll.correlated,
-        observations: [poll.observation],
-        warnings: [],
-      }),
-  });
-
 const serverToolHandlers = ServerToolkit.of({
   instance_list: ({ cursor, limit }) =>
     Effect.gen(function* () {
@@ -4852,13 +4502,7 @@ const serverToolHandlers = ServerToolkit.of({
   turn_wait: ({ turn, waitMs }) =>
     Effect.gen(function* () {
       const observations = yield* Observations;
-      const store = yield* LocalStore;
-      return yield* runTurnWait({
-        store,
-        observations,
-        turn,
-        waitMs: waitMs ?? DEFAULT_THREAD_WAIT_MILLIS,
-      });
+      return yield* observations.waitForTurn(turn, waitMs ?? DEFAULT_THREAD_WAIT_MILLIS);
     }).pipe(
       Effect.catch((error: LocalStoreError | T3CodeAdapterError | ObservationError) =>
         Effect.succeed({

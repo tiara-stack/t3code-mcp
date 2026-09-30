@@ -1,4 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
+import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -9,17 +10,19 @@ import * as TestClock from "effect/testing/TestClock";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { LocalStore, LocalStoreError } from "./local-store";
+import { LocalStore, LocalStoreError, LocalStoreStartupError } from "./local-store";
 import type { ThreadState } from "./domain";
 import { InstanceConnections, type InstanceConnection } from "./instance-connections";
 import {
   ObservationError,
+  type ObservationServiceError,
   Observations,
   synchronizeShellStream,
   synchronizeThreadStream,
   type ThreadConditionWaitResult,
   type SynchronizedShell,
   type ThreadSessionShutdownTarget,
+  type ObservationsService,
 } from "./observations";
 import * as Result from "effect/Result";
 import {
@@ -934,51 +937,917 @@ interface ThreadScripts {
     instanceId: string,
     threadId: string,
     options?: { readonly afterSequence?: number; readonly turnLimit?: number },
-  ) => Stream.Stream<ThreadStreamItem, never>;
+  ) => Stream.Stream<ThreadStreamItem, LocalStoreError | T3CodeAdapterError>;
 }
 
-const threadObservationsLayer = (
-  databasePath: string,
-  scripts: ThreadScripts,
-  seenThreadReads: Array<{
+interface ThreadObservationsTestStateService {
+  readonly seenThreadReads: Array<{
     readonly threadId: string;
     readonly afterSequence: number | undefined;
     readonly turnLimit: number | undefined;
-  }>,
-) =>
-  Observations.layer.pipe(
-    Layer.provideMerge(
-      InstanceConnections.layerTest({
-        exchangePairingCode: () => Effect.die("not used"),
-        verifyCredential: () => Effect.die("not used"),
-        inspectCredential: () => Effect.die("not used"),
-        pair: () => Effect.die("not used"),
-        acquire: (instanceId) => scripts.acquire?.(instanceId) ?? Effect.die("not used"),
-        inspect: () => Effect.die("not used"),
-        discoverProjects: () => Effect.die("not used"),
-        discoverModels: () => Effect.die("not used"),
-        discoverVcsRefs: () => Effect.die("not used"),
-        readVcsWorktreeStatus: () => Effect.die("not used"),
-        discoverVcsWorktreeRefs: () => Effect.die("not used"),
-        openShellStream: () => Stream.die("not used"),
-        openThreadStream: (instanceId, threadId, options) => {
-          seenThreadReads.push({
-            threadId,
-            afterSequence: options?.afterSequence,
-            turnLimit: options?.turnLimit,
-          });
-          return scripts.openThreadStream(instanceId, threadId, options);
-        },
-        readArchivedShell: () => Effect.die("not used"),
-        createWorktree: () => Effect.die("not used"),
-        removeWorktree: () => Effect.die("not used"),
-        respondToApproval: () => Effect.die("not used"),
-        dispatchThreadSettlement: () => Effect.die("not used"),
-        invalidate: () => Effect.void,
-      }),
-    ),
+  }>;
+  readonly flags: Map<string, boolean>;
+  readonly counters: Map<string, number>;
+}
+
+class ThreadObservationsTestState extends Context.Service<
+  ThreadObservationsTestState,
+  ThreadObservationsTestStateService
+>()("t3code-mcp/ThreadObservationsTestState") {}
+
+const threadObservationsLayer = (
+  databasePath: string,
+  scripts: ThreadScripts | ((state: ThreadObservationsTestStateService) => ThreadScripts),
+) => {
+  const testStateLayer = Layer.sync(ThreadObservationsTestState, () => ({
+    seenThreadReads: [],
+    flags: new Map<string, boolean>(),
+    counters: new Map<string, number>(),
+  }));
+  const connectionsLayer = Layer.unwrap(
+    Effect.gen(function* () {
+      const testState = yield* ThreadObservationsTestState;
+      return InstanceConnections.layerTest(() => {
+        const resolvedScripts = typeof scripts === "function" ? scripts(testState) : scripts;
+        return {
+          exchangePairingCode: () => Effect.die("not used"),
+          verifyCredential: () => Effect.die("not used"),
+          inspectCredential: () => Effect.die("not used"),
+          pair: () => Effect.die("not used"),
+          acquire: (instanceId) => resolvedScripts.acquire?.(instanceId) ?? Effect.die("not used"),
+          inspect: () => Effect.die("not used"),
+          discoverProjects: () => Effect.die("not used"),
+          discoverModels: () => Effect.die("not used"),
+          discoverVcsRefs: () => Effect.die("not used"),
+          readVcsWorktreeStatus: () => Effect.die("not used"),
+          discoverVcsWorktreeRefs: () => Effect.die("not used"),
+          openShellStream: () => Stream.die("not used"),
+          openThreadStream: (instanceId, threadId, options) => {
+            testState.seenThreadReads.push({
+              threadId,
+              afterSequence: options?.afterSequence,
+              turnLimit: options?.turnLimit,
+            });
+            return resolvedScripts.openThreadStream(instanceId, threadId, options);
+          },
+          readArchivedShell: () => Effect.die("not used"),
+          createWorktree: () => Effect.die("not used"),
+          removeWorktree: () => Effect.die("not used"),
+          respondToApproval: () => Effect.die("not used"),
+          dispatchThreadSettlement: () => Effect.die("not used"),
+          invalidate: () => Effect.void,
+        };
+      });
+    }),
+  ).pipe(Layer.provideMerge(testStateLayer));
+  return Observations.layer.pipe(
+    Layer.provideMerge(connectionsLayer),
     Layer.provideMerge(LocalStore.layer({ databasePath })),
   );
+};
+
+const turnRef = { instanceId: "instance-a", threadId: "thread-a", turnId: "turn-a" } as const;
+
+const turnWaitActivity = (options: {
+  readonly activityId: string;
+  readonly kind: "approval.requested" | "user-input.requested";
+  readonly requestId: string | null;
+  readonly turnId: string | null;
+  readonly payload?: unknown;
+}) => ({
+  activityId: options.activityId,
+  kind: options.kind,
+  summary: options.kind === "approval.requested" ? "Approval requested" : "Input requested",
+  payload: {
+    ...(options.requestId === null ? {} : { requestId: options.requestId }),
+    ...((options.payload ?? {}) as object),
+  },
+  turnId: options.turnId,
+  createdAt: "2026-09-22T00:00:00.000Z",
+});
+
+const runTurnWaitObservation = <A>(options: {
+  readonly databasePath: string;
+  readonly scripts: ThreadScripts | (() => ThreadScripts);
+  readonly use: (observations: ObservationsService) => Effect.Effect<A, ObservationServiceError>;
+}): Effect.Effect<A, ObservationServiceError | LocalStoreStartupError> => {
+  const layer = threadObservationsLayer(options.databasePath, options.scripts);
+  return Effect.scoped(
+    Effect.gen(function* () {
+      yield* seedRegistration;
+      const observations = yield* Observations;
+      return yield* options.use(observations);
+    }).pipe(Effect.provide(layer)),
+  );
+};
+
+describe("Exact turn observation", () => {
+  it.effect("uses only supported terminal evidence for the fixed turn reference", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const layer = threadObservationsLayer(databasePath, {
+          openThreadStream: () =>
+            Stream.make(
+              threadSnapshotItem(
+                12,
+                threadDetailFixture("thread-a", {
+                  latestTurn: { turnId: "turn-a", state: "completed" },
+                }),
+              ),
+              threadSynchronizedItem,
+            ),
+        });
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedRegistration;
+            const observations = yield* Observations;
+            return yield* observations.waitForTurn(
+              { instanceId: "instance-a", threadId: "thread-a", turnId: "turn-a" },
+              0,
+            );
+          }).pipe(Effect.provide(layer)),
+        );
+        expect(result.result).toMatchObject({
+          kind: "ok",
+          value: {
+            target: { instanceId: "instance-a", threadId: "thread-a", turnId: "turn-a" },
+            observation: "condition_met",
+            execution: "completed",
+          },
+        });
+      }),
+    ),
+  );
+
+  it.effect("uses retained terminal evidence for the same target after supersession", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const layer = threadObservationsLayer(databasePath, () => {
+          let opens = 0;
+          return {
+            openThreadStream: () => {
+              opens += 1;
+              const latestTurn =
+                opens === 1
+                  ? { turnId: "turn-a", state: "completed" as const }
+                  : { turnId: "turn-b", state: "running" as const };
+              return Stream.make(
+                threadSnapshotItem(
+                  opens === 1 ? 10 : 20,
+                  threadDetailFixture("thread-a", { latestTurn }),
+                ),
+                threadSynchronizedItem,
+              );
+            },
+          };
+        });
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedRegistration;
+            const observations = yield* Observations;
+            yield* observations.threadDetail("instance-a", "thread-a");
+            const store = yield* LocalStore;
+            expect(yield* store.findTurnEvidence(turnRef)).toMatchObject({
+              state: "completed",
+              projected: false,
+              sourceSequence: 10,
+            });
+            return yield* observations.waitForTurn(turnRef, 0);
+          }).pipe(Effect.provide(layer)),
+        );
+        expect(result.result).toMatchObject({
+          kind: "ok",
+          value: {
+            target: turnRef,
+            observation: "condition_met",
+            execution: "completed",
+            evidence: [{ sourceSequence: 10 }],
+          },
+        });
+        expect(result.observations).toMatchObject([
+          { coverage: "partial", limitations: [expect.stringMatching(/retained turn evidence/)] },
+        ]);
+      }),
+    ),
+  );
+
+  it.effect(
+    "reports a history gap when the target is outside current history and evidence was evicted",
+    () =>
+      withDatabasePath((databasePath) =>
+        runTurnWaitObservation({
+          databasePath,
+          scripts: {
+            openThreadStream: () =>
+              Stream.make(
+                threadSnapshotItem(
+                  20,
+                  threadDetailFixture("thread-a", {
+                    latestTurn: { turnId: "turn-b", state: "running" },
+                  }),
+                ),
+                threadSynchronizedItem,
+              ),
+          },
+          use: (observations) => observations.waitForTurn(turnRef, 0),
+        }).pipe(
+          Effect.map((result) => {
+            expect(result.result).toMatchObject({
+              kind: "ok",
+              value: { target: turnRef, observation: "history_gap", execution: "outcome_unknown" },
+            });
+            expect(result.observations[0]?.limitations.join(" ")).toContain(
+              "not covered by the current observation",
+            );
+          }),
+        ),
+      ),
+  );
+
+  it.effect("keeps running evidence as the timeout result", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const opened = yield* Deferred.make<void>();
+        const result = yield* runTurnWaitObservation({
+          databasePath,
+          scripts: {
+            openThreadStream: () =>
+              Stream.unwrap(
+                Effect.as(
+                  Deferred.succeed(opened, undefined),
+                  Stream.make(
+                    threadSnapshotItem(
+                      10,
+                      threadDetailFixture("thread-a", {
+                        latestTurn: { turnId: "turn-a", state: "running" },
+                      }),
+                    ),
+                    threadSynchronizedItem,
+                  ),
+                ),
+              ),
+          },
+          use: (observations) =>
+            Effect.gen(function* () {
+              const fiber = yield* Effect.forkDetach(observations.waitForTurn(turnRef, 100));
+              yield* Deferred.await(opened);
+              yield* TestClock.adjust(Duration.millis(200));
+              return yield* Fiber.join(fiber);
+            }),
+        });
+        expect(result.result).toMatchObject({
+          kind: "ok",
+          value: { target: turnRef, observation: "timed_out", execution: "running" },
+        });
+        expect(
+          (result.result as { value: { evidence: ReadonlyArray<{ detail: string }> } }).value
+            .evidence[0]?.detail,
+        ).toContain("published the latest turn as running");
+      }),
+    ),
+  );
+
+  it.effect("meets a correlated approval while keeping uncorrelated requests visible", () =>
+    withDatabasePath((databasePath) =>
+      runTurnWaitObservation({
+        databasePath,
+        scripts: {
+          openThreadStream: () =>
+            Stream.make(
+              threadSnapshotItem(
+                12,
+                threadDetailFixture("thread-a", {
+                  latestTurn: { turnId: "turn-a", state: "running" },
+                  activities: [
+                    turnWaitActivity({
+                      activityId: "approval-a",
+                      kind: "approval.requested",
+                      requestId: "request-a",
+                      turnId: "turn-a",
+                      payload: { options: [{ decision: "accept", label: "Accept" }] },
+                    }),
+                    turnWaitActivity({
+                      activityId: "input-b",
+                      kind: "user-input.requested",
+                      requestId: "request-b",
+                      turnId: "turn-b",
+                      payload: {
+                        questions: [
+                          {
+                            id: "q",
+                            header: "Input",
+                            question: "Question",
+                            options: [{ label: "A", description: "Choice A" }],
+                            multiSelect: false,
+                          },
+                        ],
+                      },
+                    }),
+                    turnWaitActivity({
+                      activityId: "approval-no-turn",
+                      kind: "approval.requested",
+                      requestId: "request-no-turn",
+                      turnId: null,
+                      payload: { options: [{ decision: "accept", label: "Accept" }] },
+                    }),
+                  ],
+                }),
+              ),
+              threadSynchronizedItem,
+            ),
+        },
+        use: (observations) => observations.waitForTurn(turnRef, 0),
+      }).pipe(
+        Effect.map((result) => {
+          expect(result.result).toMatchObject({
+            kind: "ok",
+            value: {
+              target: turnRef,
+              observation: "condition_met",
+              execution: "awaiting_approval",
+              pendingRequests: [
+                {
+                  activityId: "approval-a",
+                  state: "pending",
+                  actionable: true,
+                  turn: turnRef,
+                },
+                {
+                  activityId: "approval-no-turn",
+                  state: "pending",
+                  actionable: true,
+                  turn: null,
+                },
+                {
+                  activityId: "input-b",
+                  state: "pending",
+                  actionable: true,
+                  turn: { instanceId: "instance-a", threadId: "thread-a", turnId: "turn-b" },
+                },
+              ],
+            },
+          });
+          expect(
+            (
+              result.result as {
+                value: { evidence: ReadonlyArray<{ nativeEventId: string | null }> };
+              }
+            ).value.evidence[0]?.nativeEventId,
+          ).toBe("approval-a");
+        }),
+      ),
+    ),
+  );
+
+  it.effect(
+    "keeps an exact-turn request with unknown lifecycle visible without reporting awaiting",
+    () =>
+      withDatabasePath((databasePath) =>
+        runTurnWaitObservation({
+          databasePath,
+          scripts: {
+            openThreadStream: () =>
+              Stream.make(
+                threadSnapshotItem(
+                  12,
+                  threadDetailFixture("thread-a", {
+                    latestTurn: { turnId: "turn-a", state: "running" },
+                    activities: [
+                      turnWaitActivity({
+                        activityId: "approval-unknown",
+                        kind: "approval.requested",
+                        requestId: null,
+                        turnId: "turn-a",
+                      }),
+                    ],
+                  }),
+                ),
+                threadSynchronizedItem,
+              ),
+          },
+          use: (observations) => observations.waitForTurn(turnRef, 0),
+        }).pipe(
+          Effect.map((result) => {
+            expect(result.result).toMatchObject({
+              kind: "ok",
+              value: {
+                target: turnRef,
+                observation: "timed_out",
+                execution: "running",
+                pendingRequests: [
+                  {
+                    activityId: "approval-unknown",
+                    state: "unknown",
+                    actionable: false,
+                    pendingRequestId: null,
+                  },
+                ],
+              },
+            });
+          }),
+        ),
+      ),
+  );
+
+  it.effect("keeps correlated nonactionable requests visible without reporting awaiting", () =>
+    withDatabasePath((databasePath) =>
+      runTurnWaitObservation({
+        databasePath,
+        scripts: {
+          openThreadStream: () =>
+            Stream.make(
+              threadSnapshotItem(
+                12,
+                threadDetailFixture("thread-a", {
+                  latestTurn: { turnId: "turn-a", state: "running" },
+                  activities: [
+                    turnWaitActivity({
+                      activityId: "approval-unavailable",
+                      kind: "approval.requested",
+                      requestId: "approval-request",
+                      turnId: "turn-a",
+                    }),
+                    turnWaitActivity({
+                      activityId: "input-unavailable",
+                      kind: "user-input.requested",
+                      requestId: "input-request",
+                      turnId: "turn-a",
+                    }),
+                  ],
+                }),
+              ),
+              threadSynchronizedItem,
+            ),
+        },
+        use: (observations) => observations.waitForTurn(turnRef, 0),
+      }).pipe(
+        Effect.map((result) => {
+          expect(result.result).toMatchObject({
+            kind: "ok",
+            value: {
+              target: turnRef,
+              observation: "timed_out",
+              execution: "running",
+              pendingRequests: [
+                {
+                  activityId: "approval-unavailable",
+                  state: "pending",
+                  actionable: false,
+                  pendingRequestId: "approval-request",
+                  form: { kind: "unavailable", requestKind: "approval" },
+                },
+                {
+                  activityId: "input-unavailable",
+                  state: "pending",
+                  actionable: false,
+                  pendingRequestId: "input-request",
+                  form: { kind: "unavailable", requestKind: "input" },
+                },
+              ],
+            },
+          });
+        }),
+      ),
+    ),
+  );
+
+  it.effect("does not report awaiting for a resolved correlated request", () =>
+    withDatabasePath((databasePath) =>
+      runTurnWaitObservation({
+        databasePath,
+        scripts: {
+          openThreadStream: () =>
+            Stream.make(
+              threadSnapshotItem(
+                12,
+                threadDetailFixture("thread-a", {
+                  latestTurn: { turnId: "turn-a", state: "running" },
+                  activities: [
+                    turnWaitActivity({
+                      activityId: "approval-a",
+                      kind: "approval.requested",
+                      requestId: "request-a",
+                      turnId: "turn-a",
+                      payload: { options: [{ decision: "accept", label: "Accept" }] },
+                    }),
+                    {
+                      activityId: "approval-resolved",
+                      kind: "approval.resolved",
+                      summary: "Approval resolved",
+                      payload: { requestId: "request-a" },
+                      turnId: null,
+                      createdAt: "2026-09-22T00:00:03.000Z",
+                    },
+                  ],
+                }),
+              ),
+              threadSynchronizedItem,
+            ),
+        },
+        use: (observations) => observations.waitForTurn(turnRef, 0),
+      }).pipe(
+        Effect.map((result) => {
+          expect(result.result).toMatchObject({
+            kind: "ok",
+            value: {
+              target: turnRef,
+              observation: "timed_out",
+              execution: "running",
+              pendingRequests: [{ activityId: "approval-a", state: "resolved", actionable: false }],
+            },
+          });
+        }),
+      ),
+    ),
+  );
+
+  it.effect("reports a history gap after retained terminal evidence expires", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse("2026-09-22T00:00:00.000Z"));
+        const layer = threadObservationsLayer(databasePath, {
+          openThreadStream: () =>
+            Stream.make(
+              threadSnapshotItem(
+                20,
+                threadDetailFixture("thread-a", {
+                  latestTurn: { turnId: "turn-b", state: "running" },
+                }),
+              ),
+              threadSynchronizedItem,
+            ),
+        });
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedRegistration;
+            const store = yield* LocalStore;
+            yield* store.recordTurnEvidence({
+              turn: turnRef,
+              state: "completed",
+              projected: false,
+              sourceSequence: 10,
+              observedAt: "2026-09-22T00:00:00.000Z",
+              detail: "The thread detail snapshot published the latest turn as completed.",
+            });
+            yield* TestClock.adjust(Duration.millis(30 * 24 * 60 * 60 * 1_000 + 1));
+            const observations = yield* Observations;
+            return yield* observations.waitForTurn(turnRef, 0);
+          }).pipe(Effect.provide(layer)),
+        );
+        expect(result.result).toMatchObject({
+          kind: "ok",
+          value: { target: turnRef, observation: "history_gap", execution: "outcome_unknown" },
+        });
+      }),
+    ),
+  );
+
+  it.effect("meets awaiting_input only for an unresolved input correlated to the exact turn", () =>
+    withDatabasePath((databasePath) =>
+      runTurnWaitObservation({
+        databasePath,
+        scripts: {
+          openThreadStream: () =>
+            Stream.make(
+              threadSnapshotItem(
+                12,
+                threadDetailFixture("thread-a", {
+                  latestTurn: { turnId: "turn-a", state: "running" },
+                  activities: [
+                    turnWaitActivity({
+                      activityId: "input-a",
+                      kind: "user-input.requested",
+                      requestId: "request-a",
+                      turnId: "turn-a",
+                      payload: {
+                        questions: [
+                          {
+                            id: "q1",
+                            header: "Target",
+                            question: "Which target?",
+                            options: [{ label: "staging", description: "Staging" }],
+                            multiSelect: false,
+                          },
+                        ],
+                      },
+                    }),
+                  ],
+                }),
+              ),
+              threadSynchronizedItem,
+            ),
+        },
+        use: (observations) => observations.waitForTurn(turnRef, 0),
+      }).pipe(
+        Effect.map((result) => {
+          expect(result.result).toMatchObject({
+            kind: "ok",
+            value: {
+              target: turnRef,
+              observation: "condition_met",
+              execution: "awaiting_input",
+              pendingRequests: [
+                {
+                  activityId: "input-a",
+                  state: "pending",
+                  actionable: true,
+                  pendingRequestId: "request-a",
+                },
+              ],
+            },
+          });
+        }),
+      ),
+    ),
+  );
+
+  it.effect("accepts a completed result after the thread projection is replaced", () =>
+    withDatabasePath((databasePath) => {
+      return runTurnWaitObservation({
+        databasePath,
+        scripts: () => {
+          let opens = 0;
+          return {
+            openThreadStream: () => {
+              opens += 1;
+              const latestTurn =
+                opens === 1
+                  ? { turnId: "turn-a", state: "running" as const }
+                  : { turnId: "turn-a", state: "completed" as const };
+              return Stream.make(
+                threadSnapshotItem(
+                  opens === 1 ? 10 : 20,
+                  threadDetailFixture("thread-a", { latestTurn }),
+                ),
+                threadSynchronizedItem,
+              );
+            },
+          };
+        },
+        use: (observations) =>
+          Effect.gen(function* () {
+            yield* observations.threadDetail("instance-a", "thread-a");
+            // Force the next observation to use a replacement snapshot rather
+            // than continuous replay from the existing watermark.
+            const result = yield* observations.waitForTurn(turnRef, 0);
+            expect(result.result).toMatchObject({
+              kind: "ok",
+              value: { target: turnRef, observation: "condition_met", execution: "completed" },
+            });
+            expect(result.observations).toMatchObject([{ freshness: "fresh", sourceSequence: 20 }]);
+          }),
+      });
+    }),
+  );
+
+  it.effect("classifies supported interrupted and failed terminal outcomes", () =>
+    withDatabasePath((databasePath) => {
+      return runTurnWaitObservation({
+        databasePath,
+        scripts: () => {
+          let opens = 0;
+          return {
+            openThreadStream: () => {
+              opens += 1;
+              const latestTurn =
+                opens === 1
+                  ? { turnId: "turn-a", state: "interrupted" as const }
+                  : { turnId: "turn-a", state: "error" as const };
+              return Stream.make(
+                threadSnapshotItem(opens, threadDetailFixture("thread-a", { latestTurn })),
+                threadSynchronizedItem,
+              );
+            },
+          };
+        },
+        use: (observations) =>
+          Effect.gen(function* () {
+            const interrupted = yield* observations.waitForTurn(turnRef, 0);
+            const failed = yield* observations.waitForTurn(turnRef, 0);
+            expect(interrupted.result).toMatchObject({
+              kind: "ok",
+              value: { target: turnRef, observation: "condition_met", execution: "interrupted" },
+            });
+            expect(failed.result).toMatchObject({
+              kind: "ok",
+              value: { target: turnRef, observation: "condition_met", execution: "failed" },
+            });
+          }),
+      });
+    }),
+  );
+
+  it.effect("does not treat a projected terminal state as completion", () =>
+    withDatabasePath((databasePath) => {
+      return runTurnWaitObservation({
+        databasePath,
+        scripts: () => {
+          let opens = 0;
+          return {
+            openThreadStream: () => {
+              opens += 1;
+              if (opens === 1)
+                return Stream.make(
+                  threadSnapshotItem(
+                    10,
+                    threadDetailFixture("thread-a", {
+                      latestTurn: { turnId: "turn-a", state: "running" },
+                    }),
+                  ),
+                  threadSynchronizedItem,
+                );
+              if (opens === 2)
+                return Stream.make(
+                  {
+                    kind: "session-set" as const,
+                    sequence: 11,
+                    session: {
+                      status: "idle" as const,
+                      activeTurnId: null,
+                      lastError: null,
+                      updatedAt: "2026-09-22T00:00:01.000Z",
+                    },
+                  },
+                  threadSynchronizedItem,
+                );
+              return Stream.make(threadSynchronizedItem);
+            },
+          };
+        },
+        use: (observations) =>
+          Effect.gen(function* () {
+            yield* observations.threadDetail("instance-a", "thread-a");
+            yield* observations.threadDetail("instance-a", "thread-a");
+            const result = yield* observations.waitForTurn(turnRef, 0);
+            expect(result.result).toMatchObject({
+              kind: "ok",
+              value: { target: turnRef, observation: "timed_out", execution: "outcome_unknown" },
+            });
+            expect(
+              (result.result as { value: { evidence: ReadonlyArray<{ detail: string }> } }).value
+                .evidence[0]?.detail,
+            ).toContain("projected from a session transition");
+          }),
+      });
+    }),
+  );
+
+  it.live("recovers from a transient observation failure and evaluates the same target", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const result = yield* runTurnWaitObservation({
+          databasePath,
+          scripts: () => {
+            let opens = 0;
+            return {
+              openThreadStream: () => {
+                opens += 1;
+                if (opens === 1)
+                  return Stream.make(
+                    threadSnapshotItem(
+                      10,
+                      threadDetailFixture("thread-a", {
+                        latestTurn: { turnId: "turn-a", state: "running" },
+                      }),
+                    ),
+                    threadSynchronizedItem,
+                  );
+                if (opens === 2)
+                  return Stream.fail(
+                    new T3CodeAdapterError({
+                      kind: "transport",
+                      message: "transient observation loss",
+                      uncertain: false,
+                      status: null,
+                    }),
+                  );
+                if (opens > 2)
+                  return Stream.make(
+                    threadSnapshotItem(
+                      11,
+                      threadDetailFixture("thread-a", {
+                        latestTurn: { turnId: "turn-a", state: "completed" },
+                      }),
+                    ),
+                    threadSynchronizedItem,
+                  );
+                return Stream.make(threadSynchronizedItem);
+              },
+            };
+          },
+          use: (observations) => observations.waitForTurn(turnRef, 2_000),
+        });
+        expect(result.result).toMatchObject({
+          kind: "ok",
+          value: { target: turnRef, observation: "condition_met", execution: "completed" },
+        });
+      }),
+    ),
+  );
+
+  it.live("reports a history gap when a newer turn supersedes the target during a wait", () =>
+    withDatabasePath((databasePath) => {
+      return runTurnWaitObservation({
+        databasePath,
+        scripts: () => {
+          let opens = 0;
+          return {
+            openThreadStream: () => {
+              opens += 1;
+              if (opens < 3)
+                return opens === 1
+                  ? Stream.make(
+                      threadSnapshotItem(
+                        10,
+                        threadDetailFixture("thread-a", {
+                          latestTurn: { turnId: "turn-a", state: "running" },
+                        }),
+                      ),
+                      threadSynchronizedItem,
+                    )
+                  : Stream.make(threadSynchronizedItem);
+              return Stream.make(
+                threadSnapshotItem(
+                  20,
+                  threadDetailFixture("thread-a", {
+                    latestTurn: { turnId: "turn-b", state: "running" },
+                  }),
+                ),
+                threadSynchronizedItem,
+              );
+            },
+          };
+        },
+        use: (observations) =>
+          Effect.gen(function* () {
+            yield* observations.threadDetail("instance-a", "thread-a");
+            const result = yield* observations.waitForTurn(turnRef, 1_000);
+            expect(result.result).toMatchObject({
+              kind: "ok",
+              value: { target: turnRef, observation: "history_gap", execution: "outcome_unknown" },
+            });
+            expect(result.observations[0]?.sourceSequence).toBe(20);
+          }),
+      });
+    }),
+  );
+
+  it.live(
+    "returns unavailable when observation stays unavailable through the remaining wait budget",
+    () =>
+      withDatabasePath((databasePath) => {
+        return runTurnWaitObservation({
+          databasePath,
+          scripts: () => {
+            let opens = 0;
+            return {
+              openThreadStream: () => {
+                opens += 1;
+                if (opens === 1)
+                  return Stream.make(
+                    threadSnapshotItem(
+                      10,
+                      threadDetailFixture("thread-a", {
+                        latestTurn: { turnId: "turn-a", state: "running" },
+                      }),
+                    ),
+                    threadSynchronizedItem,
+                  );
+                return Stream.fail(
+                  new T3CodeAdapterError({
+                    kind: "transport",
+                    message: "The connection failed while the registration was being observed.",
+                    uncertain: false,
+                    status: null,
+                  }),
+                );
+              },
+            };
+          },
+          use: (observations) =>
+            observations.waitForTurn(turnRef, 250).pipe(
+              Effect.map((result) => {
+                expect(result.result).toMatchObject({
+                  kind: "ok",
+                  value: {
+                    target: turnRef,
+                    observation: "unavailable",
+                    execution: "outcome_unknown",
+                  },
+                });
+                expect(result.observations).toEqual([]);
+                expect(result.warnings).toMatchObject([
+                  {
+                    code: "observation_unavailable",
+                    message: expect.stringMatching(/connection failed/),
+                  },
+                ]);
+              }),
+            ),
+        });
+      }),
+  );
+});
 
 describe("Thread session shutdown observation", () => {
   it.live("accepts forward sequence jumps and skips overlapping shutdown events", () =>
@@ -997,66 +1866,62 @@ describe("Thread session shutdown observation", () => {
           updatedAt: "2026-09-23T11:59:00.000Z",
         },
       };
-      const layer = threadObservationsLayer(
-        databasePath,
-        {
-          acquire: (instanceId) =>
-            Effect.succeed({
-              instanceId,
-              revision: 1,
-              endpoint: "https://a.test",
+      const layer = threadObservationsLayer(databasePath, {
+        acquire: (instanceId) =>
+          Effect.succeed({
+            instanceId,
+            revision: 1,
+            endpoint: "https://a.test",
+            environmentId: "env-a",
+            credential: "secret-a",
+            verified: {
               environmentId: "env-a",
-              credential: "secret-a",
-              verified: {
-                environmentId: "env-a",
-                serverVersion: "0.0.38",
-                scopes: [],
-                capabilities: {},
+              serverVersion: "0.0.38",
+              scopes: [],
+              capabilities: {},
+            },
+          }),
+        openThreadStream: () =>
+          Stream.make(
+            {
+              kind: "session-stop-requested" as const,
+              sequence: 10,
+              threadId: target.threadId,
+              commandId: target.commandId,
+              createdAt: target.createdAt,
+            },
+            {
+              kind: "session-stop-requested" as const,
+              sequence: 10,
+              threadId: "other-thread",
+              commandId: "other-command",
+              createdAt: target.createdAt,
+            },
+            {
+              kind: "session-set" as const,
+              sequence: 12,
+              session: {
+                providerInstanceId: "provider-a",
+                status: "ready" as const,
+                activeTurnId: null,
+                lastError: null,
+                updatedAt: target.createdAt,
               },
-            }),
-          openThreadStream: () =>
-            Stream.make(
-              {
-                kind: "session-stop-requested" as const,
-                sequence: 10,
-                threadId: target.threadId,
-                commandId: target.commandId,
-                createdAt: target.createdAt,
+            },
+            {
+              kind: "session-set" as const,
+              sequence: 14,
+              session: {
+                providerInstanceId: "provider-a",
+                status: "stopped" as const,
+                activeTurnId: null,
+                lastError: null,
+                updatedAt: target.createdAt,
               },
-              {
-                kind: "session-stop-requested" as const,
-                sequence: 10,
-                threadId: "other-thread",
-                commandId: "other-command",
-                createdAt: target.createdAt,
-              },
-              {
-                kind: "session-set" as const,
-                sequence: 12,
-                session: {
-                  providerInstanceId: "provider-a",
-                  status: "ready" as const,
-                  activeTurnId: null,
-                  lastError: null,
-                  updatedAt: target.createdAt,
-                },
-              },
-              {
-                kind: "session-set" as const,
-                sequence: 14,
-                session: {
-                  providerInstanceId: "provider-a",
-                  status: "stopped" as const,
-                  activeTurnId: null,
-                  lastError: null,
-                  updatedAt: target.createdAt,
-                },
-              },
-              threadSynchronizedItem,
-            ),
-        },
-        [],
-      );
+            },
+            threadSynchronizedItem,
+          ),
+      });
       return Effect.scoped(
         Effect.gen(function* () {
           yield* seedRegistration;
@@ -1088,48 +1953,44 @@ describe("Thread session shutdown observation", () => {
           updatedAt: "2026-09-23T11:59:00.000Z",
         },
       };
-      const layer = threadObservationsLayer(
-        databasePath,
-        {
-          acquire: (instanceId) =>
-            Effect.succeed({
-              instanceId,
-              revision: 1,
-              endpoint: "https://a.test",
+      const layer = threadObservationsLayer(databasePath, {
+        acquire: (instanceId) =>
+          Effect.succeed({
+            instanceId,
+            revision: 1,
+            endpoint: "https://a.test",
+            environmentId: "env-a",
+            credential: "secret-a",
+            verified: {
               environmentId: "env-a",
-              credential: "secret-a",
-              verified: {
-                environmentId: "env-a",
-                serverVersion: "0.0.38",
-                scopes: [],
-                capabilities: {},
+              serverVersion: "0.0.38",
+              scopes: [],
+              capabilities: {},
+            },
+          }),
+        openThreadStream: () =>
+          Stream.make(
+            {
+              kind: "session-stop-requested" as const,
+              sequence: 10,
+              threadId: target.threadId,
+              commandId: target.commandId,
+              createdAt: target.createdAt,
+            },
+            {
+              kind: "session-set" as const,
+              sequence: 12,
+              session: {
+                providerInstanceId: "provider-a",
+                status: "running" as const,
+                activeTurnId: "turn-2",
+                lastError: null,
+                updatedAt: "2026-09-23T12:00:01.000Z",
               },
-            }),
-          openThreadStream: () =>
-            Stream.make(
-              {
-                kind: "session-stop-requested" as const,
-                sequence: 10,
-                threadId: target.threadId,
-                commandId: target.commandId,
-                createdAt: target.createdAt,
-              },
-              {
-                kind: "session-set" as const,
-                sequence: 12,
-                session: {
-                  providerInstanceId: "provider-a",
-                  status: "running" as const,
-                  activeTurnId: "turn-2",
-                  lastError: null,
-                  updatedAt: "2026-09-23T12:00:01.000Z",
-                },
-              },
-              threadSynchronizedItem,
-            ),
-        },
-        [],
-      );
+            },
+            threadSynchronizedItem,
+          ),
+      });
       return Effect.scoped(
         Effect.gen(function* () {
           yield* seedRegistration;
@@ -1161,48 +2022,44 @@ describe("Thread session shutdown observation", () => {
           updatedAt: "2026-09-23T11:59:00.000Z",
         },
       };
-      const layer = threadObservationsLayer(
-        databasePath,
-        {
-          acquire: (instanceId) =>
-            Effect.succeed({
-              instanceId,
-              revision: 1,
-              endpoint: "https://a.test",
+      const layer = threadObservationsLayer(databasePath, {
+        acquire: (instanceId) =>
+          Effect.succeed({
+            instanceId,
+            revision: 1,
+            endpoint: "https://a.test",
+            environmentId: "env-a",
+            credential: "secret-a",
+            verified: {
               environmentId: "env-a",
-              credential: "secret-a",
-              verified: {
-                environmentId: "env-a",
-                serverVersion: "0.0.38",
-                scopes: [],
-                capabilities: {},
+              serverVersion: "0.0.38",
+              scopes: [],
+              capabilities: {},
+            },
+          }),
+        openThreadStream: () =>
+          Stream.make(
+            {
+              kind: "session-stop-requested" as const,
+              sequence: 10,
+              threadId: target.threadId,
+              commandId: target.commandId,
+              createdAt: target.createdAt,
+            },
+            {
+              kind: "session-set" as const,
+              sequence: 12,
+              session: {
+                providerInstanceId: "provider-a",
+                status: "stopped" as const,
+                activeTurnId: null,
+                lastError: null,
+                updatedAt: "2026-09-23T12:00:01.000Z",
               },
-            }),
-          openThreadStream: () =>
-            Stream.make(
-              {
-                kind: "session-stop-requested" as const,
-                sequence: 10,
-                threadId: target.threadId,
-                commandId: target.commandId,
-                createdAt: target.createdAt,
-              },
-              {
-                kind: "session-set" as const,
-                sequence: 12,
-                session: {
-                  providerInstanceId: "provider-a",
-                  status: "stopped" as const,
-                  activeTurnId: null,
-                  lastError: null,
-                  updatedAt: "2026-09-23T12:00:01.000Z",
-                },
-              },
-              threadSynchronizedItem,
-            ),
-        },
-        [],
-      );
+            },
+            threadSynchronizedItem,
+          ),
+      });
       return Effect.scoped(
         Effect.gen(function* () {
           yield* seedRegistration;
@@ -1235,30 +2092,26 @@ describe("Thread session shutdown observation", () => {
           updatedAt: "2026-09-23T11:59:00.000Z",
         },
       };
-      const layer = threadObservationsLayer(
-        databasePath,
-        {
-          acquire: (instanceId) =>
-            Effect.succeed({
-              instanceId,
-              revision: 1,
-              endpoint: "https://a.test",
+      const layer = threadObservationsLayer(databasePath, {
+        acquire: (instanceId) =>
+          Effect.succeed({
+            instanceId,
+            revision: 1,
+            endpoint: "https://a.test",
+            environmentId: "env-a",
+            credential: "secret-a",
+            verified: {
               environmentId: "env-a",
-              credential: "secret-a",
-              verified: {
-                environmentId: "env-a",
-                serverVersion: "0.0.38",
-                scopes: [],
-                capabilities: {},
-              },
-            }),
-          openThreadStream: () => {
-            streamOpens += 1;
-            return streamOpens === 1 ? Stream.make(threadSynchronizedItem) : Stream.empty;
-          },
+              serverVersion: "0.0.38",
+              scopes: [],
+              capabilities: {},
+            },
+          }),
+        openThreadStream: () => {
+          streamOpens += 1;
+          return streamOpens === 1 ? Stream.make(threadSynchronizedItem) : Stream.empty;
         },
-        [],
-      );
+      });
       return Effect.scoped(
         Effect.gen(function* () {
           yield* seedRegistration;
@@ -1280,27 +2133,18 @@ describe("Observations thread detail", () => {
   it.effect("evaluates bounded thread conditions through the Observations interface", () =>
     withDatabasePath((databasePath) =>
       Effect.gen(function* () {
-        const reads: Array<{
-          readonly threadId: string;
-          readonly afterSequence: number | undefined;
-          readonly turnLimit: number | undefined;
-        }> = [];
-        const layer = threadObservationsLayer(
-          databasePath,
-          {
-            openThreadStream: () =>
-              Stream.make(
-                threadSnapshotItem(5, threadDetailFixture("thread-a")),
-                threadSynchronizedItem,
-              ),
-          },
-          reads,
-        );
-        const result = yield* Effect.scoped(
+        const layer = threadObservationsLayer(databasePath, {
+          openThreadStream: () =>
+            Stream.make(
+              threadSnapshotItem(5, threadDetailFixture("thread-a")),
+              threadSynchronizedItem,
+            ),
+        });
+        const { result, readCount } = yield* Effect.scoped(
           Effect.gen(function* () {
             yield* seedRegistration;
             const observations = yield* Observations;
-            return yield* observations.waitForThreadCondition({
+            const result = yield* observations.waitForThreadCondition({
               instanceId: "instance-a",
               threadId: "thread-a",
               condition: "inactive",
@@ -1327,6 +2171,8 @@ describe("Observations thread detail", () => {
                   nativeSettlementUnavailable: false,
                 }),
             });
+            const testState = yield* ThreadObservationsTestState;
+            return { result, readCount: testState.seenThreadReads.length };
           }).pipe(Effect.provide(layer)),
         );
         expect(result).toMatchObject({
@@ -1334,7 +2180,7 @@ describe("Observations thread detail", () => {
           observation: "condition_met",
           state: { execution: { state: "inactive" } },
         });
-        expect(reads).toHaveLength(1);
+        expect(readCount).toBe(1);
       }),
     ),
   );
@@ -1353,22 +2199,13 @@ describe("Observations thread detail", () => {
             status: null,
           });
           let observationCalls = 0;
-          const reads: Array<{
-            readonly threadId: string;
-            readonly afterSequence: number | undefined;
-            readonly turnLimit: number | undefined;
-          }> = [];
-          const layer = threadObservationsLayer(
-            databasePath,
-            {
-              openThreadStream: () =>
-                Stream.make(
-                  threadSnapshotItem(5, threadDetailFixture("thread-a")),
-                  threadSynchronizedItem,
-                ),
-            },
-            reads,
-          );
+          const layer = threadObservationsLayer(databasePath, {
+            openThreadStream: () =>
+              Stream.make(
+                threadSnapshotItem(5, threadDetailFixture("thread-a")),
+                threadSynchronizedItem,
+              ),
+          });
           const result = yield* Effect.scoped(
             Effect.gen(function* () {
               yield* seedRegistration;
@@ -1441,29 +2278,25 @@ describe("Observations thread detail", () => {
   it.effect("requests the 20-turn window and resumes from the published watermark", () =>
     withDatabasePath((databasePath) =>
       Effect.gen(function* () {
-        const seenThreadReads: Array<{
-          readonly threadId: string;
-          readonly afterSequence: number | undefined;
-          readonly turnLimit: number | undefined;
-        }> = [];
-        const layer = threadObservationsLayer(
-          databasePath,
-          {
-            openThreadStream: () =>
-              Stream.make(
-                threadSnapshotItem(5, threadDetailFixture("thread-a")),
-                threadSynchronizedItem,
-              ),
-          },
-          seenThreadReads,
-        );
-        const { first, second } = yield* Effect.scoped(
+        const layer = threadObservationsLayer(databasePath, {
+          openThreadStream: () =>
+            Stream.make(
+              threadSnapshotItem(5, threadDetailFixture("thread-a")),
+              threadSynchronizedItem,
+            ),
+        });
+        const { first, second, seenThreadReads } = yield* Effect.scoped(
           Effect.gen(function* () {
             yield* seedRegistration;
             const observations = yield* Observations;
+            const testState = yield* ThreadObservationsTestState;
             const firstDetail = yield* observations.threadDetail("instance-a", "thread-a");
             const secondDetail = yield* observations.threadDetail("instance-a", "thread-a");
-            return { first: firstDetail, second: secondDetail };
+            return {
+              first: firstDetail,
+              second: secondDetail,
+              seenThreadReads: [...testState.seenThreadReads],
+            };
           }).pipe(Effect.provide(layer)),
         );
         expect(first.snapshotSequence).toBe(5);
@@ -1482,36 +2315,29 @@ describe("Observations thread detail", () => {
   it.effect("joins overlapping thread reads of one registration revision", () =>
     withDatabasePath((databasePath) =>
       Effect.gen(function* () {
-        let streamOpens = 0;
-        const seenThreadReads: Array<{
-          readonly threadId: string;
-          readonly afterSequence: number | undefined;
-          readonly turnLimit: number | undefined;
-        }> = [];
-        const layer = threadObservationsLayer(
-          databasePath,
-          {
-            openThreadStream: () => {
-              streamOpens += 1;
-              return Stream.make(
-                threadSnapshotItem(5, threadDetailFixture("thread-a")),
-                threadSynchronizedItem,
-              );
-            },
+        const layer = threadObservationsLayer(databasePath, (testState) => ({
+          openThreadStream: () => {
+            const streamOpens = (testState.counters.get("overlappingThreadReads") ?? 0) + 1;
+            testState.counters.set("overlappingThreadReads", streamOpens);
+            return Stream.make(
+              threadSnapshotItem(5, threadDetailFixture("thread-a")),
+              threadSynchronizedItem,
+            );
           },
-          seenThreadReads,
-        );
-        const [first, second] = yield* Effect.scoped(
+        }));
+        const [first, second, streamOpens] = yield* Effect.scoped(
           Effect.gen(function* () {
             yield* seedRegistration;
             const observations = yield* Observations;
-            return yield* Effect.all(
+            const testState = yield* ThreadObservationsTestState;
+            const [first, second] = yield* Effect.all(
               [
                 observations.threadDetail("instance-a", "thread-a"),
                 observations.threadDetail("instance-a", "thread-a"),
               ],
               { concurrency: "unbounded" },
             );
+            return [first, second, testState.counters.get("overlappingThreadReads") ?? 0] as const;
           }).pipe(Effect.provide(layer)),
         );
         expect(first.snapshotSequence).toBe(5);
@@ -1526,27 +2352,18 @@ describe("Observations thread detail", () => {
       Effect.gen(function* () {
         const gate = yield* Deferred.make<void>();
         const snapshotEmitted = yield* Deferred.make<void>();
-        const seenThreadReads: Array<{
-          readonly threadId: string;
-          readonly afterSequence: number | undefined;
-          readonly turnLimit: number | undefined;
-        }> = [];
-        const layer = threadObservationsLayer(
-          databasePath,
-          {
-            openThreadStream: () =>
-              Stream.concat(
-                Stream.make(threadSnapshotItem(5, threadDetailFixture("thread-a"))),
-                Stream.fromEffect(
-                  Effect.gen(function* () {
-                    yield* Deferred.succeed(snapshotEmitted, undefined);
-                    yield* Deferred.await(gate);
-                  }),
-                ).pipe(Stream.map(() => threadSynchronizedItem)),
-              ),
-          },
-          seenThreadReads,
-        );
+        const layer = threadObservationsLayer(databasePath, {
+          openThreadStream: () =>
+            Stream.concat(
+              Stream.make(threadSnapshotItem(5, threadDetailFixture("thread-a"))),
+              Stream.fromEffect(
+                Effect.gen(function* () {
+                  yield* Deferred.succeed(snapshotEmitted, undefined);
+                  yield* Deferred.await(gate);
+                }),
+              ).pipe(Stream.map(() => threadSynchronizedItem)),
+            ),
+        });
         yield* Effect.scoped(
           seedRegistration.pipe(Effect.provide(LocalStore.layer({ databasePath }))),
         );
@@ -1584,47 +2401,38 @@ describe("Observations thread detail", () => {
   it.effect("releases the subscription scope when synchronization overflows", () =>
     withDatabasePath((databasePath) =>
       Effect.gen(function* () {
-        let overflowing = true;
-        const seenThreadReads: Array<{
-          readonly threadId: string;
-          readonly afterSequence: number | undefined;
-          readonly turnLimit: number | undefined;
-        }> = [];
-        const layer = threadObservationsLayer(
-          databasePath,
-          {
-            openThreadStream: (_instanceId, threadId) =>
-              overflowing
-                ? Stream.make(
-                    threadActivityAppendedItem(2, {
-                      activityId: "oversized",
-                      kind: "approval.requested",
-                      summary: "Fixture summary",
-                      payload: { requestId: "request-1", detail: "x".repeat(40 * 1024 * 1024) },
-                      turnId: null,
-                      createdAt: "2026-09-22T00:00:00.000Z",
-                    }),
-                    threadSnapshotItem(1, threadDetailFixture(threadId)),
-                    threadSynchronizedItem,
-                  )
-                : Stream.make(
-                    threadSnapshotItem(3, threadDetailFixture(threadId)),
-                    threadSynchronizedItem,
-                  ),
-          },
-          seenThreadReads,
-        );
+        const layer = threadObservationsLayer(databasePath, (testState) => ({
+          openThreadStream: (_instanceId, threadId) =>
+            testState.flags.get("overflowing") !== false
+              ? Stream.make(
+                  threadActivityAppendedItem(2, {
+                    activityId: "oversized",
+                    kind: "approval.requested",
+                    summary: "Fixture summary",
+                    payload: { requestId: "request-1", detail: "x".repeat(40 * 1024 * 1024) },
+                    turnId: null,
+                    createdAt: "2026-09-22T00:00:00.000Z",
+                  }),
+                  threadSnapshotItem(1, threadDetailFixture(threadId)),
+                  threadSynchronizedItem,
+                )
+              : Stream.make(
+                  threadSnapshotItem(3, threadDetailFixture(threadId)),
+                  threadSynchronizedItem,
+                ),
+        }));
         yield* Effect.scoped(
           Effect.gen(function* () {
             yield* seedRegistration;
             const observations = yield* Observations;
+            const testState = yield* ThreadObservationsTestState;
             // The buffer overflows while a live event races the snapshot.
             const error = yield* Effect.flip(observations.threadDetail("instance-a", "thread-a"));
             if (!(error instanceof ObservationError) || error.kind !== "observation_overflow") {
               throw new Error(`expected observation_overflow, got ${JSON.stringify(error)}`);
             }
             // Overflow released the scope: a follow-up read succeeds.
-            overflowing = false;
+            testState.flags.set("overflowing", false);
             const detail = yield* observations.threadDetail("instance-a", "thread-a");
             expect(detail.snapshotSequence).toBe(3);
           }).pipe(Effect.provide(layer)),
@@ -1640,28 +2448,19 @@ describe("Observations thread detail", () => {
         Effect.gen(function* () {
           const gate = yield* Deferred.make<void>();
           const ready = yield* Deferred.make<void>();
-          let streamStarts = 0;
-          const seenThreadReads: Array<{
-            readonly threadId: string;
-            readonly afterSequence: number | undefined;
-            readonly turnLimit: number | undefined;
-          }> = [];
-          const layer = threadObservationsLayer(
-            databasePath,
-            {
-              openThreadStream: (_instanceId, threadId) => {
-                streamStarts += 1;
-                if (streamStarts === 32) Deferred.doneUnsafe(ready, Effect.void);
-                return Stream.concat(
-                  Stream.make(threadSnapshotItem(1, threadDetailFixture(threadId))),
-                  Stream.fromEffect(Deferred.await(gate)).pipe(
-                    Stream.map(() => threadSynchronizedItem),
-                  ),
-                );
-              },
+          const layer = threadObservationsLayer(databasePath, (testState) => ({
+            openThreadStream: (_instanceId, threadId) => {
+              const streamStarts = (testState.counters.get("subscriptionCapacityStarts") ?? 0) + 1;
+              testState.counters.set("subscriptionCapacityStarts", streamStarts);
+              if (streamStarts === 32) Deferred.doneUnsafe(ready, Effect.void);
+              return Stream.concat(
+                Stream.make(threadSnapshotItem(1, threadDetailFixture(threadId))),
+                Stream.fromEffect(Deferred.await(gate)).pipe(
+                  Stream.map(() => threadSynchronizedItem),
+                ),
+              );
             },
-            seenThreadReads,
-          );
+          }));
           yield* Effect.scoped(
             Effect.gen(function* () {
               yield* seedRegistration;

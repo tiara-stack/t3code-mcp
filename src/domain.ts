@@ -2475,6 +2475,7 @@ export const WorktreeInspectionToolResultSchema = toolResultFields(WorktreeInspe
 export type WorktreeInspectionToolResult = typeof WorktreeInspectionToolResultSchema.Type;
 
 export const THREAD_SNAPSHOT_TURN_LIMIT = 20;
+export const LIMITED_HISTORY_LIMITATION = `The pinned server retained only the most recent ${THREAD_SNAPSHOT_TURN_LIMIT} user-anchored turns; earlier history is unavailable through this read.`;
 export const MAX_ACTIVE_THREAD_SUBSCRIPTIONS_PER_INSTANCE = 32;
 export const MAX_PENDING_REQUEST_QUESTIONS = 32;
 export const MAX_PENDING_REQUEST_OPTIONS = 64;

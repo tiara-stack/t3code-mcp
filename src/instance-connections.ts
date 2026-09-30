@@ -343,10 +343,16 @@ export class InstanceConnections extends Context.Service<
   InstanceConnectionsService
 >()("t3code-mcp/InstanceConnections") {
   static readonly layerTest = (
-    service: Omit<InstanceConnectionsService, keyof InstanceConnectionsTestOverrides> &
-      Partial<InstanceConnectionsTestOverrides>,
+    service:
+      | (Omit<InstanceConnectionsService, keyof InstanceConnectionsTestOverrides> &
+          Partial<InstanceConnectionsTestOverrides>)
+      | (() => Omit<InstanceConnectionsService, keyof InstanceConnectionsTestOverrides> &
+          Partial<InstanceConnectionsTestOverrides>),
   ): Layer.Layer<InstanceConnections> =>
-    Layer.succeed(InstanceConnections, { ...instanceConnectionsTestDefaults, ...service });
+    Layer.sync(InstanceConnections, () => {
+      const overrides = typeof service === "function" ? service() : service;
+      return { ...instanceConnectionsTestDefaults, ...overrides };
+    });
 
   static readonly layerWithAdapter = (adapterLayer: Layer.Layer<T3CodeAdapter>) =>
     Layer.effect(

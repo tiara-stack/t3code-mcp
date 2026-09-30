@@ -22794,338 +22794,7 @@ describe("turn_wait", () => {
     ),
   );
 
-  it.effect("answers from retained evidence after supersession without replacing the target", () =>
-    withDatabasePath((databasePath) =>
-      Effect.gen(function* () {
-        const { options, connections } = emptyThreadFixtures();
-        options.activeStreams = {
-          "instance-a": () =>
-            Stream.make(
-              shellSnapshotItem(41, [shellProjectFixture("project-a", "/srv/project-a")], []),
-              shellSynchronizedItem,
-            ),
-        };
-        let opens = 0;
-        options.threadStreams = {
-          "instance-a:thread-a": () => {
-            opens += 1;
-            return opens === 1
-              ? turnWaitDetail(10, { turnId: "turn-a", state: "completed" })
-              : turnWaitDetail(20, { turnId: "turn-b", state: "running" });
-          },
-        };
-        const result = yield* Effect.scoped(
-          Effect.gen(function* () {
-            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
-            // The seeding read retains the completed-turn evidence before a
-            // newer turn exists.
-            yield* callTool("thread_get", {
-              thread: { instanceId: "instance-a", threadId: "thread-a" },
-            });
-            return yield* callTool("turn_wait", { turn: turnA, waitMs: 0 });
-          }).pipe(Effect.provide(appLayer(databasePath, connections))),
-        );
-
-        const value = result[0]?.result as unknown as TurnWaitToolResultShape;
-        expect(value.result).toMatchObject({
-          kind: "ok",
-          value: {
-            target: turnA,
-            observation: "condition_met",
-            execution: "completed",
-          },
-        });
-        const outcome = (
-          value.result as { value: { evidence: ReadonlyArray<{ sourceSequence: number | null }> } }
-        ).value;
-        // The outcome came from the retained observation of turn-a, not from
-        // the newer turn-b currently running.
-        expect(outcome.evidence).toMatchObject([{ sourceSequence: 10 }]);
-        expect(value.observations).toMatchObject([
-          {
-            instanceId: "instance-a",
-            freshness: "fresh",
-            coverage: "partial",
-            limitations: [expect.stringMatching(/retained turn evidence/)],
-          },
-        ]);
-      }),
-    ),
-  );
-
-  it.effect("reports running and times out when the turn stays active", () =>
-    withDatabasePath((databasePath) =>
-      Effect.gen(function* () {
-        const { options, connections } = emptyThreadFixtures();
-        const waitPollOpened = yield* Deferred.make<void>();
-        let opens = 0;
-        options.activeStreams = {
-          "instance-a": () =>
-            Stream.make(
-              shellSnapshotItem(41, [shellProjectFixture("project-a", "/srv/project-a")], []),
-              shellSynchronizedItem,
-            ),
-        };
-        options.threadStreams = {
-          "instance-a:thread-a": () => {
-            opens += 1;
-            if (opens === 1) return turnWaitDetail(10, { turnId: "turn-a", state: "running" });
-            return Stream.unwrap(
-              Effect.gen(function* () {
-                if (opens === 2) yield* Deferred.succeed(waitPollOpened, undefined);
-                return Stream.make({ kind: "synchronized" as const });
-              }),
-            );
-          },
-        };
-        const result = yield* Effect.scoped(
-          Effect.gen(function* () {
-            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
-            // The seeding read consumes the first open; the wait's first poll
-            // then resolves the gating deferred without a clock advance.
-            yield* callTool("thread_get", {
-              thread: { instanceId: "instance-a", threadId: "thread-a" },
-            });
-            const fiber = yield* Effect.forkDetach(
-              callTool("turn_wait", { turn: turnA, waitMs: 250 }),
-            );
-            yield* Deferred.await(waitPollOpened);
-            yield* TestClock.adjust(Duration.millis(150));
-            yield* TestClock.adjust(Duration.millis(150));
-            return yield* Fiber.join(fiber);
-          }).pipe(Effect.provide(appLayer(databasePath, connections))),
-        );
-
-        const value = result[0]?.result as unknown as TurnWaitToolResultShape;
-        expect(value.result).toMatchObject({
-          kind: "ok",
-          value: { target: turnA, observation: "timed_out", execution: "running" },
-        });
-        expect(value.observations).toMatchObject([{ freshness: "fresh" }]);
-      }),
-    ),
-  );
-
-  it.effect("reports a history gap when a newer turn supersedes the target mid-wait", () =>
-    withDatabasePath((databasePath) =>
-      Effect.gen(function* () {
-        const { options, connections } = emptyThreadFixtures();
-        const waitPollOpened = yield* Deferred.make<void>();
-        const supersedeOpened = yield* Deferred.make<void>();
-        let opens = 0;
-        options.activeStreams = {
-          "instance-a": () =>
-            Stream.make(
-              shellSnapshotItem(41, [shellProjectFixture("project-a", "/srv/project-a")], []),
-              shellSynchronizedItem,
-            ),
-        };
-        options.threadStreams = {
-          "instance-a:thread-a": () => {
-            opens += 1;
-            if (opens === 1) return turnWaitDetail(10, { turnId: "turn-a", state: "running" });
-            const stream = turnWaitDetail(20, { turnId: "turn-b", state: "running" });
-            return Stream.unwrap(
-              Effect.gen(function* () {
-                if (opens === 2) yield* Deferred.succeed(waitPollOpened, undefined);
-                if (opens === 3) yield* Deferred.succeed(supersedeOpened, undefined);
-                return stream;
-              }),
-            );
-          },
-        };
-        const result = yield* Effect.scoped(
-          Effect.gen(function* () {
-            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
-            yield* callTool("thread_get", {
-              thread: { instanceId: "instance-a", threadId: "thread-a" },
-            });
-            const fiber = yield* Effect.forkDetach(
-              callTool("turn_wait", { turn: turnA, waitMs: 10_000 }),
-            );
-            yield* Deferred.await(waitPollOpened);
-            yield* advanceUntilDone(supersedeOpened, 3_000);
-            return yield* Fiber.join(fiber);
-          }).pipe(Effect.provide(appLayer(databasePath, connections))),
-        );
-
-        const value = result[0]?.result as unknown as TurnWaitToolResultShape;
-        expect(value.result).toMatchObject({
-          kind: "ok",
-          value: {
-            target: turnA,
-            observation: "history_gap",
-            execution: "outcome_unknown",
-          },
-        });
-        // Supersession alone never establishes completion; the gap is
-        // reported explicitly so the caller can resynchronize.
-        expect(value.observations).toMatchObject([
-          {
-            freshness: "fresh",
-            sourceSequence: 20,
-            limitations: [expect.stringMatching(/not covered by the current observation/)],
-          },
-        ]);
-      }),
-    ),
-  );
-
-  it.effect("never establishes completion from a projected turn state", () =>
-    withDatabasePath((databasePath) =>
-      Effect.gen(function* () {
-        const { options, connections } = emptyThreadFixtures();
-        const waitPollOpened = yield* Deferred.make<void>();
-        let opens = 0;
-        options.activeStreams = {
-          "instance-a": () =>
-            Stream.make(
-              shellSnapshotItem(41, [shellProjectFixture("project-a", "/srv/project-a")], []),
-              shellSynchronizedItem,
-            ),
-        };
-        options.threadStreams = {
-          "instance-a:thread-a": () => {
-            opens += 1;
-            if (opens === 1) return turnWaitDetail(10, { turnId: "turn-a", state: "running" });
-            return Stream.unwrap(
-              Effect.gen(function* () {
-                if (opens === 2) yield* Deferred.succeed(waitPollOpened, undefined);
-                // A session transition to idle projects the still-running
-                // turn as completed; the projection cannot establish
-                // completion.
-                return Stream.make(
-                  {
-                    kind: "session-set" as const,
-                    sequence: 11,
-                    session: {
-                      status: "idle" as const,
-                      activeTurnId: null,
-                      lastError: null,
-                      updatedAt: "2026-09-22T00:00:01.000Z",
-                    },
-                  },
-                  { kind: "synchronized" as const },
-                );
-              }),
-            );
-          },
-        };
-        const result = yield* Effect.scoped(
-          Effect.gen(function* () {
-            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
-            yield* callTool("thread_get", {
-              thread: { instanceId: "instance-a", threadId: "thread-a" },
-            });
-            const fiber = yield* Effect.forkDetach(
-              callTool("turn_wait", { turn: turnA, waitMs: 250 }),
-            );
-            yield* Deferred.await(waitPollOpened);
-            yield* TestClock.adjust(Duration.millis(150));
-            yield* TestClock.adjust(Duration.millis(150));
-            return yield* Fiber.join(fiber);
-          }).pipe(Effect.provide(appLayer(databasePath, connections))),
-        );
-
-        const value = result[0]?.result as unknown as TurnWaitToolResultShape;
-        expect(value.result).toMatchObject({
-          kind: "ok",
-          value: { target: turnA, observation: "timed_out", execution: "outcome_unknown" },
-        });
-        const outcome = (value.result as { value: { evidence: ReadonlyArray<{ detail: string }> } })
-          .value;
-        expect(outcome.evidence[0]?.detail).toContain("projected from a session transition");
-      }),
-    ),
-  );
-
-  it.effect("keeps a superseded projected outcome unknown rather than completed", () =>
-    withDatabasePath((databasePath) =>
-      Effect.gen(function* () {
-        const { options, connections } = emptyThreadFixtures();
-        let opens = 0;
-        options.threadStreams = {
-          "instance-a:thread-a": () => {
-            opens += 1;
-            if (opens === 1) return turnWaitDetail(10, { turnId: "turn-a", state: "running" });
-            if (opens === 2) {
-              return Stream.make(
-                {
-                  kind: "session-set" as const,
-                  sequence: 11,
-                  session: {
-                    status: "idle" as const,
-                    activeTurnId: null,
-                    lastError: null,
-                    updatedAt: "2026-09-22T00:00:01.000Z",
-                  },
-                },
-                { kind: "synchronized" as const },
-              );
-            }
-            return turnWaitDetail(20, { turnId: "turn-b", state: "running" });
-          },
-        };
-        const result = yield* Effect.scoped(
-          Effect.gen(function* () {
-            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
-            // Observe and retain the projected completion for turn-a before
-            // the newer turn supersedes it.
-            yield* callTool("thread_get", {
-              thread: { instanceId: "instance-a", threadId: "thread-a" },
-            });
-            yield* callTool("thread_get", {
-              thread: { instanceId: "instance-a", threadId: "thread-a" },
-            });
-            return yield* callTool("turn_wait", { turn: turnA, waitMs: 0 });
-          }).pipe(Effect.provide(appLayer(databasePath, connections))),
-        );
-
-        const value = result[0]?.result as unknown as TurnWaitToolResultShape;
-        expect(value.result).toMatchObject({
-          kind: "ok",
-          value: { target: turnA, observation: "history_gap", execution: "outcome_unknown" },
-        });
-      }),
-    ),
-  );
-
-  it.effect("meets interrupted and failed from supported terminal states", () =>
-    withDatabasePath((databasePath) =>
-      Effect.gen(function* () {
-        const { options, connections } = emptyThreadFixtures();
-        let opens = 0;
-        options.threadStreams = {
-          "instance-a:thread-a": () => {
-            opens += 1;
-            if (opens === 1) return turnWaitDetail(10, { turnId: "turn-a", state: "interrupted" });
-            return turnWaitDetail(20, { turnId: "turn-a", state: "error" });
-          },
-        };
-        const result = yield* Effect.scoped(
-          Effect.gen(function* () {
-            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
-            const interrupted = yield* callTool("turn_wait", { turn: turnA, waitMs: 0 });
-            const failed = yield* callTool("turn_wait", { turn: turnA, waitMs: 0 });
-            return { interrupted, failed };
-          }).pipe(Effect.provide(appLayer(databasePath, connections))),
-        );
-
-        const interrupted = result.interrupted[0]?.result as unknown as TurnWaitToolResultShape;
-        expect(interrupted.result).toMatchObject({
-          kind: "ok",
-          value: { target: turnA, observation: "condition_met", execution: "interrupted" },
-        });
-        const failed = result.failed[0]?.result as unknown as TurnWaitToolResultShape;
-        expect(failed.result).toMatchObject({
-          kind: "ok",
-          value: { target: turnA, observation: "condition_met", execution: "failed" },
-        });
-      }),
-    ),
-  );
-
-  it.effect("meets awaiting_approval only from a correlated unresolved request", () =>
+  it.effect("awaits only on correlated requests and retains uncorrelated requests", () =>
     withDatabasePath((databasePath) =>
       Effect.gen(function* () {
         const { options, connections } = emptyThreadFixtures();
@@ -23163,6 +22832,14 @@ describe("turn_wait", () => {
                 state: "pending",
                 actionable: true,
                 pendingRequestId: "request-1",
+                turn: turnA,
+              },
+              {
+                activityId: "activity-2",
+                state: "pending",
+                actionable: true,
+                pendingRequestId: "request-2",
+                turn: null,
               },
             ],
           },
@@ -23171,522 +22848,6 @@ describe("turn_wait", () => {
           value.result as { value: { evidence: ReadonlyArray<{ nativeEventId: string | null }> } }
         ).value;
         expect(outcome.evidence).toMatchObject([{ nativeEventId: "activity-1" }]);
-      }),
-    ),
-  );
-
-  it.effect("never manufactures awaiting from a request whose lifecycle is unknown", () =>
-    withDatabasePath((databasePath) =>
-      Effect.gen(function* () {
-        const { options, connections } = emptyThreadFixtures();
-        options.threadStreams = {
-          "instance-a:thread-a": () =>
-            turnWaitDetail(42, { turnId: "turn-a", state: "running" }, [
-              // Turn-correlated but missing its native request identity: the
-              // lifecycle is unknown, so it cannot establish awaiting.
-              approvalActivity("activity-1", null, { turnId: "turn-a" }),
-            ]),
-        };
-        const result = yield* Effect.scoped(
-          Effect.gen(function* () {
-            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
-            return yield* callTool("turn_wait", { turn: turnA, waitMs: 0 });
-          }).pipe(Effect.provide(appLayer(databasePath, connections))),
-        );
-
-        const value = result[0]?.result as unknown as TurnWaitToolResultShape;
-        expect(value.result).toMatchObject({
-          kind: "ok",
-          value: {
-            target: turnA,
-            observation: "timed_out",
-            execution: "running",
-            pendingRequests: [
-              {
-                activityId: "activity-1",
-                state: "unknown",
-                actionable: false,
-                pendingRequestId: null,
-              },
-            ],
-          },
-        });
-      }),
-    ),
-  );
-
-  it.effect("meets awaiting_input from a correlated unresolved input request", () =>
-    withDatabasePath((databasePath) =>
-      Effect.gen(function* () {
-        const { options, connections } = emptyThreadFixtures();
-        options.threadStreams = {
-          "instance-a:thread-a": () =>
-            turnWaitDetail(42, { turnId: "turn-a", state: "running" }, [
-              inputActivity(
-                "activity-1",
-                "request-1",
-                [
-                  {
-                    id: "q1",
-                    header: "Target",
-                    question: "Which target?",
-                    options: [{ label: "staging", description: "Staging env" }],
-                    multiSelect: false,
-                  },
-                ],
-                { turnId: "turn-a" },
-              ),
-            ]),
-        };
-        const result = yield* Effect.scoped(
-          Effect.gen(function* () {
-            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
-            return yield* callTool("turn_wait", { turn: turnA, waitMs: 0 });
-          }).pipe(Effect.provide(appLayer(databasePath, connections))),
-        );
-
-        const value = result[0]?.result as unknown as TurnWaitToolResultShape;
-        expect(value.result).toMatchObject({
-          kind: "ok",
-          value: {
-            target: turnA,
-            observation: "condition_met",
-            execution: "awaiting_input",
-            pendingRequests: [
-              {
-                activityId: "activity-1",
-                state: "pending",
-                actionable: true,
-                pendingRequestId: "request-1",
-              },
-            ],
-          },
-        });
-      }),
-    ),
-  );
-
-  it.effect("ignores uncorrelated and resolved requests for the exact-turn outcome", () =>
-    withDatabasePath((databasePath) =>
-      Effect.gen(function* () {
-        const { options, connections } = emptyThreadFixtures();
-        const waitPollOpened = yield* Deferred.make<void>();
-        let opens = 0;
-        options.activeStreams = {
-          "instance-a": () =>
-            Stream.make(
-              shellSnapshotItem(41, [shellProjectFixture("project-a", "/srv/project-a")], []),
-              shellSynchronizedItem,
-            ),
-        };
-        options.threadStreams = {
-          "instance-a:thread-a": () => {
-            opens += 1;
-            if (opens === 1) {
-              return turnWaitDetail(10, { turnId: "turn-a", state: "running" }, [
-                // Correlated but already resolved: not awaiting.
-                approvalActivity("activity-1", "request-1", {
-                  options: [{ decision: "accept", label: "Accept" }],
-                  turnId: "turn-a",
-                }),
-                resolvedApprovalActivity("activity-2", "request-1"),
-                // Uncorrelated unresolved requests stay at thread scope.
-                inputActivity("activity-3", "request-3", [
-                  {
-                    id: "q1",
-                    header: "Target",
-                    question: "Which target?",
-                    options: [{ label: "staging", description: "Staging env" }],
-                    multiSelect: false,
-                  },
-                ]),
-              ]);
-            }
-            return Stream.unwrap(
-              Effect.gen(function* () {
-                if (opens === 2) yield* Deferred.succeed(waitPollOpened, undefined);
-                return Stream.make({ kind: "synchronized" as const });
-              }),
-            );
-          },
-        };
-        const result = yield* Effect.scoped(
-          Effect.gen(function* () {
-            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
-            yield* callTool("thread_get", {
-              thread: { instanceId: "instance-a", threadId: "thread-a" },
-            });
-            const fiber = yield* Effect.forkDetach(
-              callTool("turn_wait", { turn: turnA, waitMs: 250 }),
-            );
-            yield* Deferred.await(waitPollOpened);
-            yield* TestClock.adjust(Duration.millis(150));
-            yield* TestClock.adjust(Duration.millis(150));
-            return yield* Fiber.join(fiber);
-          }).pipe(Effect.provide(appLayer(databasePath, connections))),
-        );
-
-        const value = result[0]?.result as unknown as TurnWaitToolResultShape;
-        expect(value.result).toMatchObject({
-          kind: "ok",
-          value: {
-            target: turnA,
-            observation: "timed_out",
-            execution: "running",
-            pendingRequests: [{ activityId: "activity-1", state: "resolved", actionable: false }],
-          },
-        });
-      }),
-    ),
-  );
-
-  it.effect("meets completion restated by a replacement snapshot", () =>
-    withDatabasePath((databasePath) =>
-      Effect.gen(function* () {
-        const { options, connections } = emptyThreadFixtures();
-        const waitPollOpened = yield* Deferred.make<void>();
-        const replacementOpened = yield* Deferred.make<void>();
-        let opens = 0;
-        options.activeStreams = {
-          "instance-a": () =>
-            Stream.make(
-              shellSnapshotItem(41, [shellProjectFixture("project-a", "/srv/project-a")], []),
-              shellSynchronizedItem,
-            ),
-        };
-        options.threadStreams = {
-          "instance-a:thread-a": () => {
-            opens += 1;
-            if (opens === 1) return turnWaitDetail(10, { turnId: "turn-a", state: "running" });
-            const stream = turnWaitDetail(20, { turnId: "turn-a", state: "completed" });
-            return Stream.unwrap(
-              Effect.gen(function* () {
-                if (opens === 2) yield* Deferred.succeed(waitPollOpened, undefined);
-                if (opens === 3) yield* Deferred.succeed(replacementOpened, undefined);
-                return stream;
-              }),
-            );
-          },
-        };
-        const result = yield* Effect.scoped(
-          Effect.gen(function* () {
-            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
-            yield* callTool("thread_get", {
-              thread: { instanceId: "instance-a", threadId: "thread-a" },
-            });
-            const fiber = yield* Effect.forkDetach(
-              callTool("turn_wait", { turn: turnA, waitMs: 10_000 }),
-            );
-            yield* Deferred.await(waitPollOpened);
-            yield* advanceUntilDone(replacementOpened, 3_000);
-            return yield* Fiber.join(fiber);
-          }).pipe(Effect.provide(appLayer(databasePath, connections))),
-        );
-
-        const value = result[0]?.result as unknown as TurnWaitToolResultShape;
-        expect(value.result).toMatchObject({
-          kind: "ok",
-          value: { target: turnA, observation: "condition_met", execution: "completed" },
-        });
-        expect(value.observations).toMatchObject([{ freshness: "fresh", sourceSequence: 20 }]);
-      }),
-    ),
-  );
-
-  it.effect("retries a transient mid-wait observation loss and meets completion", () =>
-    withDatabasePath((databasePath) =>
-      Effect.gen(function* () {
-        const { options, connections } = emptyThreadFixtures();
-        const waitPollOpened = yield* Deferred.make<void>();
-        const failureOpened = yield* Deferred.make<void>();
-        const replayOpened = yield* Deferred.make<void>();
-        let opens = 0;
-        options.activeStreams = {
-          "instance-a": () =>
-            Stream.make(
-              shellSnapshotItem(41, [shellProjectFixture("project-a", "/srv/project-a")], []),
-              shellSynchronizedItem,
-            ),
-        };
-        options.threadStreams = {
-          "instance-a:thread-a": () => {
-            opens += 1;
-            if (opens === 1) return turnWaitDetail(10, { turnId: "turn-a", state: "running" });
-            if (opens === 2) {
-              return Stream.unwrap(
-                Effect.gen(function* () {
-                  yield* Deferred.succeed(waitPollOpened, undefined);
-                  return Stream.make({ kind: "synchronized" as const });
-                }),
-              );
-            }
-            if (opens === 3) {
-              return Stream.unwrap(
-                Effect.gen(function* () {
-                  yield* Deferred.succeed(failureOpened, undefined);
-                  return Stream.fail(
-                    new T3CodeAdapterError({
-                      kind: "transport",
-                      message: "The transient test observation failure.",
-                      uncertain: false,
-                      status: null,
-                    }),
-                  );
-                }),
-              );
-            }
-            return Stream.unwrap(
-              Effect.gen(function* () {
-                yield* Deferred.succeed(replayOpened, undefined);
-                return turnWaitDetail(20, { turnId: "turn-a", state: "completed" });
-              }),
-            );
-          },
-        };
-        const result = yield* Effect.scoped(
-          Effect.gen(function* () {
-            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
-            yield* callTool("thread_get", {
-              thread: { instanceId: "instance-a", threadId: "thread-a" },
-            });
-            const fiber = yield* Effect.forkDetach(
-              callTool("turn_wait", { turn: turnA, waitMs: 10_000 }),
-            );
-            yield* Deferred.await(waitPollOpened);
-            yield* advanceUntilDone(failureOpened, 2_000);
-            yield* advanceUntilDone(replayOpened, 3_000);
-            return yield* Fiber.join(fiber);
-          }).pipe(Effect.provide(appLayer(databasePath, connections))),
-        );
-
-        const value = result[0]?.result as unknown as TurnWaitToolResultShape;
-        expect(value.result).toMatchObject({
-          kind: "ok",
-          value: { target: turnA, observation: "condition_met", execution: "completed" },
-        });
-        expect(value.observations).toMatchObject([{ freshness: "fresh", sourceSequence: 20 }]);
-      }),
-    ),
-  );
-
-  it.effect("ends as unavailable when the registration changes mid-wait", () =>
-    withDatabasePath((databasePath) =>
-      Effect.gen(function* () {
-        const { options, connections } = emptyThreadFixtures();
-        const waitPollOpened = yield* Deferred.make<void>();
-        const snapshotEmitted = yield* Deferred.make<void>();
-        const gate = yield* Deferred.make<void>();
-        let opens = 0;
-        options.activeStreams = {
-          "instance-a": () =>
-            Stream.make(
-              shellSnapshotItem(41, [shellProjectFixture("project-a", "/srv/project-a")], []),
-              shellSynchronizedItem,
-            ),
-        };
-        options.threadStreams = {
-          "instance-a:thread-a": () => {
-            opens += 1;
-            if (opens === 1) return turnWaitDetail(10, { turnId: "turn-a", state: "running" });
-            if (opens === 2) {
-              return Stream.unwrap(
-                Effect.gen(function* () {
-                  yield* Deferred.succeed(waitPollOpened, undefined);
-                  return Stream.make({ kind: "synchronized" as const });
-                }),
-              );
-            }
-            return Stream.concat(
-              Stream.make({
-                kind: "snapshot" as const,
-                snapshot: {
-                  snapshotSequence: 11,
-                  thread: observedThreadFixture("thread-a", {
-                    latestTurn: { turnId: "turn-a", state: "running" },
-                  }),
-                  page: null,
-                },
-              }),
-              Stream.fromEffect(
-                Effect.gen(function* () {
-                  yield* Deferred.succeed(snapshotEmitted, undefined);
-                  yield* Deferred.await(gate);
-                }),
-              ).pipe(Stream.map(() => ({ kind: "synchronized" as const }))),
-            );
-          },
-        };
-        const result = yield* Effect.scoped(
-          Effect.gen(function* () {
-            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
-            yield* callTool("thread_get", {
-              thread: { instanceId: "instance-a", threadId: "thread-a" },
-            });
-            const fiber = yield* Effect.forkDetach(
-              callTool("turn_wait", { turn: turnA, waitMs: 10_000 }),
-            );
-            yield* Deferred.await(waitPollOpened);
-            yield* advanceUntilDone(snapshotEmitted, 2_000);
-            const store = yield* LocalStore;
-            yield* store.putRegistration({
-              instanceId: "instance-a",
-              alias: "Instance a renamed",
-              endpoint: "https://a.test",
-              environmentId: null,
-              connection: "connected",
-              lastObservedAt: null,
-              credential: "secret-a",
-            });
-            yield* Deferred.succeed(gate, undefined);
-            return yield* Fiber.join(fiber);
-          }).pipe(Effect.provide(appLayer(databasePath, connections))),
-        );
-
-        const value = result[0]?.result as unknown as TurnWaitToolResultShape;
-        expect(value.result).toMatchObject({
-          kind: "ok",
-          value: { target: turnA, observation: "unavailable", execution: "outcome_unknown" },
-        });
-        expect(value.observations).toEqual([]);
-        expect(value.warnings).toMatchObject([
-          { code: "observation_unavailable", message: expect.stringMatching(/changed while/) },
-        ]);
-      }),
-    ),
-  );
-
-  it.effect(
-    "cancellation releases the wait's observation scope without touching upstream work",
-    () =>
-      withDatabasePath((databasePath) =>
-        Effect.gen(function* () {
-          const { options, connections } = emptyThreadFixtures();
-          const waitPollOpened = yield* Deferred.make<void>();
-          const acquired = yield* Deferred.make<void>();
-          const released = yield* Deferred.make<void>();
-          let opens = 0;
-          options.activeStreams = {
-            "instance-a": () =>
-              Stream.make(
-                shellSnapshotItem(41, [shellProjectFixture("project-a", "/srv/project-a")], []),
-                shellSynchronizedItem,
-              ),
-          };
-          options.threadStreams = {
-            "instance-a:thread-a": () => {
-              opens += 1;
-              if (opens === 1) return turnWaitDetail(10, { turnId: "turn-a", state: "running" });
-              if (opens === 2) {
-                return Stream.unwrap(
-                  Effect.gen(function* () {
-                    yield* Deferred.succeed(waitPollOpened, undefined);
-                    return Stream.make({ kind: "synchronized" as const });
-                  }),
-                );
-              }
-              if (opens === 3) {
-                // A synchronization that stays in flight until the wait is
-                // cancelled; its scope must release on interruption.
-                return Stream.unwrap(
-                  Effect.acquireRelease(Deferred.succeed(acquired, undefined), () =>
-                    Deferred.succeed(released, undefined),
-                  ).pipe(
-                    Effect.as(
-                      Stream.concat(
-                        Stream.make({
-                          kind: "snapshot" as const,
-                          snapshot: {
-                            snapshotSequence: 11,
-                            thread: observedThreadFixture("thread-a", {
-                              latestTurn: { turnId: "turn-a", state: "running" },
-                            }),
-                            page: null,
-                          },
-                        }),
-                        Stream.never,
-                      ),
-                    ),
-                  ),
-                );
-              }
-              return turnWaitDetail(12, { turnId: "turn-a", state: "running" });
-            },
-          };
-          yield* Effect.scoped(
-            Effect.gen(function* () {
-              yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
-              yield* callTool("thread_get", {
-                thread: { instanceId: "instance-a", threadId: "thread-a" },
-              });
-              const fiber = yield* Effect.forkDetach(
-                callTool("turn_wait", { turn: turnA, waitMs: 30_000 }),
-              );
-              yield* Deferred.await(waitPollOpened);
-              yield* advanceUntilDone(acquired, 3_000);
-              yield* Fiber.interrupt(fiber);
-              yield* Deferred.await(released);
-              const exit = yield* Fiber.await(fiber);
-              expect(Exit.isFailure(exit)).toBe(true);
-              // The thread stays observable for later reads; cancelling the
-              // wait dispatched nothing.
-              const read = yield* callTool("turn_wait", { turn: turnA, waitMs: 0 });
-              const value = read[0]?.result as unknown as TurnWaitToolResultShape;
-              expect(value.result).toMatchObject({ kind: "ok" });
-            }).pipe(Effect.provide(appLayer(databasePath, connections))),
-          );
-        }),
-      ),
-  );
-
-  it.effect("reports a history gap after historical evidence eviction", () =>
-    withDatabasePath((databasePath) =>
-      Effect.gen(function* () {
-        const { options, connections } = emptyThreadFixtures();
-        options.activeStreams = {
-          "instance-a": () =>
-            Stream.make(
-              shellSnapshotItem(41, [shellProjectFixture("project-a", "/srv/project-a")], []),
-              shellSynchronizedItem,
-            ),
-        };
-        let opens = 0;
-        options.threadStreams = {
-          "instance-a:thread-a": () => {
-            opens += 1;
-            return opens === 1
-              ? turnWaitDetail(10, { turnId: "turn-a", state: "running" })
-              : turnWaitDetail(20, { turnId: "turn-b", state: "running" });
-          },
-        };
-        const result = yield* Effect.scoped(
-          Effect.gen(function* () {
-            yield* TestClock.setTime(1_000_000);
-            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
-            // The first read retains turn-a's evidence at the original
-            // observation time.
-            yield* callTool("thread_get", {
-              thread: { instanceId: "instance-a", threadId: "thread-a" },
-            });
-            const store = yield* LocalStore;
-            const before = yield* store.findTurnEvidence(turnA);
-            expect(before).toMatchObject({ state: "running", projected: false });
-            yield* TestClock.adjust(Duration.millis(THIRTY_DAYS_MILLIS + 1));
-            // The superseding read retains turn-b's evidence past the
-            // thirty-day window, evicting turn-a's expired row.
-            yield* callTool("thread_get", {
-              thread: { instanceId: "instance-a", threadId: "thread-a" },
-            });
-            const after = yield* store.findTurnEvidence(turnA);
-            expect(after).toBeNull();
-            return yield* callTool("turn_wait", { turn: turnA, waitMs: 0 });
-          }).pipe(Effect.provide(appLayer(databasePath, connections))),
-        );
-
-        const value = result[0]?.result as unknown as TurnWaitToolResultShape;
-        expect(value.result).toMatchObject({
-          kind: "ok",
-          value: { target: turnA, observation: "history_gap", execution: "outcome_unknown" },
-        });
       }),
     ),
   );
@@ -23910,6 +23071,64 @@ describe("turn_wait", () => {
     ),
   );
 
+  it.effect("returns identity_mismatch when the registration changes during observation", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const { options, connections } = emptyThreadFixtures();
+        const gate = yield* Deferred.make<void>();
+        const snapshotEmitted = yield* Deferred.make<void>();
+        options.threadStreams = {
+          "instance-a:thread-a": () =>
+            Stream.concat(
+              Stream.make({
+                kind: "snapshot" as const,
+                snapshot: {
+                  snapshotSequence: 42,
+                  thread: observedThreadFixture("thread-a", {
+                    latestTurn: { turnId: "turn-a", state: "running" },
+                  }),
+                  page: null,
+                },
+              }),
+              Stream.fromEffect(
+                Effect.gen(function* () {
+                  yield* Deferred.succeed(snapshotEmitted, undefined);
+                  yield* Deferred.await(gate);
+                }),
+              ).pipe(Stream.map(() => ({ kind: "synchronized" as const }))),
+            ),
+        };
+
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
+            const store = yield* LocalStore;
+            const waiting = yield* Effect.forkScoped(
+              callTool("turn_wait", { turn: turnA, waitMs: 0 }),
+            );
+            yield* Deferred.await(snapshotEmitted);
+            const registration = yield* store.getRegistration("instance-a");
+            if (registration === null) throw new Error("expected the seeded registration");
+            yield* store.putRegistration({
+              ...registration.registration,
+              endpoint: "https://changed.test",
+              ...(registration.credential === null ? {} : { credential: registration.credential }),
+            });
+            yield* Deferred.succeed(gate, undefined);
+            return yield* Fiber.join(waiting);
+          }).pipe(Effect.provide(appLayer(databasePath, connections))),
+        );
+
+        expect(result[0]?.result).toMatchObject({
+          result: {
+            kind: "error",
+            error: { code: "identity_mismatch", retry: "reconcile_first" },
+          },
+        });
+      }),
+    ),
+  );
+
   it.effect("rejects out-of-range wait budgets and unknown arguments before dispatch", () =>
     withDatabasePath((databasePath) =>
       Effect.gen(function* () {
@@ -23930,42 +23149,6 @@ describe("turn_wait", () => {
           expect(String(exit.cause)).toContain("Invalid parameters for tool 'turn_wait'");
         }
         expect(options.seenThreads).toEqual([]);
-      }),
-    ),
-  );
-
-  it.live("observes a live turn outcome across real time", () =>
-    withDatabasePath((databasePath) =>
-      Effect.gen(function* () {
-        const { options, connections } = emptyThreadFixtures();
-        let opens = 0;
-        let completed = false;
-        options.threadStreams = {
-          "instance-a:thread-a": () => {
-            opens += 1;
-            if (opens === 1) return turnWaitDetail(10, { turnId: "turn-a", state: "running" });
-            if (!completed) return Stream.make({ kind: "synchronized" as const });
-            return turnWaitDetail(11, { turnId: "turn-a", state: "completed" });
-          },
-        };
-        const result = yield* Effect.scoped(
-          Effect.gen(function* () {
-            yield* seedProjectRegistration("instance-a", "https://a.test", "secret-a");
-            const fiber = yield* Effect.forkDetach(
-              callTool("turn_wait", { turn: turnA, waitMs: 2_000 }),
-            );
-            yield* Effect.sleep(Duration.millis(150));
-            completed = true;
-            return yield* Fiber.join(fiber);
-          }).pipe(Effect.provide(appLayer(databasePath, connections))),
-        );
-
-        const value = result[0]?.result as unknown as TurnWaitToolResultShape;
-        expect(value.result).toMatchObject({
-          kind: "ok",
-          value: { target: turnA, observation: "condition_met", execution: "completed" },
-        });
-        expect(value.observations).toMatchObject([{ freshness: "fresh", sourceSequence: 11 }]);
       }),
     ),
   );

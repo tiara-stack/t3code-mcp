@@ -5,6 +5,7 @@ import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Match from "effect/Match";
 import * as Option from "effect/Option";
 import * as Pull from "effect/Pull";
 import * as Schema from "effect/Schema";
@@ -14,16 +15,24 @@ import {
   MAX_INSTANCE_OBSERVATION_QUEUE_BYTES,
   MAX_RETAINED_OBSERVATION_BYTES,
   MAX_THREAD_WAIT_MILLIS,
+  LIMITED_HISTORY_LIMITATION,
   SYNCHRONIZATION_BOUND_MILLIS,
   THREAD_SNAPSHOT_TURN_LIMIT,
   serializedByteLength,
   type Observation,
+  type Evidence,
+  type PendingRequest,
   type ThreadCondition,
   type ThreadObservationCursor,
   type ThreadState,
   type ThreadWaitResult,
+  type TurnReference,
+  type TurnWaitResult,
+  type TurnWaitToolResult,
 } from "./domain";
 import { LocalStore, LocalStoreError, type LocalStoreService } from "./local-store";
+import type { TurnEvidenceRecord } from "./local-store";
+import { pendingRequestsFromActivities } from "./pending-requests";
 import { InstanceConnections } from "./instance-connections";
 import { projectThreadState } from "./thread-state-projection";
 import { type BoundedWaitPoll, isRetriableWaitFailure, runBoundedWaitLoop } from "./wait-polling";
@@ -1206,6 +1215,11 @@ export interface ObservationsService {
       refreshNativeSettlement: boolean,
     ) => Effect.Effect<ThreadConditionWaitState, ObservationServiceError>;
   }) => Effect.Effect<ThreadConditionWaitResult, ObservationServiceError>;
+  /** Evaluate one exact turn using fresh and retained observation evidence. */
+  readonly waitForTurn: (
+    turn: TurnReference,
+    waitMs: number,
+  ) => Effect.Effect<TurnWaitToolResult, ObservationServiceError>;
   /**
    * Observe one accepted thread.session.stop command and its following
    * stopped-session update from an ordered replay beginning at the captured
@@ -1285,6 +1299,153 @@ const shellRetentionKey = (instanceId: string): string => `shell:${instanceId}`;
 
 const threadRetentionKey = (instanceId: string, threadId: string): string =>
   `thread:${instanceId}:${threadId}`;
+
+const TURN_HISTORY_GAP_LIMITATION =
+  "The target turn is not covered by the current observation and no retained evidence establishes its outcome; a newer turn may have superseded it, and a fresh thread_get may not recover the target. Resynchronize before deciding on a new explicit request.";
+const TURN_RETAINED_EVIDENCE_LIMITATION =
+  "The target turn is no longer covered by the current observation; the outcome was established from retained turn evidence rather than a live projection.";
+interface TurnWaitEvaluation {
+  readonly execution: TurnWaitResult["execution"];
+  readonly satisfied: boolean;
+  readonly evidence: ReadonlyArray<Evidence>;
+}
+
+const terminalExecutionByState = {
+  interrupted: "interrupted",
+  completed: "completed",
+  error: "failed",
+} satisfies Record<"interrupted" | "completed" | "error", TurnWaitResult["execution"]>;
+
+const retainedTurnEvidence = (record: TurnEvidenceRecord): Evidence => ({
+  kind: "snapshot",
+  observedAt: record.observedAt,
+  sourceSequence: record.sourceSequence,
+  nativeEventId: null,
+  detail: record.detail,
+});
+
+const unavailableRequestKind = {
+  approval: "approval",
+  input: "input",
+  unknown: null,
+} as const satisfies Record<"approval" | "input" | "unknown", "approval" | "input" | null>;
+
+const requestKindOf = (request: PendingRequest): "approval" | "input" | null =>
+  Match.value(request.form).pipe(
+    Match.when({ kind: "approval" }, () => "approval" as const),
+    Match.when({ kind: "input" }, () => "input" as const),
+    Match.when({ kind: "unavailable" }, ({ requestKind }) => unavailableRequestKind[requestKind]),
+    Match.exhaustive,
+  );
+
+// fallow-ignore-next-line complexity
+const evaluateTurnOutcome = (options: {
+  readonly turn: TurnReference;
+  readonly detail: SynchronizedThreadDetail;
+  readonly evidence: TurnEvidenceRecord | null;
+  readonly pendingRequests: ReadonlyArray<PendingRequest>;
+}): TurnWaitEvaluation => {
+  const { turn, detail, evidence, pendingRequests } = options;
+  const latest = detail.thread.latestTurn;
+  if (latest !== null && latest.turnId === turn.turnId) {
+    const projection = projectThreadState({ instanceId: turn.instanceId, detail });
+    if (projection.execution.state === "inactive" && latest.state !== "running") {
+      return {
+        execution: terminalExecutionByState[latest.state],
+        satisfied: true,
+        evidence: projection.execution.evidence,
+      };
+    }
+    const pending = pendingRequests.filter(
+      (request) => request.state === "pending" && request.actionable,
+    );
+    const approval = pending.find((request) => requestKindOf(request) === "approval");
+    const input = pending.find((request) => requestKindOf(request) === "input");
+    const awaiting = approval ?? input;
+    if (awaiting !== undefined) {
+      const kind = approval === undefined ? "input" : "approval";
+      return {
+        execution: kind === "approval" ? "awaiting_approval" : "awaiting_input",
+        satisfied: true,
+        evidence: [
+          {
+            kind: "snapshot",
+            observedAt: detail.observedAt,
+            sourceSequence: detail.snapshotSequence,
+            nativeEventId: awaiting.activityId,
+            detail: `The retained activity ${awaiting.activityId} published an unresolved ${kind} request correlated to the turn.`,
+          },
+        ],
+      };
+    }
+    if (latest.state === "running")
+      return { execution: "running", satisfied: false, evidence: projection.execution.evidence };
+    return {
+      execution: "outcome_unknown",
+      satisfied: false,
+      evidence: projection.execution.evidence,
+    };
+  }
+  if (evidence !== null && !evidence.projected && evidence.state !== "running") {
+    return {
+      execution: terminalExecutionByState[evidence.state],
+      satisfied: true,
+      evidence: [retainedTurnEvidence(evidence)],
+    };
+  }
+  return {
+    execution: "outcome_unknown",
+    satisfied: false,
+    evidence: evidence === null ? [] : [retainedTurnEvidence(evidence)],
+  };
+};
+
+const turnWaitResult = (options: {
+  readonly turn: TurnReference;
+  readonly observation: TurnWaitResult["observation"];
+  readonly evaluation: TurnWaitEvaluation;
+  readonly pendingRequests: ReadonlyArray<PendingRequest>;
+  readonly observations: ReadonlyArray<Observation>;
+  readonly warnings: ReadonlyArray<{ readonly code: string; readonly message: string }>;
+}): TurnWaitToolResult => ({
+  result: {
+    kind: "ok",
+    value: {
+      target: options.turn,
+      observation: options.observation,
+      execution: options.evaluation.execution,
+      evidence: options.evaluation.evidence,
+      pendingRequests: options.pendingRequests,
+    },
+  },
+  observations: options.observations,
+  warnings: options.warnings,
+});
+
+const freshTurnObservation = (options: {
+  readonly turn: TurnReference;
+  readonly detail: SynchronizedThreadDetail;
+  readonly covered: boolean;
+  readonly satisfied: boolean;
+}): Observation => ({
+  instanceId: options.turn.instanceId,
+  observedAt: options.detail.observedAt,
+  freshness: "fresh",
+  sourceSequence: options.detail.snapshotSequence,
+  coverage: options.covered && !options.detail.limitedHistory ? "complete_for_query" : "partial",
+  limitations: [
+    ...(options.detail.limitedHistory ? [LIMITED_HISTORY_LIMITATION] : []),
+    ...(!options.covered
+      ? [options.satisfied ? TURN_RETAINED_EVIDENCE_LIMITATION : TURN_HISTORY_GAP_LIMITATION]
+      : []),
+  ],
+});
+
+const unknownTurnWaitEvaluation: TurnWaitEvaluation = {
+  execution: "outcome_unknown",
+  satisfied: false,
+  evidence: [],
+};
 
 export class Observations extends Context.Service<Observations, ObservationsService>()(
   "t3code-mcp/Observations",
@@ -1678,6 +1839,77 @@ export class Observations extends Context.Service<Observations, ObservationsServ
         });
       };
 
+      const waitForTurn: ObservationsService["waitForTurn"] = (turn, waitMs) =>
+        runBoundedWaitLoop({
+          waitMs,
+          poll: () =>
+            Effect.gen(function* () {
+              const detail = yield* threadDetail(turn.instanceId, turn.threadId);
+              const evidence =
+                detail.thread.latestTurn?.turnId === turn.turnId
+                  ? null
+                  : yield* store.findTurnEvidence(turn);
+              // Requests outside the target turn remain visible; only the
+              // exact-turn subset can establish an awaiting outcome.
+              const threadRequests = pendingRequestsFromActivities(
+                { instanceId: turn.instanceId, threadId: turn.threadId },
+                detail.thread.activities,
+                detail.limitedHistory,
+              );
+              const correlated = threadRequests.filter(
+                (request) => request.turn !== null && request.turn.turnId === turn.turnId,
+              );
+              const evaluation = evaluateTurnOutcome({
+                turn,
+                detail,
+                evidence,
+                pendingRequests: correlated,
+              });
+              const covered = detail.thread.latestTurn?.turnId === turn.turnId;
+              const observation = freshTurnObservation({
+                turn,
+                detail,
+                covered,
+                satisfied: evaluation.satisfied,
+              });
+              const pending = { evaluation, threadRequests, observation };
+              if (evaluation.satisfied || !covered) {
+                return {
+                  kind: "result" as const,
+                  result: turnWaitResult({
+                    turn,
+                    observation: evaluation.satisfied ? "condition_met" : "history_gap",
+                    evaluation,
+                    pendingRequests: threadRequests,
+                    observations: [observation],
+                    warnings: [],
+                  }),
+                };
+              }
+              return { kind: "pending" as const, pending };
+            }),
+          isRetriable: (failure) =>
+            isRetriableWaitFailure(failure, (candidate) => candidate instanceof ObservationError),
+          unavailable: (failure) =>
+            turnWaitResult({
+              turn,
+              observation: "unavailable",
+              evaluation: unknownTurnWaitEvaluation,
+              pendingRequests: [],
+              observations: [],
+              warnings: [{ code: "observation_unavailable", message: failure.message }],
+            }),
+          timedOut: (pending) =>
+            turnWaitResult({
+              turn,
+              observation: "timed_out",
+              evaluation: pending.evaluation,
+              pendingRequests: pending.threadRequests,
+              observations: [pending.observation],
+              warnings: [],
+            }),
+        });
+
       const consumeThreadSessionShutdown = (
         target: ThreadSessionShutdownTarget,
         waitMs: number,
@@ -1746,6 +1978,7 @@ export class Observations extends Context.Service<Observations, ObservationsServ
         archivedShell,
         threadDetail,
         waitForThreadCondition,
+        waitForTurn,
         watchThreadSessionShutdown,
       });
     }),
