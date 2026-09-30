@@ -10,12 +10,14 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LocalStore, LocalStoreError } from "./local-store";
+import type { ThreadState } from "./domain";
 import { InstanceConnections, type InstanceConnection } from "./instance-connections";
 import {
   ObservationError,
   Observations,
   synchronizeShellStream,
   synchronizeThreadStream,
+  type ThreadConditionWaitResult,
   type SynchronizedShell,
   type ThreadSessionShutdownTarget,
 } from "./observations";
@@ -1275,6 +1277,167 @@ describe("Thread session shutdown observation", () => {
 });
 
 describe("Observations thread detail", () => {
+  it.effect("evaluates bounded thread conditions through the Observations interface", () =>
+    withDatabasePath((databasePath) =>
+      Effect.gen(function* () {
+        const reads: Array<{
+          readonly threadId: string;
+          readonly afterSequence: number | undefined;
+          readonly turnLimit: number | undefined;
+        }> = [];
+        const layer = threadObservationsLayer(
+          databasePath,
+          {
+            openThreadStream: () =>
+              Stream.make(
+                threadSnapshotItem(5, threadDetailFixture("thread-a")),
+                threadSynchronizedItem,
+              ),
+          },
+          reads,
+        );
+        const result = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedRegistration;
+            const observations = yield* Observations;
+            return yield* observations.waitForThreadCondition({
+              instanceId: "instance-a",
+              threadId: "thread-a",
+              condition: "inactive",
+              cursor: null,
+              waitMs: 0,
+              observe: (detail) =>
+                Effect.succeed({
+                  state: {
+                    summary: { settlement: "unsettled" },
+                    execution: { state: "inactive" },
+                    session: { state: "ready" },
+                    pendingRequests: { items: [] },
+                  } as unknown as ThreadState,
+                  observations: [
+                    {
+                      instanceId: "instance-a",
+                      observedAt: detail.observedAt,
+                      freshness: "fresh",
+                      sourceSequence: detail.snapshotSequence,
+                      coverage: "complete_for_query",
+                      limitations: [],
+                    },
+                  ],
+                  nativeSettlementUnavailable: false,
+                }),
+            });
+          }).pipe(Effect.provide(layer)),
+        );
+        expect(result).toMatchObject({
+          condition: "inactive",
+          observation: "condition_met",
+          state: { execution: { state: "inactive" } },
+        });
+        expect(reads).toHaveLength(1);
+      }),
+    ),
+  );
+
+  it.effect(
+    "returns unavailable when retriable observation failures continue through the wait deadline",
+    () =>
+      withDatabasePath((databasePath) =>
+        Effect.gen(function* () {
+          const firstObservation = yield* Deferred.make<void>();
+          const waitCompleted = yield* Deferred.make<ThreadConditionWaitResult>();
+          const retriableFailure = new T3CodeAdapterError({
+            kind: "transport",
+            message: "The thread observation callback is temporarily unavailable.",
+            uncertain: false,
+            status: null,
+          });
+          let observationCalls = 0;
+          const reads: Array<{
+            readonly threadId: string;
+            readonly afterSequence: number | undefined;
+            readonly turnLimit: number | undefined;
+          }> = [];
+          const layer = threadObservationsLayer(
+            databasePath,
+            {
+              openThreadStream: () =>
+                Stream.make(
+                  threadSnapshotItem(5, threadDetailFixture("thread-a")),
+                  threadSynchronizedItem,
+                ),
+            },
+            reads,
+          );
+          const result = yield* Effect.scoped(
+            Effect.gen(function* () {
+              yield* seedRegistration;
+              const observations = yield* Observations;
+              const fiber = yield* Effect.forkChild(
+                observations
+                  .waitForThreadCondition({
+                    instanceId: "instance-a",
+                    threadId: "thread-a",
+                    condition: "settled",
+                    cursor: null,
+                    waitMs: 500,
+                    observe: (detail) => {
+                      observationCalls += 1;
+                      if (observationCalls > 1) return Effect.fail(retriableFailure);
+                      return Deferred.succeed(firstObservation, undefined).pipe(
+                        Effect.as({
+                          state: {
+                            summary: { settlement: "unsettled" },
+                            execution: { state: "active" },
+                            session: { state: "ready" },
+                            pendingRequests: { items: [] },
+                          } as unknown as ThreadState,
+                          observations: [
+                            {
+                              instanceId: "instance-a",
+                              observedAt: detail.observedAt,
+                              freshness: "fresh",
+                              sourceSequence: detail.snapshotSequence,
+                              coverage: "complete_for_query",
+                              limitations: [],
+                            },
+                          ],
+                          nativeSettlementUnavailable: false,
+                        }),
+                      );
+                    },
+                  })
+                  .pipe(Effect.tap((result) => Deferred.succeed(waitCompleted, result))),
+              );
+              yield* Deferred.await(firstObservation);
+              for (let step = 0; step < 10; step += 1) {
+                if (yield* Deferred.isDone(waitCompleted)) break;
+                yield* TestClock.adjust(Duration.millis(100));
+                yield* Effect.yieldNow;
+              }
+              const completed = yield* Deferred.isDone(waitCompleted);
+              if (!completed) yield* Fiber.interrupt(fiber);
+              expect(completed).toBe(true);
+              expect(observationCalls).toBeGreaterThan(1);
+              const result = yield* Fiber.join(fiber);
+              return result;
+            }).pipe(Effect.provide(layer)),
+          );
+
+          expect(result).toMatchObject({
+            observation: "unavailable",
+            state: null,
+            warnings: [
+              {
+                code: "observation_unavailable",
+                message: retriableFailure.message,
+              },
+            ],
+          });
+        }),
+      ),
+  );
+
   it.effect("requests the 20-turn window and resumes from the published watermark", () =>
     withDatabasePath((databasePath) =>
       Effect.gen(function* () {

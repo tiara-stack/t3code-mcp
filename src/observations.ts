@@ -17,10 +17,16 @@ import {
   SYNCHRONIZATION_BOUND_MILLIS,
   THREAD_SNAPSHOT_TURN_LIMIT,
   serializedByteLength,
+  type Observation,
+  type ThreadCondition,
+  type ThreadObservationCursor,
+  type ThreadState,
+  type ThreadWaitResult,
 } from "./domain";
 import { LocalStore, LocalStoreError, type LocalStoreService } from "./local-store";
 import { InstanceConnections } from "./instance-connections";
 import { projectThreadState } from "./thread-state-projection";
+import { type BoundedWaitPoll, isRetriableWaitFailure, runBoundedWaitLoop } from "./wait-polling";
 import {
   T3CodeAdapterError,
   type DiscoveredProject,
@@ -96,6 +102,180 @@ export interface ThreadSessionShutdownTarget {
 }
 
 export type ObservationServiceError = LocalStoreError | T3CodeAdapterError | ObservationError;
+
+export interface ThreadConditionWaitState {
+  readonly state: ThreadState;
+  readonly observations: ReadonlyArray<Observation>;
+  readonly nativeSettlementUnavailable: boolean;
+}
+
+export interface ThreadConditionWaitResult {
+  readonly condition: ThreadCondition;
+  readonly observation: ThreadWaitResult["observation"];
+  readonly state: ThreadState | null;
+  readonly observations: ReadonlyArray<Observation>;
+  readonly warnings: ReadonlyArray<{ readonly code: string; readonly message: string }>;
+}
+
+const HISTORY_GAP_LIMITATION =
+  "The observation cursor could not be continuously established; resynchronize with a fresh thread_get before waiting again.";
+
+const hasUnresolvedRequests = (state: ThreadState): boolean =>
+  state.pendingRequests.items.some(
+    (request) => request.state === "pending" || request.state === "unknown",
+  );
+
+type ThreadConditionEvaluation = "met" | "not_met" | "history_gap";
+
+interface ThreadConditionEvaluationInput {
+  readonly cursor: ThreadObservationCursor | null;
+  readonly detail: SynchronizedThreadDetail;
+  readonly state: ThreadState;
+}
+
+const evaluateChangedThreadCondition = ({ cursor, detail }: ThreadConditionEvaluationInput) => {
+  if (cursor === null) return "not_met" as const;
+  if (detail.snapshotReset || detail.snapshotSequence < cursor.snapshotSequence)
+    return "history_gap" as const;
+  return detail.snapshotSequence > cursor.snapshotSequence ? "met" : "not_met";
+};
+
+const evaluateInactiveThreadCondition = ({ state }: ThreadConditionEvaluationInput) =>
+  state.execution.state === "inactive" && !hasUnresolvedRequests(state) ? "met" : "not_met";
+
+const evaluateSettledThreadCondition = ({ state }: ThreadConditionEvaluationInput) =>
+  state.summary.settlement === "settled" ? "met" : "not_met";
+
+const evaluateUnsettledThreadCondition = ({ state }: ThreadConditionEvaluationInput) =>
+  state.summary.settlement === "unsettled" ? "met" : "not_met";
+
+const evaluateStoppedSessionCondition = ({ state }: ThreadConditionEvaluationInput) =>
+  state.session.state === "stopped" ? "met" : "not_met";
+
+const evaluateNeedsResponseCondition = ({ state }: ThreadConditionEvaluationInput) =>
+  state.pendingRequests.items.some((request) => request.state === "pending") ? "met" : "not_met";
+
+const threadConditionEvaluators: Record<
+  ThreadCondition,
+  (input: ThreadConditionEvaluationInput) => ThreadConditionEvaluation
+> = {
+  changed: evaluateChangedThreadCondition,
+  inactive: evaluateInactiveThreadCondition,
+  settled: evaluateSettledThreadCondition,
+  unsettled: evaluateUnsettledThreadCondition,
+  session_stopped: evaluateStoppedSessionCondition,
+  needs_response: evaluateNeedsResponseCondition,
+};
+
+const evaluateThreadCondition = (
+  options: ThreadConditionEvaluationInput & { readonly condition: ThreadCondition },
+): ThreadConditionEvaluation => threadConditionEvaluators[options.condition](options);
+
+type WaitObservationError = LocalStoreError | T3CodeAdapterError | ObservationError;
+
+const unavailableThreadConditionResult = (
+  condition: ThreadCondition,
+  message: string,
+): ThreadConditionWaitResult => ({
+  condition,
+  observation: "unavailable",
+  state: null,
+  observations: [],
+  warnings: [{ code: "observation_unavailable", message }],
+});
+
+const nativeSettlementUnavailableResult = (
+  condition: ThreadCondition,
+  current: ThreadConditionWaitState,
+): ThreadConditionWaitResult => ({
+  condition,
+  observation: "unavailable",
+  state: null,
+  observations: current.observations,
+  warnings: [
+    {
+      code: "native_settlement_unavailable",
+      message: "The current native thread attention state could not be established from the shell.",
+    },
+  ],
+});
+
+const threadConditionResult = (
+  condition: ThreadCondition,
+  outcome: Exclude<ThreadConditionEvaluation, "not_met">,
+  current: ThreadConditionWaitState,
+): ThreadConditionWaitResult => {
+  const observation = outcome === "met" ? "condition_met" : "history_gap";
+  const observations =
+    outcome === "history_gap" && current.observations[0] !== undefined
+      ? [
+          {
+            ...current.observations[0],
+            limitations: [...current.observations[0].limitations, HISTORY_GAP_LIMITATION],
+          },
+          ...current.observations.slice(1),
+        ]
+      : current.observations;
+  return {
+    condition,
+    observation,
+    state: current.state,
+    observations,
+    warnings: [],
+  };
+};
+
+const observeThreadConditionPoll = (options: {
+  readonly condition: ThreadCondition;
+  readonly observe: (
+    detail: SynchronizedThreadDetail,
+    refreshNativeSettlement: boolean,
+  ) => Effect.Effect<ThreadConditionWaitState, WaitObservationError>;
+  readonly readDetail: () => Effect.Effect<SynchronizedThreadDetail, WaitObservationError>;
+}): Effect.Effect<
+  { readonly detail: SynchronizedThreadDetail; readonly current: ThreadConditionWaitState },
+  WaitObservationError
+> =>
+  Effect.gen(function* () {
+    const detail = yield* options.readDetail();
+    const current = yield* options.observe(
+      detail,
+      options.condition === "settled" || options.condition === "unsettled",
+    );
+    return { detail, current };
+  });
+
+type ThreadConditionPollStep = BoundedWaitPoll<ThreadConditionWaitResult, ThreadConditionWaitState>;
+
+const resolveThreadConditionPoll = (
+  condition: ThreadCondition,
+  cursor: ThreadObservationCursor | null,
+  detail: SynchronizedThreadDetail,
+  current: ThreadConditionWaitState,
+): ThreadConditionPollStep => {
+  if (current.nativeSettlementUnavailable) {
+    return {
+      kind: "result",
+      result: nativeSettlementUnavailableResult(condition, current),
+    };
+  }
+  const outcome = evaluateThreadCondition({ condition, cursor, detail, state: current.state });
+  if (outcome === "not_met") return { kind: "pending", pending: current };
+  return { kind: "result", result: threadConditionResult(condition, outcome, current) };
+};
+
+const observeThreadConditionStep = (options: {
+  readonly condition: ThreadCondition;
+  readonly cursor: ThreadObservationCursor | null;
+  readonly readPoll: () => Effect.Effect<
+    { readonly detail: SynchronizedThreadDetail; readonly current: ThreadConditionWaitState },
+    WaitObservationError
+  >;
+}): Effect.Effect<ThreadConditionPollStep, WaitObservationError> =>
+  Effect.gen(function* () {
+    const poll = yield* options.readPoll();
+    return resolveThreadConditionPoll(options.condition, options.cursor, poll.detail, poll.current);
+  });
 
 interface ShellStaging {
   projects: Map<string, DiscoveredProject>;
@@ -1014,6 +1194,18 @@ export interface ObservationsService {
     instanceId: string,
     threadId: string,
   ) => Effect.Effect<SynchronizedThreadDetail, ObservationServiceError>;
+  /** Evaluate one bounded thread condition over fresh synchronized details. */
+  readonly waitForThreadCondition: (options: {
+    readonly instanceId: string;
+    readonly threadId: string;
+    readonly condition: ThreadCondition;
+    readonly cursor: ThreadObservationCursor | null;
+    readonly waitMs: number;
+    readonly observe: (
+      detail: SynchronizedThreadDetail,
+      refreshNativeSettlement: boolean,
+    ) => Effect.Effect<ThreadConditionWaitState, ObservationServiceError>;
+  }) => Effect.Effect<ThreadConditionWaitResult, ObservationServiceError>;
   /**
    * Observe one accepted thread.session.stop command and its following
    * stopped-session update from an ordered replay beginning at the captured
@@ -1457,6 +1649,35 @@ export class Observations extends Context.Service<Observations, ObservationsServ
           return yield* Fiber.join(entry.fiber);
         });
 
+      const waitForThreadCondition: ObservationsService["waitForThreadCondition"] = (options) => {
+        const readPoll = () =>
+          observeThreadConditionPoll({
+            condition: options.condition,
+            observe: options.observe,
+            readDetail: () => threadDetail(options.instanceId, options.threadId),
+          });
+        return runBoundedWaitLoop({
+          waitMs: options.waitMs,
+          poll: () =>
+            observeThreadConditionStep({
+              condition: options.condition,
+              cursor: options.cursor,
+              readPoll,
+            }),
+          isRetriable: (failure) =>
+            isRetriableWaitFailure(failure, (candidate) => candidate instanceof ObservationError),
+          unavailable: (failure) =>
+            unavailableThreadConditionResult(options.condition, failure.message),
+          timedOut: (last) => ({
+            condition: options.condition,
+            observation: "timed_out",
+            state: last.state,
+            observations: last.observations,
+            warnings: [],
+          }),
+        });
+      };
+
       const consumeThreadSessionShutdown = (
         target: ThreadSessionShutdownTarget,
         waitMs: number,
@@ -1524,6 +1745,7 @@ export class Observations extends Context.Service<Observations, ObservationsServ
         activeShell,
         archivedShell,
         threadDetail,
+        waitForThreadCondition,
         watchThreadSessionShutdown,
       });
     }),
