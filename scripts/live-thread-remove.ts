@@ -1,6 +1,6 @@
 /**
  * Disposable live check for TIA-295. This creates one temporary worktree and
- * one sessionless thread on a pinned T3Code 0.0.38 instance, removes the
+ * one sessionless thread on a pinned T3Code 0.0.45 instance, removes the
  * thread through the public MCP tool, then verifies the checkout is still
  * present on its original branch.
  *

@@ -3211,7 +3211,7 @@ const staleWorktreeInspectionReadLimitation = staleProjectReadLimitation;
 
 /**
  * The conditional guarantees reported for a provider/model. The pinned
- * T3Code 0.0.38 server configuration does not advertise per-model steering or
+ * T3Code 0.0.45 server configuration does not advertise per-model steering or
  * retained-context behavior, so every guarantee stays unknown rather than
  * claiming unverified support.
  */
@@ -3222,7 +3222,7 @@ export const unknownModelCapabilities = (): ReadonlyArray<Capability> =>
     name,
     support: "unknown" as const,
     reason:
-      "The pinned T3Code 0.0.38 server configuration does not advertise this conditional guarantee for the provider/model.",
+      "The pinned T3Code 0.0.45 server configuration does not advertise this conditional guarantee for the provider/model.",
     limitations: ["Capability support has not been verified for this provider/model."],
   }));
 

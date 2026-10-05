@@ -1,7 +1,7 @@
 /**
  * Disposable live check for the thread_create slice (TIA-285).
  *
- * Pair with a disposable pinned T3Code 0.0.38 server that already has a
+ * Pair with a disposable pinned T3Code 0.0.45 server that already has a
  * project. The script creates one unstarted thread, never creates a worktree,
  * and never submits a prompt. The server itself must be disposable; the
  * created thread remains in that instance for its lifetime. A temporary MCP

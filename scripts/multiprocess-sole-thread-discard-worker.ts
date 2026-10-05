@@ -123,7 +123,7 @@ const connection = (id: string): InstanceConnection => {
     credential: `credential-${id}`,
     verified: {
       environmentId,
-      serverVersion: "0.0.38",
+      serverVersion: "0.0.45",
       scopes: ["orchestration:read", "orchestration:operate"],
       capabilities: {},
     },

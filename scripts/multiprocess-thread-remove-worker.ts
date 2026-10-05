@@ -104,7 +104,7 @@ const connections = InstanceConnections.layerTest({
       credential: `secret-${instanceId}`,
       verified: {
         environmentId,
-        serverVersion: "0.0.38",
+        serverVersion: "0.0.45",
         scopes: [],
         capabilities: {},
       },

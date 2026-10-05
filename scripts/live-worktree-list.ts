@@ -1,7 +1,7 @@
 /**
  * Disposable live check for the worktree_list slice (TIA-282).
  *
- * Pairs with a pinned disposable T3Code 0.0.38 server (started with
+ * Pairs with a pinned disposable T3Code 0.0.45 server (started with
  * `t3 serve --base-dir <dir> --port <port>`), creates fixture worktrees and
  * threads through the pinned VCS and orchestration RPCs — the only upstream
  * write paths available ahead of the mutation slices — and then exercises
@@ -40,7 +40,7 @@ import { ServerToolkit, serverToolkitLayer } from "../src/tools";
  * Fixture-only RPCs against the pinned server. The supported adapter subset
  * deliberately excludes mutations in this slice; these clients exist only to
  * create disposable upstream fixtures. Wire shapes are pinned to release
- * commit c0995d2eaf8ec787b3318ed1169ae266ed1529f8.
+ * commit 6c8fed35dded9ff71c5b46807125457acbb76be6.
  */
 const FixtureDispatchRpc = Rpc.make("orchestration.dispatchCommand", {
   payload: Schema.Unknown,

@@ -1,7 +1,7 @@
 /**
  * Disposable live check for TIA-287 steering and retained-context guarantees.
  *
- * Use a disposable pinned T3Code 0.0.38 instance and an existing UI thread
+ * Use a disposable pinned T3Code 0.0.45 instance and an existing UI thread
  * that currently has an active turn. The script submits only guaranteed
  * variants that the pinned adapter must refuse before dispatch.
  *
@@ -19,6 +19,7 @@ import { join } from "node:path";
 import { InstanceConnections } from "../src/instance-connections";
 import { LocalStore } from "../src/local-store";
 import { ServerToolkit, serverToolkitLayer } from "../src/tools";
+import { LIVE_T3CODE_VERSION } from "./live-check-support";
 
 const appLayer = (databasePath: string) =>
   serverToolkitLayer.pipe(
@@ -75,8 +76,8 @@ const liveCheck = (endpoint: string, pairingCode: string, threadId: string) =>
   Effect.gen(function* () {
     const connections = yield* InstanceConnections;
     const staged = yield* connections.pair({ endpoint, pairingCode });
-    if (staged.serverVersion !== "0.0.38") {
-      throw new Error(`expected pinned T3Code 0.0.38, got ${staged.serverVersion}`);
+    if (staged.serverVersion !== LIVE_T3CODE_VERSION) {
+      throw new Error(`expected pinned T3Code ${LIVE_T3CODE_VERSION}, got ${staged.serverVersion}`);
     }
 
     const store = yield* LocalStore;

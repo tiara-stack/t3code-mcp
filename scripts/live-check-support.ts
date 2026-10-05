@@ -16,7 +16,7 @@ import { InstanceConnections } from "../src/instance-connections";
 import { LocalStore } from "../src/local-store";
 import { ServerToolkit, serverToolkitLayer } from "../src/tools";
 
-const LIVE_T3CODE_VERSION = "0.0.38";
+export const LIVE_T3CODE_VERSION = "0.0.45";
 
 const FixtureDispatchRpc = Rpc.make("orchestration.dispatchCommand", {
   payload: Schema.Unknown,

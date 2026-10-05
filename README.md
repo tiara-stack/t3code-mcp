@@ -13,7 +13,7 @@ by each T3Code instance.
 - Node.js 24.18.0 or newer.
 - Embedded SQLite 3.51.3 or newer, or a verified fixed backport. The server
   checks the SQLite version at startup.
-- T3Code 0.0.38 for the pinned adapter behavior described by this release.
+- T3Code 0.0.45 for the pinned adapter behavior described by this release.
 
 Check the runtime versions with:
 

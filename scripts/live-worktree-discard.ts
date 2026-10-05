@@ -4,7 +4,7 @@
  * The script creates a fresh worktree on the supplied disposable repository,
  * checks through public tools that no active or archived thread references
  * it, then discards that generated checkout. Run it against both local and
- * remote T3Code 0.0.38 instances. Add
+ * remote T3Code 0.0.45 instances. Add
  * `--verify-local-filesystem` only when the endpoint's filesystem is shared
  * with this runner; that mode creates an untracked probe file and confirms the
  * forced discard removes it. No host Git command is used.

@@ -1876,7 +1876,7 @@ describe("Thread session shutdown observation", () => {
             credential: "secret-a",
             verified: {
               environmentId: "env-a",
-              serverVersion: "0.0.38",
+              serverVersion: "0.0.45",
               scopes: [],
               capabilities: {},
             },
@@ -1963,7 +1963,7 @@ describe("Thread session shutdown observation", () => {
             credential: "secret-a",
             verified: {
               environmentId: "env-a",
-              serverVersion: "0.0.38",
+              serverVersion: "0.0.45",
               scopes: [],
               capabilities: {},
             },
@@ -2032,7 +2032,7 @@ describe("Thread session shutdown observation", () => {
             credential: "secret-a",
             verified: {
               environmentId: "env-a",
-              serverVersion: "0.0.38",
+              serverVersion: "0.0.45",
               scopes: [],
               capabilities: {},
             },
@@ -2102,7 +2102,7 @@ describe("Thread session shutdown observation", () => {
             credential: "secret-a",
             verified: {
               environmentId: "env-a",
-              serverVersion: "0.0.38",
+              serverVersion: "0.0.45",
               scopes: [],
               capabilities: {},
             },
@@ -2515,7 +2515,7 @@ describe("InstanceConnections observation capacity", () => {
             verifyCredential: () =>
               Effect.succeed({
                 environmentId: "env-capacity",
-                serverVersion: "0.0.38",
+                serverVersion: "0.0.45",
                 scopes: ["orchestration:read", "orchestration:operate"],
                 capabilities: {},
               }),
@@ -2616,7 +2616,7 @@ describe("InstanceConnections observation capacity", () => {
           verifyCredential: () =>
             Effect.succeed({
               environmentId: "env-reuse",
-              serverVersion: "0.0.38",
+              serverVersion: "0.0.45",
               scopes: ["orchestration:read", "orchestration:operate"],
               capabilities: {},
             }),

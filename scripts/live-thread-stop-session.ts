@@ -1,7 +1,7 @@
 /**
  * Disposable wire check for the thread_stop_session slice (TIA-289).
  *
- * Pair with a pinned T3Code 0.0.38 server, create one fixture thread, verify
+ * Pair with a pinned T3Code 0.0.45 server, create one fixture thread, verify
  * that the public tool handles a missing session, dispatch the pinned native
  * thread.session.stop command through the production adapter, then read the
  * observed stopped state and verify the public tool treats it as already

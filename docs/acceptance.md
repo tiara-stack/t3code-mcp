@@ -20,7 +20,7 @@ normalized input schemas expected from the packaged server.
 
 ## Prepare two disposable instances
 
-Use two T3Code 0.0.38 instances with independent data directories and project
+Use two T3Code 0.0.45 instances with independent data directories and project
 checkouts. They may run on different hosts. Each instance needs a project, an
 available provider/model, and a repository with the requested start ref. Grant
 `review:write` during pairing so `diff_read` can run.
@@ -99,7 +99,7 @@ Optional values select a project and start ref on each instance:
   `T3CODE_MCP_ACCEPTANCE_START_REF_B` select the worktree start refs. Both
   default to `main`.
 
-The runner checks T3Code 0.0.38, pairs both instances through `instance_pair`,
+The runner checks T3Code 0.0.45, pairs both instances through `instance_pair`,
 reads the colliding UI threads through qualified references, answers their
 approval and input requests, creates a worktree and thread, submits a prompt,
 observes a native turn, reads output and diffs, cancels a pending `thread_wait`

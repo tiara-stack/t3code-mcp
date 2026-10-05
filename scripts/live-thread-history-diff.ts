@@ -1,7 +1,7 @@
 /**
  * Disposable live check for native thread-history diff sources (TIA-294).
  *
- * Pair with a disposable pinned T3Code 0.0.38 instance and a thread with
+ * Pair with a disposable pinned T3Code 0.0.45 instance and a thread with
  * retained checkpoint history. The script reads one native turn range and
  * one through-turn diff through the public diff_read tool. It creates no
  * thread and submits no prompt. The temporary MCP database is removed after
@@ -24,6 +24,7 @@ import { DiffReadToolResultSchema } from "../src/domain";
 import { InstanceConnections } from "../src/instance-connections";
 import { LocalStore } from "../src/local-store";
 import { ServerToolkit, serverToolkitLayer } from "../src/tools";
+import { LIVE_T3CODE_VERSION } from "./live-check-support";
 
 const appLayer = (databasePath: string) =>
   serverToolkitLayer.pipe(
@@ -84,8 +85,10 @@ const liveCheck = (args: ReturnType<typeof parseArguments>) =>
       endpoint: args.endpoint,
       pairingCode: args.pairingCode,
     });
-    if (paired.serverVersion !== "0.0.38") {
-      throw new Error(`expected disposable T3Code 0.0.38, got ${paired.serverVersion}`);
+    if (paired.serverVersion !== LIVE_T3CODE_VERSION) {
+      throw new Error(
+        `expected disposable T3Code ${LIVE_T3CODE_VERSION}, got ${paired.serverVersion}`,
+      );
     }
     const store = yield* LocalStore;
     yield* store.putRegistration({
@@ -97,7 +100,7 @@ const liveCheck = (args: ReturnType<typeof parseArguments>) =>
       lastObservedAt: new Date().toISOString(),
       credential: paired.credential,
     });
-    console.log("PASS pair: verified disposable T3Code 0.0.38");
+    console.log(`PASS pair: verified disposable T3Code ${LIVE_T3CODE_VERSION}`);
 
     const readSource = (source: unknown) =>
       Effect.gen(function* () {

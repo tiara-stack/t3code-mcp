@@ -2,7 +2,7 @@
  * Disposable live check for TIA-297. This creates a fresh worktree and one
  * unstarted thread through public tools, removes them with one
  * `worktree_discard` request, then verifies checkout absence and branch
- * retention. Run it only against disposable local and remote T3Code 0.0.38
+ * retention. Run it only against disposable local and remote T3Code 0.0.45
  * instances that contain a disposable project and an available model.
  *
  * Usage:

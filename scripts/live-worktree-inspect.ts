@@ -1,7 +1,7 @@
 /**
  * Live integration check for the worktree_inspect slice (TIA-283).
  *
- * Pair with a disposable pinned T3Code 0.0.38 server. The supplied repository
+ * Pair with a disposable pinned T3Code 0.0.45 server. The supplied repository
  * and worktree paths must name a branch-attached checkout on that instance.
  * Refreshing VCS status may fetch and update local remote-tracking refs. The
  * script does not create or discard worktrees or threads. It uses an ephemeral

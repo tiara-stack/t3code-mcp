@@ -1,7 +1,7 @@
 /**
  * Disposable live check for input_respond (TIA-292).
  *
- * Run this against a disposable T3Code 0.0.38 instance and a thread that
+ * Run this against a disposable T3Code 0.0.45 instance and a thread that
  * already has a native actionable input form. The script checks the exact
  * pending request through the public thread_get tool, then answers only that
  * request through the public input_respond tool. It does not submit the

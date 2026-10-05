@@ -39,8 +39,8 @@ import {
 
 /**
  * Wire schemas are intentionally local to the adapter. They describe the
- * pinned T3Code 0.0.38 release (commit c0995d2eaf8ec787b3318ed1169ae266ed1529f8)
- * without importing its beta Effect runtime into this rc application.
+ * pinned T3Code 0.0.45 release (commit 6c8fed35dded9ff71c5b46807125457acbb76be6)
+ * while keeping the upstream contract separate from the MCP domain types.
  */
 const AccessTokenWireSchema = Schema.Struct({
   access_token: Schema.NonEmptyString,
@@ -747,9 +747,9 @@ const ServerGetConfigRpc = Rpc.make("server.getConfig", {
 });
 
 /**
- * The pinned 0.0.38 VCS RPC uses cwd/refName/newRefName/baseRefName/path and
+ * The pinned 0.0.45 VCS RPC uses cwd/refName/newRefName/baseRefName/path and
  * returns the effective path and ref. These adapter-owned schemas keep the
- * beta server contract out of the rc application runtime.
+ * upstream contract separate from the application types.
  */
 const VcsCreateWorktreeRpc = Rpc.make("vcs.createWorktree", {
   payload: Schema.Struct({
@@ -927,7 +927,7 @@ type AdapterRpcClient = RpcClient.RpcClient<
   RpcClientError.RpcClientError
 >;
 
-const PINNED_T3CODE_VERSION = "0.0.38";
+const PINNED_T3CODE_VERSION = "0.0.45";
 const REQUIRED_T3CODE_SCOPES = ["orchestration:read", "orchestration:operate"] as const;
 export const requestedT3CodePairingScopes = (
   includeDiffReadScope = false,

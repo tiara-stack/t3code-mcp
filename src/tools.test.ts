@@ -221,14 +221,14 @@ const fakeConnections = (options?: {
         )
       : Effect.succeed({
           environmentId,
-          serverVersion: "0.0.38",
+          serverVersion: "0.0.45",
           scopes: ["orchestration:read", "orchestration:operate"],
           capabilities: {},
         });
   const inspectCredential = (_input: { readonly endpoint: string; readonly credential: string }) =>
     Effect.succeed({
       environmentId,
-      serverVersion: "0.0.38",
+      serverVersion: "0.0.45",
       authorization: { read: "allowed" as const, operate: "allowed" as const },
       capabilities: [],
     });
@@ -246,7 +246,7 @@ const fakeConnections = (options?: {
               connection: "connected" as const,
               lastObservedAt: "2026-09-21T00:00:00.000Z",
             },
-            serverVersion: options?.inspection?.serverVersion ?? "0.0.38",
+            serverVersion: options?.inspection?.serverVersion ?? "0.0.45",
             authorization: {
               read: options?.inspection?.read ?? "allowed",
               operate: options?.inspection?.operate ?? "allowed",
@@ -368,7 +368,7 @@ const fakeAdapterLayer = (
   verifyCredential: T3CodeAdapterService["verifyCredential"] = () =>
     Effect.succeed({
       environmentId: "environment-a",
-      serverVersion: "0.0.38",
+      serverVersion: "0.0.45",
       scopes: ["orchestration:read", "orchestration:operate"],
       capabilities: {},
     }),
@@ -408,7 +408,7 @@ const fakeAdapterLayer = (
       failure.current === null
         ? Effect.succeed({
             environmentId: environmentByEndpoint[endpoint] ?? "environment-a",
-            serverVersion: "0.0.38",
+            serverVersion: "0.0.45",
             authorization: { read: "allowed" as const, operate: "allowed" as const },
             capabilities: [],
           })
@@ -1599,7 +1599,7 @@ describe("InstanceConnections.removeWorktree", () => {
                 endpoint === "https://initial.test"
                   ? "environment-initial"
                   : "environment-replacement",
-              serverVersion: "0.0.38",
+              serverVersion: "0.0.45",
               scopes: ["orchestration:read", "orchestration:operate"],
               capabilities: {},
             }),
@@ -1923,7 +1923,7 @@ describe("instance_get", () => {
                 instanceId: "instance-a",
                 environmentId: "environment-a",
               },
-              serverVersion: "0.0.38",
+              serverVersion: "0.0.45",
               authorization: { read: "allowed", operate: "denied" },
               capabilities: [
                 {
@@ -2849,7 +2849,7 @@ describe("instance_pair_again", () => {
     const environmentId = options?.environmentId ?? "env-repair";
     const verified = {
       environmentId,
-      serverVersion: "0.0.38",
+      serverVersion: "0.0.45",
       scopes: ["orchestration:read", "orchestration:operate"],
       capabilities: {},
     };
@@ -2889,7 +2889,7 @@ describe("instance_pair_again", () => {
       inspectCredential: () =>
         Effect.succeed({
           environmentId,
-          serverVersion: "0.0.38",
+          serverVersion: "0.0.45",
           authorization: { read: "allowed" as const, operate: "allowed" as const },
           capabilities: [],
         }),
@@ -2918,7 +2918,7 @@ describe("instance_pair_again", () => {
               connection: "connected" as const,
               lastObservedAt: "2026-09-21T00:00:00.000Z",
             },
-            serverVersion: "0.0.38",
+            serverVersion: "0.0.45",
             authorization: { read: "allowed" as const, operate: "allowed" as const },
             capabilities: [],
           },
@@ -3294,7 +3294,7 @@ describe("instance_pair_again", () => {
               );
               return {
                 environmentId: "env-repair",
-                serverVersion: "0.0.38",
+                serverVersion: "0.0.45",
                 scopes: ["orchestration:read", "orchestration:operate"],
                 capabilities: {},
               };
@@ -3302,7 +3302,7 @@ describe("instance_pair_again", () => {
           inspectCredential: () =>
             Effect.succeed({
               environmentId: "env-repair",
-              serverVersion: "0.0.38",
+              serverVersion: "0.0.45",
               authorization: { read: "allowed" as const, operate: "allowed" as const },
               capabilities: [],
             }),
@@ -3335,7 +3335,7 @@ describe("instance_pair_again", () => {
                   connection: "connected" as const,
                   lastObservedAt: null,
                 },
-                serverVersion: "0.0.38",
+                serverVersion: "0.0.45",
                 authorization: { read: "allowed" as const, operate: "allowed" as const },
                 capabilities: [],
               },
@@ -4264,7 +4264,7 @@ const projectFixtures = (
         ? Effect.fail(failures.current[endpoint]!)
         : Effect.succeed({
             environmentId: "environment-project",
-            serverVersion: "0.0.38",
+            serverVersion: "0.0.45",
             scopes: ["orchestration:read", "orchestration:operate"],
             capabilities: {},
           }),
@@ -5603,7 +5603,7 @@ const modelFixtures = (
     verifyCredential: () =>
       Effect.succeed({
         environmentId: "environment-model",
-        serverVersion: "0.0.38",
+        serverVersion: "0.0.45",
         scopes: ["orchestration:read", "orchestration:operate"],
         capabilities: {},
       }),
@@ -6233,7 +6233,7 @@ describe("model_list", () => {
               verifyCredential: () =>
                 Effect.succeed({
                   environmentId: "environment-model",
-                  serverVersion: "0.0.38",
+                  serverVersion: "0.0.45",
                   scopes: ["orchestration:read", "orchestration:operate"],
                   capabilities: {},
                 }),
@@ -6757,7 +6757,7 @@ const threadConnections = (options: ThreadFixtureOptions) =>
         credential: "test-token",
         verified: {
           environmentId,
-          serverVersion: "0.0.38",
+          serverVersion: "0.0.45",
           scopes: ["orchestration:read", "orchestration:operate"],
           capabilities: {},
         },
@@ -16986,7 +16986,7 @@ describe("input_respond", () => {
                 credential: "test-token",
                 verified: {
                   environmentId: `environment-${instanceId}`,
-                  serverVersion: "0.0.38",
+                  serverVersion: "0.0.45",
                   scopes: ["orchestration:read", "orchestration:operate"],
                   capabilities: {},
                 },

@@ -158,9 +158,10 @@ const pinnedT3CodeFixtureServer = Layer.unwrap(
           "/.well-known/t3/environment",
           HttpServerResponse.json({
             environmentId: "fixture-environment",
-            label: "T3Code 0.0.38 fixture",
-            platform: { os: "linux", arch: "x64" },
-            serverVersion: "0.0.38",
+            label: "T3Code 0.0.45 fixture",
+            platform: { os: "linux", arch: "x64", machine: "linux" },
+            serverVersion: "0.0.45",
+            orchestrationProtocolVersion: 1,
             capabilities: {},
           }),
         ),

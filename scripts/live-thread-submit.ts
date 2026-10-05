@@ -1,7 +1,7 @@
 /**
  * Disposable live check for thread_submit (TIA-286).
  *
- * Run this against a disposable T3Code 0.0.38 instance and a thread created
+ * Run this against a disposable T3Code 0.0.45 instance and a thread created
  * through its UI. The script submits a unique harmless prompt through the
  * public MCP toolkit, then waits for the provider's response in thread_output.
  * It does not create a thread; the supplied thread remains disposable test data.

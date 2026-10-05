@@ -1,7 +1,7 @@
 /**
  * Disposable live check for worktree_create (TIA-284).
  *
- * The T3Code 0.0.38 instance and repository must both be disposable. This
+ * The T3Code 0.0.45 instance and repository must both be disposable. This
  * creates one worktree and leaves it in that repository; removing the
  * disposable instance/repository is the cleanup boundary. `repositoryPath`
  * belongs to the target T3Code instance and is sent unchanged over its VCS

@@ -10,6 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { StdioMcpProcess, type JsonRpcResponse } from "./mcp-stdio";
+import { LIVE_T3CODE_VERSION } from "./live-check-support";
 
 const repositoryRoot = new URL("..", import.meta.url);
 const executable = fileURLToPath(new URL("dist/main.mjs", repositoryRoot));
@@ -697,15 +698,17 @@ const runAcceptance = Effect.acquireUseRelease(
         [processB.process, instanceB],
       ] as const) {
         const details = await call(process, "instance_get", { instanceId });
-        if (details["serverVersion"] !== "0.0.38") {
-          throw new Error(`expected disposable T3Code 0.0.38 for ${instanceId}`);
+        if (details["serverVersion"] !== LIVE_T3CODE_VERSION) {
+          throw new Error(`expected disposable T3Code ${LIVE_T3CODE_VERSION} for ${instanceId}`);
         }
         const authorization = asRecord(details["authorization"], "instance authorization");
         if (authorization["read"] !== "allowed" || authorization["operate"] !== "allowed") {
           throw new Error(`instance ${instanceId} lacks read or operate authorization`);
         }
       }
-      console.log("PASS two instance pairing: both disposable servers report T3Code 0.0.38");
+      console.log(
+        `PASS two instance pairing: both disposable servers report T3Code ${LIVE_T3CODE_VERSION}`,
+      );
 
       const fromPeer = await call(processB.process, "instance_list", {});
       if (!Array.isArray(fromPeer["items"]) || fromPeer["items"].length !== 2) {

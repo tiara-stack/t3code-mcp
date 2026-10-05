@@ -1,7 +1,7 @@
 /**
  * Disposable live check for native thread settlement (TIA-290).
  *
- * Pairs with a disposable T3Code 0.0.38 server, creates one idle fixture
+ * Pairs with a disposable T3Code 0.0.45 server, creates one idle fixture
  * thread, and exercises settle/unsettle through the public MCP tools. The
  * fixture RPC is used only to create, pin, snooze, and finally delete the
  * disposable thread. A fresh MCP database is removed at the end of the run.
